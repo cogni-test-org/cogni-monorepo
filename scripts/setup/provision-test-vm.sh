@@ -9,8 +9,7 @@
 # Usage:
 #   CHERRY_AUTH_TOKEN=<token> bash scripts/setup/provision-test-vm.sh preview
 #   CHERRY_AUTH_TOKEN=<token> bash scripts/setup/provision-test-vm.sh production
-#   CHERRY_AUTH_TOKEN=<token> DOMAIN=test.cognidao.org \
-#     bash scripts/setup/provision-test-vm.sh candidate-a
+#   CHERRY_AUTH_TOKEN=<token> bash scripts/setup/provision-test-vm.sh candidate-a
 #   CHERRY_AUTH_TOKEN=<token> bash scripts/setup/provision-test-vm.sh candidate-b
 # Environments:
 #   preview, production     — long-lived post-merge lanes
@@ -18,15 +17,18 @@
 #                             Requires matching infra/k8s/argocd/
 #                             ${slot}-applicationset.yaml and
 #                             infra/k8s/overlays/${slot}/*. DNS defaults to
-#                             ${slot}.cognidao.org; pass DOMAIN=... to override
-#                             (candidate-a inherits test.cognidao.org from the
-#                             retired canary env).
+#                             Cogni owns operator + resy public DNS and a
+#                             repo-scoped VM alias. It does not provision or
+#                             route cogni-poly.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PROVISION_DIR="$REPO_ROOT/infra/provision/cherry/base"
+
+# shellcheck source=./scripts/setup/lib/cogni-deployment-identity.sh
+source "$SCRIPT_DIR/lib/cogni-deployment-identity.sh"
 
 # ── Flags ─────────────────────────────────────────────────────
 AUTO_APPROVE=false
@@ -45,8 +47,8 @@ if [[ -z "$DEPLOY_ENV" ]]; then
   echo ""
   echo "  preview       — preview.cognidao.org"
   echo "  production    — cognidao.org"
-  echo "  candidate-a   — test.cognidao.org (pass DOMAIN=test.cognidao.org)"
-  echo "  candidate-b   — candidate-b.cognidao.org (or pass DOMAIN)"
+  echo "  candidate-a   — test.cognidao.org + resy-test.cognidao.org"
+  echo "  candidate-b   — candidate-b.cognidao.org + resy-candidate-b.cognidao.org"
   echo "  --yes         — skip confirmation prompt (for CI/automation)"
   exit 1
 fi
@@ -58,9 +60,6 @@ case "$DEPLOY_ENV" in
     K8S_NAMESPACE="cogni-preview"
     OVERLAY_DIR="preview"
     APPSET_FILE="preview-applicationset.yaml"
-    DOMAIN="${DOMAIN:-preview.cognidao.org}"
-    POLY_DOMAIN="${POLY_DOMAIN:-poly-preview.cognidao.org}"
-    RESY_DOMAIN="${RESY_DOMAIN:-resy-preview.cognidao.org}"
     WORKSPACE="preview"
     ;;
   production)
@@ -69,29 +68,19 @@ case "$DEPLOY_ENV" in
     K8S_NAMESPACE="cogni-production"
     OVERLAY_DIR="production"
     APPSET_FILE="production-applicationset.yaml"
-    DOMAIN="${DOMAIN:-cognidao.org}"
-    POLY_DOMAIN="${POLY_DOMAIN:-poly.cognidao.org}"
-    RESY_DOMAIN="${RESY_DOMAIN:-resy.cognidao.org}"
     WORKSPACE="production"
     ;;
   candidate-*)
     # Pre-merge candidate slots. All fields derive from ${DEPLOY_ENV} so
-    # spinning up candidate-b, candidate-c, ... only needs (1) a matching
-    # infra/k8s/argocd/${slot}-applicationset.yaml, (2) a matching
-    # infra/k8s/overlays/${slot}/ overlay tree, and (3) DNS. No edits
-    # here. candidate-a historically inherited test.cognidao.org from the
-    # retired canary env — pass DOMAIN=test.cognidao.org when provisioning
-    # candidate-a to preserve that; other candidates default to
-    # ${slot}.cognidao.org.
+    # spinning up candidate-b, candidate-c, ... only needs matching
+    # infra/k8s/argocd/${slot}-applicationset.yaml and
+    # infra/k8s/overlays/${slot}/ overlay trees. DNS is Cogni-scoped below.
     SLOT="$DEPLOY_ENV"
     BRANCH="main"
     DEPLOY_BRANCH="deploy/${SLOT}"
     K8S_NAMESPACE="cogni-${SLOT}"
     OVERLAY_DIR="${SLOT}"
     APPSET_FILE="${SLOT}-applicationset.yaml"
-    DOMAIN="${DOMAIN:-${SLOT}.cognidao.org}"
-    POLY_DOMAIN="${POLY_DOMAIN:-poly-${SLOT}.cognidao.org}"
-    RESY_DOMAIN="${RESY_DOMAIN:-resy-${SLOT}.cognidao.org}"
     WORKSPACE="${SLOT}"
     ;;
   *)
@@ -101,6 +90,15 @@ case "$DEPLOY_ENV" in
     exit 1
     ;;
 esac
+
+COGNI_DOMAIN_ROOT="$(cogni_domain_root)"
+COGNI_DEPLOYMENT_SLUG="$(cogni_deployment_slug)"
+DOMAIN="${DOMAIN:-$(cogni_operator_domain_for_env "$DEPLOY_ENV" "$COGNI_DOMAIN_ROOT")}"
+RESY_DOMAIN="${RESY_DOMAIN:-$(cogni_resy_domain_for_env "$DEPLOY_ENV" "$COGNI_DOMAIN_ROOT")}"
+VM_DNS_HOST="${VM_DNS_HOST:-$(cogni_vm_host_for_env "$DEPLOY_ENV" "$COGNI_DOMAIN_ROOT" "$COGNI_DEPLOYMENT_SLUG")}"
+DNS_RECORDS=("$DOMAIN" "$RESY_DOMAIN" "$VM_DNS_HOST")
+CADDYFILE_TEMPLATE="$REPO_ROOT/infra/compose/edge/configs/Caddyfile.cogni.tmpl"
+COGNI_APP_TARGETS=("operator" "resy" "scheduler-worker")
 
 # Allow branch override (e.g., testing a feature branch on preview infra)
 BRANCH="${COGNI_REPO_REF:-$BRANCH}"
@@ -236,16 +234,12 @@ TEMPORAL_DB_USER="${TEMPORAL_DB_USER:-temporal}"
 APP_ENV="${DEPLOY_ENV}"
 DEPLOY_ENVIRONMENT="${DEPLOY_ENV}"
 
-# Per-node databases
-COGNI_NODE_DBS="cogni_operator,cogni_poly,cogni_resy"
+# Per-node databases. cogni-poly lives in its own repo/VM after the split.
+COGNI_NODE_DBS="cogni_operator,cogni_resy"
 LITELLM_DB_NAME="litellm"
 
 # EVM RPC — use public Base mainnet endpoint for test
 EVM_RPC_URL="${EVM_RPC_URL:-https://mainnet.base.org}"
-# Polygon RPC — optional; poly-node reads fall back to viem default (public
-# polygon-rpc.com, often tenant-rate-limited). Pass a real Alchemy/QuickNode
-# URL via env to unblock /api/v1/poly/wallet/balance on candidate-a.
-POLYGON_RPC_URL="${POLYGON_RPC_URL:-}"
 
 # PostHog — use placeholder (app logs warning but starts)
 POSTHOG_API_KEY="${POSTHOG_API_KEY:-phc_placeholder_test}"
@@ -257,7 +251,7 @@ COGNI_REPO_REF="$BRANCH"
 
 # LiteLLM node endpoints — billing callback routing (Compose→k8s NodePorts via host gateway)
 # Format: nodeId=billingIngestUrl (one per node)
-COGNI_NODE_ENDPOINTS="4ff8eac1-4eba-4ed0-931b-b1fe4f64713d=http://host.docker.internal:30000/api/internal/billing/ingest,5ed2d64f-2745-4676-983b-2fb7e05b2eba=http://host.docker.internal:30100/api/internal/billing/ingest,f6d2a17d-b7f6-4ad1-a86b-f0ad2380999e=http://host.docker.internal:30300/api/internal/billing/ingest"
+COGNI_NODE_ENDPOINTS="4ff8eac1-4eba-4ed0-931b-b1fe4f64713d=http://host.docker.internal:30000/api/internal/billing/ingest,f6d2a17d-b7f6-4ad1-a86b-f0ad2380999e=http://host.docker.internal:30300/api/internal/billing/ingest"
 
 # DATABASE_URLs (constructed from parts — same derivation as setup-secrets.ts)
 # DATABASE_URLs use VM_IP placeholder — replaced after Phase 3 when IP is known.
@@ -379,10 +373,10 @@ ssh $SSH_OPTS root@"$VM_IP" 'kubectl get nodes && echo "---" && kubectl -n argoc
 # ══════════════════════════════════════════════════════════════
 if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] && [[ -n "${CLOUDFLARE_ZONE_ID:-}" ]]; then
   log_step "Phase 4b: Create DNS records"
-  # Derive subdomains from domain vars (e.g., test.cognidao.org → test)
-  DNS_RECORDS=("$DOMAIN" "$POLY_DOMAIN" "$RESY_DOMAIN")
+  # Derive subdomains from domain vars (e.g., test.cognidao.org → test).
+  # Cogni writes only its own public domains plus its repo-scoped VM alias.
   for fqdn in "${DNS_RECORDS[@]}"; do
-    sub="${fqdn%.cognidao.org}"  # Strip zone suffix to get subdomain
+    sub="${fqdn%.${COGNI_DOMAIN_ROOT}}"  # Strip zone suffix to get subdomain
     # Delete existing A records for this subdomain
     EXISTING=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
       "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?name=${fqdn}&type=A" \
@@ -408,25 +402,39 @@ fi
 # issue until the hourly window resets. See .claude/skills/dns-ops/SKILL.md.
 
 # ══════════════════════════════════════════════════════════════
-# Phase 4c: Patch EndpointSlice IPs on deploy branch
+# Phase 4c: Seed per-app deploy branches with fresh VM state
 # ══════════════════════════════════════════════════════════════
-log_step "Phase 4c: Patch EndpointSlice IPs to $VM_IP on $DEPLOY_BRANCH"
+log_step "Phase 4c: Seed per-app deploy branches with $VM_IP"
 
-# deploy/<env> is the sole persistence layer for env-discovered state (VM IPs).
-# promote-and-deploy.yml no longer rsyncs overlays — only updates digests.
-# Provision is the one writer for IP state.
-DEPLOY_TMP=$(mktemp -d)
+# deploy/<env>-<app> branches are Argo's source of truth for rendered app
+# state. Provision is the one writer for env-discovered VM state and must seed
+# these branches before applying the ApplicationSet, otherwise a fresh cluster
+# can sync stale ExternalName targets from pre-split branches.
 REPO_URL="https://${GHCR_USERNAME:-Cogni-1729}:${GHCR_TOKEN}@github.com/Cogni-DAO/cogni.git"
 
-log_info "Cloning $DEPLOY_BRANCH..."
-git clone --depth=1 --branch "$DEPLOY_BRANCH" "$REPO_URL" "$DEPLOY_TMP" 2>/dev/null
+for app in "${COGNI_APP_TARGETS[@]}"; do
+  DEPLOY_BRANCH="deploy/${DEPLOY_ENV}-${app}"
+  DEPLOY_TMP=$(mktemp -d)
 
-# Write VM IP to each overlay's env-state.yaml (bug.0334). This is the ONLY
-# file provision writes under infra/k8s/. The promote workflow rsyncs
-# everything else from main with --exclude='env-state.yaml'.
-for overlay_dir in "$DEPLOY_TMP/infra/k8s/overlays/${OVERLAY_DIR}"/*/; do
-  [[ -d "$overlay_dir" ]] || continue
-  cat > "${overlay_dir}env-state.yaml" <<EOF
+  log_info "Cloning $DEPLOY_BRANCH..."
+  if ! git clone --depth=1 --branch "$DEPLOY_BRANCH" "$REPO_URL" "$DEPLOY_TMP" 2>/dev/null; then
+    log_error "Missing deploy branch: $DEPLOY_BRANCH"
+    log_error "Run the deploy-branch bootstrap for ${DEPLOY_ENV}/${app} before provisioning."
+    exit 1
+  fi
+
+  rm -rf \
+    "$DEPLOY_TMP/infra/k8s/base" \
+    "$DEPLOY_TMP/infra/k8s/overlays/${OVERLAY_DIR}/${app}" \
+    "$DEPLOY_TMP/infra/catalog/${app}.yaml"
+  mkdir -p \
+    "$DEPLOY_TMP/infra/k8s/overlays/${OVERLAY_DIR}" \
+    "$DEPLOY_TMP/infra/catalog"
+  cp -R "$REPO_ROOT/infra/k8s/base" "$DEPLOY_TMP/infra/k8s/base"
+  cp -R "$REPO_ROOT/infra/k8s/overlays/${OVERLAY_DIR}/${app}" "$DEPLOY_TMP/infra/k8s/overlays/${OVERLAY_DIR}/${app}"
+  cp "$REPO_ROOT/infra/catalog/${app}.yaml" "$DEPLOY_TMP/infra/catalog/${app}.yaml"
+
+  cat > "$DEPLOY_TMP/infra/k8s/overlays/${OVERLAY_DIR}/${app}/env-state.yaml" <<EOF
 # SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
 # SPDX-FileCopyrightText: 2025 Cogni-DAO
 #
@@ -440,21 +448,21 @@ metadata:
 data:
   VM_IP: "${VM_IP}"
 EOF
-done
 
-cd "$DEPLOY_TMP"
-git config user.name "provision-script"
-git config user.email "provision@cogni.dev"
-git add -A
-if ! git diff --cached --quiet; then
-  git commit -m "chore(infra): write env-state.yaml for ${DEPLOY_ENV} — VM_IP=${VM_IP} [provision]"
-  git push origin "$DEPLOY_BRANCH"
-  log_info "Pushed EndpointSlice IP patches to $DEPLOY_BRANCH"
-else
-  log_info "EndpointSlice IPs already correct on $DEPLOY_BRANCH"
-fi
-rm -rf "$DEPLOY_TMP"
-cd "$REPO_ROOT"
+  cd "$DEPLOY_TMP"
+  git config user.name "provision-script"
+  git config user.email "provision@cogni.dev"
+  git add -A
+  if ! git diff --cached --quiet; then
+    git commit -m "chore(infra): seed ${DEPLOY_ENV}/${app} for VM ${VM_IP} [provision]"
+    git push origin "$DEPLOY_BRANCH"
+    log_info "Seeded $DEPLOY_BRANCH"
+  else
+    log_info "$DEPLOY_BRANCH already seeded"
+  fi
+  rm -rf "$DEPLOY_TMP"
+  cd "$REPO_ROOT"
+done
 
 # ══════════════════════════════════════════════════════════════
 # Phase 5: Deploy Compose infrastructure
@@ -467,7 +475,7 @@ ssh $SSH_OPTS root@"$VM_IP" 'mkdir -p /opt/cogni-template-edge/configs /opt/cogn
 
 # Edge stack
 scp $SSH_OPTS "$REPO_ROOT/infra/compose/edge/docker-compose.yml" root@"$VM_IP":/opt/cogni-template-edge/docker-compose.yml
-scp $SSH_OPTS "$REPO_ROOT/infra/compose/edge/configs/Caddyfile.tmpl" root@"$VM_IP":/opt/cogni-template-edge/configs/Caddyfile.tmpl
+scp $SSH_OPTS "$CADDYFILE_TEMPLATE" root@"$VM_IP":/opt/cogni-template-edge/configs/Caddyfile.tmpl
 
 # Runtime stack
 scp $SSH_OPTS "$REPO_ROOT/infra/compose/runtime/docker-compose.yml" root@"$VM_IP":/opt/cogni-template-runtime/docker-compose.yml
@@ -484,10 +492,8 @@ log_info "Writing .env files..."
 
 ssh $SSH_OPTS root@"$VM_IP" "cat > /opt/cogni-template-edge/.env << 'ENVEOF'
 DOMAIN=${DOMAIN}
-POLY_DOMAIN=${POLY_DOMAIN}
 RESY_DOMAIN=${RESY_DOMAIN}
 OPERATOR_UPSTREAM=host.docker.internal:30000
-POLY_UPSTREAM=host.docker.internal:30100
 RESY_UPSTREAM=host.docker.internal:30300
 ENVEOF"
 
@@ -523,7 +529,6 @@ PROMETHEUS_PASSWORD=${PROMETHEUS_PASSWORD:-}
 # App service vars (placeholders — services not started, but compose validates all)
 AUTH_SECRET=${AUTH_SECRET}
 EVM_RPC_URL=${EVM_RPC_URL}
-POLYGON_RPC_URL=${POLYGON_RPC_URL}
 DATABASE_URL=${DATABASE_URL}
 DATABASE_SERVICE_URL=${DATABASE_SERVICE_URL}
 POSTHOG_API_KEY=${POSTHOG_API_KEY}
@@ -594,12 +599,11 @@ log_step "Phase 6: Create k8s secrets on cluster"
 # Create namespace (Argo CD creates it on first sync, but secrets need it now)
 ssh $SSH_OPTS root@"$VM_IP" "kubectl create namespace ${K8S_NAMESPACE} 2>/dev/null || true"
 
-# Node-app secrets — one per node (operator, poly, resy)
+# Node-app secrets — one per Cogni node (operator, resy)
 # The Deployment references secretRef: {namePrefix}-node-app-secrets
-for node in operator poly resy; do
+for node in operator resy; do
   case $node in
     operator) db_name="cogni_operator" ;;
-    poly)     db_name="cogni_poly" ;;
     resy)     db_name="cogni_resy" ;;
   esac
 
@@ -613,7 +617,6 @@ for node in operator poly resy; do
     --from-literal=LITELLM_MASTER_KEY='${LITELLM_MASTER_KEY}' \
     --from-literal=OPENROUTER_API_KEY='${OPENROUTER_API_KEY}' \
     --from-literal=EVM_RPC_URL='${EVM_RPC_URL}' \
-    --from-literal=POLYGON_RPC_URL='${POLYGON_RPC_URL}' \
     --from-literal=POSTHOG_API_KEY='${POSTHOG_API_KEY}' \
     --from-literal=POSTHOG_HOST='${POSTHOG_HOST}' \
     --from-literal=OPENCLAW_GATEWAY_TOKEN='${OPENCLAW_GATEWAY_TOKEN}' \
@@ -664,7 +667,6 @@ log_step "Phase 7: Apply ApplicationSets (triggers Argo sync)"
 # Gate: verify prerequisites exist before enabling Argo sync
 ssh $SSH_OPTS root@"$VM_IP" "
   kubectl -n ${K8S_NAMESPACE} get secret operator-node-app-secrets >/dev/null || { echo 'FATAL: operator secrets missing'; exit 1; }
-  kubectl -n ${K8S_NAMESPACE} get secret poly-node-app-secrets >/dev/null || { echo 'FATAL: poly secrets missing'; exit 1; }
   kubectl -n ${K8S_NAMESPACE} get secret resy-node-app-secrets >/dev/null || { echo 'FATAL: resy secrets missing'; exit 1; }
   kubectl -n ${K8S_NAMESPACE} get secret scheduler-worker-secrets >/dev/null || { echo 'FATAL: scheduler-worker secrets missing'; exit 1; }
   echo 'All prerequisite secrets verified'
@@ -778,7 +780,7 @@ echo ""
 log_step "Phase 9: Verify /readyz on all nodes (up to 5 min)"
 
 READYZ_OK=true
-for node_port in 30000 30100 30300; do
+for node_port in 30000 30300; do
   NODE_OK=false
   for attempt in $(seq 1 30); do
     STATUS=$(ssh $SSH_OPTS root@"$VM_IP" "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 http://localhost:${node_port}/readyz" 2>/dev/null || echo "000")
@@ -800,10 +802,10 @@ done
 
 echo ""
 if [[ "$READYZ_OK" == "true" ]]; then
-  log_info "═══ ALL NODES HEALTHY — CANARY IS GREEN ═══"
+  log_info "═══ ALL COGNI NODES HEALTHY — ${DEPLOY_ENV} IS GREEN ═══"
   exit 0
 else
-  log_error "═══ SOME NODES FAILED /readyz — CANARY IS RED ═══"
+  log_error "═══ SOME COGNI NODES FAILED /readyz — ${DEPLOY_ENV} IS RED ═══"
   log_error "Debug: ssh -i .local/${DEPLOY_ENV}-vm-key root@$VM_IP 'kubectl -n ${K8S_NAMESPACE} logs -l app.kubernetes.io/name=node-app --tail=20'"
   exit 1
 fi
