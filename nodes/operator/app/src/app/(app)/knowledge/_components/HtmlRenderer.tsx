@@ -5,17 +5,19 @@
  * Module: `@app/(app)/knowledge/_components/HtmlRenderer`
  * Purpose: Renders a knowledge entry's `content` as a sandboxed HTML document.
  *   Used for `entryType === 'html'` — the canonical agent→human visual output
- *   channel (cf. Anthropic Artifacts: HTML-as-default for human-facing content).
+ *   channel. Reads theme via next-themes (the sanctioned ThemeProvider path)
+ *   and passes the result into the shell so the artifact matches the parent.
  * Scope: Pure presentation. `sandbox=""` disables scripts, popups, form submission,
  *   and same-origin access — untrusted content cannot reach parent cookies or DOM.
- *   Authoring contract: `html` is a self-contained HTML document (or fragment);
- *   author owns its styles. Renderer adds no wrap.
+ * Links: docs/spec/knowledge-html-style.md
  * @internal
  */
 
 "use client";
 
-import type { ReactElement } from "react";
+import { useTheme } from "next-themes";
+import { type ReactElement, useEffect, useState } from "react";
+import { buildHtmlShell, type RenderTheme } from "./htmlShell";
 
 interface HtmlRendererProps {
   readonly html: string;
@@ -23,13 +25,26 @@ interface HtmlRendererProps {
 }
 
 export function HtmlRenderer({ html, title }: HtmlRendererProps): ReactElement {
+  const { resolvedTheme, theme: themePref, systemTheme } = useTheme();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  const effective =
+    resolvedTheme ??
+    (themePref === "system" ? systemTheme : themePref) ??
+    systemTheme;
+  const theme: RenderTheme = effective === "dark" ? "dark" : "light";
+  const srcDoc = mounted ? buildHtmlShell(html, title, theme) : "";
+
   return (
     <iframe
+      key={mounted ? theme : "pending"}
       title={title}
-      srcDoc={html}
+      srcDoc={srcDoc}
       sandbox=""
       referrerPolicy="no-referrer"
-      className="h-[var(--height-artifact-canvas)] w-full rounded-md border border-border bg-[var(--bg-artifact-canvas)]"
+      aria-busy={!mounted}
+      className="h-[var(--height-artifact-canvas)] w-full rounded-md border border-border bg-background"
     />
   );
 }
