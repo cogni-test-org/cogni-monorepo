@@ -50,6 +50,9 @@ importers:
       '@cogni/ingestion-core':
         specifier: workspace:*
         version: link:packages/ingestion-core
+      '@cogni/knowledge-base':
+        specifier: workspace:*
+        version: link:packages/knowledge-base
       '@cogni/knowledge-store':
         specifier: workspace:^
         version: link:packages/knowledge-store
@@ -59,9 +62,6 @@ importers:
       '@cogni/node-core':
         specifier: workspace:*
         version: link:packages/node-core
-      '@cogni/node-template-knowledge':
-        specifier: workspace:*
-        version: link:nodes/node-template/packages/knowledge
       '@cogni/operator-wallet':
         specifier: workspace:*
         version: link:packages/operator-wallet
@@ -982,9 +982,9 @@ importers:
 
   nodes/operator/packages/doltgres-schema:
     dependencies:
-      '@cogni/node-template-knowledge':
+      '@cogni/knowledge-base':
         specifier: workspace:*
-        version: link:../../../node-template/packages/knowledge
+        version: link:../../../../packages/knowledge-base
       drizzle-orm:
         specifier: ^0.44.7
         version: 0.44.7(@opentelemetry/api@1.9.0)(@types/pg@8.16.0)(pg@8.17.1)(postgres@3.4.7)
@@ -1553,6 +1553,22 @@ importers:
         version: 5.9.3
 
   packages/ingestion-core:
+    devDependencies:
+      tsup:
+        specifier: ^8.5.1
+        version: 8.5.1(@swc/core@1.15.10)(jiti@2.6.1)(postcss@8.5.6)(tsx@4.20.6)(typescript@5.9.3)(yaml@2.8.3)
+      typescript:
+        specifier: ^5
+        version: 5.9.3
+
+  packages/knowledge-base:
+    dependencies:
+      '@cogni/knowledge-store':
+        specifier: workspace:*
+        version: link:../knowledge-store
+      drizzle-orm:
+        specifier: ^0.44.7
+        version: 0.44.7(@opentelemetry/api@1.9.0)(@types/pg@8.16.0)(pg@8.17.1)(postgres@3.4.7)
     devDependencies:
       tsup:
         specifier: ^8.5.1

@@ -4,8 +4,8 @@
 /**
  * Module: `@cogni/operator-doltgres-schema/knowledge`
  * Purpose: Operator's Doltgres knowledge schema. Re-exports the syntropy seed
- *   bundle from @cogni/node-template-knowledge and owns operator-specific
- *   contribution metadata tables.
+ *   bundle from @cogni/knowledge-base and owns operator-specific contribution
+ *   metadata tables (knowledge_contributions, knowledge_contribution_commits).
  * Scope: Drizzle table definitions only. Targets Doltgres via pg wire protocol (dialect: postgresql).
  * Invariants:
  *   - DB_PER_NODE: this schema applies to `knowledge_operator` only.
@@ -26,13 +26,14 @@ import {
   uniqueIndex,
 } from "drizzle-orm/pg-core";
 
-// Syntropy seed bundle — inherited from node-template.
+// Syntropy seed bundle — shared base from @cogni/knowledge-base. Identical
+// across all knowledge-capable nodes until per-node schema divergence is needed.
 export {
   citations,
   domains,
   knowledge,
   sources,
-} from "@cogni/node-template-knowledge";
+} from "@cogni/knowledge-base";
 
 export const knowledgeContributions = pgTable(
   "knowledge_contributions",
