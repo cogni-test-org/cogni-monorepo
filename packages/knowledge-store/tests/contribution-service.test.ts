@@ -22,6 +22,9 @@ import type {
 import { KnowledgeGateError, shapeGate } from "../src/domain/gates/index.js";
 import {
   ContributionForbiddenError,
+  type CreateEdoDecisionInput,
+  type CreateEdoHypothesisInput,
+  type CreateEdoOutcomeInput,
   type KnowledgeContributionPort,
 } from "../src/port/contribution.port.js";
 import { createContributionService } from "../src/service/contribution-service.js";
@@ -58,10 +61,26 @@ function contribution(
 class FakeContributionPort implements KnowledgeContributionPort {
   records: ContributionRecord[] = [];
   commits: ContributionCommitRecord[] = [];
+  /**
+   * Simulated "main branch" entry ids — the EDO atomic-batch port methods on
+   * the real Doltgres adapter open a `contrib/*` branch and apply rows there;
+   * main stays untouched. The fake records everything that lands on the
+   * branch into `branchWrites[contributionId]` and DOES NOT touch
+   * `mainEntryIds` until a hypothetical merge step. Tests assert the
+   * EDO_BEARER_VIA_CONTRIB_BRANCH invariant by checking this list stays empty.
+   */
+  mainEntryIds = new Set<string>();
+  branchWrites = new Map<
+    string,
+    Array<{ kind: "entry" | "citation"; id: string; branch: string }>
+  >();
   lastCreate: Parameters<KnowledgeContributionPort["create"]>[0] | null = null;
   lastAppend: Parameters<KnowledgeContributionPort["appendCommit"]>[0] | null =
     null;
   lastClose: Parameters<KnowledgeContributionPort["close"]>[0] | null = null;
+  lastEdoHypothesis: CreateEdoHypothesisInput | null = null;
+  lastEdoDecision: CreateEdoDecisionInput | null = null;
+  lastEdoOutcome: CreateEdoOutcomeInput | null = null;
 
   async create(
     input: Parameters<KnowledgeContributionPort["create"]>[0]
@@ -74,6 +93,191 @@ class FakeContributionPort implements KnowledgeContributionPort {
     });
     this.records.push(record);
     return record;
+  }
+
+  private nextEdoContribution(principal: Principal): {
+    contributionId: string;
+    branch: string;
+  } {
+    const slug = (principal.name ?? principal.id).toLowerCase();
+    const sid = String(this.records.length + 1).padStart(6, "0");
+    return {
+      contributionId: `contrib-${slug}-${sid}`,
+      branch: `contrib/${slug}-${sid}`,
+    };
+  }
+
+  async createEdoHypothesis(
+    input: CreateEdoHypothesisInput
+  ): Promise<ContributionRecord> {
+    this.lastEdoHypothesis = input;
+    const { contributionId, branch } = this.nextEdoContribution(
+      input.principal
+    );
+    const writes: Array<{
+      kind: "entry" | "citation";
+      id: string;
+      branch: string;
+    }> = [{ kind: "entry", id: input.entry.id, branch }];
+    for (const evidenceId of input.evidenceForIds ?? []) {
+      writes.push({
+        kind: "citation",
+        id: `${input.entry.id}->${evidenceId}:evidence_for`,
+        branch,
+      });
+    }
+    this.branchWrites.set(contributionId, writes);
+    const record = contribution({
+      contributionId,
+      branch,
+      principalKind: input.principal.kind,
+      principalId: input.principal.id,
+      commitCount: 1,
+      idempotencyKey: input.idempotencyKey ?? null,
+      message: input.message,
+    });
+    this.records.push(record);
+    return record;
+  }
+
+  async createEdoDecision(
+    input: CreateEdoDecisionInput
+  ): Promise<ContributionRecord> {
+    this.lastEdoDecision = input;
+    const { contributionId, branch } = this.nextEdoContribution(
+      input.principal
+    );
+    this.branchWrites.set(contributionId, [
+      { kind: "entry", id: input.entry.id, branch },
+      {
+        kind: "citation",
+        id: `${input.entry.id}->${input.derivesFromHypothesisId}:derives_from`,
+        branch,
+      },
+    ]);
+    const record = contribution({
+      contributionId,
+      branch,
+      principalKind: input.principal.kind,
+      principalId: input.principal.id,
+      commitCount: 1,
+      idempotencyKey: input.idempotencyKey ?? null,
+      message: input.message,
+    });
+    this.records.push(record);
+    return record;
+  }
+
+  async createEdoOutcome(
+    input: CreateEdoOutcomeInput
+  ): Promise<ContributionRecord> {
+    this.lastEdoOutcome = input;
+    const { contributionId, branch } = this.nextEdoContribution(
+      input.principal
+    );
+    this.branchWrites.set(contributionId, [
+      { kind: "entry", id: input.entry.id, branch },
+      {
+        kind: "citation",
+        id: `${input.entry.id}->${input.hypothesisId}:${input.edge}`,
+        branch,
+      },
+    ]);
+    const record = contribution({
+      contributionId,
+      branch,
+      principalKind: input.principal.kind,
+      principalId: input.principal.id,
+      commitCount: 1,
+      idempotencyKey: input.idempotencyKey ?? null,
+      message: input.message,
+    });
+    this.records.push(record);
+    return record;
+  }
+
+  async findOpenForPrincipal(
+    principalId: string
+  ): Promise<ContributionRecord | null> {
+    return (
+      this.records.find(
+        (r) => r.state === "open" && r.principalId === principalId
+      ) ?? null
+    );
+  }
+
+  private appendEdoToExisting(
+    contributionId: string,
+    writes: Array<{ kind: "entry" | "citation"; id: string }>
+  ): ContributionRecord {
+    const idx = this.records.findIndex(
+      (r) => r.contributionId === contributionId
+    );
+    if (idx < 0) {
+      throw new Error(`contribution ${contributionId} not found`);
+    }
+    const rec = this.records[idx];
+    if (!rec) {
+      throw new Error(`contribution ${contributionId} not found`);
+    }
+    if (rec.state !== "open") {
+      throw new Error(`contribution ${contributionId} is ${rec.state}`);
+    }
+    const branch = rec.branch;
+    const existing = this.branchWrites.get(contributionId) ?? [];
+    this.branchWrites.set(contributionId, [
+      ...existing,
+      ...writes.map((w) => ({ ...w, branch })),
+    ]);
+    const updated: ContributionRecord = {
+      ...rec,
+      commitCount: rec.commitCount + 1,
+      headCommit: `append-${rec.commitCount + 1}`,
+    };
+    this.records[idx] = updated;
+    return updated;
+  }
+
+  async appendEdoHypothesis(
+    input: CreateEdoHypothesisInput & { contributionId: string }
+  ): Promise<ContributionRecord> {
+    this.lastEdoHypothesis = input;
+    const writes: Array<{ kind: "entry" | "citation"; id: string }> = [
+      { kind: "entry", id: input.entry.id },
+    ];
+    for (const evidenceId of input.evidenceForIds ?? []) {
+      writes.push({
+        kind: "citation",
+        id: `${input.entry.id}->${evidenceId}:evidence_for`,
+      });
+    }
+    return this.appendEdoToExisting(input.contributionId, writes);
+  }
+
+  async appendEdoDecision(
+    input: CreateEdoDecisionInput & { contributionId: string }
+  ): Promise<ContributionRecord> {
+    this.lastEdoDecision = input;
+    return this.appendEdoToExisting(input.contributionId, [
+      { kind: "entry", id: input.entry.id },
+      {
+        kind: "citation",
+        id: `${input.entry.id}->${input.derivesFromHypothesisId}:derives_from`,
+      },
+    ]);
+  }
+
+  async appendEdoOutcome(
+    input: CreateEdoOutcomeInput & { contributionId: string }
+  ): Promise<ContributionRecord> {
+    this.lastEdoOutcome = input;
+    return this.appendEdoToExisting(input.contributionId, [
+      { kind: "entry", id: input.entry.id },
+      {
+        kind: "citation",
+        id: `${input.entry.id}->${input.hypothesisId}:${input.edge}`,
+      },
+    ]);
   }
 
   async appendCommit(
@@ -352,6 +556,244 @@ describe("createContributionService", () => {
     // Fire-and-forget — yield once so the microtask runs.
     await Promise.resolve();
     expect(pushCalls).toBe(1);
+  });
+
+  it("routes bearer EDO hypothesize through the contrib-branch port method (W2 — does not write to main)", async () => {
+    const port = new FakeContributionPort();
+    const service = createContributionService({
+      port,
+      canMergeKnowledge: () => false,
+      rateLimit: { maxOpenPerPrincipal: 5 },
+    });
+
+    const record = await service.createEdoHypothesisContribution({
+      principal: agent,
+      body: {
+        message: "file hypothesis on contrib branch",
+        entry: {
+          id: "h-test-1",
+          domain: "meta",
+          title: "test hypothesis",
+          content: "the loop closes",
+          evaluateAt: new Date("2026-06-01T00:00:00Z"),
+        },
+        evidenceForIds: ["evt-1", "evt-2"],
+      },
+    });
+
+    // Record lands as 'open' on a contrib/* branch.
+    expect(record.state).toBe("open");
+    expect(record.branch.startsWith("contrib/")).toBe(true);
+    expect(port.lastEdoHypothesis?.entry.id).toBe("h-test-1");
+    expect(port.lastEdoHypothesis?.evidenceForIds).toEqual(["evt-1", "evt-2"]);
+    // EDO_BEARER_VIA_CONTRIB_BRANCH: writes live on the branch, NOT on main.
+    expect(port.mainEntryIds.size).toBe(0);
+    const writes = port.branchWrites.get(record.contributionId) ?? [];
+    expect(writes.length).toBe(3); // entry + 2 evidence_for citations
+    expect(writes.every((w) => w.branch === record.branch)).toBe(true);
+  });
+
+  it("routes bearer EDO decide + recordOutcome through contrib-branch port methods", async () => {
+    const port = new FakeContributionPort();
+    const service = createContributionService({
+      port,
+      canMergeKnowledge: () => false,
+      rateLimit: { maxOpenPerPrincipal: 5 },
+    });
+
+    const decision = await service.createEdoDecisionContribution({
+      principal: agent,
+      body: {
+        message: "act on hypothesis",
+        entry: {
+          id: "d-test-1",
+          domain: "meta",
+          title: "test decision",
+          content: "we picked X",
+        },
+        derivesFromHypothesisId: "h-test-1",
+      },
+    });
+    expect(decision.branch.startsWith("contrib/")).toBe(true);
+    expect(port.lastEdoDecision?.derivesFromHypothesisId).toBe("h-test-1");
+
+    const outcome = await service.createEdoOutcomeContribution({
+      principal: agent,
+      body: {
+        message: "record observed result",
+        entry: {
+          id: "o-test-1",
+          domain: "meta",
+          title: "test outcome",
+          content: "X worked",
+        },
+        hypothesisId: "h-test-1",
+        edge: "validates",
+      },
+    });
+    expect(outcome.branch.startsWith("contrib/")).toBe(true);
+    expect(port.lastEdoOutcome?.edge).toBe("validates");
+
+    // Main untouched across all three EDO bearer writes.
+    expect(port.mainEntryIds.size).toBe(0);
+  });
+
+  it("EDO calls compound onto one open contribution per principal (W2.5)", async () => {
+    // COMPOUNDING_VIA_ONE_OPEN_CONTRIBUTION_PER_PRINCIPAL: when a principal
+    // already has an open contribution, subsequent EDO writes append to its
+    // branch instead of opening a new one. A hypothesize -> decide ->
+    // record-outcome chain by the same agent compounds onto ONE branch with
+    // 3 commits — one human merge gates the whole loop.
+    const port = new FakeContributionPort();
+    const service = createContributionService({
+      port,
+      canMergeKnowledge: () => false,
+      rateLimit: { maxOpenPerPrincipal: 5 },
+    });
+
+    const h = await service.createEdoHypothesisContribution({
+      principal: agent,
+      body: {
+        message: "file hypothesis",
+        entry: {
+          id: "h-chain",
+          domain: "meta",
+          title: "compound chain root",
+          content: "...",
+          evaluateAt: new Date("2026-06-01T00:00:00Z"),
+        },
+      },
+    });
+    expect(h.commitCount).toBe(1);
+
+    const d = await service.createEdoDecisionContribution({
+      principal: agent,
+      body: {
+        message: "act on hypothesis",
+        entry: {
+          id: "d-chain",
+          domain: "meta",
+          title: "compound decision",
+          content: "we picked X",
+        },
+        derivesFromHypothesisId: "h-chain",
+      },
+    });
+    // Same contribution + same branch as the hypothesis — NOT a new contrib.
+    expect(d.contributionId).toBe(h.contributionId);
+    expect(d.branch).toBe(h.branch);
+    expect(d.commitCount).toBe(2);
+
+    const o = await service.createEdoOutcomeContribution({
+      principal: agent,
+      body: {
+        message: "record observed result",
+        entry: {
+          id: "o-chain",
+          domain: "meta",
+          title: "compound outcome",
+          content: "X worked",
+        },
+        hypothesisId: "h-chain",
+        edge: "validates",
+      },
+    });
+    expect(o.contributionId).toBe(h.contributionId);
+    expect(o.commitCount).toBe(3);
+
+    // ONE contribution holds the full chain.
+    expect(port.records.length).toBe(1);
+    // Branch carries all three entries + their citations.
+    const writes = port.branchWrites.get(h.contributionId) ?? [];
+    expect(writes.length).toBe(5); // 3 entries + derives_from + validates
+    expect(writes.every((w) => w.branch === h.branch)).toBe(true);
+    // Main still untouched (W2 invariant preserved through compounding).
+    expect(port.mainEntryIds.size).toBe(0);
+  });
+
+  it("EDO open-quota gates NEW contributions but does not block compounding", async () => {
+    // Quota only applies when there is NO existing open contribution to
+    // append onto. Once compounding kicks in, the chain shares one slot.
+    const port = new FakeContributionPort();
+    const service = createContributionService({
+      port,
+      canMergeKnowledge: () => false,
+      rateLimit: { maxOpenPerPrincipal: 1 },
+    });
+
+    // First hypothesize opens a contribution (no quota hit — count was 0).
+    const first = await service.createEdoHypothesisContribution({
+      principal: agent,
+      body: {
+        message: "first",
+        entry: {
+          id: "h-q-1",
+          domain: "meta",
+          title: "first",
+          content: "...",
+          evaluateAt: new Date("2026-06-01T00:00:00Z"),
+        },
+      },
+    });
+    expect(first.commitCount).toBe(1);
+
+    // Second hypothesize for the SAME principal compounds — quota irrelevant.
+    const second = await service.createEdoHypothesisContribution({
+      principal: agent,
+      body: {
+        message: "second compounds",
+        entry: {
+          id: "h-q-2",
+          domain: "meta",
+          title: "second",
+          content: "...",
+          evaluateAt: new Date("2026-06-02T00:00:00Z"),
+        },
+      },
+    });
+    expect(second.contributionId).toBe(first.contributionId);
+    expect(second.commitCount).toBe(2);
+    expect(port.records.length).toBe(1);
+  });
+
+  it("EDO contribution methods replay on idempotency key", async () => {
+    const port = new FakeContributionPort();
+    const service = createContributionService({
+      port,
+      canMergeKnowledge: () => false,
+      rateLimit: { maxOpenPerPrincipal: 5 },
+    });
+    const first = await service.createEdoHypothesisContribution({
+      principal: agent,
+      body: {
+        message: "first",
+        idempotencyKey: "idem-1",
+        entry: {
+          id: "h-idem",
+          domain: "meta",
+          title: "h",
+          content: "c",
+          evaluateAt: new Date("2026-06-01T00:00:00Z"),
+        },
+      },
+    });
+    const second = await service.createEdoHypothesisContribution({
+      principal: agent,
+      body: {
+        message: "second (replay)",
+        idempotencyKey: "idem-1",
+        entry: {
+          id: "h-idem",
+          domain: "meta",
+          title: "h",
+          content: "c",
+          evaluateAt: new Date("2026-06-01T00:00:00Z"),
+        },
+      },
+    });
+    expect(second.contributionId).toBe(first.contributionId);
+    // Only the first call hit the port.
+    expect(port.records.length).toBe(1);
   });
 
   it("does not block or fail the merge when pushMainOnMerge throws (fire-and-forget contract)", async () => {
