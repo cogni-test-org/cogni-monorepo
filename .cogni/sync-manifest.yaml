@@ -36,7 +36,7 @@ exclude:
 # Anything NOT covered by exclude[] or these lists MUST match across hub + artifact.
 divergences:
   - artifact: Cogni-DAO/node-template
-    reason: "OSS public quickstart — sovereign-fork story extends operator-scope with OpenBao/ESO; omits hub-only nodes + canary env."
+    reason: "OSS public quickstart — omits hub-only nodes + canary env. Secrets substrate (OpenBao/ESO + catalog loader + tier spec) graduated to shared via task.5081."
     omit_from_artifact:
       # AGENTS.md exists on BOTH repos but intentionally diverges — the
       # artifact prepends a development-freeze banner (Cogni-DAO/node-template#66)
@@ -50,6 +50,8 @@ divergences:
       - "nodes/resy/**" # hub-only node
       - "infra/catalog/operator.yaml"
       - "infra/catalog/resy.yaml"
+      - "infra/catalog/node-template.yaml" # hub-style; artifact carries standalone-style (task.5078) — both-sides intentional divergence
+      - ".github/workflows/release.yml" # no production env
       - "infra/k8s/overlays/canary/**" # no canary env
       - "tests/ci-invariants/**" # hub-only CI structural tests
       - "infra/k8s/secrets/production/**" # hub production secrets — never ship to public template
@@ -60,28 +62,15 @@ divergences:
     artifact_only:
       - "AGENTS.md" # dev-freeze banner twin (see omit_from_artifact comment) — both lists required to zero the bidirectional drift flag
       - "infra/fork.yaml"
-      - "infra/k8s/argocd/openbao-application.yaml"
-      - "infra/k8s/argocd/openbao/**"
-      - "infra/k8s/argocd/external-secrets-application.yaml"
-      - "infra/k8s/argocd/external-secrets/**"
-      - "infra/k8s/secrets/external-secrets/**"
       - "infra/k8s/overlays/_template/node-template/**"
-      - "infra/k8s/overlays/candidate-a/node-template/**"
+      - "infra/catalog/node-template.yaml" # standalone-style fork catalog — see omit_from_artifact twin (both-sides divergence)
+      - "infra/k8s/overlays/candidate-a/node-template/**" # hub + artifact diverge; hub overlay activates ExternalSecret via task.5081 CP2
       - "infra/k8s/overlays/preview/node-template/**"
       - "infra/k8s/overlays/production/node-template/**"
-      - "docs/spec/secrets-management.md"
-      - "docs/guides/secrets-add-new.md"
-      - "docs/guides/secrets-rotate.md"
-      - "docs/runbooks/fork-quickstart.md"
-      - "docs/spec/agentic-fork-bootstrap.md"
-      - "infra/catalog/node-template.yaml"
-      - "scripts/secrets/**"
       - "scripts/dev/worktree-setup.sh"
       - "scripts/rename-node.sh"
-      - "scripts/setup/bootstrap.sh"
+      - "scripts/setup/bootstrap.sh" # sources lib/fork-identity.sh; hub uses lib/cogni-deployment-identity.sh — reconcile separately
       - "scripts/bootstrap/install/install-bash.sh"
-      - ".claude/skills/cicd-secrets-expert/**"
-      - ".env.bootstrap.example"
 
   - artifact: Cogni-DAO/cogni-poly
     reason: "Private per-node fork; carries the poly node, omits the template node + other hub nodes."
@@ -91,5 +80,6 @@ divergences:
       - "nodes/node-template/**"
       - "infra/catalog/operator.yaml"
       - "infra/catalog/resy.yaml"
+      - "infra/catalog/scheduler-worker.yaml"
     artifact_only:
       - "nodes/poly/**"
