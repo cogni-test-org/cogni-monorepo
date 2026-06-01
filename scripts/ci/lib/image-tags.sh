@@ -43,7 +43,10 @@ declare -A _image_tags_suffix_cache=()
 declare -A _image_tags_primary_cache=()
 declare -A _image_tags_node_port_cache=()
 declare -A _image_tags_node_id_cache=()
+declare -A _image_tags_type_cache=()
 for _t in "${ALL_TARGETS[@]}"; do
+  _ty=$(yq -N '.type' "${_image_tags_catalog_root}/${_t}.yaml")
+  _image_tags_type_cache["$_t"]="$_ty"
   _s=$(yq '.image_tag_suffix' "${_image_tags_catalog_root}/${_t}.yaml")
   [ "$_s" = "null" ] && _s=""
   _image_tags_suffix_cache["$_t"]="$_s"
@@ -62,7 +65,13 @@ for _t in "${ALL_TARGETS[@]}"; do
   fi
   _image_tags_node_id_cache["$_t"]="$_nid"
 done
-unset _t _s _p _np _pp _rs _nid
+unset _t _ty _s _p _np _pp _rs _nid
+
+# True for type:infra targets — built in CI but deployed via Compose-on-VM,
+# not k8s/Argo. Overlay / promotion / gitops-coverage loops skip these.
+is_infra_target() {
+  [ "${_image_tags_type_cache[$1]:-}" = "infra" ]
+}
 
 image_name_for_target() {
   printf '%s' "$IMAGE_NAME_APP"
@@ -81,6 +90,40 @@ image_tag_for_target() {
   local image_name="$1" base_tag="$2" target="$3" suffix
   suffix=$(tag_suffix_for_target "$target") || return 1
   printf '%s:%s%s' "$image_name" "$base_tag" "$suffix"
+}
+
+# Content-hash tag for a type:infra target (e.g. litellm). The tag changes only
+# when the image's build dir changes, so the affected-only build rebuilds it
+# rarely and deploy-infra resolves the identical tag deterministically — no
+# manual `docker build` + hand-pin, no per-sha gap. The build dir is the parent
+# of the catalog `dockerfile`. AGENTS.md + __pycache__ are excluded so docs /
+# bytecode never perturb the image identity. LC_ALL=C sort keeps it stable
+# across macOS (dev) and Linux (CI).
+infra_content_hash() {
+  local target="$1" dockerfile dir base
+  dockerfile=$(yq -N '.dockerfile' "${_image_tags_catalog_root}/${target}.yaml")
+  dir=$(dirname "$dockerfile")
+  # Resolve relative to the catalog's own tree so an override
+  # (COGNI_CATALOG_ROOT=app-src/infra/catalog, the #1427 pre-merge birth flow)
+  # hashes the PR's files; fall back to the script's repo root.
+  base="$(cd "${_image_tags_catalog_root}/../.." 2>/dev/null && pwd || echo "$_image_tags_repo_root")"
+  # git ls-files → tracked files only (untracked/gitignored, incl. __pycache__,
+  # can't perturb identity); AGENTS.md excluded (docs ≠ image). `read -r` per line
+  # keeps it space-safe and portable across BSD (dev) + GNU (CI) — no sort -z.
+  ( cd "$base" && \
+    git ls-files -- "$dir" \
+      | grep -vE '(^|/)AGENTS\.md$' \
+      | LC_ALL=C sort \
+      | while IFS= read -r _f; do cat "$_f"; done \
+      | shasum -a 256 | cut -c1-12 )
+}
+
+# Full GHCR tag for a type:infra image: <image>:<target>-<contenthash>
+# (e.g. ghcr.io/cogni-dao/cogni-template:litellm-<hash>). Single source of
+# truth for both the CI build (build-and-push) and the deploy (deploy-infra).
+infra_image_tag() {
+  local target="$1"
+  printf '%s:%s-%s' "$IMAGE_NAME_APP" "$target" "$(infra_content_hash "$target")"
 }
 
 # Resolve the public host for a node, given a base DOMAIN. Catalog drives
