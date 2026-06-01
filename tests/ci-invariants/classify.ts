@@ -64,6 +64,39 @@ function isRideAlong(path: string): boolean {
 }
 
 /**
+ * NODE_BIRTH ride-along (bug.5086): a node may carry its OWN deploy wiring —
+ * the operator-owned files that exist only to make `nodes/<node>/` deployable.
+ * This lets a single welcome PR create + wire a node in one PR (the
+ * CATALOG_IS_SSOT / create-node.md contract) without splitting node app from
+ * its catalog/overlays/AppSet. Bounded to the node's OWN slug — a node PR
+ * still cannot touch another node's catalog/overlay.
+ *
+ * RESIDUAL: the AppSet files are shared (one per env, not slug-pathed), so a
+ * node-wiring PR could in principle also alter another node's generator block
+ * in them. Tighten later via a content check or a glob-based AppSet (the per-
+ * node `revision:` blocks are why they aren't a glob today). Reviewed at PR time.
+ */
+function isNodeWiring(path: string, node: string): boolean {
+  if (node === "") return false;
+  const overlayPrefix = "infra/k8s/overlays/";
+  const argocdPrefix = "infra/k8s/argocd/";
+  if (path.startsWith(overlayPrefix)) {
+    const rest = path.slice(overlayPrefix.length);
+    const slash = rest.indexOf("/");
+    return slash > 0 && rest.slice(slash + 1).startsWith(`${node}/`);
+  }
+  if (path.startsWith(argocdPrefix)) {
+    const file = path.slice(argocdPrefix.length);
+    return (
+      !file.includes("/") &&
+      file.includes("applicationset") &&
+      (file.endsWith(".yaml") || file.endsWith(".yml"))
+    );
+  }
+  return path === `infra/catalog/${node}.yaml`;
+}
+
+/**
  * Classify a list of changed paths against the set of known non-operator nodes.
  * The rule:
  *   domain(path) = X         if path starts with `nodes/<X>/` for X in nonOperatorNodes
@@ -96,12 +129,17 @@ export function classify(
     if (assigned === OPERATOR_NODE) operatorPaths.push(p);
   }
 
+  // The single non-operator node (if exactly one) — used for the NODE_BIRTH
+  // wiring carve-out so a node may ride along its OWN catalog/overlays/AppSet.
+  const nonOperator = [...domains].filter((d) => d !== OPERATOR_NODE);
+  const theNode = nonOperator.length === 1 ? nonOperator[0] : "";
+
   let rideAlongApplied = false;
   if (
     domains.size === 2 &&
     domains.has(OPERATOR_NODE) &&
     operatorPaths.length > 0 &&
-    operatorPaths.every(isRideAlong)
+    operatorPaths.every((p) => isRideAlong(p) || isNodeWiring(p, theNode))
   ) {
     domains.delete(OPERATOR_NODE);
     rideAlongApplied = true;
