@@ -1,0 +1,11 @@
+name: ay
+type: node
+port: 3200
+node_port: 30500
+dockerfile: nodes/ay/app/Dockerfile
+image_tag_suffix: "-ay"
+migrator_tag_suffix: "-ay-migrate"
+candidate_a_branch: deploy/candidate-a-ay
+preview_branch: deploy/preview-ay
+production_branch: deploy/production-ay
+path_prefix: nodes/ay/
