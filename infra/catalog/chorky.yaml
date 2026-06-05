@@ -1,0 +1,11 @@
+name: chorky
+type: node
+port: 3200
+node_port: 30500
+dockerfile: nodes/chorky/app/Dockerfile
+image_tag_suffix: "-chorky"
+migrator_tag_suffix: "-chorky-migrate"
+candidate_a_branch: deploy/candidate-a-chorky
+preview_branch: deploy/preview-chorky
+production_branch: deploy/production-chorky
+path_prefix: nodes/chorky/

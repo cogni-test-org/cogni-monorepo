@@ -1,0 +1,3 @@
+[submodule "nodes/chorky"]
+	path = nodes/chorky
+	url = https://github.com/cogni-test-org/chorky.git
