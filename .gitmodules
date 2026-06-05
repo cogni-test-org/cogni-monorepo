@@ -1,0 +1,3 @@
+[submodule "nodes/anotha-one"]
+	path = nodes/anotha-one
+	url = https://github.com/cogni-test-org/anotha-one.git
