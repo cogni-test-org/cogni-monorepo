@@ -1,0 +1,13 @@
+name: anotha-one
+type: node
+port: 3200
+node_port: 30500
+dockerfile: nodes/anotha-one/app/Dockerfile
+image_tag_suffix: "-anotha-one"
+migrator_tag_suffix: "-anotha-one-migrate"
+source_repo: https://github.com/cogni-test-org/anotha-one.git
+image_repository: ghcr.io/cogni-test-org/cogni-node-template
+candidate_a_branch: deploy/candidate-a-anotha-one
+preview_branch: deploy/preview-anotha-one
+production_branch: deploy/production-anotha-one
+path_prefix: nodes/anotha-one/
