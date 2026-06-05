@@ -246,3 +246,5 @@ jobs:
             -H "Authorization: Bearer ${INTERNAL_OPS_TOKEN}" \
             -H "Content-Type: application/json" \
             -d '{"limit":500}' | jq .
+
+# Activation touch for GitHub Actions workflow registration.
