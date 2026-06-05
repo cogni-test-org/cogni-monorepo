@@ -400,7 +400,7 @@ jobs:
     needs: unit
     # Sonar is PR-time signal only (decorates the PR with a comment + Sonar dashboard link).
     # Has no meaning on the merge_group ref; skip to save runtime.
-    if: needs.unit.result == 'success' && github.event_name != 'merge_group'
+    if: needs.unit.result == 'success' && github.event_name != 'merge_group' && github.repository == 'cogni-dao/cogni-template'
     permissions:
       contents: read
       pull-requests: write # Required for PR decoration
