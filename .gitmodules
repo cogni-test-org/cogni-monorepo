@@ -1,0 +1,3 @@
+[submodule "nodes/hope"]
+	path = nodes/hope
+	url = https://github.com/cogni-test-org/hope.git

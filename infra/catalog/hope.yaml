@@ -1,0 +1,13 @@
+name: hope
+type: node
+port: 3200
+node_port: 30500
+dockerfile: nodes/hope/app/Dockerfile
+image_tag_suffix: "-hope"
+migrator_tag_suffix: "-hope-migrate"
+source_repo: https://github.com/cogni-test-org/hope.git
+image_repository: ghcr.io/cogni-test-org/cogni-node-template
+candidate_a_branch: deploy/candidate-a-hope
+preview_branch: deploy/preview-hope
+production_branch: deploy/production-hope
+path_prefix: nodes/hope/
