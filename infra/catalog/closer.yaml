@@ -1,0 +1,11 @@
+name: closer
+type: node
+port: 3200
+node_port: 30500
+dockerfile: nodes/closer/app/Dockerfile
+image_tag_suffix: "-closer"
+migrator_tag_suffix: "-closer-migrate"
+candidate_a_branch: deploy/candidate-a-closer
+preview_branch: deploy/preview-closer
+production_branch: deploy/production-closer
+path_prefix: nodes/closer/
