@@ -1,0 +1,3 @@
+[submodule "nodes/squibby"]
+	path = nodes/squibby
+	url = https://github.com/cogni-test-org/squibby.git
