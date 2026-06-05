@@ -1,0 +1,11 @@
+name: squibby
+type: node
+port: 3200
+node_port: 30500
+dockerfile: nodes/squibby/app/Dockerfile
+image_tag_suffix: "-squibby"
+migrator_tag_suffix: "-squibby-migrate"
+candidate_a_branch: deploy/candidate-a-squibby
+preview_branch: deploy/preview-squibby
+production_branch: deploy/production-squibby
+path_prefix: nodes/squibby/
