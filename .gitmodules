@@ -1,0 +1,3 @@
+[submodule "nodes/hello-world"]
+	path = nodes/hello-world
+	url = https://github.com/cogni-test-org/hello-world.git

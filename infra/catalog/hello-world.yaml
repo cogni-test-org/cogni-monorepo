@@ -1,0 +1,13 @@
+name: hello-world
+type: node
+port: 3200
+node_port: 30500
+dockerfile: nodes/hello-world/app/Dockerfile
+image_tag_suffix: "-hello-world"
+migrator_tag_suffix: "-hello-world-migrate"
+source_repo: https://github.com/cogni-test-org/hello-world.git
+image_repository: ghcr.io/cogni-test-org/cogni-node-template
+candidate_a_branch: deploy/candidate-a-hello-world
+preview_branch: deploy/preview-hello-world
+production_branch: deploy/production-hello-world
+path_prefix: nodes/hello-world/
