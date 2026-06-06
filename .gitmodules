@@ -1,0 +1,3 @@
+[submodule "nodes/ayo"]
+	path = nodes/ayo
+	url = https://github.com/cogni-test-org/ayo.git
