@@ -1,0 +1,3 @@
+[submodule "nodes/bruh"]
+	path = nodes/bruh
+	url = https://github.com/cogni-test-org/bruh.git

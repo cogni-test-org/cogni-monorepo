@@ -1,0 +1,13 @@
+name: bruh
+type: node
+port: 3200
+node_port: 30500
+dockerfile: nodes/bruh/app/Dockerfile
+image_tag_suffix: "-bruh"
+migrator_tag_suffix: "-bruh-migrate"
+source_repo: https://github.com/cogni-test-org/bruh.git
+image_repository: ghcr.io/cogni-test-org/cogni-node-template
+candidate_a_branch: deploy/candidate-a-bruh
+preview_branch: deploy/preview-bruh
+production_branch: deploy/production-bruh
+path_prefix: nodes/bruh/
