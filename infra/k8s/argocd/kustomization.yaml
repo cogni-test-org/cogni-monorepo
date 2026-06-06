@@ -28,16 +28,19 @@ resources:
   - candidate-a-operator-applicationset.yaml
   - candidate-a-resy-applicationset.yaml
   - candidate-a-scheduler-worker-applicationset.yaml
+  - candidate-a-yo-applicationset.yaml
   - preview-canary-applicationset.yaml
   - preview-node-template-applicationset.yaml
   - preview-operator-applicationset.yaml
   - preview-resy-applicationset.yaml
   - preview-scheduler-worker-applicationset.yaml
+  - preview-yo-applicationset.yaml
   - production-canary-applicationset.yaml
   - production-node-template-applicationset.yaml
   - production-operator-applicationset.yaml
   - production-resy-applicationset.yaml
   - production-scheduler-worker-applicationset.yaml
+  - production-yo-applicationset.yaml
   # <<< GENERATED node-appsets
 
 patches:

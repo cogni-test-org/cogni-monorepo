@@ -1,0 +1,13 @@
+name: yo
+type: node
+port: 3200
+node_port: 30500
+dockerfile: nodes/yo/app/Dockerfile
+image_tag_suffix: "-yo"
+migrator_tag_suffix: "-yo-migrate"
+source_repo: https://github.com/cogni-test-org/yo.git
+image_repository: ghcr.io/cogni-test-org/cogni-node-template
+candidate_a_branch: deploy/candidate-a-yo
+preview_branch: deploy/preview-yo
+production_branch: deploy/production-yo
+path_prefix: nodes/yo/
