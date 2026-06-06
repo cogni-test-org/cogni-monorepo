@@ -1,0 +1,13 @@
+name: dolty
+type: node
+port: 3200
+node_port: 30500
+dockerfile: nodes/dolty/app/Dockerfile
+image_tag_suffix: "-dolty"
+migrator_tag_suffix: "-dolty-migrate"
+source_repo: https://github.com/cogni-test-org/dolty.git
+image_repository: ghcr.io/cogni-test-org/cogni-node-template
+candidate_a_branch: deploy/candidate-a-dolty
+preview_branch: deploy/preview-dolty
+production_branch: deploy/production-dolty
+path_prefix: nodes/dolty/

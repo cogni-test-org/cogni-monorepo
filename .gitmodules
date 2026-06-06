@@ -1,0 +1,3 @@
+[submodule "nodes/dolty"]
+	path = nodes/dolty
+	url = https://github.com/cogni-test-org/dolty.git
