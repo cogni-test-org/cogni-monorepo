@@ -1,0 +1,3 @@
+[submodule "nodes/holysmokes"]
+	path = nodes/holysmokes
+	url = https://github.com/cogni-test-org/holysmokes.git

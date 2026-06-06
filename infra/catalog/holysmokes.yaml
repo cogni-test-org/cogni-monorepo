@@ -1,0 +1,13 @@
+name: holysmokes
+type: node
+port: 3200
+node_port: 30500
+dockerfile: nodes/holysmokes/app/Dockerfile
+image_tag_suffix: "-holysmokes"
+migrator_tag_suffix: "-holysmokes-migrate"
+source_repo: https://github.com/cogni-test-org/holysmokes.git
+image_repository: ghcr.io/cogni-test-org/cogni-node-template
+candidate_a_branch: deploy/candidate-a-holysmokes
+preview_branch: deploy/preview-holysmokes
+production_branch: deploy/production-holysmokes
+path_prefix: nodes/holysmokes/
