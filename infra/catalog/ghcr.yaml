@@ -1,0 +1,13 @@
+name: ghcr
+type: node
+port: 3200
+node_port: 30800
+dockerfile: nodes/ghcr/app/Dockerfile
+image_tag_suffix: "-ghcr"
+migrator_tag_suffix: "-ghcr-migrate"
+source_repo: https://github.com/cogni-test-org/ghcr.git
+image_repository: ghcr.io/cogni-test-org/ghcr
+candidate_a_branch: deploy/candidate-a-ghcr
+preview_branch: deploy/preview-ghcr
+production_branch: deploy/production-ghcr
+path_prefix: nodes/ghcr/
