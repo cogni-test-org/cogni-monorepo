@@ -7,3 +7,6 @@
 [submodule "nodes/brother"]
 	path = nodes/brother
 	url = https://github.com/cogni-test-org/brother.git
+[submodule "nodes/ghcr"]
+	path = nodes/ghcr
+	url = https://github.com/cogni-test-org/ghcr.git
