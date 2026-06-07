@@ -1,0 +1,13 @@
+name: broo
+type: node
+port: 3200
+node_port: 31000
+dockerfile: nodes/broo/app/Dockerfile
+image_tag_suffix: "-broo"
+migrator_tag_suffix: "-broo-migrate"
+source_repo: https://github.com/cogni-test-org/broo.git
+image_repository: ghcr.io/cogni-test-org/broo
+candidate_a_branch: deploy/candidate-a-broo
+preview_branch: deploy/preview-broo
+production_branch: deploy/production-broo
+path_prefix: nodes/broo/
