@@ -1,0 +1,13 @@
+name: ihatedevops
+type: node
+port: 3200
+node_port: 30800
+dockerfile: nodes/ihatedevops/app/Dockerfile
+image_tag_suffix: "-ihatedevops"
+migrator_tag_suffix: "-ihatedevops-migrate"
+source_repo: https://github.com/cogni-test-org/ihatedevops.git
+image_repository: ghcr.io/cogni-test-org/ihatedevops
+candidate_a_branch: deploy/candidate-a-ihatedevops
+preview_branch: deploy/preview-ihatedevops
+production_branch: deploy/production-ihatedevops
+path_prefix: nodes/ihatedevops/
