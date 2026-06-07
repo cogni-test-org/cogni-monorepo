@@ -1,0 +1,13 @@
+name: test-cog
+type: node
+port: 3200
+node_port: 30600
+dockerfile: nodes/test-cog/app/Dockerfile
+image_tag_suffix: "-test-cog"
+migrator_tag_suffix: "-test-cog-migrate"
+source_repo: https://github.com/cogni-test-org/test-cog.git
+image_repository: ghcr.io/cogni-test-org/test-cog-node
+candidate_a_branch: deploy/candidate-a-test-cog
+preview_branch: deploy/preview-test-cog
+production_branch: deploy/production-test-cog
+path_prefix: nodes/test-cog/

@@ -1,3 +1,6 @@
 [submodule "nodes/yo"]
 	path = nodes/yo
 	url = https://github.com/cogni-test-org/yo.git
+[submodule "nodes/test-cog"]
+	path = nodes/test-cog
+	url = https://github.com/cogni-test-org/test-cog.git
