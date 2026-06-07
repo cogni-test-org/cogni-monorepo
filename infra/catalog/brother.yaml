@@ -1,0 +1,13 @@
+name: brother
+type: node
+port: 3200
+node_port: 30700
+dockerfile: nodes/brother/app/Dockerfile
+image_tag_suffix: "-brother"
+migrator_tag_suffix: "-brother-migrate"
+source_repo: https://github.com/cogni-test-org/brother.git
+image_repository: ghcr.io/cogni-test-org/brother
+candidate_a_branch: deploy/candidate-a-brother
+preview_branch: deploy/preview-brother
+production_branch: deploy/production-brother
+path_prefix: nodes/brother/
