@@ -1,0 +1,13 @@
+name: ihatetesting
+type: node
+port: 3200
+node_port: 30800
+dockerfile: nodes/ihatetesting/app/Dockerfile
+image_tag_suffix: "-ihatetesting"
+migrator_tag_suffix: "-ihatetesting-migrate"
+source_repo: https://github.com/cogni-test-org/ihatetesting.git
+image_repository: ghcr.io/cogni-test-org/ihatetesting
+candidate_a_branch: deploy/candidate-a-ihatetesting
+preview_branch: deploy/preview-ihatetesting
+production_branch: deploy/production-ihatetesting
+path_prefix: nodes/ihatetesting/
