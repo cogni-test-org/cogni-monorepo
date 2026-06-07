@@ -23,6 +23,7 @@ resources:
   # ApplicationSets — one per (env, node) for structural LANE_ISOLATION (axiom 18).
   # candidate-b is provisioned separately (provision-env.yml) and not listed here.
   # >>> GENERATED node-appsets (scripts/ci/render-node-appset.sh) — DO NOT EDIT BY HAND
+  - candidate-a-anotha-applicationset.yaml
   - candidate-a-brother-applicationset.yaml
   - candidate-a-canary-applicationset.yaml
   - candidate-a-ghcr-applicationset.yaml
@@ -32,6 +33,7 @@ resources:
   - candidate-a-scheduler-worker-applicationset.yaml
   - candidate-a-test-cog-applicationset.yaml
   - candidate-a-yo-applicationset.yaml
+  - preview-anotha-applicationset.yaml
   - preview-brother-applicationset.yaml
   - preview-canary-applicationset.yaml
   - preview-ghcr-applicationset.yaml
@@ -41,6 +43,7 @@ resources:
   - preview-scheduler-worker-applicationset.yaml
   - preview-test-cog-applicationset.yaml
   - preview-yo-applicationset.yaml
+  - production-anotha-applicationset.yaml
   - production-brother-applicationset.yaml
   - production-canary-applicationset.yaml
   - production-ghcr-applicationset.yaml
