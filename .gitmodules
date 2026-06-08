@@ -13,3 +13,6 @@
 [submodule "nodes/anotha"]
 	path = nodes/anotha
 	url = https://github.com/cogni-test-org/anotha.git
+[submodule "nodes/sleepy"]
+	path = nodes/sleepy
+	url = https://github.com/cogni-test-org/sleepy.git
