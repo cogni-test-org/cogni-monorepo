@@ -31,6 +31,7 @@ resources:
   - candidate-a-operator-applicationset.yaml
   - candidate-a-resy-applicationset.yaml
   - candidate-a-scheduler-worker-applicationset.yaml
+  - candidate-a-sigh-applicationset.yaml
   - candidate-a-test-cog-applicationset.yaml
   - candidate-a-yo-applicationset.yaml
   - preview-anotha-applicationset.yaml
@@ -41,6 +42,7 @@ resources:
   - preview-operator-applicationset.yaml
   - preview-resy-applicationset.yaml
   - preview-scheduler-worker-applicationset.yaml
+  - preview-sigh-applicationset.yaml
   - preview-test-cog-applicationset.yaml
   - preview-yo-applicationset.yaml
   - production-anotha-applicationset.yaml
@@ -51,6 +53,7 @@ resources:
   - production-operator-applicationset.yaml
   - production-resy-applicationset.yaml
   - production-scheduler-worker-applicationset.yaml
+  - production-sigh-applicationset.yaml
   - production-test-cog-applicationset.yaml
   - production-yo-applicationset.yaml
   # <<< GENERATED node-appsets
