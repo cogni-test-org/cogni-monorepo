@@ -26,6 +26,7 @@ resources:
   - candidate-a-anotha-applicationset.yaml
   - candidate-a-brother-applicationset.yaml
   - candidate-a-canary-applicationset.yaml
+  - candidate-a-garzo-applicationset.yaml
   - candidate-a-ghcr-applicationset.yaml
   - candidate-a-node-template-applicationset.yaml
   - candidate-a-operator-applicationset.yaml
@@ -36,6 +37,7 @@ resources:
   - preview-anotha-applicationset.yaml
   - preview-brother-applicationset.yaml
   - preview-canary-applicationset.yaml
+  - preview-garzo-applicationset.yaml
   - preview-ghcr-applicationset.yaml
   - preview-node-template-applicationset.yaml
   - preview-operator-applicationset.yaml
@@ -46,6 +48,7 @@ resources:
   - production-anotha-applicationset.yaml
   - production-brother-applicationset.yaml
   - production-canary-applicationset.yaml
+  - production-garzo-applicationset.yaml
   - production-ghcr-applicationset.yaml
   - production-node-template-applicationset.yaml
   - production-operator-applicationset.yaml
