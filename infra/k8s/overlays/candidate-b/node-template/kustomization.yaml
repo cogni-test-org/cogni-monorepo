@@ -62,6 +62,9 @@ patches:
         path: /spec/template/spec/initContainers/0/envFrom/1/secretRef/name
         value: "node-template-env-secrets"
       - op: replace
+        path: /spec/template/spec/initContainers/0/command/2
+        value: exec node /app/app/migrate.mjs /app/app/migrations
+      - op: replace
         path: /spec/template/spec/containers/0/ports/0/containerPort
         value: 3200
       - op: add
