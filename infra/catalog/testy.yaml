@@ -1,0 +1,20 @@
+name: testy
+type: node
+port: 3200
+node_port: 31000
+dockerfile: nodes/testy/app/Dockerfile
+image_tag_suffix: "-testy"
+migrator_tag_suffix: "-testy-migrate"
+source_repo: https://github.com/cogni-test-org/testy.git
+image_repository: ghcr.io/cogni-test-org/testy
+source_sha: 4cde4fa6365159d1dc6d8c332b966a0a3d5785ff
+candidate_a_branch: deploy/candidate-a-testy
+preview_branch: deploy/preview-testy
+production_branch: deploy/production-testy
+# task.5017 — per-env node-set (deploy ⊆ provisioned). A wizard birth enters all
+# NODE_FORMATION_ENVS; this list is the catalog twin so render-node-appset.sh
+# renders exactly the births appset.ts generates. Trimming a node's reach is a
+# later catalog edit (drop an env here) once its envs are provisioned.
+envs: [candidate-a, preview, production]
+path_prefix: nodes/testy/
+node_id: 7392e636-db9f-47f7-ae74-0a9a7aea37e0
