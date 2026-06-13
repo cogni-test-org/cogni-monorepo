@@ -64,5 +64,21 @@ ${daoLines}
 # Payment rails — activate with: pnpm node:activate-payments
 payments:
   status: pending_activation
+
+gates:
+  - type: review-limits
+    id: review_limits
+    with:
+      max_changed_files: 50
+      max_total_diff_kb: 1500
+  - type: ai-rule
+    with:
+      rule_file: pr-syntropy-coherence.yaml
+  - type: ai-rule
+    with:
+      rule_file: patterns-and-docs.yaml
+  - type: ai-rule
+    with:
+      rule_file: repo-goal-alignment.yaml
 `;
 }

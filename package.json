@@ -60,7 +60,7 @@
     "db:generate:operator": "dotenv -e .env.local -- tsx node_modules/drizzle-kit/bin.cjs generate --config=nodes/operator/drizzle.config.ts",
     "db:generate:resy": "dotenv -e .env.local -- bash -c 'DATABASE_URL=$DATABASE_URL_RESY tsx node_modules/drizzle-kit/bin.cjs generate --config=nodes/resy/drizzle.config.ts'",
     "db:generate:operator:doltgres": "dotenv -e .env.local -- bash -c 'DATABASE_URL=$DOLTGRES_URL_OPERATOR tsx node_modules/drizzle-kit/bin.cjs generate --config=nodes/operator/drizzle.doltgres.config.ts'",
-    "db:check": "pnpm db:check:operator && pnpm db:check:resy && pnpm db:check:operator:doltgres && pnpm db:check:journal-when && pnpm db:check:immutable",
+    "db:check": "pnpm db:check:operator && pnpm db:check:resy && pnpm db:check:operator:doltgres && pnpm db:check:journal-when && pnpm db:check:immutable && pnpm db:check:generate-clean",
     "db:check:journal-when": "node scripts/db/check-journal-when.mjs",
     "db:check:immutable": "node scripts/db/check-migrations-immutable.mjs",
     "db:check:operator": "DATABASE_URL=postgres://check@localhost:0/check tsx node_modules/drizzle-kit/bin.cjs check --config=nodes/operator/drizzle.config.ts",
@@ -181,7 +181,8 @@
     "validate:chain": "tsx --no-cache --tsconfig tsconfig.scripts.json scripts/validate-chain-config.ts",
     "governance:schedules:sync": "pnpm dotenv -e .env.local -- sh -lc 'curl -fsS -X POST http://localhost:3000/api/internal/ops/governance/schedules/sync -H \"Authorization: Bearer ${INTERNAL_OPS_TOKEN:?INTERNAL_OPS_TOKEN is required}\"'",
     "knip": "dotenv -e .env.local -- knip --include files,exports,dependencies",
-    "prepare": "husky"
+    "prepare": "husky",
+    "db:check:generate-clean": "node scripts/db/check-generate-clean.mjs"
   },
   "engines": {
     "node": "22.x"

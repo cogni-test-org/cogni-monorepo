@@ -33,7 +33,13 @@ function repoRoot(): string {
   throw new Error("repo root (pnpm-workspace.yaml) not found");
 }
 
-const RULES_DIR = join(repoRoot(), "nodes/node-template/.cogni/rules");
+repoRoot();
+
+const TEMPLATE_RULE_FILES = [
+  "pr-syntropy-coherence.yaml",
+  "patterns-and-docs.yaml",
+  "repo-goal-alignment.yaml",
+];
 
 const rendered = renderRepoSpec({
   nodeId: "11111111-2222-4333-8444-555555555555",
@@ -75,16 +81,11 @@ describe("renderRepoSpec — BORN_REVIEWABLE", () => {
     expect(spec.nodes).toBeUndefined();
   });
 
-  it("references only ai-rule files that exist as canonical node-template rules", () => {
+  it("references the external node-template ai-rule set", () => {
     const ruleFiles = gates
       .filter((g) => g.type === "ai-rule")
       .map((g) => g.with?.rule_file)
       .filter((rf): rf is string => typeof rf === "string");
-    expect(ruleFiles.length).toBeGreaterThan(0);
-    for (const rf of ruleFiles) {
-      expect(existsSync(join(RULES_DIR, rf)), `missing rule file: ${rf}`).toBe(
-        true
-      );
-    }
+    expect(ruleFiles).toEqual(TEMPLATE_RULE_FILES);
   });
 });
