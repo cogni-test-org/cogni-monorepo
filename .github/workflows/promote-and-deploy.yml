@@ -20,6 +20,9 @@ on:
       build_sha:
         description: "SHA baked into images at build time (PR branch head). Defaults to source_sha. Ignored in preview-forward mode."
         required: false
+      node_source_sha:
+        description: "Remote-source node image sha (source-addressed, like candidate-flight). task.5022 preview-promote E2E harness input; accepted so the operator dispatch is not rejected (resolver wiring is on Cogni-DAO/cogni)."
+        required: false
       nodes:
         description: "CSV of nodes to promote (default: all NODE_TARGETS + scheduler-worker). Set by flight-preview.yml from RESOLVED_TARGETS."
         required: false
