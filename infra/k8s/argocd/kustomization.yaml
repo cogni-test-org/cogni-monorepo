@@ -24,6 +24,7 @@ resources:
   # candidate-b is provisioned separately (provision-env.yml) and not listed here.
   # >>> GENERATED node-appsets (scripts/ci/render-node-appset.sh) — DO NOT EDIT BY HAND
   - candidate-a-anotha-applicationset.yaml
+  - candidate-a-booya-applicationset.yaml
   - candidate-a-brother-applicationset.yaml
   - candidate-a-canary-applicationset.yaml
   - candidate-a-ghcr-applicationset.yaml
@@ -34,6 +35,7 @@ resources:
   - candidate-a-test-cog-applicationset.yaml
   - candidate-a-yo-applicationset.yaml
   - preview-anotha-applicationset.yaml
+  - preview-booya-applicationset.yaml
   - preview-brother-applicationset.yaml
   - preview-canary-applicationset.yaml
   - preview-ghcr-applicationset.yaml
@@ -44,6 +46,7 @@ resources:
   - preview-test-cog-applicationset.yaml
   - preview-yo-applicationset.yaml
   - production-anotha-applicationset.yaml
+  - production-booya-applicationset.yaml
   - production-brother-applicationset.yaml
   - production-canary-applicationset.yaml
   - production-ghcr-applicationset.yaml
