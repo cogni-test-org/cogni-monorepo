@@ -99,6 +99,9 @@ secrets:
     type: env
 
 # Gates run in the order they appear below.
+review:
+  enabled: false
+
 gates:
   # Built-in gates (run directly in bot process)
   - type: review-limits
