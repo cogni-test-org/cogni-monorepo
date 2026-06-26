@@ -98,6 +98,11 @@ secrets:
   manager:
     type: env
 
+
+review:
+  enabled: true
+  model: llama-3.3-70b
+
 # Gates run in the order they appear below.
 gates:
   # Built-in gates (run directly in bot process)
