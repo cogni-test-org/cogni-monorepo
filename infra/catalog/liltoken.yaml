@@ -1,0 +1,20 @@
+name: liltoken
+type: node
+port: 3200
+node_port: 31000
+dockerfile: nodes/liltoken/app/Dockerfile
+image_tag_suffix: "-liltoken"
+migrator_tag_suffix: "-liltoken-migrate"
+source_repo: https://github.com/cogni-test-org/liltoken.git
+image_repository: ghcr.io/cogni-test-org/liltoken
+source_sha: f070dbef218466f490f51d5915174d319cc17e95
+candidate_a_branch: deploy/candidate-a-liltoken
+preview_branch: deploy/preview-liltoken
+production_branch: deploy/production-liltoken
+# task.5017 — per-env node-set (deploy ⊆ provisioned). A wizard birth enters all
+# NODE_FORMATION_ENVS; this list is the catalog twin so render-node-appset.sh
+# renders exactly the births appset.ts generates. Trimming a node's reach is a
+# later catalog edit (drop an env here) once its envs are provisioned.
+envs: [candidate-a, preview, production]
+path_prefix: nodes/liltoken/
+node_id: f007bea1-e9a3-4e13-a09c-ef4bfcc4529a
