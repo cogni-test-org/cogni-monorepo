@@ -11,5 +11,4 @@ kind: Kustomization
 namespace: argocd
 
 resources:
-  - candidate-a-anotha-applicationset.yaml
   - candidate-a-brother-applicationset.yaml
