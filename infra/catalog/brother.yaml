@@ -11,3 +11,4 @@ candidate_a_branch: deploy/candidate-a-brother
 preview_branch: deploy/preview-brother
 production_branch: deploy/production-brother
 path_prefix: nodes/brother/
+envs: [candidate-a, preview, production]

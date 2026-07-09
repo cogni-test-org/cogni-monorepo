@@ -14,3 +14,4 @@ candidate_a_branch: deploy/candidate-a-node-template
 preview_branch: deploy/preview-node-template
 production_branch: deploy/production-node-template
 path_prefix: nodes/node-template/
+envs: [candidate-a, preview, production]
