@@ -11,3 +11,4 @@ candidate_a_branch: deploy/candidate-a-ghcr
 preview_branch: deploy/preview-ghcr
 production_branch: deploy/production-ghcr
 path_prefix: nodes/ghcr/
+envs: [candidate-a, preview, production]

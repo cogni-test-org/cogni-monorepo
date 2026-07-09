@@ -11,3 +11,4 @@ candidate_a_branch: deploy/candidate-a-test-cog
 preview_branch: deploy/preview-test-cog
 production_branch: deploy/production-test-cog
 path_prefix: nodes/test-cog/
+envs: [candidate-a, preview, production]

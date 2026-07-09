@@ -7,19 +7,19 @@
 apiVersion: argoproj.io/v1alpha1
 kind: ApplicationSet
 metadata:
-  name: cogni-__ENV__-__NODE__
+  name: cogni-candidate-a-brother
   namespace: argocd
 spec:
   goTemplate: true
   generators:
     - git:
         repoURL: https://github.com/cogni-dao/cogni.git
-        revision: deploy/__ENV__-__NODE__
+        revision: deploy/candidate-a-brother
         files:
-          - path: "infra/catalog/__NODE__.yaml"
+          - path: "infra/catalog/brother.yaml"
   template:
     metadata:
-      name: "__ENV__-{{.name}}"
+      name: "candidate-a-{{.name}}"
       namespace: argocd
       finalizers:
         - resources-finalizer.argocd.argoproj.io
@@ -27,11 +27,11 @@ spec:
       project: default
       source:
         repoURL: https://github.com/cogni-dao/cogni.git
-        targetRevision: "deploy/__ENV__-{{.name}}"
-        path: "infra/k8s/overlays/__ENV__/{{.name}}"
+        targetRevision: "deploy/candidate-a-{{.name}}"
+        path: "infra/k8s/overlays/candidate-a/{{.name}}"
       destination:
         server: https://kubernetes.default.svc
-        namespace: cogni-__ENV__
+        namespace: cogni-candidate-a
       syncPolicy:
         automated:
           prune: true
