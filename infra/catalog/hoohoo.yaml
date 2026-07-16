@@ -1,0 +1,20 @@
+name: hoohoo
+type: node
+port: 3200
+node_port: 31000
+dockerfile: nodes/hoohoo/app/Dockerfile
+image_tag_suffix: "-hoohoo"
+migrator_tag_suffix: "-hoohoo-migrate"
+source_repo: https://github.com/cogni-test-org/hoohoo.git
+image_repository: ghcr.io/cogni-test-org/hoohoo
+source_sha: bcd2128ec3838e23b9c726ce0581e30741140c04
+candidate_a_branch: deploy/candidate-a-hoohoo
+preview_branch: deploy/preview-hoohoo
+production_branch: deploy/production-hoohoo
+# task.5017 — per-env node-set (deploy ⊆ provisioned). A wizard birth enters all
+# NODE_FORMATION_ENVS; this list is the catalog twin so render-node-appset.sh
+# renders exactly the births appset.ts generates. Trimming a node's reach is a
+# later catalog edit (drop an env here) once its envs are provisioned.
+envs: [candidate-a, preview, production]
+path_prefix: nodes/hoohoo/
+node_id: fcfd3757-1dff-4bf6-b024-10c5e281d87b
