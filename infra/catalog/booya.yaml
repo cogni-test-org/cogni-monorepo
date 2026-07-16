@@ -1,0 +1,20 @@
+name: booya
+type: node
+port: 3200
+node_port: 31000
+dockerfile: nodes/booya/app/Dockerfile
+image_tag_suffix: "-booya"
+migrator_tag_suffix: "-booya-migrate"
+source_repo: https://github.com/cogni-test-org/booya.git
+image_repository: ghcr.io/cogni-test-org/booya
+source_sha: 7c34a6a64947f282d7f013a64e104fff48af2582
+candidate_a_branch: deploy/candidate-a-booya
+preview_branch: deploy/preview-booya
+production_branch: deploy/production-booya
+# task.5017 — per-env node-set (deploy ⊆ provisioned). A wizard birth enters all
+# NODE_FORMATION_ENVS; this list is the catalog twin so render-node-appset.sh
+# renders exactly the births appset.ts generates. Trimming a node's reach is a
+# later catalog edit (drop an env here) once its envs are provisioned.
+envs: [candidate-a, preview, production]
+path_prefix: nodes/booya/
+node_id: a95e366f-b9cd-4f1d-b02f-9a0da6036a42
