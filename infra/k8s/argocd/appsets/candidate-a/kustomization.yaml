@@ -12,3 +12,4 @@ namespace: argocd
 
 resources:
   - candidate-a-brother-applicationset.yaml
+  - candidate-a-toks2-applicationset.yaml

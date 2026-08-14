@@ -68,4 +68,5 @@ export const NETWORK_NODES: readonly NetworkNode[] = [
   { name: "resy" },
   { name: "test-cog" },
   { name: "yo" },
+  { name: "toks2", nodeId: "cf909432-5324-4bff-bb2d-7806f545eeda" },
 ];

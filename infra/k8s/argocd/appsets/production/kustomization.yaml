@@ -13,3 +13,4 @@ namespace: argocd
 resources:
   - production-anotha-applicationset.yaml
   - production-brother-applicationset.yaml
+  - production-toks2-applicationset.yaml

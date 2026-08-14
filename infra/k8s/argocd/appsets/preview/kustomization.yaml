@@ -13,3 +13,4 @@ namespace: argocd
 resources:
   - preview-anotha-applicationset.yaml
   - preview-brother-applicationset.yaml
+  - preview-toks2-applicationset.yaml
