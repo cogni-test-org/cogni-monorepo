@@ -1,0 +1,20 @@
+name: toks2
+type: node
+port: 3200
+node_port: 31000
+dockerfile: nodes/toks2/app/Dockerfile
+image_tag_suffix: "-toks2"
+migrator_tag_suffix: "-toks2-migrate"
+source_repo: https://github.com/cogni-test-org/toks2.git
+image_repository: ghcr.io/cogni-test-org/toks2
+source_sha: ac65d5ac378c6209e35636bc766703ce658f8523
+candidate_a_branch: deploy/candidate-a-toks2
+preview_branch: deploy/preview-toks2
+production_branch: deploy/production-toks2
+# task.5017 — per-env node-set (deploy ⊆ provisioned). A wizard birth enters all
+# NODE_FORMATION_ENVS; this list is the catalog twin so render-node-appset.sh
+# renders exactly the births appset.ts generates. Trimming a node's reach is a
+# later catalog edit (drop an env here) once its envs are provisioned.
+envs: [candidate-a, preview, production]
+path_prefix: nodes/toks2/
+node_id: cf909432-5324-4bff-bb2d-7806f545eeda

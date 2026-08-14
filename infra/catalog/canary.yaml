@@ -12,3 +12,4 @@ candidate_a_branch: deploy/candidate-a-canary
 preview_branch: deploy/preview-canary
 production_branch: deploy/production-canary
 path_prefix: nodes/canary/
+envs: ["candidate-a"]
