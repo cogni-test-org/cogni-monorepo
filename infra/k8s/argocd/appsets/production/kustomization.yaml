@@ -13,4 +13,8 @@ namespace: argocd
 resources:
   - production-anotha-applicationset.yaml
   - production-brother-applicationset.yaml
+  - production-ghcr-applicationset.yaml
+  - production-node-template-applicationset.yaml
+  - production-test-cog-applicationset.yaml
   - production-toks2-applicationset.yaml
+  - production-yo-applicationset.yaml
