@@ -15,3 +15,4 @@ preview_branch: deploy/preview-node-template
 production_branch: deploy/production-node-template
 path_prefix: nodes/node-template/
 envs: [candidate-a, preview, production]
+node_id: b927a9dd-6132-4fc9-a51e-e3cee2568e3c

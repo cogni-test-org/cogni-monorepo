@@ -12,3 +12,4 @@ candidate_a_branch: deploy/candidate-a-resy
 preview_branch: deploy/preview-resy
 production_branch: deploy/production-resy
 path_prefix: nodes/resy/
+envs: ["candidate-a"]

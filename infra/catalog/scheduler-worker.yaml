@@ -15,3 +15,4 @@ candidate_a_branch: deploy/candidate-a-scheduler-worker
 preview_branch: deploy/preview-scheduler-worker
 production_branch: deploy/production-scheduler-worker
 path_prefix: services/scheduler-worker/
+envs: ["candidate-a"]

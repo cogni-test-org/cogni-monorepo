@@ -12,3 +12,4 @@ preview_branch: deploy/preview-yo
 production_branch: deploy/production-yo
 path_prefix: nodes/yo/
 envs: [candidate-a, preview, production]
+node_id: bb5abfa8-5435-47e8-8725-3ae5e0762791
