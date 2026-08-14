@@ -17,4 +17,3 @@ production_branch: deploy/production-toks2
 # later catalog edit (drop an env here) once its envs are provisioned.
 envs: [candidate-a, preview, production]
 path_prefix: nodes/toks2/
-node_id: cf909432-5324-4bff-bb2d-7806f545eeda
