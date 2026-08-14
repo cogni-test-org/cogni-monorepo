@@ -16,3 +16,6 @@
 [submodule "nodes/node-template"]
 	path = nodes/node-template
 	url = https://github.com/cogni-test-org/node-template.git
+[submodule "nodes/toks2"]
+	path = nodes/toks2
+	url = https://github.com/cogni-test-org/toks2.git
