@@ -7,6 +7,7 @@ image_tag_suffix: "-test-cog"
 migrator_tag_suffix: "-test-cog-migrate"
 source_repo: https://github.com/cogni-test-org/test-cog.git
 image_repository: ghcr.io/cogni-test-org/test-cog
+source_sha: e5884192f03bcc83f7adb6ee0cd9102779754315
 candidate_a_branch: deploy/candidate-a-test-cog
 preview_branch: deploy/preview-test-cog
 production_branch: deploy/production-test-cog
