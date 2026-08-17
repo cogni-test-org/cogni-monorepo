@@ -114,10 +114,13 @@ jobs:
               - 'nodes/canary/**'
             resy:
               - 'nodes/resy/**'
+            toks4:
+              - 'nodes/toks4/**'
             operator:
               - '**'
               - '!nodes/canary/**'
               - '!nodes/resy/**'
+              - '!nodes/toks4/**'
             # <<< GENERATED scope-filters
 
       # Intentionally inline — single-workflow gate, no logic duplicated across
