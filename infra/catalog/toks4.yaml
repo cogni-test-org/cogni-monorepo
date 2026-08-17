@@ -3,9 +3,8 @@
 name: toks4
 type: infra
 port: 3200
-dockerfile: infra/compose/toks4/Dockerfile
+dockerfile: infra/images/litellm/Dockerfile
+build_context: infra/images/litellm
 image_tag_suffix: "-toks4"
 migrator_tag_suffix: ""
-source_repo: https://github.com/cogni-test-org/test-cog.git
-image_repository: ghcr.io/cogni-test-org/test-cog
-path_prefix: infra/compose/toks4/
+path_prefix: infra/images/litellm/
