@@ -21,26 +21,38 @@ on:
         description: "SHA baked into images at build time (PR branch head). Defaults to source_sha. Ignored in preview-forward mode."
         required: false
       node_source_sha:
-        description: "Remote-source node image sha (source-addressed, like candidate-flight). task.5022 preview-promote E2E harness input; accepted so the operator dispatch is not rejected (resolver wiring is on Cogni-DAO/cogni)."
+        description: "Remote-source (fork) node image sha — source-addressed like candidate-flight. REQUIRED to promote a remote-source node (preview AND production); the resolver pins this sha. The catalog source_sha is birth-only metadata, never a deploy authority — a remote-source promote that omits this hard-fails (bug.5043). Not used by the preview-forward path (production w/ no shas reads deploy/preview-<node>)."
         required: false
       nodes:
         description: "CSV of nodes to promote (default: all NODE_TARGETS + scheduler-worker). Set by flight-preview.yml from RESOLVED_TARGETS."
         required: false
         default: ""
       skip_infra:
-        description: "Skip deploy-infra (Compose) step — use for app-only changes; infra has its own lever (candidate-flight-infra.yml)"
+        description: "Skip deploy-infra (Compose) step. Default true: app-digest promotion is orthogonal to substrate (mirrors candidate-flight, which has no deploy-infra job). Set false ONLY when the promoted diff touches infra/compose/**, an ESO/OpenBao secret the VM must materialize, or edge/runtime topology."
         required: false
-        default: "false"
+        default: "true"
         type: choice
         options: ["true", "false"]
+      deploy_infra_mode:
+        description: "deploy-infra mode. full reconciles Compose + k8s bridge secrets; k8s-secrets-only syncs pod secrets without Compose."
+        required: false
+        default: full
+        type: choice
+        options: [full, k8s-secrets-only]
 
 permissions:
   contents: write
   packages: read
   actions: read
 
+# Per-(env, nodes) lane (bug.5022). The operator-API prod-promote path dispatches
+# one node per run (github-repo-write.ts: `nodes: input.slug`), so an env-only group
+# let N near-simultaneous node promotes collide: with cancel-in-progress:false GitHub
+# keeps only ONE run pending per group, so the 3rd dispatch cancels the 2nd while it
+# queues. Including `inputs.nodes` gives each node its own lane. Same-node races stay
+# serialized by the per-(env,node) job groups (flight-/reconcile-appset-/node-substrate-).
 concurrency:
-  group: promote-deploy-${{ inputs.environment || github.ref_name }}
+  group: promote-deploy-${{ inputs.environment || github.ref_name }}-${{ inputs.nodes }}
   cancel-in-progress: false
 
 jobs:
@@ -54,7 +66,17 @@ jobs:
       preview_forward: ${{ steps.env.outputs.preview_forward }}
       targets_json: ${{ steps.targets.outputs.targets_json }}
       has_targets: ${{ steps.targets.outputs.has_targets }}
+      node_targets_json: ${{ steps.targets.outputs.node_targets_json }}
+      has_node_targets: ${{ steps.targets.outputs.has_node_targets }}
     steps:
+      - name: Checkout workflow source
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Verify deployment parent
+        run: bash scripts/ci/assert-deployment-parent.sh "${{ inputs.environment }}"
+
       - name: Determine environment
         id: env
         run: |
@@ -62,7 +84,14 @@ jobs:
           ENV="${{ inputs.environment }}"
           RAW_SOURCE_SHA="${{ inputs.source_sha }}"
           PREVIEW_FORWARD=false
-          if [ "$ENV" = "production" ] && [ -z "$RAW_SOURCE_SHA" ]; then
+          # Preview-forward only when NEITHER a source_sha NOR a node_source_sha is given.
+          # A fork-node production promote is SOURCE-ADDRESSED via node_source_sha (no
+          # source_sha); it must NOT be hijacked into preview-forward, or the digest job
+          # deploys the stale deploy/preview-<node> pin while node-substrate materializes
+          # the requested sha — a silent split-brain verify-buildsha can't catch because it
+          # self-confirms the preview pin it wrote (bug.5043). node_source_sha present ⇒
+          # preview_forward=false ⇒ digest reaches the remote-source branch that honors it.
+          if [ "$ENV" = "production" ] && [ -z "$RAW_SOURCE_SHA" ] && [ -z "${{ inputs.node_source_sha }}" ]; then
             PREVIEW_FORWARD=true
             RAW_SOURCE_SHA="${{ github.sha }}"
           fi
@@ -93,50 +122,7 @@ jobs:
         env:
           NODES_INPUT: ${{ inputs.nodes }}
           OVERLAY_ENV: ${{ steps.env.outputs.environment }}
-        run: |
-          set -euo pipefail
-          # shellcheck source=scripts/ci/lib/image-tags.sh
-          . scripts/ci/lib/image-tags.sh
-          if [ -n "$NODES_INPUT" ]; then
-            IFS=',' read -r -a raw <<<"${NODES_INPUT// /}"
-          else
-            raw=("${ALL_TARGETS[@]}")
-          fi
-          # Filter to targets that have a per-env overlay in app-src. ApplicationSets
-          # are env-hardcoded; a target with no overlay (e.g. node-template in
-          # preview/production) has no Argo destination and would fail the rsync at
-          # the promote-k8s `Sync infra/k8s` step. The overlay directory is the SSoT
-          # for "this target deploys to this env".
-          list=()
-          skipped=()
-          for t in "${raw[@]}"; do
-            if [ -d "infra/k8s/overlays/${OVERLAY_ENV}/${t}" ]; then
-              list+=("$t")
-            else
-              skipped+=("$t")
-            fi
-          done
-          if [ "${#skipped[@]}" -gt 0 ]; then
-            echo "::warning::Skipping targets without ${OVERLAY_ENV} overlay: ${skipped[*]}"
-          fi
-          if [ "${#list[@]}" -eq 0 ]; then
-            # Legit no-op (e.g. an infra-only target like litellm has no k8s
-            # overlay): emit has_targets=false so every deploy job step-skips,
-            # rather than exit 1 (which hard-failed the whole promote + cascaded
-            # the aggregate-preview loud-fail backstop). Visible, not silent:
-            # ::warning:: + step summary; downstream jobs surface as skipped.
-            echo "::warning::No k8s targets to promote for ${OVERLAY_ENV} (all inputs lack an overlay under infra/k8s/overlays/${OVERLAY_ENV}/) — no-op."
-            echo "### Promote no-op — no k8s targets for \`${OVERLAY_ENV}\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "All requested targets lack a per-env overlay; nothing to deploy." >> "$GITHUB_STEP_SUMMARY"
-            echo "targets_json=[]" >> "$GITHUB_OUTPUT"
-            echo "has_targets=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          targets_json=$(printf '%s\n' "${list[@]}" \
-            | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')
-          echo "targets_json=$targets_json" >> "$GITHUB_OUTPUT"
-          echo "has_targets=true" >> "$GITHUB_OUTPUT"
-          echo "Targets: ${list[*]}"
+        run: bash scripts/ci/resolve-promote-targets.sh
 
   reconcile-appset:
     needs: decide
@@ -146,6 +132,13 @@ jobs:
     # Structural fix for the shared-appset clobber — mirrors candidate-flight.yml.
     strategy:
       fail-fast: false
+      # Every matrix leg SSHes the SAME env VM. Un-capped, a full-fleet promote
+      # fires ~11 parallel SSH sessions at one sshd in the same second and trips
+      # MaxStartups (default 10:30:100) → the overflow legs get `kex_exchange_
+      # identification: Connection reset by peer` → exit 255 (NOT auth/VM-down;
+      # 8/11 succeed, ~3 random victims). Cap concurrency well under MaxStartups
+      # so the herd never forms. (Retry below covers any residual transient.)
+      max-parallel: 3
       matrix:
         node: ${{ fromJson(needs.decide.outputs.targets_json) }}
     concurrency:
@@ -187,17 +180,33 @@ jobs:
           NODE: ${{ matrix.node }}
         run: |
           set -euo pipefail
-          APPSET_FILE="infra/k8s/argocd/${DEPLOY_ENVIRONMENT}-${NODE}-applicationset.yaml"
+          APPSET_FILE="infra/k8s/argocd/appsets/${DEPLOY_ENVIRONMENT}/${DEPLOY_ENVIRONMENT}-${NODE}-applicationset.yaml"
           if [ ! -f "$APPSET_FILE" ]; then
             echo "::error::$APPSET_FILE missing at head — run 'pnpm gen:node-appset' (CATALOG_IS_SSOT)"
             exit 1
           fi
+          # Retry transient SSH failures (e.g. a MaxStartups "Connection reset"
+          # that slips past the max-parallel cap) with backoff. Idempotent target,
+          # so a retried apply is safe.
+          retry() {
+            local n=0 max=5 delay=5
+            until "$@"; do
+              n=$((n + 1))
+              if [ "$n" -ge "$max" ]; then
+                echo "::error::SSH step failed after ${max} attempts"
+                return 1
+              fi
+              echo "::warning::attempt ${n} failed (transient SSH?) — retrying in ${delay}s"
+              sleep "$delay"
+              delay=$((delay * 2))
+            done
+          }
           # shellcheck disable=SC2086
-          scp $SSH_OPTS "$APPSET_FILE" root@"$VM_HOST":/tmp/appset-${DEPLOY_ENVIRONMENT}-${NODE}.yaml
+          retry scp $SSH_OPTS "$APPSET_FILE" root@"$VM_HOST":/tmp/appset-${DEPLOY_ENVIRONMENT}-${NODE}.yaml
           # Anti-resurrection: orphan-delete the retired shared `cogni-<env>` AppSet
           # (keeps its live Applications), then apply the per-node object.
           # shellcheck disable=SC2086
-          ssh $SSH_OPTS root@"$VM_HOST" "kubectl delete applicationset cogni-${DEPLOY_ENVIRONMENT} -n argocd --cascade=orphan --ignore-not-found && kubectl apply -f /tmp/appset-${DEPLOY_ENVIRONMENT}-${NODE}.yaml -n argocd && rm -f /tmp/appset-${DEPLOY_ENVIRONMENT}-${NODE}.yaml"
+          retry ssh $SSH_OPTS root@"$VM_HOST" "kubectl delete applicationset cogni-${DEPLOY_ENVIRONMENT} -n argocd --cascade=orphan --ignore-not-found && kubectl apply -f /tmp/appset-${DEPLOY_ENVIRONMENT}-${NODE}.yaml -n argocd && rm -f /tmp/appset-${DEPLOY_ENVIRONMENT}-${NODE}.yaml"
 
   # Per-node public DNS for preview + production — mirrors candidate-flight.yml's
   # reconcile-dns. DNS is env-level + idempotent (no-op for existing nodes); a node
@@ -243,8 +252,15 @@ jobs:
           bash scripts/ci/reconcile-node-dns.sh "${DEPLOY_ENVIRONMENT}"
 
   promote-k8s:
-    needs: [decide, reconcile-appset]
-    if: needs.decide.outputs.has_targets == 'true'
+    needs: [decide, reconcile-appset, node-substrate]
+    if: |
+      always() &&
+      needs.decide.outputs.has_targets == 'true' &&
+      needs.reconcile-appset.result == 'success' &&
+      (
+        (needs.decide.outputs.has_node_targets == 'true' && needs.node-substrate.result == 'success') ||
+        (needs.decide.outputs.has_node_targets != 'true' && needs.node-substrate.result == 'skipped')
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -287,7 +303,9 @@ jobs:
         env:
           NODE: ${{ matrix.node }}
           HEAD_SHA: ${{ needs.decide.outputs.head_sha }}
+          BUILD_SHA: ${{ needs.decide.outputs.build_sha }}
           PREVIEW_FORWARD: ${{ needs.decide.outputs.preview_forward }}
+          NODE_SOURCE_SHA: ${{ inputs.node_source_sha }}
         run: |
           set -euo pipefail
           # shellcheck source=scripts/ci/lib/image-tags.sh
@@ -313,8 +331,45 @@ jobs:
               echo "::error::preview-forward: no source_sha for $NODE in preview map"
               exit 1
             fi
+          elif is_remote_source_artifact_target "$NODE"; then
+            catalog="app-src/infra/catalog/${NODE}.yaml"
+            image_repository="$(yq -N '.image_repository // ""' "$catalog")"
+            if [ -z "$image_repository" ]; then
+              echo "::error::remote-source artifact ${NODE} missing image_repository"
+              exit 1
+            fi
+            # Source-addressed ONLY (ONE_PROMOTION_PRIMITIVE, like candidate-flight): a
+            # remote-source node MUST carry node_source_sha on the dispatch — every rung
+            # (candidate/preview/production) source-addresses via the operator (`promoteNode`).
+            # The catalog source_sha is birth-only metadata, NEVER a deploy authority (bug.5043);
+            # a dispatch that omits the input hard-fails LOUDLY rather than silently deploying the
+            # stale pin. This APP_SOURCE_SHA is both the image tag below AND the value recorded into
+            # .promote-state/source-sha-by-app.json (update-source-sha-map.sh), so the deploy/<env>
+            # pin always matches what was deployed.
+            if [ -z "${NODE_SOURCE_SHA:-}" ]; then
+              echo "::error::remote-source artifact ${NODE} requires node_source_sha (source-addressed promote); catalog source_sha is birth-only, not a deploy pin (bug.5043)"
+              exit 1
+            fi
+            APP_SOURCE_SHA="$NODE_SOURCE_SHA"
+            full_tag="${image_repository}:sha-${APP_SOURCE_SHA}"
+            digest_only=$(docker buildx imagetools inspect "$full_tag" --raw 2>/dev/null \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('digest',''))" 2>/dev/null || true)
+            if [ -z "$digest_only" ]; then
+              digest_only=$(docker buildx imagetools inspect "$full_tag" 2>/dev/null \
+                | grep -oP 'Digest:\s+\Ksha256:[a-f0-9]+' | head -1 || true)
+            fi
+            if [ -z "$digest_only" ]; then
+              echo "::error::remote-source artifact image not found: $full_tag"
+              exit 1
+            fi
+            DIGEST="${full_tag%%:*}@${digest_only}"
           else
-            full_tag=$(image_tag_for_target "$(image_name_for_target "$NODE")" "preview-${HEAD_SHA}" "$NODE")
+            # In-repo artifact (operator, scheduler-worker): ONE identity —
+            # `<image>:sha-<sourceSha>{suffix}` (SOURCE_SHA_IS_DEPLOY_IDENTITY).
+            # The sha IS the BUILD_SHA baked into the image, which verify-buildsha
+            # asserts — so the tag-sha, the recorded source_sha, and /version.buildSha
+            # are the same value. (Was the legacy preview-{sha} re-tag, now purged.)
+            full_tag=$(image_tag_for_target "$(image_name_for_target "$NODE")" "sha-${BUILD_SHA}" "$NODE")
             digest_only=$(docker buildx imagetools inspect "$full_tag" --raw 2>/dev/null \
               | python3 -c "import json,sys; print(json.load(sys.stdin).get('digest',''))" 2>/dev/null || true)
             if [ -z "$digest_only" ]; then
@@ -328,7 +383,7 @@ jobs:
               exit 0
             fi
             DIGEST="${full_tag%%:*}@${digest_only}"
-            APP_SOURCE_SHA="${{ needs.decide.outputs.build_sha }}"
+            APP_SOURCE_SHA="$BUILD_SHA"
           fi
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "source_sha=$APP_SOURCE_SHA" >> "$GITHUB_OUTPUT"
@@ -374,6 +429,12 @@ jobs:
             "deploy-branch/infra/k8s/overlays/${OVERLAY_ENV}/${NODE}/"
           mkdir -p deploy-branch/infra/catalog
           cp "app-src/infra/catalog/${NODE}.yaml" "deploy-branch/infra/catalog/${NODE}.yaml"
+          if [ -d "app-src/nodes/${NODE}/k8s/external-secrets/${OVERLAY_ENV}" ]; then
+            mkdir -p "deploy-branch/nodes/${NODE}/k8s/external-secrets/${OVERLAY_ENV}"
+            rsync -a --delete \
+              "app-src/nodes/${NODE}/k8s/external-secrets/${OVERLAY_ENV}/" \
+              "deploy-branch/nodes/${NODE}/k8s/external-secrets/${OVERLAY_ENV}/"
+          fi
 
       - name: Promote digest + record source-sha
         if: steps.digest.outputs.promoted == 'true'
@@ -433,10 +494,103 @@ jobs:
           path: out/
           retention-days: 1
 
-  deploy-infra:
-    if: inputs.skip_infra != 'true' && needs.decide.outputs.has_targets == 'true'
+  # Per-node substrate (materialize -> reconcile) per-env BEFORE pods, on EVERY env
+  # (Invariant 16). One job calls run-node-substrate.sh for each type:node target,
+  # uniform across candidate-a/preview/production with no special-case.
+  # Orchestration only; logic lives in run-node-substrate.sh.
+  node-substrate:
+    needs: [decide, reconcile-appset, reconcile-dns]
+    if: |
+      always() &&
+      needs.decide.outputs.has_node_targets == 'true' &&
+      needs.reconcile-appset.result == 'success' &&
+      needs.reconcile-dns.result == 'success'
+    strategy:
+      fail-fast: false
+      # Same shared-VM SSH fan-out as reconcile-appset (run-node-substrate.sh
+      # SSHes the one env VM). Cap concurrency so a full-fleet promote can't
+      # trip sshd MaxStartups (see reconcile-appset above).
+      max-parallel: 3
+      matrix:
+        node: ${{ fromJson(needs.decide.outputs.node_targets_json) }}
+    concurrency:
+      group: node-substrate-${{ needs.decide.outputs.environment }}-${{ matrix.node }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
-    needs: [decide, promote-k8s]
+    environment: ${{ needs.decide.outputs.environment }}
+    steps:
+      - name: Checkout app source
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          ref: ${{ needs.decide.outputs.head_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.ACTIONS_AUTOMATION_BOT_PAT || github.token }}
+          path: app-src
+
+      - name: Materialize node source at the dispatched node_source_sha
+        env:
+          GH_TOKEN: ${{ secrets.GIT_READ_TOKEN || github.token }}
+          NODE: ${{ matrix.node }}
+          NODE_SOURCE_SHA: ${{ inputs.node_source_sha }}
+        run: |
+          set -euo pipefail
+          # Remote-source node: fetch its tree into nodes/<NODE> — no submodule,
+          # no gitlink, private-safe (GIT_READ_TOKEN). In-repo nodes carry no
+          # source_repo and are already in app-src. spec.node-submodule-retirement.
+          catalog="app-src/infra/catalog/${NODE}.yaml"
+          [ -f "$catalog" ] || exit 0
+          src_repo="$(yq -N '.source_repo // ""' "$catalog")"
+          [ -n "$src_repo" ] || exit 0
+          # Source-addressed ONLY (ONE_PROMOTION_PRIMITIVE) — the SAME contract as the digest job:
+          # a remote-source node MUST carry node_source_sha. The catalog source_sha is birth-only
+          # metadata, NEVER a deploy authority (bug.5043). Hard-fail a dispatch that omits it rather
+          # than fetching the tree at the stale pin (which would split-brain vs the digest job).
+          src_sha="${NODE_SOURCE_SHA:-}"
+          [ -n "$src_sha" ] || { echo "::error::remote-source node ${NODE} requires node_source_sha (source-addressed promote); catalog source_sha is birth-only, not a deploy pin (bug.5043)"; exit 1; }
+          repo_path="${src_repo#https://github.com/}"; repo_path="${repo_path%.git}"
+          rm -rf "app-src/nodes/${NODE}"
+          git init -q "app-src/nodes/${NODE}"
+          git -C "app-src/nodes/${NODE}" remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${repo_path}.git"
+          git -C "app-src/nodes/${NODE}" fetch -q --depth 1 origin "$src_sha"
+          git -C "app-src/nodes/${NODE}" checkout -q --detach FETCH_HEAD
+
+      - name: Setup SSH
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VM_HOST" ]; then
+            echo "::error::VM_HOST is required for node substrate"
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$SSH_DEPLOY_KEY" | tr -d '\r' > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -T 10 -H "$VM_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Run node substrate (materialize -> reconcile)
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          SSH_OPTS: "-i /home/runner/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o ServerAliveInterval=10 -o ServerAliveCountMax=6"
+          DEPLOY_ENVIRONMENT: ${{ needs.decide.outputs.environment }}
+          DOMAIN: ${{ vars.DOMAIN }}
+          APP_SOURCE_DIR: app-src
+          COGNI_CATALOG_ROOT: app-src/infra/catalog
+        run: bash app-src/scripts/ci/run-node-substrate.sh "${{ needs.decide.outputs.environment }}" "${{ matrix.node }}"
+
+  deploy-infra:
+    if: |
+      always() &&
+      inputs.skip_infra != 'true' &&
+      needs.decide.outputs.has_targets == 'true' &&
+      needs.promote-k8s.result == 'success' &&
+      (
+        (needs.decide.outputs.has_node_targets == 'true' && needs.node-substrate.result == 'success') ||
+        (needs.decide.outputs.has_node_targets != 'true' && needs.node-substrate.result == 'skipped')
+      )
+    runs-on: ubuntu-latest
+    needs: [decide, promote-k8s, node-substrate]
     environment: ${{ needs.decide.outputs.environment }}
     # 45m (was 15m, #785-era default): a cold-cache VM provisioning a NEW node
     # pulls the sandbox + LiteLLM images (~13m) BEFORE db-provision runs, so 15m
@@ -500,7 +654,7 @@ jobs:
       DISCORD_OAUTH_CLIENT_SECRET: ${{ secrets.DISCORD_OAUTH_CLIENT_SECRET }}
       GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
       GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
-      DOLTHUB_REMOTE_URL: ${{ secrets.DOLTHUB_REMOTE_URL }}
+      DOLTHUB_OWNER: ${{ vars.DOLTHUB_OWNER }}
       DOLT_CREDS_JWK: ${{ secrets.DOLT_CREDS_JWK }}
       DOLT_CREDS_KEYID: ${{ secrets.DOLT_CREDS_KEYID }}
       DOLTHUB_API_TOKEN: ${{ secrets.DOLTHUB_API_TOKEN }}
@@ -515,6 +669,8 @@ jobs:
       GRAFANA_PDC_NETWORK_UUID: ${{ secrets.GRAFANA_PDC_NETWORK_UUID }}
       GH_REVIEW_APP_ID: ${{ secrets.GH_REVIEW_APP_ID }}
       GH_REVIEW_APP_PRIVATE_KEY_BASE64: ${{ secrets.GH_REVIEW_APP_PRIVATE_KEY_BASE64 }}
+      NODE_MINT_OWNER: ${{ secrets.NODE_MINT_OWNER }}
+      NODE_TEMPLATE_OWNER: ${{ secrets.NODE_TEMPLATE_OWNER }}
       GH_REPOS: ${{ vars.GH_REPOS }}
       GH_WEBHOOK_SECRET: ${{ secrets.GH_WEBHOOK_SECRET }}
       PRIVY_APP_ID: ${{ secrets.PRIVY_APP_ID }}
@@ -563,14 +719,19 @@ jobs:
 
       - name: Deploy infrastructure
         if: env.VM_HOST != ''
-        run: scripts/ci/deploy-infra.sh --ref main
+        run: |
+          args=(--ref main)
+          if [ "${{ inputs.deploy_infra_mode || 'full' }}" = "k8s-secrets-only" ]; then
+            args+=(--k8s-secrets-only)
+          fi
+          scripts/ci/deploy-infra.sh "${args[@]}"
 
       - name: Provision Grafana Postgres datasources
-        if: env.VM_HOST != ''
+        if: env.VM_HOST != '' && (inputs.deploy_infra_mode || 'full') != 'k8s-secrets-only'
         run: bash scripts/ci/provision-grafana-postgres-datasources.sh
 
       - name: Verify Grafana Postgres datasources
-        if: env.VM_HOST != ''
+        if: env.VM_HOST != '' && (inputs.deploy_infra_mode || 'full') != 'k8s-secrets-only'
         continue-on-error: true
         run: bash scripts/ci/verify-grafana-postgres-datasources.sh
 
@@ -595,10 +756,14 @@ jobs:
   verify-deploy:
     # reconcile-dns ordered before the public /version probe so a newly-added node's
     # host resolves; its failure surfaces on reconcile-dns, the probe stays the gate.
-    needs: [decide, promote-k8s, deploy-infra, reconcile-dns]
+    needs: [decide, promote-k8s, deploy-infra, reconcile-dns, node-substrate]
     if: |
       always() &&
       needs.promote-k8s.result == 'success' &&
+      (
+        (needs.decide.outputs.has_node_targets == 'true' && needs.node-substrate.result == 'success') ||
+        (needs.decide.outputs.has_node_targets != 'true' && needs.node-substrate.result == 'skipped')
+      ) &&
       (needs.deploy-infra.result == 'success' || needs.deploy-infra.result == 'skipped')
     strategy:
       fail-fast: false
@@ -709,6 +874,7 @@ jobs:
       VM_HOST: ${{ secrets.VM_HOST }}
       DOMAIN: ${{ vars.DOMAIN }}
       K8S_NAMESPACE: cogni-${{ needs.decide.outputs.environment }}
+      PROMOTED_APPS: ${{ join(fromJson(needs.decide.outputs.node_targets_json), ',') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -868,23 +1034,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ACTIONS_AUTOMATION_BOT_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          ROLLUP_TARGETS_JSON: ${{ needs.decide.outputs.targets_json }}
         run: bash scripts/ci/aggregate-rollup.sh preview
-
-      - name: Lock preview on success
-        if: steps.outcome.outputs.outcome == 'dispatched'
-        env:
-          GH_TOKEN: ${{ secrets.ACTIONS_AUTOMATION_BOT_PAT }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          DEPLOY_BRANCH: deploy/preview
-        run: bash scripts/ci/set-preview-review-state.sh reviewing "$(cat /tmp/preview-current-sha)"
-
-      - name: Unlock preview on failure
-        if: always() && steps.outcome.outputs.outcome == 'failed'
-        env:
-          GH_TOKEN: ${{ secrets.ACTIONS_AUTOMATION_BOT_PAT }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          DEPLOY_BRANCH: deploy/preview
-        run: bash scripts/ci/set-preview-review-state.sh unlocked
 
       - name: Emit preview-flight-outcome artifact
         if: always()
@@ -941,4 +1092,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ACTIONS_AUTOMATION_BOT_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          ROLLUP_TARGETS_JSON: ${{ needs.decide.outputs.targets_json }}
         run: bash scripts/ci/aggregate-rollup.sh production

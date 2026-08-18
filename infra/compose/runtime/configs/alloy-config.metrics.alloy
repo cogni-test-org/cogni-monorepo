@@ -19,7 +19,7 @@ discovery.relabel "docker_logs" {
 
   rule {
     source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
-    regex         = "(app|litellm|caddy|scheduler-worker|temporal|db-backup|openclaw-gateway|llm-proxy-openclaw|autoheal|alloy-k8s-events|pdc-agent)"
+    regex         = "(app|litellm|caddy|scheduler-worker|temporal|db-backup|openfga|openfga-migrate|autoheal|alloy-k8s-events|pdc-agent)"
     action        = "keep"
   }
 
@@ -76,10 +76,29 @@ loki.process "docker_logs" {
   // Extract JSON fields from app logs (fail-safe: non-JSON lines get no extracted fields)
   stage.json {
     expressions = {
-      route       = "route",
-      status_code = "status",
-      duration_ms = "durationMs",
-      log_msg     = "msg",
+      route        = "route",
+      status_code  = "status",
+      duration_ms  = "durationMs",
+      log_msg      = "msg",
+      node_emitter = "svcNode",
+      node_legacy  = "nodeId",
+    }
+  }
+
+  // Derive the `node` stream label from the EMITTER identity (`svcNode`), falling back to
+  // the legacy `nodeId` field for pods not yet emitting svcNode. svcNode is leak-proof:
+  // operator control-plane events override `nodeId` with the TARGET node they act on, but
+  // never set svcNode — so an operator line about node X stays labeled `node=<operator>`.
+  stage.template {
+    source   = "node"
+    template = "{{ if .node_emitter }}{{ .node_emitter }}{{ else }}{{ .node_legacy }}{{ end }}"
+  }
+
+  // Promote to a `node` stream label so per-node reads can select {node="<id>"} (task.5028).
+  // Low-cardinality (one value per node); only app lines that carry the field get the label.
+  stage.labels {
+    values = {
+      node = "",
     }
   }
 
@@ -184,20 +203,43 @@ loki.process "k8s_pod_logs" {
     expression = ".*/pods/(?P<namespace>[^_]+)_(?P<pod>[^_]+)_[^/]+/(?P<container>[^/]+)/.*"
   }
 
+  // Parse the app's JSON message (set by stage.cri) to recover the node identity for the
+  // node label. Prefer the leak-proof emitter field `svcNode`; fall back to legacy `nodeId`
+  // for pods not yet emitting it. Operator control-plane events override `nodeId` with the
+  // TARGET node they act on, but never set svcNode — see alloy-config.alloy.
+  // Fail-safe: control-plane / non-JSON pod logs extract nothing and get no `node` label.
+  stage.json {
+    expressions = {
+      node_emitter = "svcNode",
+      node_legacy  = "nodeId",
+    }
+  }
+
+  stage.template {
+    source   = "node"
+    template = "{{ if .node_emitter }}{{ .node_emitter }}{{ else }}{{ .node_legacy }}{{ end }}"
+  }
+
   stage.labels {
     values = {
       namespace = "",
       pod       = "",
       container = "",
       service   = "container",
+      // Per-node stream label so {node="<id>"} selects one node's pod logs (task.5028).
+      node = "",
     }
   }
 
-  // Namespace allowlist: keep cogni-*, argocd, kube-system; drop everything else.
-  // The file-layer glob is wide so control-plane logs reach the pipeline; this
-  // stage is the single gate deciding what actually ships to Loki.
+  // Namespace allowlist: keep cogni-*, argocd, kube-system, and the secret plane
+  // (openbao, external-secrets); drop everything else. The file-layer glob is wide
+  // so control-plane logs reach the pipeline; this stage is the single gate
+  // deciding what actually ships to Loki. bug.5011: openbao/external-secrets were
+  // dropped here, so OpenBao's seal/unseal log lines never reached Loki — the
+  // secret-plane outage was invisible. These pod logs are host-mounted
+  // (/var/log/pods), so the signal was always reachable; only this gate hid it.
   stage.match {
-    selector = "{namespace!~\"cogni-.*|argocd|kube-system\"}"
+    selector = "{namespace!~\"cogni-.*|argocd|kube-system|openbao|external-secrets\"}"
     action   = "drop"
   }
 
@@ -270,6 +312,50 @@ prometheus.relabel "worker_metrics" {
   rule {
     target_label = "service"
     replacement  = "scheduler-worker"
+  }
+}
+
+// =============================================================================
+// Prometheus Metrics: OpenFGA Scraping
+// =============================================================================
+// OpenFGA exposes Prometheus metrics on :2112/metrics. Keep only OpenFGA series
+// plus `up` and add low-cardinality service/env/node labels before remote write.
+
+prometheus.scrape "openfga_metrics" {
+  targets         = [{"__address__" = "openfga:2112"}]
+  forward_to      = [prometheus.relabel.openfga_metrics.receiver]
+  scrape_interval = "15s"
+  scrape_timeout  = "10s"
+  metrics_path    = "/metrics"
+}
+
+prometheus.relabel "openfga_metrics" {
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+
+  rule {
+    source_labels = ["__name__"]
+    regex         = "(openfga_.*|up)"
+    action        = "keep"
+  }
+
+  rule {
+    target_label = "env"
+    replacement  = sys.env("DEPLOY_ENVIRONMENT")
+  }
+
+  rule {
+    target_label = "service"
+    replacement  = "openfga"
+  }
+
+  rule {
+    target_label = "node_id"
+    replacement  = sys.env("COGNI_DEFAULT_NODE_ID")
+  }
+
+  rule {
+    regex  = "(instance|job|id|image|name|path|route|url|user|object|store_id|authorization_model_id|container_label_.*)"
+    action = "labeldrop"
   }
 }
 

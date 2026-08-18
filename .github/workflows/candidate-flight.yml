@@ -60,6 +60,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify candidate-a deployment parent
+        run: bash scripts/ci/assert-deployment-parent.sh candidate-a
+
       - name: Resolve PR metadata
         id: meta
         env:
@@ -97,7 +100,12 @@ jobs:
             else
               HEAD_SHA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq '.head.sha')
             fi
-            IMAGE_TAG="pr-${PR_NUMBER}-${HEAD_SHA}"
+            # ONE identity (SOURCE_SHA_IS_DEPLOY_IDENTITY): the in-repo PR lane
+            # resolves the same `sha-<headSha>` image pr-build publishes — the
+            # legacy pr-{N}-{X} namespace is purged. (The node_slug+source_sha
+            # lane above is the converged primary; this PR-number lane is the
+            # transitional monorepo dispatch until it is unified onto node_slug.)
+            IMAGE_TAG="sha-${HEAD_SHA}"
           fi
           echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
@@ -293,16 +301,28 @@ jobs:
           fetch-depth: 0
           path: app-src
 
-      - name: Initialize node submodule when present
+      - name: Materialize node source at its catalog pin
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GIT_READ_TOKEN }}
           NODE: ${{ matrix.node }}
+          NODE_SOURCE_SHA: ${{ needs.decide.outputs.node_source_sha }}
         run: |
           set -euo pipefail
-          if git -C app-src config -f .gitmodules --get "submodule.nodes/${NODE}.path" >/dev/null 2>&1; then
-            git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
-            git -C app-src submodule update --init --depth 1 "nodes/${NODE}"
-          fi
+          # Remote-source node: fetch its tree at the catalog source_sha pin into
+          # nodes/<NODE>. Public repos need no token; private repos use the
+          # optional GIT_READ_TOKEN without embedding it in the remote URL.
+          # In-repo nodes carry no source_repo and are already in app-src.
+          # spec.node-submodule-retirement.
+          catalog="app-src/infra/catalog/${NODE}.yaml"
+          [ -f "$catalog" ] || exit 0
+          src_repo="$(yq -N '.source_repo // ""' "$catalog")"
+          [ -n "$src_repo" ] || exit 0
+          src_sha="${NODE_SOURCE_SHA:-$(yq -N '.source_sha // ""' "$catalog")}"
+          [ -n "$src_sha" ] || { echo "::error::no source_sha for remote-source node ${NODE}"; exit 1; }
+          rm -rf "app-src/nodes/${NODE}"
+          # shellcheck source=../../scripts/ci/lib/github-clone.sh
+          . app-src/scripts/ci/lib/github-clone.sh
+          github_materialize_commit "$src_repo" "$src_sha" "app-src/nodes/${NODE}"
 
       - name: Prepare deploy branch shape
         env:
@@ -321,7 +341,9 @@ jobs:
             fi
           done
 
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" deploy-branch
+          # shellcheck source=../../scripts/ci/lib/github-clone.sh
+          . app-src/scripts/ci/lib/github-clone.sh
+          github_clone_repo "${{ github.repository }}" deploy-branch
           cd deploy-branch
           git fetch origin "+refs/heads/deploy/*:refs/remotes/origin/deploy/*"
           if git rev-parse --verify --quiet "refs/remotes/origin/${PER_NODE_BRANCH}" >/dev/null; then
@@ -417,7 +439,7 @@ jobs:
           set -euo pipefail
           # shellcheck source=ci-src/scripts/ci/lib/ssh-retry.sh
           . ci-src/scripts/ci/lib/ssh-retry.sh
-          APPSET_FILE="app-src/infra/k8s/argocd/candidate-a-${NODE}-applicationset.yaml"
+          APPSET_FILE="app-src/infra/k8s/argocd/appsets/candidate-a/candidate-a-${NODE}-applicationset.yaml"
           if [ ! -f "$APPSET_FILE" ]; then
             echo "::error::$APPSET_FILE missing at head_sha — run 'pnpm gen:node-appset' (CATALOG_IS_SSOT)"
             exit 1
@@ -476,12 +498,16 @@ jobs:
 
   assert-substrate:
     needs: [decide, reconcile-appset, reconcile-dns, node-substrate]
+    # Per-cell isolation (Axiom 18): run whenever there are substrate targets and
+    # the env-level reconcile-dns succeeded. Do NOT gate on the matrix-aggregate
+    # node-substrate result — a sibling node's substrate failure must not skip
+    # this whole job and starve healthy cells of their assert marker. Each cell
+    # gates on its OWN node-substrate marker below.
     if: |
       always() &&
       needs.decide.outputs.has_substrate_node_targets == 'true' &&
-      needs.reconcile-appset.result == 'success' &&
       needs.reconcile-dns.result == 'success' &&
-      needs.node-substrate.result == 'success'
+      needs.node-substrate.result != 'skipped'
     strategy:
       fail-fast: false
       matrix:
@@ -502,6 +528,23 @@ jobs:
         with:
           ref: ${{ needs.decide.outputs.head_sha }}
           path: app-src
+
+      # Per-cell gate: this node's own node-substrate marker must be ok. The
+      # job-level gate intentionally does NOT check the aggregate node-substrate
+      # result, so a sibling's substrate failure can't skip this cell.
+      - name: Download this node's substrate marker
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.8
+        with:
+          name: substrate-ok-${{ matrix.node }}
+          path: ${{ runner.temp }}/substrate-marker
+      - name: Gate on this node's substrate marker
+        env:
+          NODE: ${{ matrix.node }}
+          KIND: substrate-ok
+          EXPECTED_JSON: ${{ needs.decide.outputs.substrate_node_targets_json }}
+          MARKER_DIR: ${{ runner.temp }}/substrate-marker
+        run: bash ci-src/scripts/ci/resolve-substrate-gate.sh
 
       - name: Setup SSH to candidate-a VM
         env:
@@ -532,6 +575,23 @@ jobs:
           ASSERT_TARGET_SUBSTRATE_APP_WAIT_ATTEMPTS: 60
           ASSERT_TARGET_SUBSTRATE_APP_WAIT_SLEEP_SECONDS: 5
         run: bash ci-src/scripts/ci/assert-target-substrate.sh
+
+      # Per-cell success marker (Axiom 18): full substrate readiness for THIS
+      # node = its node-substrate marker (gated above) AND its own assert. flight
+      # + verify-candidate gate on this marker, never the aggregate result.
+      - name: Emit per-node assert marker
+        env:
+          NODE: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          mkdir -p marker-out
+          printf 'ok' > "marker-out/assert-ok-${NODE}.txt"
+      - name: Upload per-node assert marker
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: assert-ok-${{ matrix.node }}
+          path: marker-out/assert-ok-${{ matrix.node }}.txt
+          retention-days: 1
 
   node-substrate:
     needs:
@@ -564,16 +624,28 @@ jobs:
           fetch-depth: 0
           path: app-src
 
-      - name: Initialize node submodule when present
+      - name: Materialize node source at its catalog pin
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GIT_READ_TOKEN }}
           NODE: ${{ matrix.node }}
+          NODE_SOURCE_SHA: ${{ needs.decide.outputs.node_source_sha }}
         run: |
           set -euo pipefail
-          if git -C app-src config -f .gitmodules --get "submodule.nodes/${NODE}.path" >/dev/null 2>&1; then
-            git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
-            git -C app-src submodule update --init --depth 1 "nodes/${NODE}"
-          fi
+          # Remote-source node: fetch its tree at the catalog source_sha pin into
+          # nodes/<NODE>. Public repos need no token; private repos use the
+          # optional GIT_READ_TOKEN without embedding it in the remote URL.
+          # In-repo nodes carry no source_repo and are already in app-src.
+          # spec.node-submodule-retirement.
+          catalog="app-src/infra/catalog/${NODE}.yaml"
+          [ -f "$catalog" ] || exit 0
+          src_repo="$(yq -N '.source_repo // ""' "$catalog")"
+          [ -n "$src_repo" ] || exit 0
+          src_sha="${NODE_SOURCE_SHA:-$(yq -N '.source_sha // ""' "$catalog")}"
+          [ -n "$src_sha" ] || { echo "::error::no source_sha for remote-source node ${NODE}"; exit 1; }
+          rm -rf "app-src/nodes/${NODE}"
+          # shellcheck source=../../scripts/ci/lib/github-clone.sh
+          . app-src/scripts/ci/lib/github-clone.sh
+          github_materialize_commit "$src_repo" "$src_sha" "app-src/nodes/${NODE}"
 
       - name: Setup SSH to candidate-a VM
         env:
@@ -603,6 +675,23 @@ jobs:
           SUBSTRATE_RECONCILE_SUMMARY_FILE: ${{ runner.temp }}/node-substrate-reconcile-${{ matrix.node }}.json
         run: bash ci-src/scripts/ci/run-node-substrate.sh candidate-a "${{ matrix.node }}"
 
+      # Per-cell success marker (Axiom 18). assert-substrate + flight + verify
+      # gate on THIS node's marker, never the matrix-aggregate node-substrate
+      # result — so a sibling node's substrate failure cannot block this lane.
+      - name: Emit per-node substrate marker
+        env:
+          NODE: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          mkdir -p marker-out
+          printf 'ok' > "marker-out/substrate-ok-${NODE}.txt"
+      - name: Upload per-node substrate marker
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: substrate-ok-${{ matrix.node }}
+          path: marker-out/substrate-ok-${{ matrix.node }}.txt
+          retention-days: 1
+
       - name: Push substrate reconcile telemetry to Loki
         if: always()
         uses: ./ci-src/.github/actions/loki-push
@@ -616,14 +705,16 @@ jobs:
 
   flight:
     needs: [decide, reconcile-appset, node-substrate, assert-substrate]
+    # Per-cell isolation (Axiom 18): this job runs whenever there are flight
+    # targets. It does NOT gate on the matrix-aggregate node-substrate /
+    # assert-substrate result — that rollup goes failure if ANY node's substrate
+    # cell fails, which would block every healthy node's flight leg. Each cell
+    # gates on its OWN node's assert-ok marker below (a flight target with no
+    # substrate step, e.g. a service, has no marker and passes).
     if: |
       always() &&
       needs.decide.outputs.has_flight_targets == 'true' &&
-      needs.reconcile-appset.result == 'success' &&
-      (
-        (needs.decide.outputs.has_substrate_node_targets == 'true' && needs.node-substrate.result == 'success' && needs.assert-substrate.result == 'success') ||
-        (needs.decide.outputs.has_substrate_node_targets != 'true' && needs.node-substrate.result == 'skipped' && needs.assert-substrate.result == 'skipped')
-      )
+      needs.reconcile-appset.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -649,6 +740,24 @@ jobs:
           fetch-depth: 0
           path: app-src
 
+      # Per-cell substrate gate (Axiom 18): require THIS node's own assert-ok
+      # marker. A sibling node's substrate failure leaves this node's marker
+      # intact, so this cell proceeds. A flight target that needed no substrate
+      # (not in substrate_node_targets_json) has no marker and passes.
+      - name: Download this node's assert marker
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.8
+        with:
+          name: assert-ok-${{ matrix.node }}
+          path: ${{ runner.temp }}/assert-marker
+      - name: Gate on this node's substrate readiness
+        env:
+          NODE: ${{ matrix.node }}
+          KIND: assert-ok
+          EXPECTED_JSON: ${{ needs.decide.outputs.substrate_node_targets_json }}
+          MARKER_DIR: ${{ runner.temp }}/assert-marker
+        run: bash ci-src/scripts/ci/resolve-substrate-gate.sh
+
       - name: Download resolved-pr-images
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.8
         with:
@@ -661,7 +770,9 @@ jobs:
           PER_NODE_BRANCH: deploy/${{ matrix.env }}-${{ matrix.node }}
         run: |
           set -euo pipefail
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" deploy-branch
+          # shellcheck source=../../scripts/ci/lib/github-clone.sh
+          . app-src/scripts/ci/lib/github-clone.sh
+          github_clone_repo "${{ github.repository }}" deploy-branch
           cd deploy-branch
           git fetch origin "+refs/heads/deploy/*:refs/remotes/origin/deploy/*"
           if git rev-parse --verify --quiet "refs/remotes/origin/${PER_NODE_BRANCH}" >/dev/null; then
@@ -687,14 +798,11 @@ jobs:
 
       - name: Sync base + per-node overlay + per-node catalog to deploy branch
         env:
-          GH_TOKEN: ${{ github.token }}
           NODE: ${{ matrix.node }}
         run: |
           set -euo pipefail
-          if git -C app-src config -f .gitmodules --get "submodule.nodes/${NODE}.path" >/dev/null 2>&1; then
-            git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
-            git -C app-src submodule update --init --depth 1 "nodes/${NODE}"
-          fi
+          # Node source already materialized at app-src/nodes/${NODE} by the
+          # "Materialize node source at its catalog pin" step (same job).
           rsync -a --delete app-src/infra/k8s/base/ deploy-branch/infra/k8s/base/
           mkdir -p "deploy-branch/infra/k8s/overlays/candidate-a/${NODE}"
           rsync -a --delete \
@@ -753,6 +861,7 @@ jobs:
         id: push-deploy
         working-directory: deploy-branch
         env:
+          GH_TOKEN: ${{ github.token }}
           PER_NODE_BRANCH: deploy/${{ matrix.env }}-${{ matrix.node }}
           NODE: ${{ matrix.node }}
           HEAD_SHA: ${{ needs.decide.outputs.head_sha }}
@@ -768,7 +877,7 @@ jobs:
           if [ -n "${{ needs.decide.outputs.node_source_sha }}" ]; then
             git commit -m "candidate-flight ${NODE}: node-ref ${{ needs.decide.outputs.node_source_sha }}"
           else
-            git commit -m "candidate-flight ${NODE}: pr-${{ inputs.pr_number }} ${HEAD_SHA}"
+            git commit -m "candidate-flight ${NODE}: sha-${HEAD_SHA}"
           fi
           git push origin "HEAD:${PER_NODE_BRANCH}"
           DEPLOY_SHA=$(git rev-parse HEAD)
@@ -894,21 +1003,90 @@ jobs:
           job_name: reconcile-dns
           labels: workflow=candidate-flight kind=dns_reconcile slot=candidate-a
 
+  # Env-singleton substrate reconcile (substrate-registry: scheduler-worker-routing,
+  # task.5026). The worker polls one Temporal queue per node from COGNI_NODE_ENDPOINTS
+  # in its ConfigMap; a node-add changes that set, but the worker's Argo app syncs
+  # deploy/<env>-scheduler-worker — a branch a node flight never refreshed, so the new
+  # routing never reached the worker (graph /chat/completions hung; bug.5035/bug.5021,
+  # the manual scheduler-worker heal). This propagates the catalog-rendered, gated
+  # base/scheduler-worker onto that branch; Argo + the Reloader annotation (#1609) roll
+  # the worker. Env-singleton, mirrors reconcile-dns: single per-env job, not per-node.
+  reconcile-scheduler-worker-routing:
+    needs: [decide]
+    if: needs.decide.result == 'success'
+    # Serialize per-env so concurrent node flights never race on the shared branch.
+    concurrency:
+      group: reconcile-scheduler-worker-routing-candidate-a
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    environment: candidate-a
+    steps:
+      # Workflow source at the root owns the loki-push composite action.
+      - name: Checkout workflow source
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+
+      # PR head: a PR that ADDS a node carries the new catalog + the rendered
+      # base/scheduler-worker configmap here, so routing covers it.
+      - name: Checkout app source (PR catalog + base manifests)
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          ref: ${{ needs.decide.outputs.head_sha }}
+          path: app-src
+
+      - name: Reconcile scheduler-worker routing (propagate to per-env deploy branch)
+        working-directory: app-src
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_SOURCE_DIR: "."
+          SWR_RECONCILE_SUMMARY_FILE: ${{ runner.temp }}/swr-reconcile-summary.json
+          SWR_RECONCILE_HEAD_SHA: ${{ needs.decide.outputs.head_sha }}
+          SWR_RECONCILE_NODE_SOURCE_SHA: ${{ needs.decide.outputs.node_source_sha }}
+          SWR_RECONCILE_PR_NUMBER: ${{ inputs.pr_number }}
+          SWR_RECONCILE_NODE_SLUG: ${{ needs.decide.outputs.node_slug }}
+          SWR_RECONCILE_STATUS_URL: ${{ needs.decide.outputs.status_url }}
+        run: |
+          set -euo pipefail
+          # Flights run on a main-merge ref; a head predating this script should
+          # skip rather than 127 (its routing already shipped via deploy-infra).
+          if [ ! -f scripts/ci/reconcile-scheduler-worker-routing.sh ]; then
+            echo "::warning::scripts/ci/reconcile-scheduler-worker-routing.sh absent at this ref — skipping routing reconcile"
+            exit 0
+          fi
+          bash scripts/ci/reconcile-scheduler-worker-routing.sh candidate-a
+
+      - name: Push scheduler-worker routing telemetry to Loki
+        if: always()
+        uses: ./.github/actions/loki-push
+        with:
+          loki_url: ${{ secrets.GRAFANA_CLOUD_LOKI_URL }}
+          loki_user: ${{ secrets.GRAFANA_CLOUD_LOKI_USER }}
+          loki_token: ${{ secrets.GRAFANA_CLOUD_LOKI_API_KEY }}
+          log_file: ${{ runner.temp }}/swr-reconcile-summary.json
+          job_name: reconcile-scheduler-worker-routing
+          labels: workflow=candidate-flight kind=scheduler_worker_routing_reconcile slot=candidate-a
+
   verify-candidate:
-    needs: [decide, flight, reconcile-dns, node-substrate, assert-substrate]
+    needs:
+      [
+        decide,
+        flight,
+        reconcile-dns,
+        reconcile-scheduler-worker-routing,
+        node-substrate,
+        assert-substrate,
+      ]
+    # Per-cell isolation (Axiom 18): run whenever flight ran and env-level
+    # reconcile-dns succeeded. Do NOT gate on the matrix-aggregate flight /
+    # node-substrate / assert-substrate result — a sibling node's failure must
+    # not skip this whole job. Each cell proves its OWN flight succeeded via the
+    # per-cell deploy-sha artifact (Resolve EXPECTED_SHA, fail-closed on empty)
+    # and gates on its OWN node's assert-ok marker below.
     if: |
       always() &&
       needs.decide.outputs.has_flight_targets == 'true' &&
-      needs.flight.result == 'success' &&
+      needs.flight.result != 'skipped' &&
       needs.reconcile-dns.result == 'success' &&
-      (
-        needs.decide.outputs.has_substrate_node_targets != 'true' ||
-        needs.node-substrate.result == 'success'
-      ) &&
-      (
-        (needs.decide.outputs.has_substrate_node_targets == 'true' && needs.assert-substrate.result == 'success') ||
-        (needs.decide.outputs.has_substrate_node_targets != 'true' && needs.assert-substrate.result == 'skipped')
-      )
+      needs.reconcile-scheduler-worker-routing.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -930,6 +1108,22 @@ jobs:
         with:
           ref: ${{ needs.decide.outputs.head_sha }}
           path: app-src
+
+      # Per-cell substrate gate (Axiom 18): same per-node assert-ok marker the
+      # flight cell used. A sibling node's substrate failure can't reach here.
+      - name: Download this node's assert marker
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.8
+        with:
+          name: assert-ok-${{ matrix.node }}
+          path: ${{ runner.temp }}/assert-marker
+      - name: Gate on this node's substrate readiness
+        env:
+          NODE: ${{ matrix.node }}
+          KIND: assert-ok
+          EXPECTED_JSON: ${{ needs.decide.outputs.substrate_node_targets_json }}
+          MARKER_DIR: ${{ runner.temp }}/assert-marker
+        run: bash ci-src/scripts/ci/resolve-substrate-gate.sh
 
       - name: Checkout per-node deploy branch (for source-sha map)
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4

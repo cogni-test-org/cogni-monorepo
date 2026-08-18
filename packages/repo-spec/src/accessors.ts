@@ -13,9 +13,11 @@
 
 import type {
   GateConfig,
+  KnowledgeSpec,
   NodeRegistryEntry,
   OperatorWalletSpec,
   RepoSpec,
+  StewardWalletSpec,
 } from "./schema.js";
 
 // ---------------------------------------------------------------------------
@@ -61,7 +63,42 @@ export interface InboundPaymentConfig {
   chainId: number;
   receivingAddress: string;
   provider: string;
+  /** Purchase-side markup multiplier (governance config; drives top-up + Split allocation). */
+  markupFactor: number;
+  /** System-tenant (DAO) bonus-credit fraction (0–1); 0 = no system-account credit increase. */
+  revenueShare: number;
 }
+
+/**
+ * A node-facing schedule resolved against the repo-spec's OWN node identity.
+ *
+ * M8 (security): `nodeId` is operator-pinned to the repo-spec's own `node_id` here
+ * at extraction time — it is NOT free-text from the schedule entry. A repo-spec
+ * therefore cannot author a schedule for a foreign node; every resolved schedule
+ * carries the declaring node's identity. Downstream (syncNodeSchedules) treats
+ * `nodeId` as authoritative for routing + the workflowId (`node-task:{nodeId}:{id}`).
+ *
+ * `kind` is the *inferred* workflowType selector (route XOR graph) — there is no
+ * node-facing `target` enum; the operator vocabulary stays operator-side.
+ */
+export interface NodeScheduleConfig {
+  /** Stable schedule id (from the entry). */
+  id: string;
+  /** Operator-pinned node id — the repo-spec's own node_id (NOT free-text). */
+  nodeId: string;
+  cron: string;
+  timezone: string;
+  /** Inferred from which of route/graph is present. */
+  kind: "http-dispatch" | "graph";
+  /** Relative route on the node's own host — set iff kind === "http-dispatch". */
+  route?: string;
+  /** Graph id — set iff kind === "graph". */
+  graph?: string;
+  /** Opaque payload forwarded verbatim. */
+  payload: Record<string, unknown>;
+}
+
+export type KnowledgeConfig = KnowledgeSpec;
 
 // ---------------------------------------------------------------------------
 // Identity accessors
@@ -70,6 +107,39 @@ export interface InboundPaymentConfig {
 /** Extract node_id from parsed repo-spec. */
 export function extractNodeId(spec: RepoSpec): string {
   return spec.node_id;
+}
+
+/**
+ * Human-facing node slug from `intent.name` (e.g. `operator`, `beacon`).
+ * Falls back to `node_id` when `intent.name` is absent (pre-intent repo-specs).
+ */
+export function extractNodeName(spec: RepoSpec): string {
+  return spec.intent?.name ?? spec.node_id;
+}
+
+/** One-line node mission from `intent.mission`, or null when undeclared. */
+export function extractNodeMission(spec: RepoSpec): string | null {
+  return spec.intent?.mission ?? null;
+}
+
+/** Punchy ~5-word gallery/heading hook from `intent.hook`, or null when undeclared. */
+export function extractNodeHook(spec: RepoSpec): string | null {
+  return spec.intent?.hook ?? null;
+}
+
+/** Node's self-hosted brand thumbnail URL (e.g. its OG image) from `intent.brand.thumbnail`. */
+export function extractNodeThumbnail(spec: RepoSpec): string | null {
+  return spec.intent?.brand?.thumbnail ?? null;
+}
+
+/** Monogram-tint brand color from `intent.brand.color`, or null when undeclared. */
+export function extractNodeBrandColor(spec: RepoSpec): string | null {
+  return spec.intent?.brand?.color ?? null;
+}
+
+/** Lucide icon NAME (PascalCase, e.g. `Gamepad2`) for the node's brand mark from `intent.brand.icon`. */
+export function extractNodeBrandIcon(spec: RepoSpec): string | null {
+  return spec.intent?.brand?.icon ?? null;
 }
 
 /**
@@ -86,16 +156,21 @@ export function extractScopeId(spec: RepoSpec): string {
 }
 
 /**
- * Extract numeric chain_id from cogni_dao section.
+ * Extract numeric chain_id from governance section.
  * Handles both string and number representations from YAML.
  */
 export function extractChainId(spec: RepoSpec): number {
-  const raw = spec.cogni_dao.chain_id;
+  const raw = spec.governance?.chain_id;
+  if (raw === undefined) {
+    throw new Error(
+      "[repo-spec] Missing governance.chain_id — required for on-chain operations"
+    );
+  }
   const chainId = typeof raw === "string" ? Number(raw) : raw;
 
   if (!Number.isFinite(chainId)) {
     throw new Error(
-      "[repo-spec] Invalid cogni_dao.chain_id; expected numeric chain ID"
+      "[repo-spec] Invalid governance.chain_id; expected numeric chain ID"
     );
   }
 
@@ -130,6 +205,8 @@ export function extractPaymentConfig(
     chainId,
     receivingAddress: topup.receiving_address.trim(),
     provider: topup.provider.trim(),
+    markupFactor: topup.markup_factor,
+    revenueShare: topup.revenue_share,
   };
 }
 
@@ -174,6 +251,34 @@ export function extractGovernanceConfig(spec: RepoSpec): GovernanceConfig {
   }
 
   return config;
+}
+
+/**
+ * Extract node-facing recurring-work schedules, each pinned to this repo-spec's
+ * OWN node identity (M8). The returned `nodeId` is `spec.node_id`, never anything
+ * declared inside a schedule entry — so a repo-spec is structurally incapable of
+ * producing a schedule for a foreign node.
+ *
+ * `kind` (the workflowType selector) is inferred from route XOR graph; the schema
+ * already guarantees exactly one is present, so this is a pure mapping.
+ */
+export function extractNodeSchedules(spec: RepoSpec): NodeScheduleConfig[] {
+  const ownNodeId = spec.node_id;
+  const declared = spec.schedules ?? [];
+  return declared.map((entry) => {
+    const kind: "http-dispatch" | "graph" =
+      entry.route !== undefined ? "http-dispatch" : "graph";
+    return {
+      id: entry.id,
+      nodeId: ownNodeId,
+      cron: entry.cron,
+      timezone: entry.timezone,
+      kind,
+      ...(entry.route !== undefined ? { route: entry.route } : {}),
+      ...(entry.graph !== undefined ? { graph: entry.graph } : {}),
+      payload: entry.payload,
+    };
+  });
 }
 
 /**
@@ -243,6 +348,25 @@ export function extractGatesConfig(spec: RepoSpec): GatesConfig {
   };
 }
 
+export interface ReviewConfig {
+  /** Whether the operator runs PR review for this node. */
+  enabled: boolean;
+  /** Platform model id for the pr-review graph; undefined → operator default. */
+  model?: string;
+}
+
+/**
+ * Extract PR review on/off + model from parsed repo-spec.
+ * Backward-compatible: a spec with no `review:` block defaults to enabled (review
+ * was historically always-on), with no model override (operator default applies).
+ */
+export function extractReviewConfig(spec: RepoSpec): ReviewConfig {
+  return {
+    enabled: spec.review?.enabled ?? true,
+    ...(spec.review?.model ? { model: spec.review.model } : {}),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // DAO config
 // ---------------------------------------------------------------------------
@@ -252,23 +376,40 @@ export interface DaoConfig {
   readonly plugin_contract: string;
   readonly signal_contract: string;
   readonly chain_id: string;
-  readonly base_url: string;
+  /** Governance proposal-UI host for `/propose/merge` deep-links. Optional: its
+   * absence omits the link but never blanks treasury/governance reads. */
+  readonly base_url?: string;
+}
+
+export interface DaoTokenDistributionConfig {
+  readonly chainId: number;
+  readonly tokenAddress: string;
+  readonly emissionsHolderAddress: string;
+  readonly claimContractPattern:
+    | "uniswap.merkle-distributor.v1"
+    | "1inch.cumulative-merkle-drop.v1";
+  /**
+   * The ONE cumulative Merkle distributor for this node (R2 deploy).
+   * Undefined until distributions activation records it. Epoch finalization (R3)
+   * resolves this as the terminal fallback when no manifest yet exists.
+   */
+  readonly distributorAddress?: string;
 }
 
 /**
  * Extract DAO governance configuration from parsed repo-spec.
- * Returns null if cogni_dao is missing or any required field is absent.
- * All five fields (dao_contract, plugin_contract, signal_contract, chain_id, base_url)
- * must be present for the config to be valid.
+ * Returns null only if the on-chain identity (dao_contract, plugin_contract,
+ * signal_contract, chain_id) is incomplete. `base_url` is the governance-UI
+ * deep-link host only — it gates nothing but the proposal link, so it is NOT
+ * required here (see review-handler / treasury, which never read it).
  */
 export function extractDaoConfig(spec: RepoSpec): DaoConfig | null {
-  const dao = spec.cogni_dao;
+  const dao = spec.governance;
   if (
     !dao?.dao_contract ||
     !dao.plugin_contract ||
     !dao.signal_contract ||
-    !dao.chain_id ||
-    !dao.base_url
+    !dao.chain_id
   ) {
     return null;
   }
@@ -278,8 +419,64 @@ export function extractDaoConfig(spec: RepoSpec): DaoConfig | null {
     plugin_contract: dao.plugin_contract,
     signal_contract: dao.signal_contract,
     chain_id: String(dao.chain_id),
-    base_url: dao.base_url,
+    ...(dao.base_url ? { base_url: dao.base_url } : {}),
   };
+}
+
+/**
+ * Extract active DAO token distribution config from repo-spec.
+ * Returns undefined until the node has explicitly activated distributions and
+ * published the token + DAO-controlled emissions holder addresses.
+ */
+export function extractDaoTokenDistributionConfig(
+  spec: RepoSpec,
+  expectedChainId?: number
+): DaoTokenDistributionConfig | undefined {
+  if (spec.distributions?.status !== "active") return undefined;
+
+  const chainId = extractChainId(spec);
+  if (expectedChainId !== undefined && chainId !== expectedChainId) {
+    throw new Error(
+      `[repo-spec] Chain mismatch: repo-spec declares ${chainId}, app requires ${expectedChainId}`
+    );
+  }
+
+  const tokenAddress = spec.governance.token_contract;
+  const emissionsHolderAddress = spec.governance.emissions_holder;
+  if (!tokenAddress || !emissionsHolderAddress) {
+    throw new Error(
+      "[repo-spec] distributions.status is active but governance.token_contract or governance.emissions_holder is missing"
+    );
+  }
+
+  return {
+    chainId,
+    tokenAddress,
+    emissionsHolderAddress,
+    // Default to the vendored distributor the activation flow actually deploys +
+    // claims against (1inch CumulativeMerkleDrop) — NOT the legacy non-cumulative
+    // uniswap pattern. An absent pattern on an active spec is a pre-fix activation
+    // record; the live claim/guard path is cumulative regardless (bug.5031).
+    claimContractPattern:
+      spec.distributions.claim_contract_pattern ??
+      "1inch.cumulative-merkle-drop.v1",
+    ...(spec.distributions.distributor_address
+      ? { distributorAddress: spec.distributions.distributor_address }
+      : {}),
+  };
+}
+
+/**
+ * Extract the ONE cumulative distributor address recorded at distributions
+ * activation (R2). Returns undefined until an address is recorded. This is the
+ * terminal fallback for epoch-finalization distributor resolution (R3): the
+ * FIRST epoch has no prior/current manifest, so it reads the address from here.
+ * Does NOT require `distributions.status: active` — the address is recorded at
+ * the same moment activation flips to active, but reading it should not couple
+ * to status so a partially-recorded spec still resolves the contract.
+ */
+export function extractDistributorAddress(spec: RepoSpec): string | undefined {
+  return spec.distributions?.distributor_address ?? undefined;
 }
 
 /**
@@ -294,10 +491,32 @@ export function extractOperatorWalletConfig(
 
 /**
  * Extract DAO treasury address from repo-spec.
- * Returns undefined if cogni_dao.dao_contract is not present.
+ * Returns undefined if governance.dao_contract is not present.
  */
 export function extractDaoTreasuryAddress(spec: RepoSpec): string | undefined {
-  return spec.cogni_dao.dao_contract;
+  return spec.governance.dao_contract;
+}
+
+/**
+ * Extract steward wallet config (payments_out.steward_wallet) from repo-spec.
+ * The steward wallet is the human-custodied address the operator wallet funds
+ * (via withdrawToSteward) so a human can settle vendor invoices in USDC.
+ * Returns undefined if payments_out is not present.
+ */
+export function extractStewardWalletConfig(
+  spec: RepoSpec
+): StewardWalletSpec | undefined {
+  return spec.payments_out?.steward_wallet;
+}
+
+/**
+ * Extract node-local knowledge plane config from repo-spec.
+ * Returns undefined for pre-knowledge nodes.
+ */
+export function extractKnowledgeConfig(
+  spec: RepoSpec
+): KnowledgeConfig | undefined {
+  return spec.knowledge;
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +611,8 @@ const NODES_PREFIX = "nodes/";
  *   with the implementing code.
  * - Exact single-node-scope policy maintenance files: the workflow gate,
  *   reference classifier, repo-spec resolver, parity fixtures, and narrow tests.
+ * - Exact fast-check devtools files: app Vitest source-resolution is repo
+ *   tooling, but some legacy in-tree app config entrypoints are duplicated.
  */
 const RIDE_ALONG_PATTERNS: ReadonlyArray<(p: string) => boolean> = [
   (p) => p === "pnpm-lock.yaml",
@@ -411,8 +632,41 @@ function isRideAlong(p: string): boolean {
   return RIDE_ALONG_PATTERNS.some((m) => m(p));
 }
 
+const DEVTOOLS_OPERATOR_PATTERNS: ReadonlyArray<(p: string) => boolean> = [
+  (p) => p === ".github/workflows/ci.yaml",
+  (p) => p === "docs/guides/new-worktree-setup.md",
+  (p) => p === "nodes/operator/app/vitest.config.mts",
+  (p) => p === "packages/langgraph-graphs/vitest.config.ts",
+  (p) => p === "packages/repo-spec/AGENTS.md",
+  (p) => p === "packages/repo-spec/src/accessors.ts",
+  (p) => p === "scripts/AGENTS.md",
+  (p) => p === "scripts/check-fast.sh",
+  (p) => p === "scripts/run-scoped-package-build.mjs",
+  (p) => p.startsWith("scripts/vitest/"),
+  (p) => p === "scripts/worktree-check.sh",
+  (p) => p === "tests/ci-invariants/classify.ts",
+  (p) => p.startsWith("tests/ci-invariants/fixtures/single-node-scope/"),
+  (p) => p === "tests/ci-invariants/single-node-scope-meta.spec.ts",
+  (p) => p === "vitest.config.mts",
+];
+
+function isDevtoolsOperatorPath(path: string): boolean {
+  return DEVTOOLS_OPERATOR_PATTERNS.some((m) => m(path));
+}
+
+function isRootAppVitestConfig(
+  path: string,
+  nonOperatorByTop: Map<string, NodeRegistryEntry>
+): boolean {
+  const match = path.match(/^nodes\/([^/]+)\/app\/vitest\.config\.mts$/);
+  const node = match?.[1];
+  return Boolean(
+    node && node !== "node-template" && nonOperatorByTop.has(node)
+  );
+}
+
 /**
- * NODE_BIRTH ride-along: a node may carry its OWN deploy wiring — the
+ * NODE_FORMATION ride-along: a node may carry its OWN deploy wiring — the
  * operator-owned files that exist only to make `nodes/<node>/` deployable.
  * Keep this in parity with `tests/ci-invariants/classify.ts` and the
  * `single-node-scope` bash gate.
@@ -427,14 +681,20 @@ function isNodeWiring(path: string, node: string): boolean {
     return slash > 0 && rest.slice(slash + 1).startsWith(`${node}/`);
   }
   if (path.startsWith(argocdPrefix)) {
-    const file = path.slice(argocdPrefix.length);
-    // Per-node AppSet `<env>-<node>-applicationset.yaml` belongs to THIS node
-    // only (LANE_ISOLATION). Node-scoped, so a node PR cannot ride another
-    // lane's AppSet — closes the shared-appset residual flagged in classify.ts.
+    // Per-(env, node) AppSet now lives at appsets/<env>/<env>-<node>-applicationset.yaml
+    // (story.5020 per-env app-of-apps). Node-scoped (LANE_ISOLATION): belongs to THIS
+    // node only, so a node PR cannot ride another lane's AppSet.
+    const appsetsPrefix = "appsets/";
+    const rest = path.slice(argocdPrefix.length);
+    if (!rest.startsWith(appsetsPrefix)) return false;
+    const afterEnv = rest.slice(appsetsPrefix.length);
+    const slash = afterEnv.indexOf("/");
+    if (slash <= 0) return false;
+    const name = afterEnv.slice(slash + 1);
     return (
-      !file.includes("/") &&
-      (file.endsWith(`-${node}-applicationset.yaml`) ||
-        file.endsWith(`-${node}-applicationset.yml`))
+      !name.includes("/") &&
+      (name.endsWith(`-${node}-applicationset.yaml`) ||
+        name.endsWith(`-${node}-applicationset.yml`))
     );
   }
   return (
@@ -498,12 +758,14 @@ export function extractOwningNode(
 
   const sovereigns = new Map<string, { nodeId: string; path: string }>();
   const operatorPaths: string[] = [];
+  const nonOperatorPaths: string[] = [];
 
   for (const p of paths) {
     const top = topUnderNodes(p);
     const sov = top != null ? nonOperatorByTop.get(top) : undefined;
     if (sov) {
       sovereigns.set(sov.node_id, { nodeId: sov.node_id, path: sov.path });
+      nonOperatorPaths.push(p);
     } else {
       operatorPaths.push(p);
     }
@@ -524,6 +786,17 @@ export function extractOwningNode(
     operatorPaths.every((p) => isRideAlong(p) || isNodeWiring(p, sovereignTop))
   ) {
     operatorTouched = false;
+    rideAlongApplied = true;
+  }
+
+  if (
+    sovereigns.size > 0 &&
+    operatorPaths.length > 0 &&
+    nonOperatorPaths.every((p) => isRootAppVitestConfig(p, nonOperatorByTop)) &&
+    operatorPaths.every((p) => isDevtoolsOperatorPath(p))
+  ) {
+    sovereigns.clear();
+    operatorTouched = true;
     rideAlongApplied = true;
   }
 
@@ -552,6 +825,7 @@ export function extractOwningNode(
       kind: "single",
       nodeId: operatorEntry.node_id,
       path: operatorEntry.path,
+      ...(rideAlongApplied ? { rideAlongApplied: true } : {}),
     };
   }
 

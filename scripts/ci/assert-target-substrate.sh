@@ -53,7 +53,7 @@ done
 "$contains_node" || fail "target '$node' is not a type=node catalog target"
 
 overlay_dir="${APP_SOURCE_DIR}/infra/k8s/overlays/${DEPLOY_ENVIRONMENT}/${node}"
-appset_file="${APP_SOURCE_DIR}/infra/k8s/argocd/${DEPLOY_ENVIRONMENT}-${node}-applicationset.yaml"
+appset_file="${APP_SOURCE_DIR}/infra/k8s/argocd/appsets/${DEPLOY_ENVIRONMENT}/${DEPLOY_ENVIRONMENT}-${node}-applicationset.yaml"
 
 [ -d "$overlay_dir" ] || fail "missing overlay dir: $overlay_dir"
 [ -f "$appset_file" ] || fail "missing per-target AppSet file: $appset_file"
@@ -100,6 +100,7 @@ namespace="cogni-${env_name}"
 app_name="${env_name}-${node}"
 appset_name="cogni-${env_name}-${node}"
 workload_name="${node}-node-app"
+expected_secret_name="${node}-env-secrets"
 edge_env="${remote_root}/opt/cogni-template-edge/.env"
 caddyfile="${remote_root}/opt/cogni-template-edge/configs/Caddyfile.tmpl"
 runtime_env="${remote_root}/opt/cogni-template-runtime/.env"
@@ -179,10 +180,16 @@ if [ -z "$consumed_secret_names" ]; then
 else
   while IFS= read -r consumed_secret; do
     [ -n "$consumed_secret" ] || continue
+    if [ "$consumed_secret" = "${node}-node-app-secrets" ]; then
+      mark_fail "Deployment consumes legacy plain Secret ${consumed_secret}; expected ${expected_secret_name}"
+    elif [ "$consumed_secret" != "$expected_secret_name" ]; then
+      mark_fail "Deployment consumes unexpected Secret ${consumed_secret}; expected ${expected_secret_name}"
+    fi
+
     if kubectl -n "$namespace" get secret "$consumed_secret" >/dev/null 2>&1; then
       mark_ok "Deployment-consumed Secret exists: $consumed_secret"
     else
-      mark_fail "Deployment-consumed Secret missing: $consumed_secret"
+      mark_fail "ESO-synced Secret missing: $consumed_secret"
     fi
 
     if kubectl -n "$namespace" get externalsecret "$consumed_secret" >/dev/null 2>&1; then
@@ -192,8 +199,24 @@ else
       else
         mark_fail "Deployment-consumed ExternalSecret not Ready=True: $consumed_secret"
       fi
+    else
+      mark_fail "ExternalSecret missing for Deployment-consumed Secret: $consumed_secret"
     fi
   done <<< "$consumed_secret_names"
+fi
+
+# DSN keys must be materialized into the node Secret (reconcile seeds all three
+# today; secret-materialize owns them once per-node DB creds land). Fail loud if
+# the ESO-synced Secret lacks any DSN so a missing/empty-DSN node can never ship
+# green (DATABASE_SERVICE_URL → scheduler-worker, DOLTGRES_URL → knowledge).
+if kubectl -n "$namespace" get secret "$expected_secret_name" >/dev/null 2>&1; then
+  for dsn_key in DATABASE_URL DATABASE_SERVICE_URL DOLTGRES_URL; do
+    if [ -n "$(kubectl -n "$namespace" get secret "$expected_secret_name" -o jsonpath="{.data.${dsn_key}}" 2>/dev/null)" ]; then
+      mark_ok "node Secret carries DSN key: ${dsn_key}"
+    else
+      mark_fail "node Secret ${expected_secret_name} missing DSN key ${dsn_key}; materialize/reconcile did not write it"
+    fi
+  done
 fi
 
 if [ -f "$edge_env" ]; then
@@ -207,8 +230,18 @@ else
 fi
 
 if [ -f "$caddyfile" ]; then
-  if grep -Fq "{\$${edge_key}:" "$caddyfile" && grep -Fq "host.docker.internal:${node_port}" "$caddyfile"; then
-    mark_ok "Caddyfile declares route for $node_host -> host.docker.internal:${node_port}"
+  # The primary node (edge_key=*_UPSTREAM) renders as the bare {$DOMAIN} block with a
+  # {$<SLUG>_UPSTREAM:app:3000} default — host.docker.internal:<port> is the per-env
+  # edge .env override, NOT the rendered-template default. Only non-primary nodes bake
+  # it into the template, so assert it only for them; the live-config check below
+  # covers the primary's real route. (Same fix as reconcile-node-substrate.sh / #1598.)
+  caddy_route_ok=true
+  grep -Fq "{\$${edge_key}:" "$caddyfile" || caddy_route_ok=false
+  if [[ "$edge_key" != *_UPSTREAM ]]; then
+    grep -Fq "host.docker.internal:${node_port}" "$caddyfile" || caddy_route_ok=false
+  fi
+  if "$caddy_route_ok"; then
+    mark_ok "Caddyfile declares route for $node_host (edge_key=$edge_key)"
   else
     mark_fail "Caddyfile missing route for ${node_host} / node_port ${node_port}"
   fi

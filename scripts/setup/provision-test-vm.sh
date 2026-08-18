@@ -47,8 +47,8 @@ if [[ -z "$DEPLOY_ENV" ]]; then
   echo ""
   echo "  preview       — preview.cognidao.org"
   echo "  production    — cognidao.org"
-  echo "  candidate-a   — test.cognidao.org + resy-test.cognidao.org"
-  echo "  candidate-b   — candidate-b.cognidao.org + resy-candidate-b.cognidao.org"
+  echo "  candidate-a   — test.cognidao.org"
+  echo "  candidate-b   — candidate-b.cognidao.org"
   echo "  --yes         — skip confirmation prompt (for CI/automation)"
   exit 1
 fi
@@ -91,11 +91,10 @@ esac
 COGNI_DOMAIN_ROOT="$(cogni_domain_root)"
 COGNI_DEPLOYMENT_SLUG="$(cogni_deployment_slug)"
 DOMAIN="${DOMAIN:-$(cogni_operator_domain_for_env "$DEPLOY_ENV" "$COGNI_DOMAIN_ROOT")}"
-RESY_DOMAIN="${RESY_DOMAIN:-$(cogni_resy_domain_for_env "$DEPLOY_ENV" "$COGNI_DOMAIN_ROOT")}"
 VM_DNS_HOST="${VM_DNS_HOST:-$(cogni_vm_host_for_env "$DEPLOY_ENV" "$COGNI_DOMAIN_ROOT" "$COGNI_DEPLOYMENT_SLUG")}"
-DNS_RECORDS=("$DOMAIN" "$RESY_DOMAIN" "$VM_DNS_HOST")
+DNS_RECORDS=("$DOMAIN" "$VM_DNS_HOST")
 CADDYFILE_TEMPLATE="$REPO_ROOT/infra/compose/edge/configs/Caddyfile.tmpl"
-COGNI_APP_TARGETS=("operator" "resy" "scheduler-worker")
+COGNI_APP_TARGETS=("operator" "scheduler-worker")
 
 # Allow branch override (e.g., testing a feature branch on preview infra)
 BRANCH="${COGNI_REPO_REF:-$BRANCH}"
@@ -232,7 +231,7 @@ APP_ENV="${DEPLOY_ENV}"
 DEPLOY_ENVIRONMENT="${DEPLOY_ENV}"
 
 # Per-node databases. cogni-poly lives in its own repo/VM after the split.
-COGNI_NODE_DBS="cogni_operator,cogni_resy"
+COGNI_NODE_DBS="cogni_operator"
 LITELLM_DB_NAME="litellm"
 
 # EVM RPC — use public Base mainnet endpoint for test
@@ -243,7 +242,7 @@ POSTHOG_API_KEY="${POSTHOG_API_KEY:-phc_placeholder_test}"
 POSTHOG_HOST="${POSTHOG_HOST:-https://us.i.posthog.com}"
 
 # Repo URL/ref for git-sync
-COGNI_REPO_URL="https://github.com/Cogni-DAO/cogni.git"
+COGNI_REPO_URL="https://github.com/cogni-dao/cogni.git"
 COGNI_REPO_REF="$BRANCH"
 
 # LiteLLM node endpoints — billing callback routing (Compose→k8s NodePorts via host gateway)
@@ -271,10 +270,10 @@ log_step "Phase 3: Provision VM"
 # not project-scoped. Per-fork namespacing eliminates the collision class.
 # Ported verbatim from node-template PR #19.
 #
-# Cogni-DAO/cogni               → cogni-dao-cogni
-# Cogni-DAO/standalone-node       → cogni-dao-node-template
+# cogni-dao/cogni               → cogni-dao-cogni
+# cogni-dao/standalone-node       → cogni-dao-node-template
 # i-am-coco/cogni-node-20260517 → i-am-coco-cogni-node-20260517
-GH_REPO="${GH_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "Cogni-DAO/cogni")}"
+GH_REPO="${GH_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "cogni-dao/cogni")}"
 VM_NAME_PREFIX=$(echo "${GH_REPO//\//-}" | tr '[:upper:]' '[:lower:]')
 log_info "VM/SSH-key prefix: ${VM_NAME_PREFIX} (from \$GH_REPO=${GH_REPO})"
 
@@ -422,7 +421,7 @@ log_step "Phase 4c: Seed per-app deploy branches with $VM_IP"
 # state. Provision is the one writer for env-discovered VM state and must seed
 # these branches before applying the ApplicationSet, otherwise a fresh cluster
 # can sync stale ExternalName targets from pre-split branches.
-REPO_URL="https://${GHCR_USERNAME:-Cogni-1729}:${GHCR_TOKEN}@github.com/Cogni-DAO/cogni.git"
+REPO_URL="https://${GHCR_USERNAME:-Cogni-1729}:${GHCR_TOKEN}@github.com/cogni-dao/cogni.git"
 
 for app in "${COGNI_APP_TARGETS[@]}"; do
   DEPLOY_BRANCH="deploy/${DEPLOY_ENV}-${app}"
@@ -504,9 +503,7 @@ log_info "Writing .env files..."
 
 ssh $SSH_OPTS root@"$VM_IP" "cat > /opt/cogni-template-edge/.env << 'ENVEOF'
 DOMAIN=${DOMAIN}
-RESY_DOMAIN=${RESY_DOMAIN}
 OPERATOR_UPSTREAM=host.docker.internal:30000
-RESY_UPSTREAM=host.docker.internal:30300
 ENVEOF"
 
 # All required vars must be in .env — Docker Compose validates ALL services at parse time,
@@ -545,8 +542,6 @@ DATABASE_URL=${DATABASE_URL}
 DATABASE_SERVICE_URL=${DATABASE_SERVICE_URL}
 POSTHOG_API_KEY=${POSTHOG_API_KEY}
 POSTHOG_HOST=${POSTHOG_HOST}
-OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
-OPENCLAW_GITHUB_RW_TOKEN=placeholder-not-started
 SCHEDULER_WORKER_IMAGE=placeholder:not-started
 MIGRATOR_IMAGE=placeholder:not-started
 APP_IMAGE=placeholder:not-started
@@ -641,12 +636,11 @@ log_step "Phase 6: Create k8s secrets on cluster"
 # Create namespace (Argo CD creates it on first sync, but secrets need it now)
 ssh $SSH_OPTS root@"$VM_IP" "kubectl create namespace ${K8S_NAMESPACE} 2>/dev/null || true"
 
-# Node-app secrets — one per Cogni node (operator, resy)
+# Node-app secrets — one per Cogni node (operator)
 # The Deployment references secretRef: {namePrefix}-node-app-secrets
-for node in operator resy; do
+for node in operator; do
   case $node in
     operator) db_name="cogni_operator" ;;
-    resy)     db_name="cogni_resy" ;;
   esac
 
   NODE_DB_URL="postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@${VM_IP}:5432/${db_name}?sslmode=disable"
@@ -661,8 +655,6 @@ for node in operator resy; do
     --from-literal=EVM_RPC_URL='${EVM_RPC_URL}' \
     --from-literal=POSTHOG_API_KEY='${POSTHOG_API_KEY}' \
     --from-literal=POSTHOG_HOST='${POSTHOG_HOST}' \
-    --from-literal=OPENCLAW_GATEWAY_TOKEN='${OPENCLAW_GATEWAY_TOKEN}' \
-    --from-literal=OPENCLAW_GITHUB_RW_TOKEN='placeholder-not-needed-for-test' \
     --from-literal=SCHEDULER_API_TOKEN='${SCHEDULER_API_TOKEN}' \
     --from-literal=BILLING_INGEST_TOKEN='${BILLING_INGEST_TOKEN}' \
     --from-literal=INTERNAL_OPS_TOKEN='${INTERNAL_OPS_TOKEN}' \
@@ -687,15 +679,6 @@ ssh $SSH_OPTS root@"$VM_IP" "kubectl -n ${K8S_NAMESPACE} create secret generic s
   --dry-run=client -o yaml | kubectl apply -f -"
 log_info "  Created scheduler-worker-secrets"
 
-# Sandbox-openclaw secret (placeholder)
-ssh $SSH_OPTS root@"$VM_IP" "kubectl -n ${K8S_NAMESPACE} create secret generic sandbox-openclaw-secrets \
-  --from-literal=OPENCLAW_GATEWAY_TOKEN='${OPENCLAW_GATEWAY_TOKEN}' \
-  --from-literal=OPENCLAW_GITHUB_RW_TOKEN='placeholder-not-needed-for-test' \
-  --from-literal=LITELLM_MASTER_KEY='${LITELLM_MASTER_KEY}' \
-  --from-literal=DISCORD_BOT_TOKEN='placeholder' \
-  --dry-run=client -o yaml | kubectl apply -f -"
-log_info "  Created sandbox-openclaw-secrets"
-
 log_info "All k8s secrets created"
 
 # ══════════════════════════════════════════════════════════════
@@ -709,7 +692,6 @@ log_step "Phase 7: Apply ApplicationSets (triggers Argo sync)"
 # Gate: verify prerequisites exist before enabling Argo sync
 ssh $SSH_OPTS root@"$VM_IP" "
   kubectl -n ${K8S_NAMESPACE} get secret operator-node-app-secrets >/dev/null || { echo 'FATAL: operator secrets missing'; exit 1; }
-  kubectl -n ${K8S_NAMESPACE} get secret resy-node-app-secrets >/dev/null || { echo 'FATAL: resy secrets missing'; exit 1; }
   kubectl -n ${K8S_NAMESPACE} get secret scheduler-worker-secrets >/dev/null || { echo 'FATAL: scheduler-worker secrets missing'; exit 1; }
   echo 'All prerequisite secrets verified'
 "

@@ -57,8 +57,22 @@ export interface CiStatusResult {
 /** Result of merging a pull request. */
 export interface MergeResult {
   readonly merged: boolean;
+  /**
+   * True when the PR was added to the merge queue instead of merged directly —
+   * the base branch requires a merge queue, so the merge happens asynchronously
+   * on the queue's rebased candidate. Mutually exclusive with `merged`; `sha` is
+   * undefined in this case (the merged SHA is not known until the queue drains).
+   */
+  readonly enqueued?: boolean;
   readonly sha?: string;
   readonly message: string;
+  /**
+   * GitHub HTTP status surfaced on a failed merge (`merged: false`).
+   * Lets callers classify the failure structurally — 405 = GitHub refused
+   * (not mergeable / branch protection / already merged), 409 = head modified —
+   * instead of substring-matching `message`. Undefined on success.
+   */
+  readonly status?: number;
 }
 
 /** Result of creating a branch. */
@@ -73,15 +87,32 @@ export interface CreateBranchResult {
  * GitHub's `POST /dispatches` returns HTTP 204 with no body — there is no
  * reliable way to identify the specific run it created short of a racey
  * polling lookup. We deliberately don't attempt that correlation here.
- * The caller observes the resulting run via `getCiStatus` — the
- * `candidate-flight` check appears on the PR head once GitHub picks up
- * the dispatch.
+ * The caller observes the resulting workflow run from the returned workflow URL.
  */
 export interface DispatchCandidateFlightResult {
   readonly dispatched: boolean;
+  readonly nodeSlug: string;
+  readonly sourceSha: string;
+  readonly workflowUrl: string;
+  readonly message: string;
+}
+
+/**
+ * Result of approving fork-PR workflow runs that are awaiting maintainer approval.
+ *
+ * GitHub holds `pull_request` workflow runs from first-time / outside fork
+ * contributors in an `action_required` state until a maintainer approves them.
+ * This releases all such runs for a PR head SHA in one call.
+ */
+export interface ApproveWorkflowRunsResult {
+  readonly approved: number;
   readonly prNumber: number;
   readonly headSha: string | null;
-  readonly workflowUrl: string;
+  // The PR head repo `owner/name` (the fork, for a fork PR). Enables the
+  // operator to dispatch a trusted pr-build of the approved head (run-ci's build
+  // half). Null only if the PR/head is unresolvable.
+  readonly headRepo: string | null;
+  readonly runIds: readonly number[];
   readonly message: string;
 }
 
@@ -130,11 +161,11 @@ export interface VcsCapability {
   }): Promise<CreateBranchResult>;
 
   /**
-   * Dispatch the `candidate-flight.yml` workflow for a pull request.
+   * Dispatch the `candidate-flight.yml` workflow for a node source revision.
    *
    * Thin wrapper over GitHub's `workflow_dispatch` API. Does not check slot
    * availability, CI status, or permissions — those gates live in the
-   * workflow (flight slot lease, PR Build prerequisite, Argo reconciliation).
+   * workflow (flight slot lease, digest promotion, Argo reconciliation).
    *
    * Per NO_AUTO_FLIGHT: agents must be explicitly instructed to call this.
    * The tool description repeats this to the planner.
@@ -142,8 +173,25 @@ export interface VcsCapability {
   dispatchCandidateFlight(params: {
     owner: string;
     repo: string;
-    prNumber: number;
-    headSha?: string;
+    nodeSlug: string;
+    sourceSha: string;
     workflowRef?: string;
   }): Promise<DispatchCandidateFlightResult>;
+
+  /**
+   * Approve all `action_required` (fork-PR) workflow runs for a PR head SHA.
+   *
+   * Releases the "N workflows awaiting approval" gate GitHub applies to
+   * `pull_request` runs from first-time / outside fork contributors. Requires
+   * the GitHub App installation to hold `actions: write`.
+   *
+   * Authorization to approve is the CALLER's concern — this method is a thin
+   * GitHub wrapper and does NOT check RBAC or principal identity. The operator
+   * route gates it (node-scoped `node.flight` RBAC) before calling.
+   */
+  approveWorkflowRuns(params: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  }): Promise<ApproveWorkflowRunsResult>;
 }

@@ -239,6 +239,69 @@
       "when": 1781289579960,
       "tag": "0033_resync_snapshot_baseline",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1781297484471,
+      "tag": "0034_military_human_robot",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1781301557846,
+      "tag": "0035_normal_komodo",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1781490660339,
+      "tag": "0036_broad_shockwave",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1781500000001,
+      "tag": "0037_seed_first_class_nodes",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1782259221356,
+      "tag": "0038_salty_karen_page",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1782951526052,
+      "tag": "0039_salty_maggott",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1785991086144,
+      "tag": "0040_seed_registry_nodes",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1786683260781,
+      "tag": "0041_epoch_distribution_manifest",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1786924271213,
+      "tag": "0042_peaceful_felicia_hardy",
+      "breakpoints": true
     }
   ]
 }

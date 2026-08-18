@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "upstream": {
+    "repo": "cogni-dao/cogni",
+    "sha": "6193a4729fbdc710c0a5c22beeb7b09d0ddd22eb",
+    "sourceHeads": [
+      {
+        "pr": 2041,
+        "sha": "646c880e5f9b3e12994f929a9eed78f270f6642a"
+      },
+      {
+        "pr": 2042,
+        "sha": "d98d9dc2cea25694d6034881937f4278493f9e01"
+      }
+    ]
+  },
+  "candidateFleet": [
+    "beacon",
+    "node-template",
+    "operator",
+    "poly",
+    "scheduler-worker",
+    "toks4"
+  ],
+  "allowedDivergencePaths": [
+    ".cogni/assert-candidate-parent-parity.mjs",
+    ".cogni/candidate-parent-sync.json",
+    "infra/catalog/beacon.yaml",
+    "infra/catalog/node-template.yaml",
+    "infra/catalog/operator.yaml",
+    "infra/catalog/poly.yaml",
+    "infra/catalog/scheduler-worker.yaml",
+    "infra/catalog/toks4.yaml",
+    "infra/k8s/argocd/appsets/preview/kustomization.yaml",
+    "infra/k8s/argocd/appsets/preview/preview-beacon-applicationset.yaml",
+    "infra/k8s/argocd/appsets/preview/preview-node-template-applicationset.yaml",
+    "infra/k8s/argocd/appsets/preview/preview-operator-applicationset.yaml",
+    "infra/k8s/argocd/appsets/preview/preview-poly-applicationset.yaml",
+    "infra/k8s/argocd/appsets/preview/preview-scheduler-worker-applicationset.yaml",
+    "infra/k8s/argocd/appsets/preview/preview-toks4-applicationset.yaml",
+    "infra/k8s/argocd/appsets/production/kustomization.yaml",
+    "infra/k8s/argocd/appsets/production/production-beacon-applicationset.yaml",
+    "infra/k8s/argocd/appsets/production/production-node-template-applicationset.yaml",
+    "infra/k8s/argocd/appsets/production/production-operator-applicationset.yaml",
+    "infra/k8s/argocd/appsets/production/production-poly-applicationset.yaml",
+    "infra/k8s/argocd/appsets/production/production-scheduler-worker-applicationset.yaml",
+    "infra/k8s/argocd/appsets/production/production-toks4-applicationset.yaml",
+    "infra/k8s/overlays/preview/beacon/external-secret.yaml",
+    "infra/k8s/overlays/preview/beacon/kustomization.yaml",
+    "infra/k8s/overlays/preview/poly/external-secret.yaml",
+    "infra/k8s/overlays/preview/poly/kustomization.yaml",
+    "infra/k8s/overlays/preview/toks4/external-secret.yaml",
+    "infra/k8s/overlays/preview/toks4/kustomization.yaml",
+    "infra/k8s/overlays/production/beacon/external-secret.yaml",
+    "infra/k8s/overlays/production/beacon/kustomization.yaml",
+    "infra/k8s/overlays/production/poly/external-secret.yaml",
+    "infra/k8s/overlays/production/poly/kustomization.yaml",
+    "infra/k8s/overlays/production/toks4/external-secret.yaml",
+    "infra/k8s/overlays/production/toks4/kustomization.yaml"
+  ]
+}

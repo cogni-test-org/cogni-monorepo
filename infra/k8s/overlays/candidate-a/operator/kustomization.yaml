@@ -7,6 +7,9 @@ namespace: cogni-candidate-a
 
 resources:
   - ../../../base/node-app
+  - ../../../base/openfga-external
+  - external-secret.yaml
+  - ./secrets-writer-sa.yaml
 
 namePrefix: operator-
 
@@ -23,6 +26,11 @@ patches:
       - op: replace
         path: /data/NODE_NAME
         value: "operator"
+      # Deploy-env name the secrets route stamps onto the OpenBao path
+      # (cogni/<env>/<node>/<KEY>). Distinct from APP_ENV (a build flag).
+      - op: add
+        path: /data/DEPLOY_ENVIRONMENT
+        value: "candidate-a"
       - op: replace
         path: /data/TEMPORAL_NAMESPACE
         value: "cogni-candidate-a"
@@ -47,15 +55,35 @@ patches:
       - op: add
         path: /data/NODE_TEMPLATE_OWNER
         value: "cogni-test-org"
-      # Submodule pin-PR target — a cogni-shaped mirror in the throwaway org so the test app
-      # (cogni-operator-test, zero Cogni-DAO access) can open the pin-PR. Wizard-scoped override;
-      # prod leaves these unset → pin-PR falls back to Cogni-DAO/cogni.
+      # DoltHub node knowledge repo owner — non-secret environment config.
+      # PAT stays in operator-env-secrets via OpenBao/ESO.
+      - op: add
+        path: /data/DOLTHUB_OWNER
+        value: "cogni-test-nodes"
+      # Per-env override for the operator's OWN knowledge mirror: candidate-a
+      # syncs to a throwaway repo so validation here never touches prod knowledge.
+      # A doltgres push only lands cleanly on a repo with no prior (divergent)
+      # history, so this is a dedicated fresh repo — NOT the reused probe. Prod
+      # instead targets its canonical <owner>/<slug> repo.
+      - op: add
+        path: /data/KNOWLEDGE_DOLTHUB_REMOTE_URL
+        value: "https://doltremoteapi.dolthub.com/cogni-dao/knowledge-operator-candidate-a"
+      # Submodule pin-PR target: candidate-a uses the throwaway org mirror.
       - op: add
         path: /data/NODE_SUBMODULE_PARENT_OWNER
         value: "cogni-test-org"
       - op: add
         path: /data/NODE_SUBMODULE_PARENT_REPO
         value: "cogni-monorepo"
+      - op: add
+        path: /data/OPENFGA_API_URL
+        value: "http://operator-openfga-external:8080"
+      # Node self-serve secret writes — the operator's OpenBao writer role (the
+      # SA + projected token are wired on the Deployment below). OPENBAO_ADDR
+      # defaults to the in-cluster ClusterIP, so only the role name is set here.
+      - op: add
+        path: /data/OPENBAO_NODE_SECRETS_WRITER_ROLE
+        value: "candidate-a-node-secrets-writer"
   - target:
       kind: Service
       name: node-app
@@ -82,6 +110,34 @@ patches:
       - op: add
         path: /spec/template/metadata/labels/app.kubernetes.io~1instance
         value: "operator"
+
+  # design.node-self-serve-secrets §1.B: the operator pod's OWN OpenBao identity.
+  # serviceAccountName resolves to operator-secrets-writer (namePrefix), bound by
+  # the <env>-node-secrets-writer k8s-auth role. The projected token carries the
+  # cogni-openbao audience (the default audience is bound to no role — silent-auth trap).
+  - target:
+      kind: Deployment
+      name: node-app
+    patch: |
+      - op: add
+        path: /spec/template/spec/serviceAccountName
+        value: secrets-writer
+      - op: add
+        path: /spec/template/spec/volumes
+        value:
+          - name: openbao-token
+            projected:
+              sources:
+                - serviceAccountToken:
+                    path: token
+                    audience: cogni-openbao
+                    expirationSeconds: 3600
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts
+        value:
+          - name: openbao-token
+            mountPath: /var/run/secrets/openbao
+            readOnly: true
 
   # task.0423: Doltgres knowledge-plane migrator runs as a second initContainer
   # on the operator Deployment. DATABASE_URL maps to DOLTGRES_URL (separate from
@@ -143,6 +199,16 @@ patches:
       kind: Service
       metadata:
         name: litellm-external
+      spec:
+        type: ExternalName
+        externalName: cogni-candidate-a.vm.cognidao.org
+        clusterIP: null
+  - target: { kind: Service, name: openfga-external }
+    patch: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: openfga-external
       spec:
         type: ExternalName
         externalName: cogni-candidate-a.vm.cognidao.org

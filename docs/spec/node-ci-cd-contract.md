@@ -9,7 +9,7 @@ read_when: Modifying CI workflows, adding checks to merge gate, or planning mult
 implements: []
 owner: cogni-dev
 created: 2025-12-22
-verified: 2026-06-08
+verified: 2026-06-15
 tags:
   - ci-cd
   - deployment
@@ -55,7 +55,7 @@ The simplification target is one artifact contract and one promotion primitive. 
 
 7. **SINGLE_RESPONSIBILITY**: Each workflow file owns one concern (build, promote+deploy, E2E+release). No monoliths.
 
-8. **SINGLE_DOMAIN_HARD_FAIL**: Source-code PRs happen in the source repo that owns the artifact. Parent repo PRs for hosted artifacts are operator control-plane changes: gitlink/pin acceptance, catalog rows, overlays, AppSets, DNS/provisioning wiring, and deploy-state machinery. Legacy in-tree node directories remain transitional and are still guarded by `single-node-scope`; they are not the future build model. See `## Single-Domain Scope` below.
+8. **SINGLE_DOMAIN_HARD_FAIL**: Source-code PRs happen in the source repo that owns the artifact. Parent repo PRs for hosted artifacts are operator control-plane changes: gitlink/pin acceptance, catalog rows, overlays, AppSets, DNS/provisioning wiring, and deploy-state machinery. Legacy in-tree node directories remain transitional and are still guarded by `single-node-scope`; submodule gitlinks are operator pins, not parent source domains. See `## Single-Domain Scope` below.
 
 9. **SOURCE_SHA_IS_DEPLOY_IDENTITY**: `sourceSha` is the deployment coordinate for every deployable artifact. Every flightable artifact for that source revision must be published as `<image_repository>:sha-<40-char-sourceSha>`. The operator resolves that tag to `image@sha256:<digest>` before writing deploy state.
 
@@ -76,12 +76,12 @@ Every path in the operator control-plane repo belongs to **exactly one review do
 ### Transitional domains
 
 ```
-4 disjoint domains. PR scope = exactly 1 column.
+Remaining legacy in-tree domains plus the operator control plane. PR scope = exactly 1 column.
 
   ┌─────────────────────────────────────────────────────────────┐
-  │  poly         resy         node-template       operator     │
-  │  ────         ────         ─────────────       ────────     │
-  │  nodes/poly/  nodes/resy/  nodes/node-tmpl/    nodes/opr/   │
+  │  legacy-a          legacy-b                    operator    │
+  │  ────────          ────────                    ────────    │
+  │  nodes/legacy-a/   nodes/legacy-b/             nodes/operator/ │
   │                                                  ∪          │
   │                                                EVERYTHING   │
   │                                                ELSE         │
@@ -94,7 +94,7 @@ Every path in the operator control-plane repo belongs to **exactly one review do
 
 The broad `operator` domain is the control plane, not the operator app artifact. It owns the substrate every hosted artifact consumes. The operator app image is just one deployable artifact within that control plane and should not be used as the mental model for every operator-owned file.
 
-Future node source changes happen in child repos, not in `nodes/<X>/**` inside this repo. The in-tree `poly`, `resy`, and `node-template` domains are legacy migration surfaces. New hosted node PRs in this repo should be pin/deploy-state/control-plane changes and therefore route as operator-domain work.
+Future node source changes happen in child repos, not in `nodes/<X>/**` inside this repo. Remaining in-tree non-operator node domains are legacy migration surfaces. New hosted node PRs in this repo should be pin/deploy-state/control-plane changes and therefore route as operator-domain work.
 
 ### Rule
 
@@ -139,7 +139,7 @@ Sovereignty contracts only hold when the false-positive cost is accepted. Carvin
 
 Cross-domain rejections must do half the contributor's work in the failure annotation:
 
-1. **Name the conflicting domains** explicitly (e.g., `poly + operator`, not just "scope error").
+1. **Name the conflicting domains** explicitly (e.g., `legacy-node + operator`, not just "scope error").
 2. **Name the operator-territory paths** that triggered the operator domain match, when operator is one of the conflicting domains. The contributor needs to know which file they touched is "operator's intent."
 3. **Suggest the split**: "file an operator PR with `<paths>` first; rebase your `<other-domain>` PR on it."
 4. **Link the substrate-request convention** so the rejected change becomes a roadmap input rather than dropped friction. (Convention TBD; until it lands, link this spec section.)
@@ -150,9 +150,14 @@ Each gate firing is a feedback loop, not a barrier. Future: rejections logged st
 
 ## Operator-hosted artifacts
 
+> **Superseded (the submodule gitlink is retired).** Sections below that describe a `nodes/<slug>` > **git submodule gitlink** + `.gitmodules` + pin PRs are historical. The gitlink is gone:
+> the operator never checks out node source — it fetches needed node files by `sourceSha` via the
+> GitHub API / `actions/checkout` (deploy) or pure catalog metadata (secret-free CI), and the deploy
+> pin is a `source_sha` **field on the catalog row**. See [node-submodule-retirement.md](./node-submodule-retirement.md).
+
 The target model is artifact-first. A hosted node's source lives in the repo that owns it, and that repo publishes the artifact the operator deploys. A git submodule at `nodes/<slug>` is only the current approval-pin mechanism: a node-template fork the operator pins by SHA. It is not a build context, not a workflow execution surface, and not the long-term identity model.
 
-Legacy in-tree nodes (`resy`, `poly`, `node-template`, and any remaining similar rows) are transitional. They should be migrated toward the same `source_repo + image_repository + sourceSha + digest` contract instead of being preserved as a parallel first-class model.
+Legacy in-tree node source directories, if any remain, are transitional. They should be migrated toward the same `source_repo + image_repository + sourceSha + digest` contract instead of being preserved as a parallel first-class model. `node-template` is no longer an in-tree source domain; it is the external template repo plus an operator pin/deployment row.
 
 ### Plain-English authority model
 
@@ -201,11 +206,47 @@ Flight authorization is operator-local:
 4. Operator dispatches with its environment GitHub App. The App is a capability
    executor, not an authorization oracle.
 
-Until real RBAC lands, the safe Pareto default is: any registered agent may
-request **candidate/test** flight for the node/work item it owns; preview/prod
-remain human-approved operator actions. This avoids relying on GitHub repo
-permissions while still stopping arbitrary agents from mutating arbitrary
-environments.
+The as-built ladder is in **Env-promotion progression** below; the historical
+Pareto default (candidate-only for agents, preview/prod human-approved) is
+superseded by it.
+
+### Env-promotion progression (candidate → preview → production)
+
+A node walks one ladder. Each rung has its own trigger and its own
+authorization; the promotion **primitive is always the same** — `promote-and-deploy`
+by digest, the [one promotion primitive](./legacy-cicd-to-remove.md) — only the
+policy differs.
+
+| Env             | Trigger                                        | Authorization                                                                            | Mechanism                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| --------------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **candidate-a** | agent/human requests flight for a node it owns | `node.flight` → `can_flight` (the node `developer` role)                                 | source-addressed `candidate-flight.yml`                                                                                                                                                                                                                                                                                                                                                                                                |
+| **preview**     | **automatic on node `main`-merge**             | **ungated** — continues the trust the node earned to be spawned+flighted                 | operator GitHub App dispatches `promote-and-deploy(env=preview)` SOURCE-ADDRESSED by the node image sha (`node_source_sha` input, like `candidate-flight`); the pin is recorded on `deploy/preview` — **NO write to `main`** (task.5022 killed the stalling pin-PR + `flight-preview.yml` rung for spawned nodes)                                                                                                                      |
+| **production**  | explicit operator/human action                 | `node.promote_production` → `can_promote_production` (`promoter` role; `admin` inherits) | operator GitHub App dispatches `promote-and-deploy(env=production)` — for a REMOTE-SOURCE (fork) node, SOURCE-ADDRESSED by the node image sha (`node_source_sha`), identical to preview; for an IN-REPO node, by `source_sha` (the operator checkout ref). NO catalog `source_sha` read for resolution. The pin is recorded on `deploy/production` — **NO write to `main`** ([cicd-platform-boundary.md](./cicd-platform-boundary.md)) |
+
+Invariants:
+
+- **`TRUST_LADDER_IS_MONOTONIC`**: a node reaches preview only after earning candidate-a, production only after a `production_promoter` grant. Preview adds no new gate because candidate-a already proved the trust; production does because it is the irreversible environment.
+- **`PROMOTION_RUNS_AS_THE_OPERATOR`**: preview + production promotion is an operator GitHub-App activity (dispatch for both) — never a contributor's personal `gh` credential. This supersedes the v0 "preview/prod are human-approved operator actions" framing: preview is now operator-automatic, production is operator-dispatched + RBAC-gated (human-approved until a `production_promoter` grant exists; today only the org admin holds it).
+- **`ONE_PROMOTION_PRIMITIVE`**: every rung — candidate-a, preview, production — dispatches `promote-and-deploy` directly by digest. No rung routes through a code-branch PR (task.5022 retired the last one: preview's catalog-pin PR stalled open forever, since a catalog-only PR earns no required merge_group checks and a bot catalog commit carries no `(#NNN)` suffix for `flight-preview.yml` to resolve). Preview **and production** are **source-addressed** like `candidate-flight` for REMOTE-SOURCE (fork) nodes: the node image sha rides the dispatch as `node_source_sha`, the workflow's remote-source digest resolver pins THAT input — a SINGLE operator method (`promoteNode`, dispatched at `env=preview` or `env=production`; the rung differs only by env + authz) reads the catalog row only to discriminate remote-source (`source_repo` present) from in-repo, never `source_sha` for resolution. The catalog `source_sha` is **birth-only metadata** (set at node formation), never a deploy authority for promotion — a remote-source promote that omits `node_source_sha` **hard-fails loudly** (no silent stale-pin fallback; both the digest resolver and `materialize-substrate` enforce this, bug.5043). IN-REPO nodes (no catalog `source_repo`, e.g. operator/poly) are not source-addressed by node sha — they pass `source_sha` (the operator checkout ref), unchanged. The pin is recorded on the env deploy branch (`update-source-sha-map.sh`). Promotion writes **ZERO commits to `main`**. No env rebuilds, no second dispatch path, no PR-tag substitution. (bug.5043 retired production's stale catalog-pin read.)
+- **`MAIN_WRITE_IS_GOVERNANCE_ONLY`**: the operator App's `main`-write privilege is reserved for DAO-governance/code merges that bypass normal review — never routine deploy pins. Deploy state lives in git but on **deploy branches** (`deploy/<env>`, `deploy/<env>-<node>`), separate from code; promotion records the per-node `source_sha` pin there (`.promote-state/source-sha-by-app.json`), never on `main`.
+- **`APP_PROMOTE_IS_NO_INFRA`**: promotion reconciles the **app digest only** — it is orthogonal to substrate, mirroring `candidate-flight.yml` (which has no `deploy-infra` job). The operator-API promote (`dispatchNodePromote`) hard-sets `skip_infra=true`; `promote-and-deploy.yml` defaults `skip_infra=true`. Per-node ESO `ExternalSecret`s are materialized by the ungated `node-substrate` lane, so the no-infra default does **not** skip secret reconciliation. `deploy-infra` (Compose + k8s bridge secrets) is a **deliberate** lever — run it only when the promoted diff touches `infra/compose/**`, a VM-materialized OpenBao/ESO bridge secret, or edge/runtime topology (human dispatch `-f skip_infra=false`, or `-f deploy_infra_mode=k8s-secrets-only` for pod-secret-only changes).
+
+RBAC is additive (immutable OpenFGA model, [rbac.md](./rbac.md)): the ladder is `can_flight` (candidate) + `can_promote_production` (prod) today; a `can_promote_preview` rung is a one-relation addition **if/when manual dev-driven preview promotes arrive** — preview _auto_-promote stays ungated regardless.
+
+#### Agent-facing CI/CD API surface
+
+An agent drives the ladder over HTTP with its registered Bearer key — never a personal `gh` credential. The operator GitHub App performs every dispatch.
+
+| Action                 | Endpoint                                  | Body                                        | Authz (action → relation)                                                                      | Result                                                        |
+| ---------------------- | ----------------------------------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| Flight to candidate-a  | `POST /api/v1/vcs/flight`                 | `{ nodeRef: { nodeId, sourceSha } }`        | `node.flight` → `can_flight` (`developer`)                                                     | `202` + `candidate-flight.yml` dispatch (candidate-a only)    |
+| Promote to production  | `POST /api/v1/deploy/promote`             | `{ nodeId, env: "production", sourceSha? }` | `node.promote_production` → `can_promote_production` (`production_promoter`; `admin` inherits) | `200` dispatched; app-digest only (`APP_PROMOTE_IS_NO_INFRA`) |
+| Request a role         | `POST /api/v1/nodes/{id}/access-requests` | `{ role }`                                  | self-request (`SELF_REQUEST_ONLY`)                                                             | tracking row `pending` (OpenFGA tuple is the authority)       |
+| Owner approves/revokes | `POST /api/v1/nodes/{id}/developers`      | `{ agentUserId, decision, role }`           | node **owner** session (`OWNER_GATING`)                                                        | writes/deletes the OpenFGA role tuple — the grant             |
+
+Deny-by-default holds: before a grant the gated route returns `403 authz_denied`; after the owner approves it flips to a downstream code (dispatch result, or `dispatch_failed` if the env's operator App is uninstalled). `503 authz_unavailable` ≠ `403` — the former means the env's OpenFGA store is unbootstrapped, not a denial. Preview is auto-promoted on `main`-merge and has no agent-facing endpoint. These endpoints are advertised in `/.well-known/agent.json`.
+
+Implementing PRs: #1643 (DeployCapability + freeze), #1653 (`can_promote_production` + promote dispatch), #1640 (operator merge authority + the preview merge-hook), #1670 (`APP_PROMOTE_IS_NO_INFRA` default + agent-facing surface in `agent.json`).
 
 ### Artifact contract
 
@@ -322,7 +363,7 @@ A node's **integration model** (how it attaches to the operator) picks its templ
 | Template repo                                              | Integration                                                                       | `NodeSummary.kind` | Status               |
 | ---------------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------ | -------------------- |
 | `Cogni-DAO/standalone-node` (renamed from `node-template`) | fork the whole near-monorepo → run your own sovereign Cogni                       | `full-app`         | live (sync artifact) |
-| new node-at-root submodule template                        | `generate` → `submodule add` at `nodes/<slug>` in the shared operator             | `full-app`         | this design          |
+| new node-at-root submodule template                        | named fork → `submodule add` at `nodes/<slug>` in the shared operator             | `full-app`         | this design          |
 | agent-scope template (langgraph + dolt only)               | submodule within the registry node; "launch an AI dev in a fresh scope-only repo" | `agent-scope`      | vFuture              |
 
 Two `full-app` templates differ **only by integration** (fork-whole vs submodule); `agent-scope` is a third, minimal template (no Next.js app, just agent packages + Dolt migrations). Submodule-ness stays invisible to `NodeRegistryPort` consumers (catalog metadata + gitlink pin) — discovery is metadata-driven (above). The renamed `standalone-node` is **not** the submodule template: a fork-whole repo nests the node at `nodes/node-template/`, but a submodule must expose the node **at its root** so it lands at `nodes/<slug>/app`. That layout difference is why the submodule template is a distinct repo, not a reuse.
@@ -331,11 +372,11 @@ Two `full-app` templates differ **only by integration** (fork-whole vs submodule
 
 All three repos carry the node **app + its merge-gate CI + image build**. They differ on **one axis: how much of the deploy/infra plane they carry.**
 
-| Repo                                        | Node app                                  | Node CI (merge-gate + build→GHCR)         | Deploy/infra plane¹      | Who deploys it                                           |
-| ------------------------------------------- | ----------------------------------------- | ----------------------------------------- | ------------------------ | -------------------------------------------------------- |
-| **cogni monorepo**                          | operator + inline nodes (`nodes/poly`, …) | yes (shared root configs)                 | **owns it — every node** | itself                                                   |
-| **standalone-node** (fork-whole)            | node nested at `nodes/node-template/`     | yes                                       | **yes — you self-host**  | itself (you _are_ an operator)                           |
-| **node-template** (submodule, node-at-root) | node at repo root                         | **yes — own `pr-build.yml` + build→GHCR** | **no**                   | the shared operator (pin → provision → flight → promote) |
+| Repo                                        | Node app                               | Node CI (merge-gate + build→GHCR)         | Deploy/infra plane¹      | Who deploys it                                           |
+| ------------------------------------------- | -------------------------------------- | ----------------------------------------- | ------------------------ | -------------------------------------------------------- |
+| **cogni monorepo**                          | operator + legacy inline nodes, if any | yes (shared root configs)                 | **owns it — every node** | itself                                                   |
+| **standalone-node** (fork-whole)            | node nested at `nodes/node-template/`  | yes                                       | **yes — you self-host**  | itself (you _are_ an operator)                           |
+| **node-template** (submodule, node-at-root) | node at repo root                      | **yes — own `pr-build.yml` + build→GHCR** | **no**                   | the shared operator (pin → provision → flight → promote) |
 
 ¹ Deploy/infra plane = `provision-env`, Argo AppSets + k8s overlays, `deploy-infra`, `candidate-flight`, OpenBao/ESO substrate, the operator app, `infra/catalog`, root monorepo tooling.
 
@@ -352,7 +393,7 @@ All three repos carry the node **app + its merge-gate CI + image build**. They d
 
 > **Born-reviewable (the `ay` gap).** A minted node must ship its own `.cogni/rules/` + review gate, or a PR in it routes to _nothing_ — the failure observed on the first mint (`cogni-test-org/ay`), where the review bot triggered but had no node-local rules to apply. The P1 projection must carry these from the canonical node, not just `app/`.
 
-**Derivation (this is P1).** `node-template` = the canonical node source in the cogni monorepo (`nodes/node-template/{app,graphs,k8s,packages}`) **projected to repo root**, plus the node-level CI/policy, **minus the deploy/infra plane**. The projection is path-identical (the sync feature `detect-sync-drift.mjs` lacks; #1366); the omit-column above _is_ the projection's exclusion list. This keeps `node-template` in lockstep with the canonical node without ever shipping it the operator's plane.
+**Derivation (this is P1).** `node-template` is the canonical node-at-root source repo. It carries the node-level app, graphs, package layer, CI, and policy that were ported from the retired in-tree template shape, **minus the deploy/infra plane**. Future template changes land in `Cogni-DAO/node-template`; the operator repo carries only the catalog/deploy wiring and gitlink pin for approval.
 
 ### Node-dev vs operator split — adding a secret or service to a submodule node
 
@@ -373,14 +414,58 @@ The forward deployment contract is:
 
 1. **Parent CI builds only artifacts whose source repo is this repo.** `.gitmodules` still identifies current submodule slugs for parent-domain routing, but build selection keys on artifact build ownership: a catalog row whose `source_repo` is another repo is a deploy input, not a parent build leg. A parent `build (<slug>)` leg is always wrong for a remote-source submodule node.
 2. **The submodule template is node-at-root and self-building.** A minted node repo contains `app/`, `graphs/`, `k8s/`, `packages/`, node-local rules, and its own merge gate/build workflow at repo root. It publishes every flightable deployable to GHCR as `sha-<sourceSha>`.
-3. **Candidate flight is source-addressed.** The operator API accepts `nodeRef { nodeId, sourceSha }`, verifies the catalog, verifies the child commit exists, verifies `.cogni/repo-spec.yaml` identity at that commit, verifies `image_repository:sha-<sourceSha>` exists, ensures the parent gitlink pins that commit, then dispatches `candidate-flight.yml`.
+3. **Candidate flight is source-addressed.** The operator API accepts `nodeRef { nodeId, sourceSha }`, verifies the catalog, verifies the child commit exists, verifies `.cogni/repo-spec.yaml` identity at that commit, verifies `image_repository:sha-<sourceSha>` exists, then dispatches `candidate-flight.yml` carrying `source_sha` — **no catalog pin on `main`**. The deploy pin rides the dispatch and lands on the deploy branch, never on the operator code branch (`MAIN_WRITE_IS_GOVERNANCE_ONLY` / `ONE_PROMOTION_PRIMITIVE`, task.5022). The prior `ensureCatalogSourceSha` pin PR is retired: a catalog-only PR earns no required merge_group checks and a bot catalog commit carries no `(#NNN)` for any rung to resolve, so it stalled open forever (live repro: red's pin PR #1729).
 4. **Deploy state is digest-addressed.** `candidate-flight.yml` resolves `image_repository:sha-<sourceSha>` to `image_repository@sha256:<digest>`, writes only deploy-state branches, and verifies `/version.buildSha == sourceSha`.
 5. **Substrate is asserted before app rollout.** For target shapes enabled in app flight today, `candidate-flight.yml` reconciles the per-target AppSet/DNS prerequisites, then runs the target substrate gate. The gate is read-only; missing VM, Argo objects, DNS, edge route, consumed Secret/ExternalSecret, Service NodePort, or DB stops the app flight and points to the explicit infra/substrate lane.
 6. **Promotion preserves the digest.** Preview and production promote the candidate-proven digest. The operator never rebuilds child source and never substitutes a PR tag.
+7. **Node-merge advances preview automatically (`PREVIEW_VIA_SOURCE_ADDRESSED_PROMOTE`).** A spawned node gets the same merge→preview model an in-repo node already has, out of the box. On a node-repo `pull_request` merge, the operator GitHub App (webhook plane, `dispatchNodePreviewPromote`) dispatches `promote-and-deploy.yml` at `env=preview` SOURCE-ADDRESSED by the merged **PR head SHA** (`node_source_sha`, exactly like candidate-flight) — the build the node's PR CI published as `sha-<headSha>`. The pin is recorded on `deploy/preview` (`update-source-sha-map.sh`); the operator writes **ZERO commits to `main`** and opens **no catalog pin PR**. This reuses the one promote primitive (`ONE_PROMOTION_PRIMITIVE`) — task.5022 retired both the stalling catalog pin PR and the `flight-preview.yml` rung for spawned nodes. Image existence is not gated in-app (the GitHub Packages API false-negatives on private node images), so the workflow's own "no images found" hard-fail is the loud backstop. Production is the same source-addressed `promoteNode` primitive (`env=production`), RBAC-gated on `can_promote_production` (bug.5043) — no longer vNext. RBAC: v0 rides the candidate-a grant — a `node.promote` gate is vNext only if a node can earn preview without first earning candidate-a.
 
-**Identity/config prerequisite (per-env, proven on candidate-a).** Minting authenticates as an env-scoped GitHub App that must (a) be installed **all-repositories** on the mint org and (b) hold **`workflows:write`** — the seed/pin flow edits `.github/workflows/pr-build.yml`, which GitHub 403s without it. Mint target, template owner, and submodule-pin-PR parent are env config (`NODE_MINT_OWNER` / `NODE_TEMPLATE_OWNER` / `NODE_SUBMODULE_PARENT_{OWNER,REPO}`), fail-closed (mint) / fail-open (parent → `getGithubRepo()`), so a candidate/test operator has **zero access to the production org** (candidate-a mints into the disposable `cogni-test-org`, pin-PRs into a cogni-shaped fork there).
+**Identity/config prerequisite (per-env, proven on candidate-a).** Minting authenticates as an env-scoped GitHub App that must (a) be installed **all-repositories** on the mint org and (b) hold **`workflows:write`** — the seed/pin flow edits `.github/workflows/pr-build.yml`, which GitHub 403s without it. Mint target and template owner remain env config (`NODE_MINT_OWNER` / `NODE_TEMPLATE_OWNER`). The deployment parent is declared once in `infra/deployment-parents.json`: `candidate-a → cogni-test-org/cogni-monorepo`; `preview|production → cogni-dao/cogni`. Runtime `NODE_SUBMODULE_PARENT_{OWNER,REPO}` must match that declaration. `PUBLISH_PARENT_IS_DEPLOY_PARENT`: publish PR repo == flight workflow repo == generated AppSet/root `repoURL` == deploy-branch repo; publish and workflows fail before mutation on any mismatch. Thus a candidate/test operator has **zero access to the production org**.
+
+**A divergent deployment parent converges through a non-destructive, canonical-authoritative merge.** `TEST_PARENT_SYNC_IS_TWO_PARENT_AND_FULL_PARITY`: the test parent is a long-lived fork with its own candidate fleet identity, not an independently maintained copy of shared platform code. Its sync PR starts from current test-parent `main` (first parent) and records the reviewed canonical/#2041 ancestry as the second parent; it never resets or rebases away test history. The resulting tree takes the full reviewed canonical platform tree, then overlays only an explicit, reviewed allowlist of candidate fleet identity (catalog rows and their matching node gitlinks). Derived artifacts are regenerated with the canonical generators; stale shared code/workflows and test preview/production/legacy artifacts are removed. A tree-parity gate must prove equality with the reviewed canonical tree outside that allowlist. Test-parent CI, candidate deploy branches, environment-secret custody, and the complete root → app-of-apps → AppSet `repoURL` chain must all be proven before live cutover.
 
 > **Correction (live repro `cogni-test-org/cogni-monorepo#1`): gitlink-aware scope routing is still needed while submodules remain.** A generated dorny filter `nodes/<slug>/**` matches the bare gitlink, so submodule pins must route as operator-domain work. Build exclusion should not depend on submodule ontology: it follows artifact source ownership. The child repo remains the build plane because its `source_repo` is not this repo.
+
+### Node-scoped external-contributor approval + merge contract
+
+A read-only external agent (e.g. `flock-leader`, pull-only on GitHub) drives a fork PR to a node's
+OWN repo entirely through the operator GitHub App — no human, no `gh` privilege on the agent's side:
+
+1. **`POST /api/v1/vcs/run-ci` `{ nodeId, prNumber }`.** GitHub holds a first-time / outside
+   fork contributor's `pull_request` workflow runs in `action_required`. The operator App releases
+   them so the node's own CI can run. RBAC `node.flight` on the named node is the gate; the App
+   approves ONLY standard `pull_request` runs (never `pull_request_target` / secret-bearing runs) —
+   safety is structural. `owner/repo` are operator-resolved from the node's catalog `source_repo`.
+2. **The node's own CI runs** (`pr-build.yml` `push:main` / `pull_request`) and publishes
+   `sha-<sha>` images — the node repo builds itself. There is no operator-dispatched "fork-build"
+   lane; that abstraction is purged.
+3. **`POST /api/v1/vcs/merge` `{ nodeId, prNumber }`** on green. RBAC `node.flight` on the same node
+   authorizes the squash merge of any PR to that node's repo, INCLUDING a PR the agent authored from
+   its own fork — the owner-granted RBAC tuple IS the trust boundary (no self-merge / probation
+   check). **Branch protection on the node repo is the merge authority**; the operator's
+   `evaluateMergeGate` is fast-fail UX, not the sole gate.
+4. **Node-merge auto-promotes preview** via the existing `dispatchNodePreviewPromote`
+   (`PREVIEW_VIA_SOURCE_ADDRESSED_PROMOTE`, above) — the merged PR head SHA source-addresses the
+   preview promote. No additional wiring.
+
+> **The operator merges like every node.** `POST /api/v1/vcs/merge { nodeId: "operator", prNumber }`
+> (slug or UUID) resolves to the monorepo: the operator is the one IN-REPO node, so its `nodeId`
+> resolves to `NODE_SUBMODULE_PARENT_*` — the same resolution `run-ci` and `flight` already use.
+> Every contributor path, operator and spawned nodes alike, is node-scoped by `nodeId`;
+> `NODE_SCOPED_NEVER_RETARGETS` keeps a typo'd or unknown slug a hard 404.
+
+#### Planned: collapse the in-repo exception
+
+The operator resolves by `{nodeId}` via an in-repo branch currently duplicated across three routes —
+`merge`, `run-ci`, and `developers` each short-circuit `slug === "operator"` to
+`NODE_SUBMODULE_PARENT_*` — plus a transitional no-`nodeId` merge lane. That duplication exists
+because catalog `source_repo`-PRESENCE is overloaded: it drives BOTH promote addressing
+(present ⇒ node sha; absent ⇒ `source_sha`) AND whether a `nodeId` resolves to a repo. The durable
+fix splits the bit into two independent signals: an explicit node `kind` (`in-repo` | `remote-source`)
+for promote semantics, and a `resolveNodeRepo` that resolves in-repo nodes to the parent repo by
+construction. Then the three route special-cases and the no-`nodeId` lane all delete with no behavior
+change: operator/poly stay `source_sha`-addressed, forks stay `node_source_sha`-addressed, and
+`NODE_SCOPED_NEVER_RETARGETS` still 404s an unknown slug.
 
 ---
 
@@ -473,16 +558,16 @@ This standard does not split `.dependency-cruiser.cjs` per node. That's a separa
 
 ### Workflow Entrypoints
 
-| File                              | Type | Secrets                   | Trigger                      | Concern                                                                                        |
-| --------------------------------- | ---- | ------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------- |
-| `ci.yaml`                         | CI   | No                        | PR; push main                | Typecheck, lint, unit, component, docs, architecture, scope                                    |
-| `stack-test.yml`                  | CI   | No                        | workflow_dispatch            | Per-node full-stack vitest                                                                     |
-| `pr-build.yml`                    | CI   | GHCR write                | pull_request; merge_group    | Transitional in-repo artifact build aliases (`pr-*` / `mq-*`)                                  |
-| `candidate-flight.yml`            | CD   | GHCR read; deploy         | workflow_dispatch            | Candidate-a target substrate assertion + digest flight from `image_repository:sha-<sourceSha>` |
-| `candidate-flight-infra.yml`      | CD   | SSH/secrets               | workflow_dispatch            | Candidate-a VM compose substrate only                                                          |
-| `flight-preview.yml`              | CD   | GHCR read/write           | push main; workflow_dispatch | Preview dispatch/queue control; any re-tagging is transitional lookup plumbing                 |
-| `promote-and-deploy.yml`          | CD   | SSH/secrets; deploy       | workflow_dispatch            | Preview/production digest promotion, infra reconcile, verify, e2e                              |
-| `promote-preview-digest-seed.yml` | CD   | GHCR read; contents write | workflow_run                 | Maintains preview digest seed pins on `main` after dispatched preview flights                  |
+| File                              | Type | Secrets                   | Trigger                              | Concern                                                                                                                                                                                                      |
+| --------------------------------- | ---- | ------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ci.yaml`                         | CI   | No                        | PR; push main                        | Typecheck, lint, unit, component, docs, architecture, scope                                                                                                                                                  |
+| `stack-test.yml`                  | CI   | No                        | workflow_dispatch                    | Per-node full-stack vitest                                                                                                                                                                                   |
+| `pr-build.yml`                    | CI   | GHCR write                | pull_request; merge_group; push main | In-repo artifact build → `<image>:sha-<sourceSha>` (SOURCE_SHA_IS_DEPLOY_IDENTITY). `push:main` self-builds every merge (incl. admin/`/vcs/merge` squash); `merge_group` produces the `manifest` queue check |
+| `candidate-flight.yml`            | CD   | GHCR read; deploy         | workflow_dispatch                    | Candidate-a target substrate assertion + digest flight from `image_repository:sha-<sourceSha>`                                                                                                               |
+| `candidate-flight-infra.yml`      | CD   | SSH/secrets               | workflow_dispatch                    | Candidate-a VM compose substrate only                                                                                                                                                                        |
+| `flight-preview.yml`              | CD   | GHCR read                 | push main; workflow_dispatch         | Preview dispatch by digest: resolves the merge's `sha-<mainSha>` images and dispatches `promote-and-deploy(preview)`. NO re-tag step — promote consumes the same `sha-<mainSha>` digest                      |
+| `promote-and-deploy.yml`          | CD   | SSH/secrets; deploy       | workflow_dispatch                    | Preview/production digest promotion, infra reconcile, verify, e2e                                                                                                                                            |
+| `promote-preview-digest-seed.yml` | CD   | GHCR read; contents write | workflow_run                         | Maintains preview digest seed pins on `main` after dispatched preview flights                                                                                                                                |
 
 ### Local Gates
 
@@ -556,7 +641,11 @@ Centralizing lint/depcruise configs causes fork friction, policy fights, and los
 
 ## Repo Setup Fixture
 
-Every Cogni node-template fork (and `node-template` itself) shares the same `main`-branch GitHub configuration: classic branch protection with a narrow required-status-checks set + GitHub Merge Queue. The canonical fixture lives in `infra/github/` and is applied via a single command:
+There are **two** `main`-branch GitHub configurations, by repo role:
+
+### Monorepo (`Cogni-DAO/cogni` / `node-template` itself)
+
+Classic branch protection with the full required-status-checks set + GitHub Merge Queue. The canonical fixture lives in `infra/github/` and is applied manually via a single command:
 
 ```bash
 bash infra/github/setup-main-branch.sh                      # current repo
@@ -565,15 +654,27 @@ bash infra/github/setup-main-branch.sh my-org/my-fork       # explicit repo
 
 What the fixture establishes:
 
-| Layer               | Source of truth                          | Apply mechanism                                                                                                                                              |
-| ------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Repo merge settings | `setup-main-branch.sh` step 1            | `gh api PATCH /repos/{repo}` — squash-only, auto-merge on, delete-branch-on-merge                                                                            |
-| Branch protection   | `infra/github/branch-protection.json`    | `gh api PUT /repos/{repo}/branches/main/protection` — required checks: `unit`, `component`, `static`, `manifest`                                             |
-| Merge queue toggle  | `infra/github/merge-queue.json` (values) | **UI-only**: Settings → Branches → main → "Require merge queue" + form values. REST silently drops `required_merge_queue` (verified empirically 2026-04-28). |
+| Layer               | Source of truth                         | Apply mechanism                                                                                                                                                                                                      |
+| ------------------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Repo merge settings | `setup-main-branch.sh` step 1           | `gh api PATCH /repos/{repo}` — squash-only, auto-merge on, delete-branch-on-merge                                                                                                                                    |
+| Branch protection   | `infra/github/branch-protection.json`   | `gh api PUT /repos/{repo}/branches/main/protection` — required checks: `unit`, `component`, `static`, `manifest`                                                                                                     |
+| Merge queue         | `infra/github/merge-queue-ruleset.json` | `gh api POST/PUT /repos/{repo}/rulesets` — a `merge_queue` ruleset (config-as-code, idempotent). Classic protection's REST drops `required_merge_queue`; the rulesets API carries it, so there is no manual UI step. |
 
 The required-status-checks set is constrained by an empirical GitHub Merge Queue behavior: the queue waits forever for required checks whose workflows lack a `merge_group:` trigger. Full design + rationale in [`merge-queue-config.md`](./merge-queue-config.md), validated against `Cogni-DAO/test-repo` PR #53.
 
-External-node-formation impact: a fresh fork clones, runs `setup-main-branch.sh`, clicks once in Settings → Branches, and is in lock-step with `Cogni-DAO/cogni`'s gate. No spelunking through Settings; no ad-hoc divergence.
+### Spawned node repos (forks minted by the operator)
+
+A spawned node repo is **born protected** with the monorepo's config, **verbatim**. Node formation (`GitHubRepoWriter.forkFromTemplate`) reads the deployment monorepo's (`NODE_SUBMODULE_PARENT_*`) live `main` branch protection and copies it onto the new node repo's `main` — same required-status-check set (`unit`, `component`, `static`, `manifest`), same flags — with **no manual step and no operator-invented node policy**. There is exactly **one** source of truth for protection: the monorepo. (Fails loud if the monorepo is unprotected — it MUST be the canonical protected repo for nodes to inherit it.) `restrictions` is not replicated (push is open; the monorepo has none).
+
+Born with the monorepo's **merge mechanism** too: formation sets the canonical repo merge settings (squash-only, **auto-merge on**, delete-branch-on-merge — auto-merge is required for the queue path) and copies the monorepo's `merge_queue` ruleset (`main-merge-queue`) verbatim. The queue is admin-opt-in on the monorepo, so when it is not yet enabled there this is a clean **skip** — the node mirrors the monorepo and is born queue-less; once the monorepo gains the ruleset, every subsequently-formed node inherits it. Under a required queue, `/vcs/merge` enqueues (auto-merge) rather than direct-merging — see [development-lifecycle.md §8 — Operator Merge Authority](./development-lifecycle.md#8-request-merge--the-operator-is-the-merge-authority).
+
+This slots into the node contribution model. The **standard** path is branch-push: a developer granted node access (RBAC, `developer-rbac-request`) gets GitHub collaborator push, opens a **same-repo PR**, and its normal `pull_request` build produces a flightable image. The **fallback** path is a fork PR (external contributor with no grant) driven through the operator GitHub App. A fork PR satisfies the required set the same way it does on the monorepo: `static`/`unit`/`component` run once `POST /vcs/run-ci` releases the held fork CI (and dispatches the trusted `pr-build`), and `manifest`/`build` (behind `pr-build.yml`'s resolve fork-guard) **skip** — which GitHub counts as passing for a required check, so they never deadlock the golden path.
+
+**The merge gate reads GitHub's required set, never an operator-invented list.** `GitHubVcsAdapter.getCiStatus` fetches `…/branches/{base}/protection/required_status_checks` and computes `allGreen` as "every required context is satisfied (`success` or `skipped`)." An unprotected branch (no required checks) is **not green** — `/vcs/merge` fails closed. So "merge on green" means precisely "all of GitHub's required checks are green," and the operator never re-defines greenness.
+
+> Existing node repos minted before this became automatic need a one-time backfill by the operator App (or a repo admin): copy the monorepo's protection onto their `main` (`gh api PUT /repos/{repo}/branches/main/protection`) and — once the monorepo queue is live — its merge settings + `merge_queue` ruleset (`bash infra/github/setup-main-branch.sh <owner>/<repo>`).
+
+External-node-formation impact: a spawned node is in lock-step with the monorepo's exact merge-on-green gate the moment it is formed — no spelunking through Settings, no ad-hoc divergence.
 
 ## Acceptance Checks
 

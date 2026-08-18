@@ -73,6 +73,11 @@ export type {
   BillingResolver,
   PreflightCreditCheckFn,
 } from "./billing-context";
+export type {
+  CatalogNodeOwnerProjection,
+  CatalogNodeRegistryPort,
+  CatalogNodeRegistryReconcileSummary,
+} from "./catalog-node-registry.port";
 export type { Clock } from "./clock.port";
 export type {
   ConnectionBrokerPort,
@@ -80,10 +85,31 @@ export type {
   ResolvedConnection,
 } from "./connection-broker.port";
 export type {
+  CandidateFlightDispatchResult,
+  CatalogForkTarget,
+  CatalogNodeDefinition,
+  DeployPlanePort,
+  MirrorCanonicalFilesInput,
+  MirrorCanonicalFilesResult,
+  NodePromoteResult,
+  PreparedNodeRefCandidateFlight,
+  PrepareNodeRefCandidateFlightInput,
+  PromoteNodeInput,
+  ResolvedNodeRepo,
+  ResolveNodeRepoInput,
+  SyncTemplateUpstreamInput,
+  SyncTemplateUpstreamResult,
+} from "./deploy-plane.port";
+export type {
   GovernanceRun,
   GovernanceStatusPort,
   UpcomingRun,
 } from "./governance-status.port";
+export type {
+  LangfuseReaderPort,
+  LangfuseTraceQuery,
+  LangfuseTraceSummary,
+} from "./langfuse-reader.port";
 // LlmError types re-exported for adapters (adapters can only import from ports)
 // Features should import directly from @/core
 export {
@@ -108,6 +134,11 @@ export {
   normalizeErrorToExecutionCode,
 } from "./llm.port";
 export type {
+  LokiLogLine,
+  LokiQueryRange,
+  LokiReaderPort,
+} from "./loki-reader.port";
+export type {
   InstantQueryParams,
   MetricsQueryPort,
   MetricTemplate,
@@ -131,6 +162,18 @@ export type {
 } from "./model-provider.port";
 export type { ModelProviderResolverPort } from "./model-provider-resolver.port";
 export type {
+  AssertLiveResult,
+  EnvFlightStatus,
+  FlightEnv,
+  LiveProbes,
+  NodeFlightStatus,
+  NodeIdentity,
+  NodeProber,
+  RunCarriesResult,
+  RungStatus,
+  ServingResult,
+} from "./node-flight.port";
+export type {
   NodeKind,
   NodeRegistryPort,
   NodeSummary,
@@ -141,9 +184,12 @@ export type {
   VerificationStatus,
 } from "./onchain-verifier.port";
 export type {
-  OperatorWalletPort,
-  TransferIntent,
-} from "./operator-wallet.port";
+  OperatorSecretsPlanePort,
+  SecretWriteOp,
+  WriteNodeSecretInput,
+  WriteNodeSecretResult,
+} from "./operator-secrets-plane.port";
+export type { OperatorWalletPort } from "./operator-wallet.port";
 export {
   type CreatePaymentAttemptParams,
   isPaymentAttemptNotFoundPortError,
@@ -159,11 +205,14 @@ export {
   type PaymentErrorCode,
   TxHashAlreadyBoundPortError,
 } from "./payment-attempt.port";
-export type {
-  ProviderFundingContext,
-  ProviderFundingOutcome,
-  ProviderFundingPort,
-} from "./provider-funding.port";
+export {
+  isPaymentRailMisconfiguredPortError,
+  type PaymentRailGuardConfig,
+  type PaymentRailGuardPort,
+  type PaymentRailMisconfigurationCode,
+  PaymentRailMisconfiguredPortError,
+} from "./payment-rail-guard.port";
+export type { ReceiptDelivery } from "./receipt-delivery.port";
 export type {
   ProxyBillingEntry,
   SandboxErrorCode,

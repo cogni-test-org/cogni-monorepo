@@ -48,6 +48,28 @@ export class EnvValidationError extends Error {
   }
 }
 
+function assertOpenFgaEnv(env: z.infer<typeof serverSchema>): void {
+  const authzActivationEnv =
+    env.OPENFGA_STORE_ID !== undefined ||
+    env.OPENFGA_AUTHORIZATION_MODEL_ID !== undefined ||
+    env.OPENFGA_API_TOKEN !== undefined;
+
+  if (!authzActivationEnv) return;
+
+  const missing = [
+    env.OPENFGA_API_URL === undefined ? "OPENFGA_API_URL" : undefined,
+    env.OPENFGA_STORE_ID === undefined ? "OPENFGA_STORE_ID" : undefined,
+  ].filter((key): key is string => key !== undefined);
+
+  if (missing.length > 0) {
+    throw new EnvValidationError({
+      code: "INVALID_ENV",
+      missing,
+      invalid: [],
+    });
+  }
+}
+
 // Server schema with all environment variables
 export const serverSchema = z.object({
   NODE_ENV: z
@@ -84,11 +106,10 @@ export const serverSchema = z.object({
   LITELLM_MVP_API_KEY: z.string().default("test-mvp-api-key"),
 
   // Billing (Stage 6.5)
+  // SPEND-side LLM markup (calculateLlmUserCharge). The PURCHASE-side markup +
+  // system-tenant revenue share are governance config in repo-spec payments_in
+  // (markup_factor / revenue_share), not env. See docs/spec/chain-config.md.
   USER_PRICE_MARKUP_FACTOR: z.coerce.number().min(1.0).default(2.0),
-
-  // System tenant revenue share — fraction of user credits minted as bonus to system tenant
-  // 0 = disabled, 0.75 = 75% bonus (default). Per docs/spec/system-tenant.md
-  SYSTEM_TENANT_REVENUE_SHARE: z.coerce.number().min(0).max(1).default(0.75),
 
   // Database connections — both required, no component-piece fallback.
   // Per DATABASE_RLS_SPEC.md design decision 7: runtime app consumes explicit DSNs only.
@@ -114,7 +135,13 @@ export const serverSchema = z.object({
   // Per SCHEDULER_SPEC.md: scheduler worker authenticates via shared secret to call
   // POST /api/internal/graphs/{graphId}/runs. Min 32 chars to reduce weak-token risk.
   // Required: Internal execution API will not function without this token.
+  // Also the Bearer for operator-gateway → owning-node attribution receipt delivery
+  // (POST {nodeUrl}/api/internal/attribution/receipts), mirroring the graph-dispatch identity.
   SCHEDULER_API_TOKEN: z.string().min(32),
+
+  // NOTE: the operator app does NOT read a static COGNI_NODE_ENDPOINTS map. NORTH_STAR — the
+  // operator resolves node URLs from its OWN DB registry (listRoutableNodes → internalNodeAppUrl).
+  // The static COGNI_NODE_ENDPOINTS configmap is only for the DB-less scheduler-worker.
 
   // Internal ops token - Bearer auth for deploy-time internal operations endpoints
   // Optional in schema to avoid breaking environments that do not use ops endpoints.
@@ -128,6 +155,15 @@ export const serverSchema = z.object({
     .default("true")
     .transform((v) => v === "true"),
 
+  // Node env-membership verb (story.5020 W4): flag-gated DNS reverse/forward reconcile seam.
+  // v0 ships OFF — a node-env add/remove only LOGS the intended Cloudflare change (a removed node's
+  // A record lingers until TTL). vNext (W3b) wires the live CloudflareAdapter prune/upsert.
+  // Default: false. See docs/design/operator-fleet-safety.md.
+  DNS_REVERSE_RECONCILE: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+
   // GitHub webhook secret - HMAC-SHA256 verification for incoming GitHub webhook payloads.
   // Required when GitHub webhook ingestion is enabled. Per WEBHOOK_SECRET_NOT_IN_CODE.
   GH_WEBHOOK_SECRET: optionalString,
@@ -136,16 +172,22 @@ export const serverSchema = z.object({
   // Required when on-chain governance signal execution is enabled.
   ALCHEMY_WEBHOOK_SECRET: optionalString,
 
-  // DoltHub credentials — service-side push of knowledge hubs to DoltHub
-  // remote (cogni-dao/knowledge-<node>). v0 push uses DoltHub Dolt creds
-  // (keypair, see docs/runbooks/dolthub-remote-bootstrap.md). DOLTHUB_REMOTE_URL
-  // gates the push job — when unset, merges still succeed locally and never
-  // attempt a push. DOLTHUB_API_TOKEN (PAT) is for the REST/SQL HTTP API only
-  // (future librarian/x402 reads). DoltHub OAuth pair is reserved for v1
-  // per-user identity (task.5070, blocked on DoltHub app approval). Per
-  // proj.knowledge-syntropy (W0c tier) + task.5069.
-  DOLTHUB_REMOTE_URL: optionalString,
+  // DoltHub credentials — node publish creates env-owned knowledge repos via
+  // REST. DOLT_CREDS_* authenticate the Dolt push protocol in Doltgres.
+  DOLTHUB_OWNER: optionalString,
   DOLTHUB_API_TOKEN: optionalString,
+  // Additional non-prod DoltHub org whose <owner>/<slug> repo publish must ALSO
+  // create (bug.5002). Non-prod envs derive their mirror as <this-owner>/<slug>,
+  // so that repo must exist or the first candidate/preview dolt_push 404s. Only
+  // the PROD operator holds a cross-org DoltHub PAT (bug.5003 gates it out of
+  // non-prod), so publish — always run on prod — is the single context that can
+  // create every env's repo. Unset → publish bootstraps only DOLTHUB_OWNER.
+  DOLTHUB_NONPROD_OWNER: optionalString,
+  // Per-env override for THIS node's own knowledge mirror remote. When set it
+  // wins over repo-spec `knowledge.remote.url`, letting non-prod envs sync to a
+  // throwaway test repo while prod targets the canonical `<owner>/<slug>` repo.
+  // Empty/unset → fall back to repo-spec (no per-env mirror).
+  KNOWLEDGE_DOLTHUB_REMOTE_URL: optionalUrl,
   DOLTHUB_OAUTH_CLIENT_ID: optionalString,
   DOLTHUB_OAUTH_CLIENT_SECRET: optionalString,
 
@@ -163,13 +205,14 @@ export const serverSchema = z.object({
   NODE_MINT_OWNER: optionalString,
   NODE_TEMPLATE_OWNER: optionalString,
 
-  // Node-formation Publish: the submodule-PIN-PR target (the operator's deployment monorepo).
-  // Wizard-scoped override ONLY — does NOT touch getGithubRepo()/operator identity. Fail-open: when
-  // unset, the pin-PR targets `node.repoOwner/repoName` (= Cogni-DAO/cogni in prod, unchanged). Set
-  // on candidate-a to a cogni-shaped mirror in the throwaway org so the test app can open the pin-PR
-  // without any Cogni-DAO access.
+  // Required env-scoped deployment parent for submodule pin PRs and node-ref flights.
   NODE_SUBMODULE_PARENT_OWNER: optionalString,
   NODE_SUBMODULE_PARENT_REPO: optionalString,
+
+  // MVP node-capacity ceiling (merge-authority): the operator refuses to birth a new node once the
+  // network has this many `nodes/<slug>` submodules deployed. Config, never hardcoded; tunable per env.
+  // vNext replaces the flat ceiling with VM-capacity-aware placement.
+  NODE_CAPACITY_CEILING: z.coerce.number().int().positive().default(8),
 
   // Billing ingest token - Bearer auth for LiteLLM generic_api callback → billing ingest endpoint
   // Per billing-ingest-spec: CALLBACK_AUTHENTICATED invariant. Min 32 chars to reduce weak-token risk.
@@ -184,8 +227,27 @@ export const serverSchema = z.object({
   PROMETHEUS_QUERY_URL: optionalUrl,
   PROMETHEUS_READ_USERNAME: optionalString,
   PROMETHEUS_READ_PASSWORD: optionalString,
+
+  // Grafana/Loki READ credential for the node-pinned log-read PROXY (task.5025). The operator
+  // holds this read-only Viewer token to run a dev's LogQL server-side, forced to {node="<id>"};
+  // the dev never holds it (spec.grafana-observability-access: proxy, not issuer). Optional: the
+  // proxy route returns 503 observability_unwired until ESO surfaces these from cogni/<env>/_shared.
+  GRAFANA_URL: optionalUrl,
+  GRAFANA_SERVICE_ACCOUNT_TOKEN: optionalString,
   ANALYTICS_K_THRESHOLD: z.coerce.number().int().positive().default(50),
   ANALYTICS_QUERY_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+
+  // Compute-substrate spend awareness (story.5011). CHERRY_AUTH_TOKEN is the same Cherry
+  // Servers API token used for provisioning; here it powers the READ-only balance read
+  // exposed on-demand via GET /api/v1/compute/balances (ComputeResourcePort + CherryComputeAdapter).
+  // Optional: when unset the compute capability returns no balances (graceful degradation)
+  // until ESO surfaces the token onto the operator runtime.
+  CHERRY_AUTH_TOKEN: optionalString,
+  COMPUTE_BALANCE_QUERY_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(5000),
 
   // EVM RPC - On-chain verification (Phase 3)
   // Required for production/preview/dev; not used in test mode (FakeEvmOnchainClient)
@@ -274,6 +336,28 @@ export const serverSchema = z.object({
   // Optional — BYO-AI features disabled when not set.
   CONNECTIONS_ENCRYPTION_KEY: optionalString,
 
+  // OpenFGA authorization — optional until the RBAC store is deployed.
+  OPENFGA_API_URL: optionalUrl,
+  OPENFGA_STORE_ID: optionalString,
+  OPENFGA_AUTHORIZATION_MODEL_ID: optionalString,
+  OPENFGA_API_TOKEN: optionalString,
+  // Per-attempt client deadline (checks + each write attempt). OpenFGA's p99 target
+  // is ≤50ms, so 1500ms is a generous safety net, not a tuning knob.
+  OPENFGA_TIMEOUT_MS: z.coerce.number().int().positive().default(1500),
+  // Retries for idempotent writes (approve/deny/revoke) on a transient failure —
+  // masks a single cold-path latency spike instead of surfacing a user-facing 503.
+  // Bounded (0–5): 0 disables retry; the ceiling caps worst-case write latency
+  // (retries × OPENFGA_TIMEOUT_MS + backoff) so a fat-fingered value can't hang requests.
+  OPENFGA_WRITE_MAX_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
+
+  // OpenBao node-secrets writer — the operator pod's OWN in-cluster identity for
+  // node self-serve secret writes (design.node-self-serve-secrets §Phase 1.B).
+  // Optional: the secrets plane returns 503 until the writer role is provisioned
+  // (candidate-a first). ADDR + SA_TOKEN_PATH default to the in-cluster wiring.
+  OPENBAO_ADDR: z.string().url().default("http://openbao.openbao.svc:8200"),
+  OPENBAO_NODE_SECRETS_WRITER_ROLE: optionalString,
+  OPENBAO_SA_TOKEN_PATH: z.string().default("/var/run/secrets/openbao/token"),
+
   // PostHog product analytics — required
   // See docs/guides/posthog-setup.md for setup
   // PostHog Cloud free tier: 1M events/month at https://us.i.posthog.com
@@ -305,6 +389,7 @@ export function serverEnv(): ServerEnv {
       // Cross-field invariants (beyond Zod schema)
       // Per DATABASE_RLS_SPEC.md design decision 7: enforce role separation at boot
       assertEnvInvariants(parsed);
+      assertOpenFgaEnv(parsed);
 
       // Per DATABASE_RLS_SPEC.md §SSL_REQUIRED_NON_LOCAL: reject non-localhost
       // PostgreSQL URLs without sslmode= to prevent credential sniffing.

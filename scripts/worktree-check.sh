@@ -25,6 +25,30 @@ fail() {
   printf 'fail: %s\n' "$1"
 }
 
+read_env_file_value() {
+  var_name="$1"
+  env_file="$2"
+
+  [ -f "$env_file" ] || return 0
+  awk -F= -v key="$var_name" '
+    $1 == key {
+      value = substr($0, length(key) + 2)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      gsub(/^["'\''"]|["'\''"]$/, "", value)
+      print value
+      exit
+    }
+  ' "$env_file" 2>/dev/null
+}
+
+has_node_cogni_key() {
+  env_file="$1"
+  key=""
+
+  key="$(read_env_file_value COGNI_NODE_API_KEY "$env_file")"
+  [ -n "$key" ]
+}
+
 if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
   fail "not inside a git worktree"
 else
@@ -78,6 +102,16 @@ else
   fail "node_modules missing or incomplete; run pnpm install --frozen-lockfile"
 fi
 
+if [ -f .env.cogni ]; then
+  if has_node_cogni_key .env.cogni; then
+    pass ".env.cogni has COGNI_NODE_API_KEY"
+  else
+    fail ".env.cogni exists but has no COGNI_NODE_API_KEY for session cognition"
+  fi
+else
+  fail ".env.cogni missing; Conductor setup should symlink it from the primary checkout"
+fi
+
 if [ -f work/items/_index.md ]; then
   fail "work/items/_index.md exists; work item index has been purged"
 else
@@ -85,7 +119,7 @@ else
 fi
 
 if node scripts/run-scoped-package-build.mjs --dry-run >/tmp/cogni-worktree-package-plan.$$ 2>&1; then
-  if grep -q "Package build scope: none" /tmp/cogni-worktree-package-plan.$$; then
+  if grep -q "Package declaration scope: none" /tmp/cogni-worktree-package-plan.$$; then
     pass "package declaration outputs are present"
   else
     warn "package declarations need bootstrap: node scripts/run-scoped-package-build.mjs"

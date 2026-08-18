@@ -6,6 +6,9 @@
  * Purpose: VcsCapability adapter using Octokit + GitHub App authentication.
  * Scope: Implements VcsCapability for GitHub API operations (list PRs, CI status, merge, create branch, dispatch candidate-flight).
  * Invariants:
+ *   - MERGE_IS_QUEUE_TOLERANT: `mergePr` detects the base branch's merge-queue state (GraphQL
+ *     `mergeQueue`) and either direct-merges (no queue → `merged` + `sha`) or enqueues via
+ *     `enablePullRequestAutoMerge` (queue required → `enqueued`, async, no `sha`).
  *   - AUTH_VIA_APP: Uses @octokit/auth-app for GitHub App JWT + installation token management
  *   - INSTALLATION_CACHED: Installation ID resolved once per owner/repo and cached
  *   - TOKEN_AUTO_REFRESH: Octokit auth-app handles token caching and refresh automatically
@@ -18,6 +21,7 @@
  */
 
 import type {
+  ApproveWorkflowRunsResult,
   CheckInfo,
   CiStatusResult,
   CreateBranchResult,
@@ -161,35 +165,63 @@ export class GitHubVcsAdapter implements VcsCapability {
       })),
     ];
 
-    // Gate on GitHub Actions check runs only — third-party app checks (SonarCloud, etc.)
-    // are informational and do not block merge via branch protection.
-    const ciChecks = [
-      ...rawCheckRuns
-        .filter((cr) => cr.app?.slug === "github-actions")
-        .map((cr) => ({ status: cr.status, conclusion: cr.conclusion })),
-      // Legacy commit statuses are always included (they are GitHub-native)
-      ...(statusResponse.data.statuses as Array<{ state: string }>).map(
-        (s) => ({
-          status: "completed",
-          conclusion:
-            s.state === "success"
-              ? "success"
-              : s.state === "pending"
-                ? null
-                : "failure",
-        })
-      ),
-    ];
+    // Index GitHub-native check producers by context name — github-actions check
+    // runs (by name) + legacy commit statuses (by context). Third-party app checks
+    // (SonarCloud, etc.) are informational and never gate a merge.
+    const byContext = new Map<
+      string,
+      { status: string; conclusion: string | null }
+    >();
+    for (const cr of rawCheckRuns) {
+      if (cr.app?.slug === "github-actions") {
+        byContext.set(cr.name, {
+          status: cr.status,
+          conclusion: cr.conclusion,
+        });
+      }
+    }
+    for (const s of statusResponse.data.statuses as Array<{
+      context: string;
+      state: string;
+    }>) {
+      byContext.set(s.context, {
+        status: "completed",
+        conclusion:
+          s.state === "success"
+            ? "success"
+            : s.state === "pending"
+              ? null
+              : "failure",
+      });
+    }
 
-    const pending = ciChecks.some(
-      (c) => c.status !== "completed" || c.conclusion === null
+    // REQUIRED_CHECKS_ARE_GITHUB_DEFINED: "green" is GitHub's OWN required-status-
+    // check set for the PR's base branch (from branch protection), never an
+    // operator-invented list. A required context is satisfied iff it completed
+    // success|skipped — GitHub's own rule (a required check that legitimately
+    // skips, e.g. a fork-guarded build, is passing). An unprotected branch (no
+    // required checks) is NOT green: merge-on-green is meaningless without a
+    // required set, so it fails closed.
+    const requiredContexts = await this.getRequiredContexts(
+      octokit,
+      params.owner,
+      params.repo,
+      pr.base.ref
     );
+    const pending = requiredContexts.some((ctx) => {
+      const c = byContext.get(ctx);
+      return !c || c.status !== "completed" || c.conclusion === null;
+    });
     const allGreen =
-      ciChecks.length > 0 &&
-      !pending &&
-      ciChecks.every(
-        (c) => c.conclusion === "success" || c.conclusion === "skipped"
-      );
+      requiredContexts.length > 0 &&
+      requiredContexts.every((ctx) => {
+        const c = byContext.get(ctx);
+        return (
+          c != null &&
+          c.status === "completed" &&
+          (c.conclusion === "success" || c.conclusion === "skipped")
+        );
+      });
 
     // Compute review decision from individual reviews.
     // Take the latest review per reviewer; if any APPROVED and none CHANGES_REQUESTED → approved.
@@ -226,6 +258,44 @@ export class GitHubVcsAdapter implements VcsCapability {
     };
   }
 
+  /**
+   * The branch's REQUIRED status-check contexts, per GitHub branch protection —
+   * the single source of truth for what "green" means (no operator-invented set).
+   * Returns `[]` when the branch is unprotected or requires no checks (which the
+   * merge gate treats as not-green / fail-closed). Uses the App's `administration`
+   * read (the same privilege it uses to WRITE protection at node formation).
+   */
+  private async getRequiredContexts(
+    octokit: Octokit,
+    owner: string,
+    repo: string,
+    branch: string
+  ): Promise<string[]> {
+    try {
+      const { data } = await octokit.request(
+        "GET /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks",
+        { owner, repo, branch }
+      );
+      return (data.contexts ?? []) as string[];
+    } catch (error) {
+      if ((error as { status?: number })?.status === 404) return [];
+      throw error;
+    }
+  }
+
+  /**
+   * Merge a PR — queue-tolerant. When the base branch requires a merge queue,
+   * GitHub `405`s a direct `PUT .../merge`, so we instead enable auto-merge
+   * (`enablePullRequestAutoMerge`), which GitHub routes through the queue: the
+   * merge happens asynchronously on the queue's rebased candidate (`enqueued`,
+   * no `sha` yet). When no queue is required (today's state everywhere), we
+   * direct-merge exactly as before (`merged` + `sha`, synchronous). The branch's
+   * queue state is detected deterministically up front (GraphQL `mergeQueue`) so
+   * we never have to disambiguate a `405`.
+   *
+   * MERGED_XOR_ENQUEUED: the merge gate (caller) has already asserted the PR is
+   * green; this method only chooses the execution path by queue requirement.
+   */
   async mergePr(params: {
     owner: string;
     repo: string;
@@ -233,6 +303,41 @@ export class GitHubVcsAdapter implements VcsCapability {
     method: "squash" | "merge" | "rebase";
   }): Promise<MergeResult> {
     const octokit = await this.getOctokit(params.owner, params.repo);
+
+    // Resolve the PR's base branch + GraphQL node id once (node id is required by
+    // the auto-merge mutation; base ref drives the queue check).
+    let baseRef: string;
+    let prNodeId: string;
+    try {
+      const { data: pr } = await octokit.request(
+        "GET /repos/{owner}/{repo}/pulls/{pull_number}",
+        { owner: params.owner, repo: params.repo, pull_number: params.prNumber }
+      );
+      baseRef = pr.base.ref;
+      prNodeId = pr.node_id;
+    } catch (error) {
+      return this.toMergeFailure(error);
+    }
+
+    const queueEnabled = await this.isMergeQueueEnabled(
+      octokit,
+      params.owner,
+      params.repo,
+      baseRef
+    );
+
+    if (queueEnabled) {
+      try {
+        await this.enableAutoMerge(octokit, prNodeId, params.method);
+        return {
+          merged: false,
+          enqueued: true,
+          message: `Pull request added to the merge queue on '${baseRef}' (async — merge completes on the queue's rebased candidate)`,
+        };
+      } catch (error) {
+        return this.toMergeFailure(error);
+      }
+    }
 
     try {
       const { data } = await octokit.request(
@@ -247,38 +352,95 @@ export class GitHubVcsAdapter implements VcsCapability {
 
       return {
         merged: data.merged,
+        enqueued: false,
         sha: data.sha,
         message: data.message,
       };
     } catch (error) {
-      // GitHub returns 405 for already merged or not mergeable
-      const message = error instanceof Error ? error.message : "Merge failed";
-      return { merged: false, message };
+      return this.toMergeFailure(error);
     }
+  }
+
+  /**
+   * Normalize a thrown GitHub error into a failed `MergeResult`, surfacing the
+   * HTTP status so callers classify structurally (405 = refused/not-mergeable/
+   * already-merged, 409 = head modified) rather than substring-matching.
+   */
+  private toMergeFailure(error: unknown): MergeResult {
+    const status =
+      error &&
+      typeof error === "object" &&
+      "status" in error &&
+      typeof (error as { status: unknown }).status === "number"
+        ? (error as { status: number }).status
+        : undefined;
+    const message = error instanceof Error ? error.message : "Merge failed";
+    // exactOptionalPropertyTypes: omit `status` rather than set it `undefined`.
+    return status === undefined
+      ? { merged: false, enqueued: false, message }
+      : { merged: false, enqueued: false, status, message };
+  }
+
+  /**
+   * True when `branch` has an active merge queue (a `merge_queue` ruleset or the
+   * legacy "Require merge queue" toggle). GraphQL `repository.mergeQueue(branch)`
+   * returns a non-null node when one exists. Fail-open to `false` (direct merge)
+   * if the query errors — never block a merge on a flaky discovery call.
+   */
+  private async isMergeQueueEnabled(
+    octokit: Octokit,
+    owner: string,
+    repo: string,
+    branch: string
+  ): Promise<boolean> {
+    try {
+      const result = await octokit.graphql<{
+        repository: { mergeQueue: { id: string } | null } | null;
+      }>(
+        `query ($owner: String!, $repo: String!, $branch: String!) {
+          repository(owner: $owner, name: $repo) {
+            mergeQueue(branch: $branch) { id }
+          }
+        }`,
+        { owner, repo, branch }
+      );
+      return Boolean(result.repository?.mergeQueue?.id);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Enable auto-merge on a PR (routes through the merge queue when required). */
+  private async enableAutoMerge(
+    octokit: Octokit,
+    pullRequestId: string,
+    method: "squash" | "merge" | "rebase"
+  ): Promise<void> {
+    const mergeMethod = method.toUpperCase(); // GraphQL PullRequestMergeMethod
+    await octokit.graphql(
+      `mutation ($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
+        enablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId, mergeMethod: $mergeMethod }) {
+          pullRequest { id state }
+        }
+      }`,
+      { pullRequestId, mergeMethod }
+    );
   }
 
   async dispatchCandidateFlight(params: {
     owner: string;
     repo: string;
-    prNumber: number;
-    headSha?: string;
+    nodeSlug: string;
+    sourceSha: string;
     workflowRef?: string;
   }): Promise<DispatchCandidateFlightResult> {
     const octokit = await this.getOctokit(params.owner, params.repo);
 
-    // workflow_dispatch inputs are always strings at the GitHub API boundary
-    // even when the workflow declares `type: string` — LiteLLM / Octokit
-    // preserves values as-is. We stringify prNumber explicitly.
     const inputs: Record<string, string> = {
-      pr_number: String(params.prNumber),
+      node_slug: params.nodeSlug,
+      source_sha: params.sourceSha,
     };
-    if (params.headSha) {
-      inputs.head_sha = params.headSha;
-    }
 
-    // GitHub returns HTTP 204 with no body on success. There is no run_id in
-    // the response — do NOT attempt to correlate here; the caller observes
-    // the resulting `candidate-flight` check on the PR head via getCiStatus.
     await octokit.request(
       "POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches",
       {
@@ -292,13 +454,74 @@ export class GitHubVcsAdapter implements VcsCapability {
 
     const workflowUrl = `https://github.com/${params.owner}/${params.repo}/actions/workflows/candidate-flight.yml`;
 
-    const shortSha = params.headSha ? params.headSha.slice(0, 8) : "HEAD";
     return {
       dispatched: true,
-      prNumber: params.prNumber,
-      headSha: params.headSha ?? null,
+      nodeSlug: params.nodeSlug,
+      sourceSha: params.sourceSha,
       workflowUrl,
-      message: `Flight dispatched for PR #${params.prNumber} @ ${shortSha}. Observe via core__vcs_get_ci_status (look for 'candidate-flight' check).`,
+      message: `Candidate flight dispatched for ${params.nodeSlug}@${params.sourceSha.slice(0, 8)}.`,
+    };
+  }
+
+  async approveWorkflowRuns(params: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  }): Promise<ApproveWorkflowRunsResult> {
+    const octokit = await this.getOctokit(params.owner, params.repo);
+
+    // Resolve the PR head SHA — workflow runs are keyed by head_sha.
+    const { data: pr } = await octokit.request(
+      "GET /repos/{owner}/{repo}/pulls/{pull_number}",
+      {
+        owner: params.owner,
+        repo: params.repo,
+        pull_number: params.prNumber,
+      }
+    );
+    const headSha = pr.head.sha;
+
+    // List the workflow runs GitHub is holding behind the fork-PR approval gate.
+    const { data: runsData } = await octokit.request(
+      "GET /repos/{owner}/{repo}/actions/runs",
+      {
+        owner: params.owner,
+        repo: params.repo,
+        head_sha: headSha,
+        status: "action_required",
+        event: "pull_request",
+        per_page: 100,
+      }
+    );
+
+    const pending = runsData.workflow_runs as Array<{ id: number }>;
+
+    // Approve each held run. `POST .../actions/runs/{run_id}/approve` requires
+    // the installation to hold `actions: write` (cogni-node-template does).
+    const runIds: number[] = [];
+    for (const run of pending) {
+      await octokit.request(
+        "POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve",
+        {
+          owner: params.owner,
+          repo: params.repo,
+          run_id: run.id,
+        }
+      );
+      runIds.push(run.id);
+    }
+
+    const shortSha = headSha.slice(0, 8);
+    return {
+      approved: runIds.length,
+      prNumber: params.prNumber,
+      headSha,
+      headRepo: pr.head.repo?.full_name ?? null,
+      runIds,
+      message:
+        runIds.length > 0
+          ? `Approved ${runIds.length} workflow run(s) for PR #${params.prNumber} @ ${shortSha}.`
+          : `No workflow runs awaiting approval for PR #${params.prNumber} @ ${shortSha}.`,
     };
   }
 

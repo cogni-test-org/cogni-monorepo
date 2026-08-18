@@ -69,7 +69,7 @@ For CI failures, use `env="ci"`:
    `infra/compose/runtime/configs/alloy-config.{,metrics.}alloy`):
    - app pods: `app`, `scheduler-worker`, `migrate`, `migrate-doltgres`
    - infra/compose: `litellm`, `caddy`, `temporal`, `autoheal`, `db-backup`,
-     `openclaw-gateway`, `llm-proxy-openclaw`, `alloy-k8s-events`
+     `alloy-k8s-events`
    - argocd controllers: `argocd-application-controller`,
      `argocd-applicationset-controller`, `argocd-image-updater`,
      `argocd-server`, `argocd-repo-server`, `argocd-notifications-controller`
@@ -89,6 +89,54 @@ For CI failures, use `env="ci"`:
 - `env` - Environment: local | candidate-a | preview | production | ci
 - `service` - Service name (see #2 above for full list — app pods, infra
   compose containers, argocd controllers all share this label)
+- `node` - Node id (UUID) — `{env="<env>",node="<nodeId>"}` selects exactly one
+  node's app logs. Only app pod lines carry it (promoted from the pino `nodeId`
+  field; infra/control-plane lines have no `node` label). Added task.5028;
+  prefer this over the fragile `pod=~"<slug>-node-app-.*"` prefix hack.
+
+> **This guide is operator-scope** (direct Grafana/MCP, full-fleet read). A **node
+> developer** debugging only _their_ node does NOT use this — they call the operator
+> **proxy** `GET /api/v1/nodes/{slug|node_id}/observability/logs?env=<env>&query=<full LogQL>`
+> with their Cogni API key (needs the `developer` grant). `query` takes the **same LogQL string
+> you'd paste into the MCP / `loki-query.sh` above** — e.g.
+> `query={service="app"} | json | level="error"` (URL-encode it). The operator forces
+> `env`/`service`/`node` to the caller's node and lets any other label matcher only narrow, so the
+> dev can never reach another node. `{slug|node_id}` resolves to the node's **repo-spec `node_id`**
+> (the deployment-identity SSOT, = `nodes.id`), at **any** registry status (`resolveNodeRef` — deployed
+> nodes are `published`, never `active`), so this works for any registered node, not only wizard-born
+> ones. Results come back as raw Loki JSON; no Grafana token ever reaches the dev. An empty `query`
+> returns the node's app stream.
+>
+> **Query params** (all optional except `env`):
+>
+> | param           | default         | bounds                                     | meaning                                                                                                                                            |
+> | --------------- | --------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+> | `env`           | — (required)    | `candidate-a` \| `preview` \| `production` | which deploy env to read                                                                                                                           |
+> | `query`         | node app stream | ≤2048 chars                                | the full LogQL (same string as MCP / `loki-query.sh`)                                                                                              |
+> | `limit`         | `100`           | 1–1000                                     | max lines returned (newest-first)                                                                                                                  |
+> | `minutes`       | `60`            | 1–1440                                     | **relative** window: last N minutes back from now                                                                                                  |
+> | `start` / `end` | —               | span ≤24h                                  | **absolute** window — RFC3339 (`2026-06-24T00:00:00Z`) or epoch-ms; missing `end`→now, missing `start`→`end-1h`. Overrides `minutes` when present. |
+>
+> Absolute beats relative; either form is capped at a 24h span (mirrors the operator-scope read budget).
+> A bad instant, `start ≥ end`, or a >24h span → `400 invalid_window`. Example — one historical hour:
+> `?env=production&start=2026-06-24T00:00:00Z&end=2026-06-24T01:00:00Z&query=… | json | level="error"`.
+>
+> **"Born observable" caveat — two halves must be in the SAME env.** The proxy resolves a node from
+> **that env's operator registry** (the env where it was minted), and the forced `{node="<id>"}`
+> selector needs that env's Alloy to promote the `node` label. A node's registry row and its `node`
+> label can split across envs (e.g. beacon: row in prod, label only on candidate-a). Per-env substrate
+> gaps tracked: **bug.5041** (prod Alloy `node` label stale), **bug.5040** (prod Reloader). Full
+> born-observable contract: `docs/spec/grafana-observability-access.md` §"Born observable".
+>
+> **Parity / scope:** for the caller's node slice this is **1:1** with this guide's MCP /
+> `loki-query.sh` path — same selector syntax, same `| json | …` pipeline, same JSON output — the
+> only difference is the operator runs it under an OpenFGA check instead of handing out a token. It
+> is **not** yet multi-scope: querying _other_ nodes, shared services (`scheduler-worker`, …), or
+> env-wide is the **generic** route `GET /api/v1/observability/logs` + the `logs.query` RBAC action
+> (Phase 1, not yet built). When that lands, this guide will direct all node-dev agents to it
+> instead of the MCP. Identity + phasing: `docs/design/substrate-grafana-observability.md` §"Phase
+> 0"; node-scoped design: `docs/spec/grafana-observability-access.md` §"Node-dev log scope envelope".
+
 - `source` - `k8s` (in-cluster pod logs from cAdvisor) | `k8s-events`
   (kubernetes Events stream — pod OOMKilled, probe failures, evictions,
   rollout events; shipped by `alloy-k8s-events`). Use `source="k8s-events"`

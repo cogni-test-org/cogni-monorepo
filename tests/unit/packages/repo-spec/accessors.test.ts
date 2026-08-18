@@ -13,13 +13,17 @@
 
 import {
   extractChainId,
+  extractDaoConfig,
+  extractDaoTokenDistributionConfig,
   extractGovernanceConfig,
+  extractKnowledgeConfig,
   extractLedgerApprovers,
   extractLedgerConfig,
   extractNodeId,
   extractNodePath,
   extractOwningNode,
   extractPaymentConfig,
+  extractReviewConfig,
   extractScopeId,
   parseRepoSpec,
   type RepoSpec,
@@ -38,15 +42,31 @@ const TEST_CHAIN_ID = 8453;
 
 /** Builds a minimal valid RepoSpec for testing */
 function buildSpec(overrides: Partial<RepoSpec> = {}): RepoSpec {
+  const activeDistributionLedger =
+    overrides.distributions?.status === "active" && !overrides.activity_ledger
+      ? {
+          activity_ledger: {
+            epoch_length_days: 7,
+            pool_config: { base_issuance_credits: "10000" },
+            activity_sources: {
+              github: {
+                attribution_pipeline: "cogni-v0.0",
+                source_refs: ["cogni-dao/test"],
+              },
+            },
+          },
+        }
+      : {};
   return parseRepoSpec({
     node_id: TEST_NODE_ID,
-    cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
+    governance: { chain_id: String(TEST_CHAIN_ID) },
     payments_in: {
       credits_topup: {
         provider: "cogni-usdc-backend-v1",
         receiving_address: "0x1111111111111111111111111111111111111111",
       },
     },
+    ...activeDistributionLedger,
     ...overrides,
   });
 }
@@ -57,7 +77,6 @@ function buildFullSpec(): RepoSpec {
     node_id: TEST_NODE_ID,
     scope_id: TEST_SCOPE_ID,
     scope_key: "default",
-    cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
     payments_in: {
       credits_topup: {
         provider: "cogni-usdc-backend-v1",
@@ -76,6 +95,7 @@ function buildFullSpec(): RepoSpec {
       },
     },
     governance: {
+      chain_id: String(TEST_CHAIN_ID),
       schedules: [
         {
           charter: "HEARTBEAT",
@@ -94,6 +114,27 @@ describe("extractNodeId", () => {
   });
 });
 
+describe("extractReviewConfig", () => {
+  it("defaults to enabled with no model when review block is absent", () => {
+    const cfg = extractReviewConfig(buildSpec());
+    expect(cfg.enabled).toBe(true);
+    expect(cfg.model).toBeUndefined();
+  });
+
+  it("honors review.enabled=false (node opts out of PR review)", () => {
+    const cfg = extractReviewConfig(buildSpec({ review: { enabled: false } }));
+    expect(cfg.enabled).toBe(false);
+  });
+
+  it("returns the node-selected model", () => {
+    const cfg = extractReviewConfig(
+      buildSpec({ review: { enabled: true, model: "claude-haiku-4-5" } })
+    );
+    expect(cfg.enabled).toBe(true);
+    expect(cfg.model).toBe("claude-haiku-4-5");
+  });
+});
+
 describe("extractScopeId", () => {
   it("returns scope_id when present", () => {
     const spec = buildSpec({ scope_id: TEST_SCOPE_ID });
@@ -106,6 +147,36 @@ describe("extractScopeId", () => {
   });
 });
 
+describe("extractDaoConfig", () => {
+  const ON_CHAIN = {
+    dao_contract: "0x1111111111111111111111111111111111111111",
+    plugin_contract: "0x2222222222222222222222222222222222222222",
+    signal_contract: "0x3333333333333333333333333333333333333333",
+    chain_id: String(TEST_CHAIN_ID),
+  };
+
+  it("resolves without base_url — the four on-chain fields are sufficient (treasury must not blank)", () => {
+    const dao = extractDaoConfig(buildSpec({ governance: ON_CHAIN }));
+    expect(dao).not.toBeNull();
+    expect(dao?.dao_contract).toBe(ON_CHAIN.dao_contract);
+    expect(dao?.base_url).toBeUndefined();
+  });
+
+  it("includes base_url when present (governance deep-link host)", () => {
+    const dao = extractDaoConfig(
+      buildSpec({
+        governance: { ...ON_CHAIN, base_url: "https://proposal.cognidao.org" },
+      })
+    );
+    expect(dao?.base_url).toBe("https://proposal.cognidao.org");
+  });
+
+  it("returns null when an on-chain identity field is missing", () => {
+    const { dao_contract: _omitted, ...withoutDao } = ON_CHAIN;
+    expect(extractDaoConfig(buildSpec({ governance: withoutDao }))).toBeNull();
+  });
+});
+
 describe("extractChainId", () => {
   it("parses string chain_id to number", () => {
     const spec = buildSpec();
@@ -115,7 +186,7 @@ describe("extractChainId", () => {
   it("handles numeric chain_id", () => {
     const spec = parseRepoSpec({
       node_id: TEST_NODE_ID,
-      cogni_dao: { chain_id: 8453 },
+      governance: { chain_id: 8453 },
       payments_in: {
         credits_topup: {
           provider: "test",
@@ -129,7 +200,7 @@ describe("extractChainId", () => {
   it("throws on non-numeric string", () => {
     const spec = parseRepoSpec({
       node_id: TEST_NODE_ID,
-      cogni_dao: { chain_id: "not-a-number" },
+      governance: { chain_id: "not-a-number" },
       payments_in: {
         credits_topup: {
           provider: "test",
@@ -137,7 +208,7 @@ describe("extractChainId", () => {
         },
       },
     });
-    expect(() => extractChainId(spec)).toThrow(/Invalid cogni_dao\.chain_id/);
+    expect(() => extractChainId(spec)).toThrow(/Invalid governance\.chain_id/);
   });
 });
 
@@ -148,6 +219,8 @@ describe("extractPaymentConfig", () => {
       chainId: TEST_CHAIN_ID,
       receivingAddress: "0x1111111111111111111111111111111111111111",
       provider: "cogni-usdc-backend-v1",
+      markupFactor: 1.10803324099723,
+      revenueShare: 0,
     });
   });
 
@@ -160,7 +233,7 @@ describe("extractPaymentConfig", () => {
   it("trims whitespace from address and provider", () => {
     const spec = parseRepoSpec({
       node_id: TEST_NODE_ID,
-      cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
+      governance: { chain_id: String(TEST_CHAIN_ID) },
       payments_in: {
         credits_topup: {
           provider: " cogni-usdc-backend-v1 ",
@@ -170,6 +243,86 @@ describe("extractPaymentConfig", () => {
     });
     const config = extractPaymentConfig(spec, TEST_CHAIN_ID);
     expect(config.provider).toBe("cogni-usdc-backend-v1");
+  });
+});
+
+describe("extractDaoTokenDistributionConfig", () => {
+  it("returns undefined while distributions are pending", () => {
+    const spec = buildSpec({
+      distributions: { status: "pending_activation" },
+      governance: {
+        chain_id: String(TEST_CHAIN_ID),
+        token_contract: "0x2222222222222222222222222222222222222222",
+      },
+    });
+
+    expect(
+      extractDaoTokenDistributionConfig(spec, TEST_CHAIN_ID)
+    ).toBeUndefined();
+  });
+
+  it("returns active token distribution config when inventory holder is present", () => {
+    const spec = buildSpec({
+      distributions: { status: "active" },
+      governance: {
+        chain_id: String(TEST_CHAIN_ID),
+        token_contract: "0x2222222222222222222222222222222222222222",
+        emissions_holder: "0x3333333333333333333333333333333333333333",
+      },
+    });
+
+    expect(extractDaoTokenDistributionConfig(spec, TEST_CHAIN_ID)).toEqual({
+      chainId: TEST_CHAIN_ID,
+      tokenAddress: "0x2222222222222222222222222222222222222222",
+      emissionsHolderAddress: "0x3333333333333333333333333333333333333333",
+      claimContractPattern: "1inch.cumulative-merkle-drop.v1",
+    });
+  });
+
+  it("throws when distributions are active without an emissions holder", () => {
+    const spec = buildSpec({
+      distributions: { status: "active" },
+      governance: {
+        chain_id: String(TEST_CHAIN_ID),
+        token_contract: "0x2222222222222222222222222222222222222222",
+      },
+    });
+
+    expect(() =>
+      extractDaoTokenDistributionConfig(spec, TEST_CHAIN_ID)
+    ).toThrow(/governance\.token_contract or governance\.emissions_holder/);
+  });
+});
+
+describe("extractKnowledgeConfig", () => {
+  it("returns undefined when knowledge is absent", () => {
+    expect(extractKnowledgeConfig(buildSpec())).toBeUndefined();
+  });
+
+  it("returns the node knowledge database and Cogni-owned DoltHub remote", () => {
+    const spec = buildSpec({
+      knowledge: {
+        database: "knowledge_my_node",
+        remote: {
+          provider: "dolthub",
+          owner: "cogni-dao-test",
+          repo: "my-node",
+          url: "https://doltremoteapi.dolthub.com/cogni-dao-test/my-node",
+          custody: "cogni-owned",
+        },
+      },
+    });
+
+    expect(extractKnowledgeConfig(spec)).toEqual({
+      database: "knowledge_my_node",
+      remote: {
+        provider: "dolthub",
+        owner: "cogni-dao-test",
+        repo: "my-node",
+        url: "https://doltremoteapi.dolthub.com/cogni-dao-test/my-node",
+        custody: "cogni-owned",
+      },
+    });
   });
 });
 
@@ -201,7 +354,6 @@ describe("extractGovernanceConfig", () => {
       node_id: TEST_NODE_ID,
       scope_id: TEST_SCOPE_ID,
       scope_key: "default",
-      cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
       payments_in: {
         credits_topup: {
           provider: "cogni-usdc-backend-v1",
@@ -219,6 +371,7 @@ describe("extractGovernanceConfig", () => {
         },
       },
       governance: {
+        chain_id: String(TEST_CHAIN_ID),
         schedules: [
           {
             charter: "LEDGER_INGEST",
@@ -270,7 +423,7 @@ describe("extractLedgerConfig", () => {
   it("returns null when scope_id is missing", () => {
     const spec = parseRepoSpec({
       node_id: TEST_NODE_ID,
-      cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
+      governance: { chain_id: String(TEST_CHAIN_ID) },
       payments_in: {
         credits_topup: {
           provider: "test",
@@ -295,7 +448,7 @@ describe("extractLedgerConfig", () => {
       node_id: TEST_NODE_ID,
       scope_id: TEST_SCOPE_ID,
       scope_key: "default",
-      cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
+      governance: { chain_id: String(TEST_CHAIN_ID) },
       payments_in: {
         credits_topup: {
           provider: "test",
@@ -332,7 +485,7 @@ describe("extractLedgerApprovers", () => {
       node_id: TEST_NODE_ID,
       scope_id: TEST_SCOPE_ID,
       scope_key: "default",
-      cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
+      governance: { chain_id: String(TEST_CHAIN_ID) },
       payments_in: {
         credits_topup: {
           provider: "test",
@@ -578,20 +731,20 @@ describe("extractOwningNode", () => {
     expect(extractOwningNode(standardSpec(), [])).toEqual({ kind: "miss" });
   });
 
-  it("scenario 10: node-template is sovereign when registered", () => {
-    const nodeTemplate = {
+  it("scenario 10: registered legacy node path is sovereign", () => {
+    const sampleNode = {
       node_id: "00000000-0000-4000-8000-0000000000aa",
-      node_name: "Node Template",
-      path: "nodes/node-template",
+      node_name: "Sample Node",
+      path: "nodes/sample-node",
     };
     const spec = buildTestRepoSpec({
-      nodes: [TEST_NODE_ENTRIES.operator, nodeTemplate],
+      nodes: [TEST_NODE_ENTRIES.operator, sampleNode],
     });
-    const result = extractOwningNode(spec, ["nodes/node-template/app/foo.ts"]);
+    const result = extractOwningNode(spec, ["nodes/sample-node/app/foo.ts"]);
     expect(result).toEqual({
       kind: "single",
-      nodeId: nodeTemplate.node_id,
-      path: "nodes/node-template",
+      nodeId: sampleNode.node_id,
+      path: "nodes/sample-node",
     });
   });
 
@@ -663,51 +816,64 @@ describe("extractOwningNode", () => {
     ]);
   });
 
-  it("NODE_BIRTH ride-along: canary + its own catalog/overlay/AppSet → single { canary, rideAlongApplied: true }", () => {
-    const canary = {
+  it("NODE_FORMATION ride-along: legacy node source + its own catalog/overlay/AppSet → single node", () => {
+    const sampleNode = {
       node_id: "00000000-0000-4000-8000-0000000000ca",
-      node_name: "Canary",
-      path: "nodes/canary",
+      node_name: "Sample Node",
+      path: "nodes/sample-node",
     };
     const spec = buildTestRepoSpec({
-      nodes: [TEST_NODE_ENTRIES.operator, canary, TEST_NODE_ENTRIES.resy],
+      nodes: [
+        TEST_NODE_ENTRIES.operator,
+        sampleNode,
+        {
+          node_id: "00000000-0000-4000-8000-0000000000bb",
+          node_name: "Other Node",
+          path: "nodes/other-node",
+        },
+      ],
     });
     const result = extractOwningNode(spec, [
-      "nodes/canary/app/src/app/(public)/page.tsx",
-      "infra/catalog/canary.yaml",
+      "nodes/sample-node/app/src/app/(public)/page.tsx",
+      "infra/catalog/sample-node.yaml",
       "infra/compose/edge/configs/Caddyfile.tmpl",
-      "infra/k8s/overlays/candidate-a/canary/kustomization.yaml",
-      "infra/k8s/overlays/preview/canary/kustomization.yaml",
-      "infra/k8s/argocd/candidate-a-canary-applicationset.yaml",
+      "infra/k8s/overlays/candidate-a/sample-node/kustomization.yaml",
+      "infra/k8s/overlays/preview/sample-node/kustomization.yaml",
+      "infra/k8s/argocd/appsets/candidate-a/candidate-a-sample-node-applicationset.yaml",
     ]);
     expect(result).toEqual({
       kind: "single",
-      nodeId: canary.node_id,
-      path: "nodes/canary",
+      nodeId: sampleNode.node_id,
+      path: "nodes/sample-node",
       rideAlongApplied: true,
     });
   });
 
-  it("NODE_BIRTH bounded: canary cannot ride another node's catalog", () => {
-    const canary = {
+  it("NODE_FORMATION bounded: legacy node cannot ride another node's catalog", () => {
+    const sampleNode = {
       node_id: "00000000-0000-4000-8000-0000000000ca",
-      node_name: "Canary",
-      path: "nodes/canary",
+      node_name: "Sample Node",
+      path: "nodes/sample-node",
+    };
+    const otherNode = {
+      node_id: "00000000-0000-4000-8000-0000000000bb",
+      node_name: "Other Node",
+      path: "nodes/other-node",
     };
     const spec = buildTestRepoSpec({
-      nodes: [TEST_NODE_ENTRIES.operator, canary, TEST_NODE_ENTRIES.resy],
+      nodes: [TEST_NODE_ENTRIES.operator, sampleNode, otherNode],
     });
     const result = extractOwningNode(spec, [
-      "nodes/canary/app/src/foo.ts",
-      "infra/catalog/resy.yaml",
+      "nodes/sample-node/app/src/foo.ts",
+      "infra/catalog/other-node.yaml",
     ]);
     expect(result.kind).toBe("conflict");
     if (result.kind !== "conflict") return;
     expect(result.nodes).toEqual([
       { nodeId: TEST_NODE_IDS.operator, path: "nodes/operator" },
-      { nodeId: canary.node_id, path: "nodes/canary" },
+      { nodeId: sampleNode.node_id, path: "nodes/sample-node" },
     ]);
-    expect(result.operatorPaths).toEqual(["infra/catalog/resy.yaml"]);
+    expect(result.operatorPaths).toEqual(["infra/catalog/other-node.yaml"]);
     expect(result.operatorNodeId).toBe(TEST_NODE_IDS.operator);
   });
 

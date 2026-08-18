@@ -11,6 +11,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { parse as parseYaml } from "yaml";
 
 import { buildPendingActivationRepoSpecYaml } from "@/features/nodes/repo-spec-builder";
 
@@ -20,6 +21,14 @@ const FIXTURE = {
   daoAddress: "0xdao0000000000000000000000000000000000dao",
   pluginAddress: "0xplugin000000000000000000000000000plugin0",
   signalAddress: "0xsignal000000000000000000000000000signal0",
+  tokenAddress: "0xtoken000000000000000000000000000000token",
+};
+
+const KNOWLEDGE_REMOTE = {
+  database: "knowledge_my_node",
+  owner: "cogni-dao-test",
+  repo: "my-node",
+  url: "https://doltremoteapi.dolthub.com/cogni-dao-test/my-node",
 };
 
 describe("buildPendingActivationRepoSpecYaml", () => {
@@ -31,17 +40,38 @@ describe("buildPendingActivationRepoSpecYaml", () => {
     expect(yaml).toContain(`schema_version: "0.1.4"`);
   });
 
-  it("emits the full cogni_dao block", () => {
+  it("emits the full governance block", () => {
     const yaml = buildPendingActivationRepoSpecYaml(FIXTURE);
     expect(yaml).toContain(`dao_contract: "${FIXTURE.daoAddress}"`);
     expect(yaml).toContain(`plugin_contract: "${FIXTURE.pluginAddress}"`);
     expect(yaml).toContain(`signal_contract: "${FIXTURE.signalAddress}"`);
     expect(yaml).toContain(`chain_id: "8453"`);
+    expect(parseYaml(yaml).governance).toMatchObject({
+      dao_contract: FIXTURE.daoAddress,
+      plugin_contract: FIXTURE.pluginAddress,
+      signal_contract: FIXTURE.signalAddress,
+      token_contract: FIXTURE.tokenAddress,
+      chain_id: "8453",
+    });
   });
 
-  it("emits payments.status: pending_activation", () => {
+  it("emits payments and distributions as pending activation", () => {
     const yaml = buildPendingActivationRepoSpecYaml(FIXTURE);
     expect(yaml).toMatch(/payments:\s*\n\s*status: pending_activation/);
+    expect(yaml).toMatch(/distributions:\s*\n\s*status: pending_activation/);
+  });
+
+  it("emits the Cogni-owned DoltHub knowledge remote when provided", () => {
+    const yaml = buildPendingActivationRepoSpecYaml({
+      ...FIXTURE,
+      knowledgeRemote: KNOWLEDGE_REMOTE,
+    });
+    expect(yaml).toContain(`database: "${KNOWLEDGE_REMOTE.database}"`);
+    expect(yaml).toContain("provider: dolthub");
+    expect(yaml).toContain(`owner: "${KNOWLEDGE_REMOTE.owner}"`);
+    expect(yaml).toContain(`repo: "${KNOWLEDGE_REMOTE.repo}"`);
+    expect(yaml).toContain(`url: "${KNOWLEDGE_REMOTE.url}"`);
+    expect(yaml).toContain("custody: cogni-owned");
   });
 
   it("does not emit wallet or payment rail addresses", () => {

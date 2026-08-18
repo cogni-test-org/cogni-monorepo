@@ -43,7 +43,7 @@ Ensure chain identity and payment addresses are governed in git (not env), valid
 
 5. **SINGLE_PATH_DIFFERENT_CONTENTS**: All deployments (dev/preview/prod) read `.cogni/repo-spec.yaml` from the same path; the app never branches on env to pick a different file.
 
-6. **RPC_IN_ENVIRONMENT**: `EVM_RPC_URL` varies per deployment, never committed.
+6. **RPC_IN_ENVIRONMENT**: `EVM_RPC_URL` varies per deployment, never committed. It is a **provisioned per-env substrate** (`node declares shape; operator wires environment`, [node-baas-architecture.md](./node-baas-architecture.md)) classified `inheritFrom: operator` (the same proven pattern as `OPENROUTER_API_KEY` / `LITELLM_MASTER_KEY`). Within the managed fleet it is **inherited, not human-supplied per node**: the **operator holds one value per env** (a billed, account-specific endpoint), and every spawned node-app pod inherits it via `secret-materialize.sh` — overwrite-on-drift self-heals a divergent copy, so a node can't keep a stale/missing RPC. `source: human` denotes byte-origin (a vendor RPC URL); the lone human action is the operator (or a **standalone sovereign fork**, which has no operator ancestor) seeding it **once** at `cogni/<env>/operator/EVM_RPC_URL` — nodes then converge to it on their next materialize (bug.5087: kills the blind-scan stale/missing copy, the same class the LLM-key `inheritFrom` fixed). Follow-up: an operator-side RPC **usage/balance** port/adapter (mirrors the compute-balance port) so Alchemy rate-limit / plan headroom is observable — billed substrate should be queryable, not silent.
 
 ## Design
 
@@ -84,13 +84,13 @@ Misalignment throws: `"Chain mismatch: repo-spec declares X, app requires Y"`
 
 ### File Pointers
 
-| File                                   | Role                                        | Owns                                                                |
-| -------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------- |
-| `.cogni/repo-spec.yaml`                | DAO governance (source of truth)            | `cogni_dao.chain_id`, `payments_in.credits_topup.receiving_address` |
-| `src/shared/web3/chain.ts`             | Deployment constants (must match repo-spec) | `CHAIN`, `CHAIN_ID`, `USDC_TOKEN_ADDRESS`, `MIN_CONFIRMATIONS`      |
-| `src/shared/config/repoSpec.schema.ts` | Structure validation                        | Zod schemas for repo-spec YAML                                      |
-| `src/shared/config/repoSpec.server.ts` | Loader + alignment check                    | `getPaymentConfig()` validates `chain_id` === `CHAIN_ID`            |
-| `.env`                                 | Runtime RPC endpoint                        | `EVM_RPC_URL`                                                       |
+| File                                   | Role                                        | Owns                                                                 |
+| -------------------------------------- | ------------------------------------------- | -------------------------------------------------------------------- |
+| `.cogni/repo-spec.yaml`                | DAO governance (source of truth)            | `governance.chain_id`, `payments_in.credits_topup.receiving_address` |
+| `src/shared/web3/chain.ts`             | Deployment constants (must match repo-spec) | `CHAIN`, `CHAIN_ID`, `USDC_TOKEN_ADDRESS`, `MIN_CONFIRMATIONS`       |
+| `src/shared/config/repoSpec.schema.ts` | Structure validation                        | Zod schemas for repo-spec YAML                                       |
+| `src/shared/config/repoSpec.server.ts` | Loader + alignment check                    | `getPaymentConfig()` validates `chain_id` === `CHAIN_ID`             |
+| `.env`                                 | Runtime RPC endpoint                        | `EVM_RPC_URL`                                                        |
 
 ## Acceptance Checks
 

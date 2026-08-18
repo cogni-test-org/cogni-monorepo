@@ -110,10 +110,13 @@ export {
   buildEIP712TypedData,
   type CanonicalMessageParams,
   computeApproverSetHash,
+  EIP712_DEPLOYMENT_ENVIRONMENTS,
   EIP712_DOMAIN_NAME,
   EIP712_DOMAIN_VERSION,
+  type EIP712DeploymentEnvironment,
   type EIP712TypedData,
   type EIP712TypedDataParams,
+  parseEIP712DeploymentEnvironment,
 } from "./signing";
 
 // Store port interface + types
@@ -129,6 +132,10 @@ export type {
   ClaimantStore,
   CloseIngestionWithEvaluationsParams,
   CursorStore,
+  DistributionClaimRecord,
+  DistributionLeafRecord,
+  DistributionManifestRecord,
+  DistributionManifestStore,
   EpochReader,
   EpochUserProjection,
   EpochWriter,
@@ -138,6 +145,7 @@ export type {
   IdentityResolver,
   IngestionCursor,
   IngestionReceipt,
+  InsertDistributionManifestParams,
   InsertFinalClaimantAllocationParams,
   InsertPoolComponentParams,
   InsertReceiptClaimantsParams,

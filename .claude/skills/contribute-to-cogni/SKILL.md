@@ -88,20 +88,24 @@ Code carries _what_ via names + types. The **knowledge hub** carries the _why_ +
 ## Phase 2 — Flight Request
 
 7. Wait until all required CI checks are green on your PR head SHA.
-8. Request flight: `POST /api/v1/vcs/flight { "prNumber": N }` → 202 or 422 (CI not green). **The operator endpoint is the only sanctioned flight path** — it dispatches as the GitHub App so every flight is auditable to the operator, not a human PAT. Do not run `gh workflow run candidate-flight.yml` yourself; that produces a `triggering_actor` of whichever human's PAT you're using, breaks the agent-attribution chain, and leaves the operator with no record of your flight intent.
+8. Request flight through the current deploy lane:
+   - For externally built node artifacts, call the operator primitive:
+     `POST /api/v1/vcs/flight { "nodeRef": { "nodeId": "<uuid>", "sourceSha": "<40-char sha>" } }`.
+   - For in-repo monorepo PRs, follow `coordination.nextAction` / the PR-manager lane. The candidate-flight workflow still accepts transitional `pr_number` inputs because in-repo build artifacts are PR-shaped, but `prNumber` is not the REST endpoint contract.
+   - Do not bypass the operator/policy lane unless a human explicitly asks you to diagnose a broken flight path; direct `gh workflow run candidate-flight.yml` uses the caller's GitHub actor and should be treated as an exception with a linked bug.
 
 ## Phase 3 — Self-Validate
 
-9. Wait for the `candidate-flight` check to appear on your PR head and confirm `https://test.cognidao.org/version` serves that SHA.
+9. Wait for the `candidate-flight` check to appear on the flown source and confirm `https://test.cognidao.org/version` serves that SHA.
 10. Run [`/validate-candidate`](../validate-candidate/SKILL.md) for the PR. Do **not** hand-roll this step. It owns the required matrix, feature-specific exercise, Loki query, and PR scorecard format.
 11. If validation fails: fix, push, repeat from Phase 1. Stale PRs with failed validation are closed.
 
 ## Phase 4 — Merge + Close
 
 12. Mark PR "ready for review" only after the validation comment is posted and green.
-13. Cogni operator reviews and merges.
-14. **Only after merge to `main`:** PATCH `status: done` on the work item. Pre-merge → status stays `needs_merge`. Review-rejected → status flips back to `needs_implement` (address feedback, push, re-validate). _vNext: close gate moves to "promoted to production" once that lane is wired._
-15. **Capture durable knowledge — if any.** Before closing, ask: did this change produce a reusable insight a future agent will need and can't recover from the code? If yes → file it via [`contribute-knowledge-to-cogni`](../contribute-knowledge-to-cogni/SKILL.md) (refine first; AI-text canonical, optional human-html that cites it). If no → ship nothing. No entry is the common, correct case — this is a prompt, not a gate.
+13. **Request the operator-executed merge** — you never hold GitHub write yourself; the operator GitHub App merges on your behalf. Once all required checks are green, call `POST /api/v1/vcs/merge { "nodeId": "<node>", "prNumber": <N> }` (every node — the operator included — is addressed by `nodeId`; there is no PR-number-only lane; RBAC-gated on `can_flight` for that node; squash into `main`). It refuses anything not green / not-mergeable / draft / wrong-base. _vNext: `/validate-candidate` becomes a required GitHub check the merge additionally asserts; a dedicated `can_merge` role + per-node scope + a probation tier replace the V0 `can_flight` reuse._
+
+> Fork PRs only: a fork PR's required `manifest` check is held until the operator releases the fork's CI (the approve-checks lane). Until that ships, a fork PR cannot reach green and so cannot be merged — same-repo PRs merge today. 14. **Only after merge to `main`:** PATCH `status: done` on the work item. Pre-merge → status stays `needs_merge`. Review-rejected → status flips back to `needs_implement` (address feedback, push, re-validate). _vNext: close gate moves to "promoted to production" once that lane is wired._ 15. **Capture durable knowledge — if any.** Before closing, ask: did this change produce a reusable insight a future agent will need and can't recover from the code? If yes → file it via [`contribute-knowledge-to-cogni`](../contribute-knowledge-to-cogni/SKILL.md) (refine first; AI-text canonical, optional human-html that cites it). If no → ship nothing. No entry is the common, correct case — this is a prompt, not a gate.
 
 ---
 

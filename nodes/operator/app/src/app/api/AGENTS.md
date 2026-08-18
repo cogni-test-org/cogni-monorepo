@@ -5,7 +5,7 @@
 ## Metadata
 
 - **Owners:** @derek @core-dev
-- **Last reviewed:** 2026-05-19
+- **Last reviewed:** 2026-06-07
 - **Status:** draft
 
 ## Purpose
@@ -40,14 +40,20 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
 - **Routes (if any):**
   - `/api/auth/[...nextauth]` [GET, POST]
   - `/api/setup/verify` [POST] - DAO formation verification
-  - `/api/v1/nodes` [GET, POST] - external-node registry: list owner's nodes + create a new registration
+  - `/api/v1/nodes` [GET, POST] - managed-node registry: list owner's nodes + create a new registration
   - `/api/v1/nodes/[id]` [GET, PATCH] - read + state-machine-aware update of a registered node row
-  - `/api/v1/nodes/[id]/publish` [POST] - opens a PR with governance-only `.cogni/repo-spec.yaml`, advances dao_formed → active
+  - `/api/v1/nodes/[id]/developers` [POST] - owner-gated approve/reject for registered agent developer flight authority
+  - `/api/v1/nodes/[id]/launch-pack` [GET] - owner-gated AI-assistant handoff for post-publish node launch
+  - `/api/v1/nodes/[id]/publish` [POST] - mints the node repo, opens the submodule deployment PR, advances dao_formed → published
+  - `/api/v1/nodes/[id]/activate-distributions` [POST] - terminal owner/developer-gated repo-spec PR; verifies distributor ownership/token and paired CAS publishing authority before recording active
+  - `/api/v1/nodes/[id]/distributions-status` [GET] - owner/developer-gated read of the git-plane activation record (repo-spec main + open/merged activation PR + distributor addresses)
+  - `/api/v1/nodes/[id]/reset-dao` [POST] - owner-only destructive reset of a node's DAO record (clears dao/token, status -> dao_pending) so it can be re-formed
   - `/api/internal/billing/ingest` [POST] - LiteLLM generic_api callback receiver (bearer auth, Docker-internal only)
   - `/api/internal/ops/governance/schedules/sync` [POST] - deploy-time governance sync trigger (bearer auth)
   - `/api/v1/chat/completions` [POST] - OpenAI-compatible chat completions (streaming + non-streaming, `cogni_status` extension); see [completions spec](../../../docs/spec/completions-api.md)
   - `/api/v1/ai/chat` [POST] - streaming chat with server-authoritative thread persistence
   - `/api/v1/activity` [GET]
+  - `/api/v1/citations/[id]` [GET] - depth-1 citation links for a knowledge or work-item endpoint
   - `/api/v1/public/attribution/epochs` [GET] - closed epochs list (public, no auth)
   - `/api/v1/public/attribution/epochs/[id]/user-projections` [GET] - closed epoch user projections (public)
   - `/api/v1/public/attribution/epochs/[id]/claimants` [GET] - closed epoch claimant attribution (public)

@@ -20,40 +20,17 @@ resources:
   - https://raw.githubusercontent.com/argoproj/argo-cd/v2.13.4/manifests/install.yaml
   # ksops CMP plugin ConfigMap
   - ksops-cmp.yaml
-  # ApplicationSets — one per (env, node) for structural LANE_ISOLATION (axiom 18).
-  # candidate-b is provisioned separately (provision-env.yml) and not listed here.
-  # >>> GENERATED node-appsets (scripts/ci/render-node-appset.sh) — DO NOT EDIT BY HAND
-  - candidate-a-anotha-applicationset.yaml
-  - candidate-a-brother-applicationset.yaml
-  - candidate-a-canary-applicationset.yaml
-  - candidate-a-ghcr-applicationset.yaml
-  - candidate-a-node-template-applicationset.yaml
-  - candidate-a-operator-applicationset.yaml
-  - candidate-a-resy-applicationset.yaml
-  - candidate-a-scheduler-worker-applicationset.yaml
-  - candidate-a-test-cog-applicationset.yaml
-  - candidate-a-yo-applicationset.yaml
-  - preview-anotha-applicationset.yaml
-  - preview-brother-applicationset.yaml
-  - preview-canary-applicationset.yaml
-  - preview-ghcr-applicationset.yaml
-  - preview-node-template-applicationset.yaml
-  - preview-operator-applicationset.yaml
-  - preview-resy-applicationset.yaml
-  - preview-scheduler-worker-applicationset.yaml
-  - preview-test-cog-applicationset.yaml
-  - preview-yo-applicationset.yaml
-  - production-anotha-applicationset.yaml
-  - production-brother-applicationset.yaml
-  - production-canary-applicationset.yaml
-  - production-ghcr-applicationset.yaml
-  - production-node-template-applicationset.yaml
-  - production-operator-applicationset.yaml
-  - production-resy-applicationset.yaml
-  - production-scheduler-worker-applicationset.yaml
-  - production-test-cog-applicationset.yaml
-  - production-yo-applicationset.yaml
-  # <<< GENERATED node-appsets
+  #
+  # NOTE: the per-env app-of-apps (cogni-<env>-appsets) are NO LONGER listed here.
+  # They moved under control-plane/<env>/ and are now reconciled by a per-env ROOT
+  # app-of-apps (control-plane/roots/<env>-control-plane-application.yaml, story.5020).
+  # provision applies ONLY the matching cogni-${DEPLOY_ENV}-control-plane seed — the
+  # one apply-once surface — and Argo owns the app-of-apps layer from there. They are
+  # deliberately NOT bootstrap-listed for the SAME per-env-scoping reason that kept them
+  # out of a shared source before: a single cluster rendering all three would fan every
+  # env's app-of-apps (and pods) onto it. This bootstrap kustomization now installs ONLY
+  # Argo itself (install + ksops + patches) — the self-managed control-plane boundary the
+  # roots must never cross. candidate-b is provisioned separately (provision-env.yml).
 
 patches:
   # Add ksops sidecar to repo-server for SOPS/age secret decryption

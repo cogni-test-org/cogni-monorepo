@@ -38,6 +38,7 @@ import {
   GitHubAppTokenProvider,
   GitHubSourceAdapter,
 } from "../adapters/ingestion/index.js";
+import { createSharedTokenNodePrincipalResolver } from "../adapters/node-principal.js";
 import { createReviewHttpClient } from "../adapters/review-http.js";
 import {
   createHttpExecutionGrantValidator,
@@ -51,6 +52,7 @@ import type {
   DataSourceRegistration,
   ExecutionGrantHttpValidator,
   GraphRunHttpWriter,
+  NodePrincipalResolver,
   ReviewHttpClient,
 } from "../ports/index.js";
 import type { Env } from "./env.js";
@@ -62,6 +64,8 @@ import type { Env } from "./env.js";
 export interface ServiceContainer {
   grantAdapter: ExecutionGrantHttpValidator;
   runAdapter: GraphRunHttpWriter;
+  /** Per-node dispatch principal (task.5034) — MVP resolves the shared SCHEDULER_API_TOKEN, identical to graph dispatch; per-node credential is the hardening for both paths. */
+  nodePrincipalResolver: NodePrincipalResolver;
   /** HTTP client for the operator's review GitHub plane (bug.5000). */
   reviewClient: ReviewHttpClient;
   config: {
@@ -103,6 +107,7 @@ function loadRepoSpecIdentity(): {
   chainId: number;
   configuredSources: string[];
   excludedLogins: string[];
+  sourceRefs: string[];
 } {
   // Try /app/.cogni first (Docker), then cwd (dev)
   const candidates = [
@@ -132,6 +137,13 @@ function loadRepoSpecIdentity(): {
         (s) => s.excludedLogins ?? []
       )
     : [];
+  // Collect the selection-time repo allowlist from all activity sources
+  // (fail-open: empty → no filtering).
+  const sourceRefs = ledgerConfig
+    ? Object.values(ledgerConfig.activitySources).flatMap(
+        (s) => s.sourceRefs ?? []
+      )
+    : [];
   return {
     nodeId: extractNodeId(spec),
     scopeId: extractScopeId(spec),
@@ -140,6 +152,7 @@ function loadRepoSpecIdentity(): {
       ? Object.keys(ledgerConfig.activitySources)
       : [],
     excludedLogins,
+    sourceRefs,
   };
 }
 
@@ -175,6 +188,15 @@ export function createContainer(config: Env, logger: Logger): ServiceContainer {
   return {
     grantAdapter: createHttpExecutionGrantValidator(deps),
     runAdapter: createHttpGraphRunWriter(deps),
+    // MVP (task.5034): per-node dispatch principal = the shared SCHEDULER_API_TOKEN,
+    // IDENTICAL to the credential the graph dispatch already uses in run-http.ts.
+    // NodeTask is consistent with graphs (syntropy) and dispatch can succeed today.
+    // The per-node credential is the hardening for BOTH paths (task.5033 +
+    // secrets-on-spawn); the fail-closed resolver is built but intentionally not
+    // wired until that credential store exists.
+    nodePrincipalResolver: createSharedTokenNodePrincipalResolver(
+      config.SCHEDULER_API_TOKEN
+    ),
     // Review GitHub I/O is HTTP-delegated to the operator (bug.5000); the worker
     // holds no GitHub credential. Always targets the "operator" node endpoint.
     reviewClient: createReviewHttpClient({
@@ -206,8 +228,14 @@ export function createAttributionContainer(
     return null;
   }
 
-  const { nodeId, scopeId, chainId, configuredSources, excludedLogins } =
-    loadRepoSpecIdentity();
+  const {
+    nodeId,
+    scopeId,
+    chainId,
+    configuredSources,
+    excludedLogins,
+    sourceRefs,
+  } = loadRepoSpecIdentity();
 
   logWorkerEvent(logger, WORKER_EVENT_NAMES.LIFECYCLE_STARTING, {
     phase: "ledger_container",
@@ -287,7 +315,7 @@ export function createAttributionContainer(
   return {
     attributionStore,
     sourceRegistrations: registrations,
-    registries: createDefaultRegistries({ excludedLogins }),
+    registries: createDefaultRegistries({ excludedLogins, sourceRefs }),
     nodeId,
     scopeId,
     chainId,

@@ -79,14 +79,25 @@ if [ -n "$NODE_ID" ]; then
 fi
 
 echo "==> 5. overlays x3 (ALL_THREE_ENVS_OR_NONE)"
+# Single source of overlay-generation truth: render-node-overlays.sh applies the
+# byte-exact transforms (slug + ports; the node-template template overlay already
+# carries the node-at-root migrate paths + ESO env-secrets producer) and fails
+# closed if the node-at-root migrate command is absent. Its --check drift gate
+# (bug.5008) governs these files in CI, so generating them any other way would
+# split-brain. The catalog row written above feeds node_port/port.
+#
+# Clone EVERY file the node-template overlay carries — kustomization.yaml AND
+# external-secret.yaml (the ESO producer of <slug>-env-secrets, without which the
+# pod's envFrom secret never exists → CreateContainerConfigError). This is the
+# THIRD twin of the shell renderer + the gens/overlay.ts operator mint path;
+# rendering only the kustomization here would reintroduce the fleet-wide node 502.
 for env in "${ENVS[@]}"; do
-  src="infra/k8s/overlays/$env/$TPL"
   dst="infra/k8s/overlays/$env/$SLUG"
-  [ -d "$src" ] || { echo "missing template overlay $src"; exit 1; }
-  cp -R "$src" "$dst"
-  f="$dst/kustomization.yaml"
-  perl -i -pe "s/$TPL/$SLUG/g" "$f"
-  perl -pi -e "s/\\b30200\\b/$NODEPORT/g; s/\\b3200\\b/$PORT/g" "$f"
+  mkdir -p "$dst"
+  for tf in "infra/k8s/overlays/$env/node-template/"*.yaml; do
+    bf="$(basename "$tf")"
+    bash "$ROOT/scripts/ci/render-node-overlays.sh" "$env" "$SLUG" "$bf" > "$dst/$bf"
+  done
 done
 
 echo "==> 6. per-node AppSets + bootstrap kustomization (catalog-derived, LANE_ISOLATION)"

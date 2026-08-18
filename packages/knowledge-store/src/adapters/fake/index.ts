@@ -11,6 +11,10 @@
  * @public
  */
 
+import {
+  initializeConfidence,
+  recomputeConfidence as recomputeConfidenceByPolicy,
+} from "../../domain/confidence-policy.js";
 import type {
   Citation,
   CitationType,
@@ -20,7 +24,10 @@ import type {
   NewCitation,
   NewKnowledge,
 } from "../../domain/schemas.js";
-import { HYPOTHESIS_TARGETED_EDGES } from "../../domain/schemas.js";
+import {
+  HYPOTHESIS_TARGETED_EDGES,
+  isWorkItemEndpointId,
+} from "../../domain/schemas.js";
 import type {
   ChainNode,
   EdoResolverPort,
@@ -44,36 +51,8 @@ import {
 // Confidence formula (mirrors DoltgresEdoResolverAdapter)
 // ---------------------------------------------------------------------------
 
-const SUPPORT_BUMP = 10;
-const SUPPORT_CAP = 50;
-const CONTRADICT_PENALTY = 15;
 const WALK_CHAIN_DEFAULT_DEPTH = 5;
 const WALK_CHAIN_MAX_DEPTH = 10;
-const INITIAL_BY_SOURCE: Record<string, number> = {
-  agent: 30,
-  analysis_signal: 40,
-  external: 50,
-  human: 70,
-  derived: 40,
-};
-const INITIAL_DEFAULT = 40;
-
-function isSupporting(t: CitationType): boolean {
-  return (
-    t === "supports" ||
-    t === "validates" ||
-    t === "evidence_for" ||
-    t === "extends"
-  );
-}
-
-function isContradicting(t: CitationType): boolean {
-  return t === "contradicts" || t === "invalidates";
-}
-
-function clamp(n: number): number {
-  return Math.max(0, Math.min(100, n));
-}
 
 function expectedEntryTypeForEdge(t: CitationType): string | null {
   return HYPOTHESIS_TARGETED_EDGES.includes(t) ? "hypothesis" : null;
@@ -194,7 +173,7 @@ export class FakeKnowledgeStoreAdapter implements KnowledgeStorePort {
       title: entry.title,
       content: entry.content,
       entryType: entry.entryType ?? "finding",
-      confidencePct: entry.confidencePct ?? null,
+      confidencePct: initializeConfidence(entry).confidencePct,
       sourceType: entry.sourceType,
       sourceRef: entry.sourceRef ?? null,
       tags: entry.tags ?? null,
@@ -267,16 +246,38 @@ export class FakeKnowledgeStoreAdapter implements KnowledgeStorePort {
   // --- Write — edges ---
 
   async addCitation(edge: NewCitation): Promise<Citation> {
+    const citingIsWork = isWorkItemEndpointId(edge.citingId);
+    const citedIsWork = isWorkItemEndpointId(edge.citedId);
+    const workEndpointCount = (citingIsWork ? 1 : 0) + (citedIsWork ? 1 : 0);
+    if (workEndpointCount > 0 && workEndpointCount !== 1) {
+      throw new Error(
+        `citation edge must connect exactly one work item and one knowledge entry: ${edge.citingId} -> ${edge.citedId}`
+      );
+    }
+    if (workEndpointCount > 0 && edge.citationType !== "tracks") {
+      throw new Error(
+        `work-item citation edge must use citation_type='tracks', got '${edge.citationType}'`
+      );
+    }
+    if (workEndpointCount === 0 && edge.citationType === "tracks") {
+      throw new Error(
+        "citation_type='tracks' requires exactly one work-item endpoint"
+      );
+    }
+
     const citedRow = this.rows.get(edge.citedId);
-    if (!citedRow) {
+    if (!citedRow && !citedIsWork) {
       throw new CitationTargetNotFoundError(edge.citedId);
     }
+    if (citedIsWork && !citingIsWork && !this.rows.has(edge.citingId)) {
+      throw new CitationTargetNotFoundError(edge.citingId);
+    }
     const expected = expectedEntryTypeForEdge(edge.citationType);
-    if (expected !== null && citedRow.entryType !== expected) {
+    if (expected !== null && citedRow?.entryType !== expected) {
       throw new CitationTypeMismatchError(
         edge.citationType,
         edge.citedId,
-        citedRow.entryType ?? "(none)",
+        citedRow?.entryType ?? "(none)",
         expected
       );
     }
@@ -413,6 +414,9 @@ export class FakeEdoResolverAdapter implements EdoResolverPort {
       entryType: "outcome",
       sourceType: input.sourceType,
       sourceRef: input.sourceRef ?? null,
+      confidencePct: initializeConfidence({
+        sourceType: input.sourceType,
+      }).confidencePct,
     });
 
     const citation = await this.store.addCitation({
@@ -443,19 +447,10 @@ export class FakeEdoResolverAdapter implements EdoResolverPort {
     if (!entry) {
       throw new Error(`recomputeConfidence: entry '${entryId}' not found`);
     }
-    const incoming = await this.store.listCitationsByCitedId(entryId);
-    const initial = INITIAL_BY_SOURCE[entry.sourceType] ?? INITIAL_DEFAULT;
-    let supportCount = 0;
-    let contradictCount = 0;
-    for (const c of incoming) {
-      if (isSupporting(c.citationType)) supportCount++;
-      else if (isContradicting(c.citationType)) contradictCount++;
-    }
-    const next = clamp(
-      initial +
-        Math.min(SUPPORT_CAP, SUPPORT_BUMP * supportCount) -
-        CONTRADICT_PENALTY * contradictCount
+    const incoming = (await this.store.listCitationsByCitedId(entryId)).filter(
+      (c) => c.citationType !== "tracks"
     );
+    const next = recomputeConfidenceByPolicy(entry, incoming).confidencePct;
     await this.store.updateKnowledge(entryId, { confidencePct: next });
     return next;
   }

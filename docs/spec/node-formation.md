@@ -20,13 +20,13 @@ tags: [web3, setup, dao]
 
 A Cogni DAO node has three lifecycle phases with distinct trust domains:
 
-1. **Formation** — governance identity (DAO + Signal). Runs in the shared operator repo's web UI. No secrets, no operator wallet, no payment rails.
-2. **Publish** — the operator authors the node's monorepo footprint (`nodes/<slug>/**` + catalog row + per-env overlays + per-node AppSets) as a single GitHub App–authored PR, directly via the GitHub Git Data API. No GitHub Action, no human PAT. See [Node Publish](#node-publish-operator-authored-pr).
+1. **Formation** — governance identity (DAO + Signal). Starts from a DB-backed node registration row, then runs wallet-signed transactions in the shared operator repo's web UI. No secrets, no operator wallet, no payment rails.
+2. **Publish** — the operator mints the node repo and authors the submodule pin + catalog row + per-env overlays + per-node AppSets as a single GitHub App–authored PR, directly via the GitHub Git Data API. No GitHub Action, no human PAT. See [Node Publish](#node-publish-operator-authored-pr).
 3. **Payment Activation** — operator wallet + revenue split. Runs in the child node's own trust domain via CLI. The child node owns its Privy credentials and operator wallet.
 
-Formation outputs a repo-spec fragment with `payments.status: pending_activation`. Publish lands that fragment into the monorepo as a reviewable PR; once merged + flighted, the node deploys per-node (see [ci-cd.md](ci-cd.md) Axiom 18). The child node then activates payments.
+Formation persists verified on-chain addresses to the node registry row. Publish writes those addresses into the minted node repo's `.cogni/repo-spec.yaml` with `payments.status: pending_activation`, then lands the submodule deployment pin as a reviewable PR; once merged + flighted, the node deploys per-node (see [ci-cd.md](ci-cd.md) Axiom 18). The child node then activates payments.
 
-> Formation is Node-owned tooling. No Operator dependencies. Wallet signs in browser; server verifies before persisting.
+> Contract deployment is wallet-owned tooling. The operator registry must exist before transaction signing; server verification persists the formed addresses before Publish.
 > Payment activation belongs to the child node's trust domain. The shared operator repo never creates or controls child wallets.
 
 ### The Blessed Path (wizard → monorepo → flight → ongoing CI/CD)
@@ -34,59 +34,63 @@ Formation outputs a repo-spec fragment with `payments.status: pending_activation
 The phases above are the blessed path for a node born **into the Cogni monorepo**, riding shared CI/CD:
 
 ```
-Formation (wizard) → Publish (operator PR) → Flight (candidate-a) → Ongoing (per-node deploy branch + Argo)
+Register (DB row) → Formation (wallet txs) → Publish (repo + operator PR) → Flight (candidate-a) → Ongoing (per-node deploy branch + Argo)
 ```
 
 This is distinct from a **standalone fork** — a solo operator who wants their own full instance on their own VM forks `Cogni-DAO/standalone-node` and follows [`fork-quickstart.md`](../runbooks/fork-quickstart.md). Two repos, two intents:
 
-| Repo                        | Role                                                                                                                                                                     |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `Cogni-DAO/standalone-node` | Fork-whole quickstart — your own instance, your own substrate (`fork-quickstart.md`).                                                                                    |
-| `Cogni-DAO/node-template`   | Template repo — Publish `generate`s a node's own repo from it, then submodule-pins it at `nodes/<slug>`. Maintained node-at-root from the `nodes/node-template/` subdir. |
+| Repo                        | Role                                                                                                                                                                                                   |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Cogni-DAO/standalone-node` | Fork-whole quickstart — your own instance, your own substrate (`fork-quickstart.md`).                                                                                                                  |
+| `Cogni-DAO/node-template`   | Canonical node-at-root template repo — Publish creates a named fork, commits node identity on top, then submodule-pins it at `nodes/<slug>`. The operator repo does not carry a duplicate source tree. |
 
-`CATALOG_IS_SSOT` ([ci-cd.md](ci-cd.md) Axiom 16) is what makes Publish a single reviewable PR rather than a manual checklist: the catalog entry is the only declaration site, and overlays, per-node AppSets (Axiom 18), Caddy routing, scheduler endpoints, DNS (Axiom 21), and the build matrix all derive from it. The deploy-row contract lives in [create-node.md](../guides/create-node.md); secrets are stripped from the Publish PR and inherited via ESO (`NO_SECRETS_IN_PR`, `bug.5086`).
+`CATALOG_IS_SSOT` ([ci-cd.md](ci-cd.md) Axiom 16) is what makes Publish a single reviewable PR rather than a manual checklist: the catalog entry is the only declaration site, and overlays, per-node AppSets (Axiom 18), Caddy routing, scheduler endpoints, DNS (Axiom 21), and the build matrix all derive from it. The deploy-row contract lives in [create-node.md](../guides/create-node.md); secret values are excluded from the Publish PR and inherited via ESO.
 
 ## Goal
 
-Enable any founder to create a fully-verified Cogni DAO node via a 3-field web form and 2 wallet transactions, then activate payment rails via a single CLI command in their own fork.
+Enable any founder to register a node, form a fully-verified Cogni DAO via wallet transactions, publish the node repo/deployment pin, then activate payment rails in the child node's own trust domain.
 
 ## Non-Goals
 
-| Item                                | Reason                                                          |
-| ----------------------------------- | --------------------------------------------------------------- |
-| Multiple initial holders            | P1 scope (reduces P0 to 2 wallet txs)                           |
-| Custom NonTransferableVotes token   | Aragon GovernanceERC20 sufficient for P0                        |
-| Anti-vote-buying (non-transferable) | Not a P0 invariant; revisit if needed                           |
-| Terraform provisioning              | CLI scope (P1)                                                  |
-| GitHub secrets automation           | CLI scope (P1)                                                  |
-| Repo clone/patch/write              | Now the **Publish** phase — operator App authors it (task.5092) |
-| CLI wallet signing                  | Web is simpler; add if proven needed                            |
-| Contract verification (Etherscan)   | Nice-to-have, not blocking                                      |
-| Payment activation in formation     | Wrong trust domain — child node owns its Privy wallet           |
-| Split deployment in formation       | Requires operator wallet that doesn't exist at formation time   |
+| Item                                | Reason                                                               |
+| ----------------------------------- | -------------------------------------------------------------------- |
+| Multiple genesis mint receivers     | P1 scope (requires multi-wallet collection + receiver/amount arrays) |
+| Custom NonTransferableVotes token   | Aragon GovernanceERC20 sufficient for P0                             |
+| Anti-vote-buying (non-transferable) | Not a P0 invariant; revisit if needed                                |
+| Terraform provisioning              | CLI scope (P1)                                                       |
+| GitHub secrets automation           | CLI scope (P1)                                                       |
+| Repo clone/patch/write              | Now the **Publish** phase — operator App authors it (task.5092)      |
+| CLI wallet signing                  | Web is simpler; add if proven needed                                 |
+| Contract verification (Etherscan)   | Nice-to-have, not blocking                                           |
+| Payment activation in formation     | Wrong trust domain — child node owns its Privy wallet                |
+| Split deployment in formation       | Requires operator wallet that doesn't exist at formation time        |
 
 ## Core Invariants
 
 1. **MINIMAL_USER_INPUT**: Form collects only:
    - `tokenName` (string) - e.g., "Cogni Governance"
    - `tokenSymbol` (string) - e.g., "COGNI"
-   - `initialHolder` (address) - single founder, receives 1e18 tokens
+   - `tokenomicsTemplate` - typed ownership template (P0 enables one concrete receiver; P1 adds 3/N receiver arrays)
+   - `policySupply` (whole-token integer) - long-run ownership policy supply
+   - `initialHolder` (address) - concrete genesis mint recipient for enabled single-receiver templates
 
    User wallet signs 2 transactions: `createDao` + `deployCogniSignal`.
 
 2. **ARAGON_MINTED_TOKEN**: Use Aragon's GovernanceERC20 minted during DAO creation. No custom NonTransferableVotes deployment. Tokens are transferable.
 
-   Forward note: the Financial Ledger reward-distribution path reuses this same `GovernanceERC20` as the rewards token. The current founder bootstrap mint is acceptable for formation testing, but it is NOT the final rewards-ready setup. Before live contributor distributions, formation must mint a fixed supply to a DAO-controlled emissions holder and the server verification path must validate that holder and total supply.
+   The wizard distinguishes long-run policy supply from genesis mint. P0 mints only the enabled template's concrete genesis amount to an explicit holder (a governance-bootstrap marker, e.g. one token). The remaining policy supply is future supply that is not minted yet; concrete contributor, reserve, or ecosystem allocation rules are not implied by the formation UI and are not represented as current on-chain inventory. The DAO holds `MINT_PERMISSION` on the GovernanceERC20 (granted by Aragon's `TokenVotingSetup`), so live contributor distributions are minted **per-epoch by the DAO into a Merkle distributor under a signed root** — no pre-minted vault, no human-moved float.
+
+   Distribution readiness is non-linear with formation. A newly formed node and an already-deployed DAO both publish the same repo-spec lifecycle: `governance.token_contract` identifies the Aragon `GovernanceERC20` when known, while `distributions.status: pending_activation` remains separate from `payments.status`. Distribution activation is a later repo-spec update, surfaced as a **visible owner-driven node checkpoint** (not a hidden API): it is **metadata-only** — it verifies the token + DAO contracts **exist on-chain (bytecode present)**, opens a one-file PR against the node's own repo, records `governance.emissions_holder = the DAO contract` (the minter), pins `distributions.claim_contract_pattern: 1inch.cumulative-merkle-drop.v1` (the vendored distributor the deploy path uses), and flips `distributions.status: active`. It **never checks token balance and never moves tokens** (nothing is pre-minted). Existing DAO nodes do not replay formation; they run this activation against their existing repo-spec.
 
 3. **NO_PRIVATE_KEY_ENV_VARS**: Formation transactions are signed via wallet UI (wagmi/rainbowkit), never by script-loaded secrets. Payment activation (child node CLI) uses `DEPLOYER_PRIVATE_KEY` for Split deployment — this is acceptable because it runs in the child node's own environment, not the shared operator repo.
 
-4. **SERVER_VERIFICATION_BOUNDARY**: Browser is untrusted. Server derives ALL addresses from tx receipts. Request contains only `{ chainId, daoTxHash, signalTxHash, initialHolder }`.
+4. **SERVER_VERIFICATION_BOUNDARY**: Browser is untrusted. Server derives ALL addresses from tx receipts. Request contains only transaction coordinates, the expected holder, the expected genesis mint, and an optional node id for log correlation: `{ chainId, daoTxHash, signalTxHash, signalBlockNumber, nodeId?, initialHolder, expectedTokenSupplyUnits }`.
 
 5. **PACKAGE_ISOLATION**: `aragon-osx` cannot import `src/`, `services/`, or browser/node-specific APIs.
 
 6. **FORK_FREEDOM**: Formation tooling works standalone without Cogni Operator accounts.
 
-7. **FORMATION_IS_GOVERNANCE_ONLY**: Formation outputs `cogni_dao` and `payments.status: pending_activation`. It does NOT provision operator wallets, deploy Split contracts, or configure payment rails. Those belong to payment activation in the child node's trust domain.
+7. **FORMATION_IS_GOVERNANCE_ONLY**: Formation outputs `governance` and `payments.status: pending_activation`. It does NOT provision operator wallets, deploy Split contracts, or configure payment rails. Those belong to payment activation in the child node's trust domain.
 
 8. **CHILD_OWNS_OPERATOR_WALLET**: The child node's Privy app credentials create and control the operator wallet. The shared operator repo never creates, stores, or administers child node wallets.
 
@@ -96,25 +100,27 @@ Enable any founder to create a fully-verified Cogni DAO node via a 3-field web f
 
 ## Schema
 
-**User Input (P0 form - 3 fields):**
+**User Input (P0 form):**
 
 - `tokenName` (string, required) - e.g., "Cogni Governance"
 - `tokenSymbol` (string, required) - e.g., "COGNI"
-- `initialHolder` (address, required) - Single founder, receives 1e18 tokens
+- `tokenomicsTemplate` (string, required) - e.g., `solo_one_token` or `solo_20_percent`
+- `policySupply` (integer, required) - Whole-token policy supply for the DAO's ownership model
+- `initialHolder` (address, required) - Single concrete holder receiving the computed genesis mint
 
 **Derived (not user input):**
 
 - `chainId` - From connected wallet (must be in `SUPPORTED_CHAIN_IDS`)
+- `genesisMint` - Whole-token amount computed from the selected template
 
 **Verify Request (to server):**
 
-- `chainId`, `daoTxHash`, `signalTxHash`, `initialHolder`
+- `chainId`, `daoTxHash`, `signalTxHash`, `signalBlockNumber`, `nodeId?`, `initialHolder`, `expectedTokenSupplyUnits`
 - No addresses - server derives all from receipts
 
 **Verify Response (from server):**
 
 - `addresses.dao`, `addresses.token`, `addresses.plugin`, `addresses.signal`
-- `repoSpecYaml` - Ready to write, `chain_id` as string per existing schema
 
 **Forbidden:**
 
@@ -183,8 +189,10 @@ Server derives addresses from receipts (never trusts client):
 1. Decode `daoTxHash` → extract DAO + plugin addresses from events (DAORegistered, InstallationApplied)
 2. Call `TokenVoting(plugin).getVotingToken()` → token address
 3. Decode `signalTxHash` → extract CogniSignal address from contractAddress
-4. Verify `balanceOf(initialHolder) == 1e18` and `CogniSignal.DAO() == dao`
-5. Return verified addresses + repo-spec YAML
+4. Verify `balanceOf(initialHolder) == expectedTokenSupplyUnits`, `totalSupply() == expectedTokenSupplyUnits`, and `CogniSignal.DAO() == dao`
+5. Return verified addresses
+
+`expectedTokenSupplyUnits` is the computed genesis mint amount, not necessarily the long-run policy supply. Any future supply displayed by policy is not an on-chain reserve until a later distributor/emissions-holder flow exists.
 
 ### viem Encoding (TokenVoting Setup with Mint)
 
@@ -224,7 +232,7 @@ Hardcoded per chainId. Server enforces `chainId in SUPPORTED_CHAIN_IDS` before a
 │ ────────────────────────────────                                    │
 │ - DAOFactory.createDao(daoSettings, pluginSettings)                 │
 │ - TokenVoting plugin + GovernanceERC20 deployed by Aragon           │
-│ - MintSettings mints 1e18 to initialHolder                          │
+│ - MintSettings mints computed genesisMintUnits to initialHolder      │
 │ - Capture daoTxHash                                                 │
 └─────────────────────────────────────────────────────────────────────┘
                               │
@@ -241,10 +249,10 @@ Hardcoded per chainId. Server enforces `chainId in SUPPORTED_CHAIN_IDS` before a
 ┌─────────────────────────────────────────────────────────────────────┐
 │ SERVER VERIFICATION (server-side)                                   │
 │ ─────────────────────────────────                                   │
-│ - POST { chainId, daoTxHash, signalTxHash, initialHolder }          │
+│ - POST { chainId, tx hashes, signal block, holder, genesis mint }    │
 │ - Server derives ALL addresses from receipts (never trusts client)  │
-│ - Server verifies balanceOf + CogniSignal.DAO()                     │
-│ - Returns addresses + repo-spec YAML                                │
+│ - Server verifies balanceOf + totalSupply + CogniSignal.DAO()       │
+│ - Returns verified addresses                                        │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -281,8 +289,8 @@ Hardcoded per chainId. Server enforces `chainId in SUPPORTED_CHAIN_IDS` before a
 
 1. Validate `chainId` against SUPPORTED_CHAIN_IDS (BASE + SEPOLIA only)
 2. Derive all addresses from receipts using strict decoders
-3. Verify on-chain state: `balanceOf(initialHolder) == 1e18`, `CogniSignal.DAO() == dao`
-4. Return repo-spec YAML
+3. Verify on-chain state: `balanceOf(initialHolder) == expectedTokenSupplyUnits`, `totalSupply() == expectedTokenSupplyUnits`, `CogniSignal.DAO() == dao`
+4. Return verified addresses
 
 **Security:** No fallback heuristics. Missing events throw errors.
 
@@ -302,14 +310,19 @@ Hardcoded per chainId. Server enforces `chainId in SUPPORTED_CHAIN_IDS` before a
 
 #### 6. Repo-Spec Output
 
-**YAML Builder:** → `src/app/api/setup/verify/route.ts` (`buildRepoSpecYaml`)
+`POST /api/setup/verify` does not emit repo-spec YAML. It returns only verified
+addresses derived from receipts. The per-node wizard persists those addresses to
+the operator node registry row with `PATCH /api/v1/nodes/<id>`.
 
-Populates at formation time:
+Publish later builds the child repo's `.cogni/repo-spec.yaml` from the verified
+registry row:
 
-- `node_id` — random UUID
-- `scope_id` — deterministic from node_id
-- `cogni_dao.dao_contract`, `plugin_contract`, `signal_contract`, `chain_id`
+- `node_id` - existing DB-backed node identity
+- `scope_id` - deterministic from `node_id`
+- `governance.dao_contract`, `plugin_contract`, `signal_contract`, `chain_id`
 - `payments.status: pending_activation`
+- `distributions.status: pending_activation`
+- `governance.token_contract` when the setup verifier resolved the Aragon voting token
 
 Populated later by `pnpm node:activate-payments` (child node CLI):
 
@@ -322,7 +335,9 @@ Populated later by `pnpm node:activate-payments` (child node CLI):
 - Server derives DAO/plugin/signal addresses from receipts, not client input
 - `chain_id` is string (e.g., `"8453"` not `8453`)
 - Canonical path: `.cogni/repo-spec.yaml`
-- `payments.status` is explicit — never inferred from field presence
+- `payments.status` is explicit - never inferred from field presence
+- `distributions.status` is explicit - never inferred from token address presence
+- `distributions.status: active` requires verified `governance.token_contract` and `governance.emissions_holder`
 
 > Current schema: [.cogni/repo-spec.yaml](../../.cogni/repo-spec.yaml)
 
@@ -334,8 +349,8 @@ After Formation returns a verified repo-spec fragment, the **operator** mints th
 
 **Mechanism** (`adapters/server/vcs/github-repo-write.ts` + `shared/node-app-scaffold/`):
 
-1. **Mint** — `POST /repos/Cogni-DAO/node-template/generate` creates `Cogni-DAO/<slug>` from the `node-template` template repo (server-side copy; the template seed already strips `.cogni/secrets-catalog.yaml` + `k8s/external-secrets/**` per `bug.5086` — see `NO_SECRETS_IN_PR`).
-2. **Identity** — commit the regenerated `.cogni/repo-spec.yaml` (formed `node_id` / `scope_id` + DAO addresses) to the new repo's `main`; generate copies node-template's identity verbatim, so this overrides it. The new HEAD SHA is the gitlink pin.
+1. **Mint** — `POST /repos/Cogni-DAO/node-template/forks` creates `Cogni-DAO/<slug>` as a named fork of `node-template` (`default_branch_only: true`). This preserves a shared merge base so node developers can fetch and merge upstream template updates.
+2. **Identity + ESO leaves** — commit the regenerated `.cogni/repo-spec.yaml` (formed `node_id` / `scope_id` + DAO addresses) and the `candidate-a`, `preview`, and `production` ExternalSecret leaves to the fork's `main`. The new HEAD SHA is the gitlink pin.
 3. **Pin** — the operator authors a PR on the monorepo: a `160000` gitlink at `nodes/<slug>` + a `.gitmodules` stanza, plus the footprint gens (catalog, overlays×3, per-node AppSets×3, Caddyfile route, `ci.yaml` scope filter, scheduler-worker endpoints) — **no `pnpm-lock.yaml`** (a submodule node is not a workspace member). One tree, one commit, one ref, one PR.
 4. **Author** — the PR opens under the operator App installation (author = the App, auditable — not `github-actions[bot]`, not a human PAT).
 
@@ -343,8 +358,10 @@ After Formation returns a verified repo-spec fragment, the **operator** mints th
 
 - `NO_ACTION_INDIRECTION` — the operator authors the PR itself; it never dispatches a workflow to act on its own behalf.
 - `SUBMODULE_NOT_INLINE` — node content lives in its own repo + a gitlink, never inlined into the operator tree.
-- `NO_SECRETS_IN_PR` — secrets-catalog + external-secrets are absent from the template seed; values live in OpenBao, inherited via ESO ([secrets-management.md](secrets-management.md)).
+- `NO_SECRET_VALUES_IN_PR` — secret values and per-node `secrets-catalog.yaml` are absent from the template seed. The PR may carry ESO shape (`k8s/external-secrets/**`) so OpenBao values can materialize as `<slug>-env-secrets` ([secrets-management.md](secrets-management.md), [node-wizard-secret-setting.md](../design/node-wizard-secret-setting.md)).
 - `GENS_ARE_BYTE_EXACT` — every footprint gen shares one template with its `scripts/ci/render-*.sh` source of truth, enforced by the per-gen CI drift gate.
+- `PUBLISH_PARENT_IS_DEPLOY_PARENT` — `infra/deployment-parents.json` selects the parent per env; runtime config, the parent PR, flight workflow, Argo roots/AppSets, and deploy branches must all name that same repo. The parent is compatibility-checked before the child fork is touched.
+- `MAIN_IS_PUBLISH_TRUTH` — `publishPrUrl` is a convenience pointer, not completion authority. A published DB row whose catalog entry never reached parent `main` is repairable: Publish regenerates the fixed birth branch from current templates and opens/reuses a current PR. Only a catalog row on parent `main` returns `alreadyPublished`.
 
 > Verification: flight the operator + Publish one throwaway node → it mints `Cogni-DAO/<slug>` and opens the submodule PR; the gitlink PR passes `single-node-scope`, and the node flights (`<node>-test/version == build_sha`). Requires the env's operator App to hold org `administration: write` + an "all repositories" install (it must create AND commit to the new repo — see node-ci-cd-contract.md).
 
@@ -359,7 +376,7 @@ Payment activation runs in the child node's own repo after formation + infra set
 - Privy credentials in env (`PRIVY_APP_ID`, `PRIVY_APP_SECRET`, `PRIVY_SIGNING_KEY`)
 - Funded deployer EOA on Base (`DEPLOYER_PRIVATE_KEY`) for Split deployment gas
 - `EVM_RPC_URL` for on-chain calls
-- `cogni_dao.dao_contract` in repo-spec (from formation)
+- `governance.dao_contract` in repo-spec (from formation)
 
 **Steps (each idempotent):**
 
@@ -386,29 +403,32 @@ Payment activation runs in the child node's own repo after formation + infra set
 
 ### File Pointers
 
-| File                                                    | Purpose                                                |
-| ------------------------------------------------------- | ------------------------------------------------------ |
-| `packages/aragon-osx/src/aragon.ts`                     | OSx address constants (BASE + SEPOLIA only)            |
-| `packages/aragon-osx/src/encoding.ts`                   | TokenVoting struct encoding (viem, v1.3/v1.4 support)  |
-| `packages/aragon-osx/src/osx/events.ts`                 | OSx event ABIs + topic constants                       |
-| `packages/aragon-osx/src/osx/receipt.ts`                | Strict receipt decoders (throws if events not found)   |
-| `packages/aragon-osx/src/osx/version.ts`                | Pinned OSx version constants                           |
-| `src/shared/web3/node-formation/aragon-abi.ts`          | Minimal ABIs: DAOFactory, TokenVoting, GovernanceERC20 |
-| `src/shared/web3/node-formation/bytecode.ts`            | CogniSignal bytecode + ABI                             |
-| `src/features/setup/daoFormation/formation.reducer.ts`  | Pure reducer + types (state machine)                   |
-| `src/features/setup/daoFormation/txBuilders.ts`         | Pure tx argument builders                              |
-| `src/features/setup/daoFormation/api.ts`                | Server verification API client                         |
-| `src/features/setup/hooks/useAragonPreflight.ts`        | Preflight validation hook                              |
-| `src/features/setup/hooks/useDAOFormation.ts`           | Thin wiring layer (wagmi → reducer)                    |
-| `src/app/api/setup/verify/route.ts`                     | Server derives addresses from receipts, verifies state |
-| `src/contracts/setup.verify.v1.contract.ts`             | Zod schemas for verify request/response                |
-| `src/app/(app)/setup/dao/page.tsx`                      | Wizard entry point                                     |
-| `src/app/(app)/setup/dao/DAOFormationPage.client.tsx`   | Client component with form + flow orchestration        |
-| `src/features/setup/components/FormationFlowDialog.tsx` | Modal dialog for progress/success/error states         |
-| `scripts/node-activate-payments.ts`                     | Payment activation CLI (child node)                    |
-| `scripts/provision-operator-wallet.ts`                  | Standalone Privy wallet provisioning                   |
-| `scripts/deploy-split.ts`                               | Standalone Split deployment                            |
-| `docs/guides/operator-wallet-setup.md`                  | Operator wallet + payment activation guide             |
+| File                                                        | Purpose                                                |
+| ----------------------------------------------------------- | ------------------------------------------------------ |
+| `packages/aragon-osx/src/aragon.ts`                         | OSx address constants (BASE + SEPOLIA only)            |
+| `packages/aragon-osx/src/encoding.ts`                       | TokenVoting struct encoding (viem, v1.3/v1.4 support)  |
+| `packages/aragon-osx/src/osx/events.ts`                     | OSx event ABIs + topic constants                       |
+| `packages/aragon-osx/src/osx/receipt.ts`                    | Strict receipt decoders (throws if events not found)   |
+| `packages/aragon-osx/src/osx/version.ts`                    | Pinned OSx version constants                           |
+| `src/shared/web3/node-formation/aragon-abi.ts`              | Minimal ABIs: DAOFactory, TokenVoting, GovernanceERC20 |
+| `src/shared/web3/node-formation/bytecode.ts`                | CogniSignal bytecode + ABI                             |
+| `src/features/setup/daoFormation/formation.reducer.ts`      | Pure reducer + types (state machine)                   |
+| `src/features/setup/daoFormation/txBuilders.ts`             | Pure tx argument builders                              |
+| `src/features/setup/daoFormation/api.ts`                    | Server verification API client                         |
+| `src/features/setup/hooks/useAragonPreflight.ts`            | Preflight validation hook                              |
+| `src/features/setup/hooks/useDAOFormation.ts`               | Thin wiring layer (wagmi → reducer)                    |
+| `src/app/api/setup/verify/route.ts`                         | Server derives addresses from receipts, verifies state |
+| `src/contracts/setup.verify.v1.contract.ts`                 | Zod schemas for verify request/response                |
+| `src/app/(app)/nodes/page.tsx`                              | DB-backed wizard entry point                           |
+| `src/app/(app)/nodes/[id]/page.tsx`                         | Canonical per-node setup page                          |
+| `src/app/(app)/nodes/[id]/NodeDaoFormationPanel.client.tsx` | Client component with form + flow orchestration        |
+| `src/app/(app)/nodes/payments/page.tsx`                     | Payment activation page                                |
+| `src/app/(app)/setup/dao/page.tsx`                          | Legacy redirect to `/nodes`                            |
+| `src/features/setup/components/FormationFlowDialog.tsx`     | Modal dialog for progress/success/error states         |
+| `scripts/node-activate-payments.ts`                         | Payment activation CLI (child node)                    |
+| `scripts/provision-operator-wallet.ts`                      | Standalone Privy wallet provisioning                   |
+| `scripts/deploy-split.ts`                                   | Standalone Split deployment                            |
+| `docs/guides/operator-wallet-setup.md`                      | Operator wallet + payment activation guide             |
 
 ### Appendix: Aragon OSx Addresses
 
@@ -426,9 +446,9 @@ OSx v1.4.0 deployments. Hardcoded addresses from [cogni-signal-evm-contracts](ht
 
 1. Successfully deployed DAOs on Base mainnet, verified via Aragon app
 2. Server derives all addresses from receipts without client-provided addresses
-3. `balanceOf(initialHolder) == 1e18` verified on-chain
+3. `balanceOf(initialHolder)` and `totalSupply()` both equal `expectedTokenSupplyUnits` on-chain
 4. Observability event `SETUP_DAO_VERIFY_COMPLETE` emitted with outcome, chainId, duration
-5. Repo-spec output includes `payments.status: pending_activation`
+5. Publish output includes `payments.status: pending_activation`
 
 **Payment Activation (manual):**
 

@@ -75,6 +75,12 @@ export {
   type LangfuseAdapterConfig,
   type LangfuseSpanHandle,
 } from "./ai-telemetry/langfuse.adapter";
+export {
+  CherryComputeAdapter,
+  type CherryComputeAdapterConfig,
+  CherryComputeError,
+  type CherryComputeErrorCode,
+} from "./compute/cherry-compute.adapter";
 // Connection broker adapter
 export {
   ConnectionDecryptionError,
@@ -84,6 +90,11 @@ export {
   type TokenRefreshFn,
 } from "./connections/drizzle-broker.adapter";
 export { type Database, getAppDb } from "./db/client";
+export { DrizzleCatalogNodeRegistryAdapter } from "./db/drizzle-catalog-node-registry.adapter";
+export {
+  ProbeDeployAdapter,
+  type ProbeDeployConfig,
+} from "./deploy/probe-deploy.adapter";
 export { DrizzleGovernanceStatusAdapter } from "./governance/drizzle-governance-status.adapter";
 export {
   ALCHEMY_ADAPTER_VERSION,
@@ -99,11 +110,26 @@ export {
   TemplateQueryError,
   type TemplateQueryErrorCode,
 } from "./metrics/mimir.adapter";
+export { HttpNodeProber } from "./node-flight/node-prober.adapter";
+export {
+  LiveNodeRegistryAdapter,
+  type LiveNodeRegistryDeps,
+} from "./node-registry/live-node-registry.adapter";
+export {
+  type LivenessRollup,
+  type NodeLiveness,
+  type ProdLivenessConfig,
+  type ProdLivenessDeps,
+  resolveNodeLiveness,
+} from "./node-registry/prod-liveness";
+export { HttpLangfuseReader } from "./observability/langfuse-reader.adapter";
+export { HttpLokiReader } from "./observability/loki-reader.adapter";
 export { ViemEvmOnchainClient } from "./onchain/viem-evm-onchain-client.adapter";
 export { ViemTreasuryAdapter } from "./onchain/viem-treasury.adapter";
 export { UserDrizzlePaymentAttemptRepository } from "./payments/drizzle-payment-attempt.adapter";
 export { EvmRpcOnChainVerifierAdapter } from "./payments/evm-rpc-onchain-verifier.adapter";
 export { PonderOnChainVerifierAdapter } from "./payments/ponder-onchain-verifier.adapter";
+export { SplitPaymentRailGuardAdapter } from "./payments/split-payment-rail-guard.adapter";
 export {
   GitLsFilesAdapter,
   type GitLsFilesAdapterConfig,
@@ -116,6 +142,11 @@ export {
   createGithubReviewAdapter,
   type GithubReviewAdapter,
 } from "./review/github-review.adapter";
+// Node self-serve secrets — OpenBao writer adapter (design.node-self-serve-secrets).
+export {
+  OpenBaoSecretsAdapter,
+  type OpenBaoSecretsAdapterDeps,
+} from "./secrets/openbao-secrets.adapter";
 // NOTE: Sandbox adapters (SandboxRunnerAdapter, SandboxGraphProvider) are NOT
 // re-exported here. They pull in dockerode → ssh2 → cpu-features (native addon)
 // which breaks Turbopack bundling. Import directly from subpath when needed:
@@ -127,14 +158,14 @@ export {
   type TemporalScheduleControlConfig,
 } from "./temporal";
 export { SystemClock } from "./time/system.adapter";
-// Single-file commit + open-PR helper (task.5083) — operator-only.
+// Operator-only GitHub-App repo writer — node formation + candidate-flight prep.
 export {
-  type CommitFileAndOpenPrInput,
-  type CommitFileAndOpenPrResult,
+  type ForkFromTemplateInput,
   GitHubRepoWriter,
   type GitHubRepoWriterConfig,
   type OpenNodeAppPrInput,
   type OpenNodeAppPrResult,
+  type PackageImageTagExistsInput,
 } from "./vcs/github-repo-write";
 // VCS capability (GitHub App adapter)
 export {

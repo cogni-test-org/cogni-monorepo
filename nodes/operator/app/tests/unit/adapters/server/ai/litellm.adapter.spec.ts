@@ -26,19 +26,20 @@ vi.mock("@/shared/env", () => ({
 }));
 
 // Capture logger.warn calls for private error diagnostic assertions (bug.0059)
-const { mockLoggerWarn } = vi.hoisted(() => ({
+const { mockLoggerWarn, mockLoggerError } = vi.hoisted(() => ({
   mockLoggerWarn: vi.fn(),
+  mockLoggerError: vi.fn(),
 }));
 vi.mock("@/shared/observability", () => ({
   makeLogger: () => ({
     warn: mockLoggerWarn,
     info: vi.fn(),
-    error: vi.fn(),
+    error: mockLoggerError,
     debug: vi.fn(),
     child: vi.fn().mockReturnValue({
       warn: mockLoggerWarn,
       info: vi.fn(),
-      error: vi.fn(),
+      error: mockLoggerError,
       debug: vi.fn(),
     }),
   }),
@@ -63,40 +64,61 @@ describe("LiteLlmAdapter", () => {
     global.fetch = mockFetch;
   });
 
-  describe("completion method", () => {
+  /**
+   * Build a mock fetch Response that streams SSE chunks via body.getReader().
+   * Models LiteLLM's streaming response shape (used by completionStream()).
+   * Each entry in `chunks` is sent as one reader.read() value; caller supplies
+   * the raw SSE frames (e.g. `data: {...}\n\n`, `data: [DONE]\n\n`).
+   */
+  function makeSseResponse(chunks: string[], headers: Headers = new Headers()) {
+    const reads = chunks.map((c) => ({
+      done: false as const,
+      value: new TextEncoder().encode(c),
+    }));
+    let read = vi.fn();
+    for (const r of reads) {
+      read = read.mockResolvedValueOnce(r);
+    }
+    read = read.mockResolvedValueOnce({ done: true, value: undefined });
+
+    return {
+      ok: true,
+      headers,
+      body: {
+        getReader: () => ({ read, releaseLock: vi.fn() }),
+      },
+    };
+  }
+
+  /** Drain a stream to completion (triggers SSE parsing + final settlement). */
+  async function drain(
+    stream: AsyncIterable<import("@/ports").ChatDeltaEvent>
+  ): Promise<void> {
+    for await (const _ of stream) {
+      // discard deltas; we assert on `final` / request shape
+    }
+  }
+
+  describe("completionStream method", () => {
     const basicParams = {
       model: "gpt-3.5-turbo", // model is required (no env fallback)
       messages: [{ role: "user" as const, content: "Hello world" }],
       caller: testCaller,
     };
 
-    const mockSuccessResponse = {
-      id: "chatcmpl-test-123",
-      choices: [
-        {
-          message: {
-            role: "assistant",
-            content: "Hello! How can I help you today?",
-          },
-          finish_reason: "stop",
-        },
-      ],
-      usage: {
-        prompt_tokens: 10,
-        completion_tokens: 8,
-        total_tokens: 18,
-      },
-      response_cost: 0.0002,
-    };
+    /** Standard happy-path SSE frames: one content delta, a usage event, DONE. */
+    const successFrames = [
+      'data: {"choices":[{"delta":{"content":"Hello! How can I help you today?"},"finish_reason":null}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+      'data: {"usage":{"prompt_tokens":10,"completion_tokens":8,"total_tokens":18}}\n\n',
+      "data: [DONE]\n\n",
+    ];
 
     it("sends correct request to LiteLLM API with master key auth", async () => {
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => mockSuccessResponse,
-      });
+      mockFetch.mockResolvedValueOnce(makeSseResponse(successFrames));
 
-      await adapter.completion(basicParams);
+      const { stream } = await adapter.completionStream(basicParams);
+      await drain(stream);
 
       expect(mockFetch).toHaveBeenCalledWith(
         "https://api.test-litellm.com/v1/chat/completions",
@@ -117,6 +139,8 @@ describe("LiteLlmAdapter", () => {
               request_id: "req-test-abc",
               existing_trace_id: "trace-test-xyz",
             },
+            stream: true,
+            stream_options: { include_usage: true },
           }),
           signal: expect.any(AbortSignal),
         }
@@ -124,18 +148,15 @@ describe("LiteLlmAdapter", () => {
     });
 
     it("uses provided parameters over defaults", async () => {
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => mockSuccessResponse,
-      });
+      mockFetch.mockResolvedValueOnce(makeSseResponse(successFrames));
 
-      await adapter.completion({
+      const { stream } = await adapter.completionStream({
         ...basicParams,
         model: "custom-model",
         temperature: 0.2,
         maxTokens: 1024,
       });
+      await drain(stream);
 
       const firstCall = mockFetch.mock.calls[0];
       expect(firstCall).toBeDefined();
@@ -153,21 +174,21 @@ describe("LiteLlmAdapter", () => {
           request_id: "req-test-abc",
           existing_trace_id: "trace-test-xyz",
         },
+        stream: true,
+        stream_options: { include_usage: true },
       });
     });
 
-    it("returns properly formatted response with usage and cost from header", async () => {
-      const mockHeaders = new Headers();
-      mockHeaders.set("x-litellm-response-cost", "0.0002");
-      mockHeaders.set("x-litellm-call-id", "litellm-call-abc-123");
+    it("resolves final with usage and cost from header", async () => {
+      const headers = new Headers();
+      headers.set("x-litellm-response-cost", "0.0002");
+      headers.set("x-litellm-call-id", "litellm-call-abc-123");
 
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: mockHeaders,
-        json: async () => mockSuccessResponse,
-      });
+      mockFetch.mockResolvedValueOnce(makeSseResponse(successFrames, headers));
 
-      const result = await adapter.completion(basicParams);
+      const { stream, final } = await adapter.completionStream(basicParams);
+      await drain(stream);
+      const result = await final;
 
       expect(result).toEqual({
         message: {
@@ -175,7 +196,7 @@ describe("LiteLlmAdapter", () => {
           content: "Hello! How can I help you today?",
         },
         finishReason: "stop",
-        providerMeta: mockSuccessResponse,
+        providerMeta: { model: "gpt-3.5-turbo", provider: "openai" },
         usage: {
           promptTokens: 10,
           completionTokens: 8,
@@ -186,22 +207,17 @@ describe("LiteLlmAdapter", () => {
         // New fields per AI_SETUP_SPEC.md
         promptHash: expect.any(String), // SHA-256 hash of canonical payload
         resolvedProvider: "openai", // Inferred from "gpt-" prefix in model name
-        resolvedModel: "gpt-3.5-turbo", // From response (defaults to request model)
+        resolvedModel: "gpt-3.5-turbo", // From request param (SSE doesn't return it)
       });
     });
 
-    it("returns message without providerCostUsd when x-litellm-response-cost header is missing", async () => {
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    it("omits providerCostUsd when no cost in header or usage event", async () => {
+      // No cost header AND no usage.cost field → cost must be absent
+      mockFetch.mockResolvedValueOnce(makeSseResponse(successFrames));
 
-      // Mock response without cost header
-      const mockHeaders = new Headers();
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: mockHeaders,
-        json: async () => mockSuccessResponse,
-      });
-
-      const result = await adapter.completion(basicParams);
+      const { stream, final } = await adapter.completionStream(basicParams);
+      await drain(stream);
+      const result = await final;
 
       // Message should still be returned
       expect(result.message.content).toBe("Hello! How can I help you today?");
@@ -216,20 +232,12 @@ describe("LiteLlmAdapter", () => {
         completionTokens: 8,
         totalTokens: 18,
       });
-
-      // Note: Missing cost header logging removed from adapter
-      // Feature layer handles this via completion.ts logging
-      warnSpy.mockRestore();
     });
 
     it("handles multiple messages correctly", async () => {
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => mockSuccessResponse,
-      });
+      mockFetch.mockResolvedValueOnce(makeSseResponse(successFrames));
 
-      await adapter.completion({
+      const { stream } = await adapter.completionStream({
         ...basicParams,
         messages: [
           { role: "system", content: "You are helpful" },
@@ -238,6 +246,7 @@ describe("LiteLlmAdapter", () => {
           { role: "user", content: "How are you?" },
         ],
       });
+      await drain(stream);
 
       const firstCall = mockFetch.mock.calls[0];
       expect(firstCall).toBeDefined();
@@ -260,65 +269,24 @@ describe("LiteLlmAdapter", () => {
         text: async () => '{"error":"invalid api key"}',
       });
 
-      await expect(adapter.completion(basicParams)).rejects.toThrow(
+      await expect(adapter.completionStream(basicParams)).rejects.toThrow(
         "LiteLLM API error: 401 Unauthorized"
-      );
-    });
-
-    it("throws error when response has no content", async () => {
-      const invalidResponse = {
-        id: "test-id",
-        choices: [
-          {
-            message: {}, // no content
-            finish_reason: "stop",
-          },
-        ],
-        response_cost: 0.0002,
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => invalidResponse,
-      });
-
-      await expect(adapter.completion(basicParams)).rejects.toThrow(
-        "Invalid response from LiteLLM"
-      );
-    });
-
-    it("throws error when response has no choices", async () => {
-      const invalidResponse = {
-        id: "test-id",
-        choices: null,
-        response_cost: 0.0002,
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => invalidResponse,
-      });
-
-      await expect(adapter.completion(basicParams)).rejects.toThrow(
-        "Invalid response from LiteLLM"
       );
     });
 
     it("handles fetch network error", async () => {
       mockFetch.mockRejectedValueOnce(new Error("Network error"));
 
-      await expect(adapter.completion(basicParams)).rejects.toThrow(
-        "LiteLLM network error: Network error"
+      await expect(adapter.completionStream(basicParams)).rejects.toThrow(
+        "LiteLLM stream init failed: Network error"
       );
     });
 
     it("handles unknown error", async () => {
       mockFetch.mockRejectedValueOnce("Unknown error string");
 
-      await expect(adapter.completion(basicParams)).rejects.toThrow(
-        "LiteLLM completion failed: Unknown error"
+      await expect(adapter.completionStream(basicParams)).rejects.toThrow(
+        "LiteLLM stream init failed: Unknown error"
       );
     });
 
@@ -328,100 +296,41 @@ describe("LiteLlmAdapter", () => {
         caller: testCaller,
       };
 
-      await expect(adapter.completion(paramsWithoutModel)).rejects.toThrow(
-        "LiteLLM completion requires model parameter"
-      );
+      await expect(
+        adapter.completionStream(paramsWithoutModel)
+      ).rejects.toThrow("LiteLLM completionStream requires model parameter");
 
       // Verify fetch was never called
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it("handles different finish reasons", async () => {
-      const responseWithFinishReason = {
-        ...mockSuccessResponse,
-        choices: [
-          {
-            message: { content: "Response" },
-            finish_reason: "length",
-          },
-        ],
-        response_cost: 0.0002,
-      };
+      const frames = [
+        'data: {"choices":[{"delta":{"content":"Response"},"finish_reason":null}]}\n\n',
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n',
+        'data: {"usage":{"prompt_tokens":10,"completion_tokens":8,"total_tokens":18}}\n\n',
+        "data: [DONE]\n\n",
+      ];
+      mockFetch.mockResolvedValueOnce(makeSseResponse(frames));
 
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => responseWithFinishReason,
-      });
-
-      const result = await adapter.completion(basicParams);
+      const { stream, final } = await adapter.completionStream(basicParams);
+      await drain(stream);
+      const result = await final;
       expect(result.finishReason).toBe("length");
-    });
-
-    it("handles usage with string numbers", async () => {
-      const responseWithStringUsage = {
-        ...mockSuccessResponse,
-        usage: {
-          prompt_tokens: "15",
-          completion_tokens: "12",
-          total_tokens: "27",
-        },
-        response_cost: 0.0002,
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => responseWithStringUsage,
-      });
-
-      const result = await adapter.completion(basicParams);
-      expect(result.usage).toEqual({
-        promptTokens: 15,
-        completionTokens: 12,
-        totalTokens: 27,
-      });
-    });
-
-    it("handles invalid usage numbers by defaulting to 0", async () => {
-      const responseWithInvalidUsage = {
-        ...mockSuccessResponse,
-        usage: {
-          prompt_tokens: "invalid",
-          completion_tokens: null,
-          total_tokens: undefined,
-        },
-        response_cost: 0.0002,
-      };
-
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => responseWithInvalidUsage,
-      });
-
-      const result = await adapter.completion(basicParams);
-      expect(result.usage).toEqual({
-        promptTokens: 0,
-        completionTokens: 0,
-        totalTokens: 0,
-      });
     });
   });
 
   describe("AI_SETUP_SPEC.md: Correlation ID propagation", () => {
     it("includes request_id and trace_id in LiteLLM metadata", async () => {
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => ({
-          id: "test",
-          choices: [{ message: { content: "test" }, finish_reason: "stop" }],
-          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-        }),
-      });
+      mockFetch.mockResolvedValueOnce(
+        makeSseResponse([
+          'data: {"choices":[{"delta":{"content":"test"},"finish_reason":"stop"}]}\n\n',
+          'data: {"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n',
+          "data: [DONE]\n\n",
+        ])
+      );
 
-      await adapter.completion({
+      const { stream } = await adapter.completionStream({
         model: "test-model",
         messages: [{ role: "user", content: "test" }],
         caller: {
@@ -431,6 +340,7 @@ describe("LiteLlmAdapter", () => {
           traceId: "trace-correlation-test",
         },
       });
+      await drain(stream);
 
       const requestBody = JSON.parse(
         mockFetch.mock.calls[0]?.[1]?.body as string
@@ -460,7 +370,7 @@ describe("LiteLlmAdapter", () => {
         text: async () => errorBody,
       });
 
-      await expect(adapter.completion(errorTestParams)).rejects.toThrow();
+      await expect(adapter.completionStream(errorTestParams)).rejects.toThrow();
 
       expect(mockLoggerWarn).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -472,7 +382,7 @@ describe("LiteLlmAdapter", () => {
           provider: "openai",
           responseExcerpt: expect.stringContaining("No endpoints found"),
         }),
-        "adapter.litellm.http_error"
+        "adapter.litellm.stream_http_error"
       );
     });
 
@@ -486,7 +396,7 @@ describe("LiteLlmAdapter", () => {
         text: async () => bodyWithSecret,
       });
 
-      await expect(adapter.completion(errorTestParams)).rejects.toThrow();
+      await expect(adapter.completionStream(errorTestParams)).rejects.toThrow();
 
       const logPayload = mockLoggerWarn.mock.calls[0]?.[0];
       expect(logPayload?.responseExcerpt).not.toContain("sk-1234567890");
@@ -498,7 +408,7 @@ describe("LiteLlmAdapter", () => {
       networkErr.cause = { code: "ECONNREFUSED" };
       mockFetch.mockRejectedValueOnce(networkErr);
 
-      await expect(adapter.completion(errorTestParams)).rejects.toThrow();
+      await expect(adapter.completionStream(errorTestParams)).rejects.toThrow();
 
       expect(mockLoggerWarn).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -507,7 +417,7 @@ describe("LiteLlmAdapter", () => {
           causeCode: "ECONNREFUSED",
           requestId: testCaller.requestId,
         }),
-        "adapter.litellm.network_error"
+        "adapter.litellm.stream_network_error"
       );
     });
 
@@ -516,14 +426,14 @@ describe("LiteLlmAdapter", () => {
       timeoutErr.name = "TimeoutError";
       mockFetch.mockRejectedValueOnce(timeoutErr);
 
-      await expect(adapter.completion(errorTestParams)).rejects.toThrow();
+      await expect(adapter.completionStream(errorTestParams)).rejects.toThrow();
 
       expect(mockLoggerWarn).toHaveBeenCalledWith(
         expect.objectContaining({
           rootCauseKind: "timeout",
           requestId: testCaller.requestId,
         }),
-        "adapter.litellm.network_error"
+        "adapter.litellm.stream_network_error"
       );
     });
 
@@ -537,70 +447,30 @@ describe("LiteLlmAdapter", () => {
         },
       });
 
-      await expect(adapter.completion(errorTestParams)).rejects.toThrow();
+      await expect(adapter.completionStream(errorTestParams)).rejects.toThrow();
 
-      expect(mockLoggerWarn).toHaveBeenCalledWith(
+      // status 500 is operator-fault → logged at error level (bug.5056)
+      expect(mockLoggerError).toHaveBeenCalledWith(
         expect.objectContaining({
           responseExcerpt: "[unreadable]",
         }),
-        "adapter.litellm.http_error"
-      );
-    });
-  });
-
-  describe("bug.0057: x-litellm-spend-logs-metadata header", () => {
-    const metadataTestParams = {
-      model: "openai/gpt-4",
-      messages: [{ role: "user" as const, content: "Hello" }],
-      caller: testCaller,
-    };
-
-    const mockSuccessResponse = {
-      id: "chatcmpl-test-meta",
-      choices: [
-        {
-          message: { role: "assistant", content: "Hi" },
-          finish_reason: "stop",
-        },
-      ],
-      usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
-    };
-
-    it("sets x-litellm-spend-logs-metadata header when spendLogsMetadata provided", async () => {
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => mockSuccessResponse,
-      });
-
-      await adapter.completion({
-        ...metadataTestParams,
-        spendLogsMetadata: { run_id: "run-abc", graph_id: "langgraph:poet" },
-      });
-
-      const requestOptions = mockFetch.mock.calls[0]?.[1];
-      expect(requestOptions?.headers).toEqual(
-        expect.objectContaining({
-          "x-litellm-spend-logs-metadata": JSON.stringify({
-            run_id: "run-abc",
-            graph_id: "langgraph:poet",
-          }),
-        })
+        "adapter.litellm.stream_http_error"
       );
     });
 
-    it("does not set x-litellm-spend-logs-metadata header when spendLogsMetadata absent", async () => {
+    it("logs operator-fault upstream 402 at error level, not warn (bug.5056)", async () => {
       mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => mockSuccessResponse,
+        ok: false,
+        status: 402,
+        statusText: "Payment Required",
+        text: async () => '{"error":{"message":"Insufficient credits"}}',
       });
 
-      await adapter.completion(metadataTestParams);
+      await expect(adapter.completionStream(errorTestParams)).rejects.toThrow();
 
-      const requestOptions = mockFetch.mock.calls[0]?.[1];
-      expect(requestOptions?.headers).not.toHaveProperty(
-        "x-litellm-spend-logs-metadata"
+      expect(mockLoggerError).toHaveBeenCalledWith(
+        expect.objectContaining({ statusCode: 402 }),
+        "adapter.litellm.stream_http_error"
       );
     });
   });
@@ -681,21 +551,18 @@ describe("LiteLlmAdapter", () => {
   describe("LlmService interface compliance", () => {
     it("implements LlmService interface correctly", () => {
       const service: LlmService = adapter;
-      expect(service.completion).toBeTypeOf("function");
+      expect(service.completionStream).toBeTypeOf("function");
     });
 
-    it("completion method returns a promise", () => {
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        headers: new Headers(),
-        json: async () => ({
-          id: "test",
-          choices: [{ message: { content: "test" }, finish_reason: "stop" }],
-          response_cost: 0.0002,
-        }),
-      });
+    it("completionStream method returns a promise", () => {
+      mockFetch.mockResolvedValueOnce(
+        makeSseResponse([
+          'data: {"choices":[{"delta":{"content":"test"},"finish_reason":"stop"}]}\n\n',
+          "data: [DONE]\n\n",
+        ])
+      );
 
-      const result = adapter.completion({
+      const result = adapter.completionStream({
         model: "test-model", // model is required
         messages: [{ role: "user", content: "test" }],
         caller: testCaller,

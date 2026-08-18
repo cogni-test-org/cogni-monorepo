@@ -25,12 +25,22 @@ activity_ledger:
     base_issuance_credits: "10000"
   activity_sources:
     github:
+      # cogni-v0.0 selects via main-merge-selection: a PR merged to main IS the
+      # contribution. (The profile was repointed from the old promotion-selection,
+      # which excluded every direct-to-main PR → zero claimants on this repo.)
       attribution_pipeline: cogni-v0.0
-      source_refs: ["Cogni-DAO/standalone-node"]
+      # source_refs is a selection-time, fail-open repo allowlist (SSOT for the
+      # repos whose merged PRs earn attribution). Empty/missing → no filtering.
+      source_refs: ["cogni-dao/cogni"]
+      # source_refs: ["cogni-test-org/test-cog"]   # candidate-a test value — swap back for candidate-a attribution testing
       excluded_logins: ["Cogni-1729"]
 
 intent:
   name: cogni-template
+  # One-line north star surfaced by the cognition substrate at session start.
+  # The running operator app reads its OWN node spec (nodes/operator/.cogni/repo-spec.yaml);
+  # this is the monorepo identity for tooling that resolves the repo root.
+  mission: "The Cogni node platform monorepo — the operator control plane plus the node template every Cogni DAO node is forged from."
 
 # Node registry — operator declares child nodes in the monorepo.
 # Each entry points to a node dir with its own .cogni/repo-spec.yaml.
@@ -41,14 +51,6 @@ nodes:
     node_name: "Cogni Operator"
     path: "nodes/operator"
     endpoint: "http://app:3000/api/internal/billing/ingest"
-  - node_id: "5ed2d64f-2745-4676-983b-2fb7e05b2eba"
-    node_name: "Poly Prediction"
-    path: "nodes/poly"
-    endpoint: "http://poly:3100/api/internal/billing/ingest"
-  - node_id: "f6d2a17d-b7f6-4ad1-a86b-f0ad2380999e"
-    node_name: "Resy Helper"
-    path: "nodes/resy"
-    endpoint: "http://resy:3300/api/internal/billing/ingest"
 
 # Control GitHub check conclusion behavior for gate errors/timeouts
 # false (default): errors/timeouts result in 'neutral' conclusion (non-blocking)
@@ -61,12 +63,23 @@ fail_on_error: true
 operator_wallet:
   address: "0xdCCa8D85603C2CC47dc6974a790dF846f8695056" # Privy-managed operator wallet
 
-cogni_dao:
+governance:
   dao_contract: "0xF61c3fafD4D34b4568e7a500d92b28Ac175e83C6" # Current Cogni parent DAO Contract Address
   plugin_contract: "0x609B427f04C1C42De3e28898cb7b9Bad329e6b77" # DAO's Aragon Voting Plugin Address
   signal_contract: "0x590FC79B9c925C377fA63F4AaF54cdbF4Ee273A1" # DAO's CogniSignal Contract Address
   chain_id: "8453" # Chain ID: Eth Sepolia testnet
   base_url: "https://proposal.cognidao.org" # v0 Base URL: cogni-proposal-launcher service
+  # Governance council schedules (charter-scoped per governance-council.md).
+  # Each triggers a sandbox agent run with a 1-word entrypoint. Cron: https://crontab.guru/
+  schedules:
+    - charter: HEARTBEAT
+      cron: "0 * * * *" # once per hour — git delta check + Discord status
+      timezone: UTC
+      entrypoint: HEARTBEAT
+    - charter: LEDGER_INGEST
+      cron: "0 6 * * *" # daily at 6am UTC
+      timezone: UTC
+      entrypoint: LEDGER_INGEST
 
 # DAO Financial Rails Configuration
 # Inbound payment configuration for USDC credits top-up
@@ -76,11 +89,24 @@ payments:
 payments_in:
   credits_topup:
     provider: cogni-usdc-backend-v1
-    receiving_address: "0xDe4dE5e40f7215E4606c3e422D28cf01f97C8c66" # Push Split V2o2 — 92.1% operator / 7.9% DAO
+    receiving_address: "0x4C4e559B2117AbA5f8BaE8a37d4B26BBAdc4C294" # Push Split V2o2 — 95.0001% operator / 4.9999% DAO (matches markup_factor 1.10803324099723 / revenue_share 0; on-chain splitHash 0xe62078796d90766dd09550d8997c3e067ba271a25a0c664ea289a1871ecb2943)
     allowed_chains:
       - Base
     allowed_tokens:
       - USDC
+    # Purchase-side economics (governance config; replaces env USER_PRICE_MARKUP_FACTOR / SYSTEM_TENANT_REVENUE_SHARE).
+    # Target default: 95% provider top-up / 5% DAO Split margin, no system-account credit increase.
+    # Activation must point receiving_address at a Split whose on-chain splitHash matches these values.
+    markup_factor: 1.10803324099723
+    revenue_share: 0
+
+# Outbound: human-custodied steward wallet that settles vendor invoices
+# (OpenRouter, Cherry) via manual USDC crypto checkout. Mirrors
+# nodes/operator/.cogni/repo-spec.yaml. MVP: reuse the governance approver wallet.
+# See docs/design/node-steward-wallet.md.
+payments_out:
+  steward_wallet:
+    address: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
 
 providers:
   openrouter:
@@ -97,6 +123,14 @@ llm_proxy:
 secrets:
   manager:
     type: env
+
+# PR review on/off + model selection. The operator reads THIS block from the
+# target repo, so each node controls its own review with no operator-side hardcode.
+#   enabled: false → operator skips review entirely (no Check Run, no comment).
+#   model: any platform (LiteLLM-resolvable) model id; omit to use operator default.
+review:
+  enabled: true
+  model: gpt-4o-mini
 
 # Gates run in the order they appear below.
 gates:
@@ -128,17 +162,4 @@ gates:
   # - type: ai-rule
   #   with:
   #     rule_file: ai-rule-template.yaml
-
-# Governance schedule definitions (charter-scoped per governance-council.md)
-# Each schedule triggers a sandbox agent run with a 1-word entrypoint.
-# Cron Format syntax: https://crontab.guru/
-governance:
-  schedules:
-    - charter: HEARTBEAT
-      cron: "0 * * * *" # once per hour — git delta check + Discord status
-      timezone: UTC
-      entrypoint: HEARTBEAT
-    - charter: LEDGER_INGEST
-      cron: "0 6 * * *" # daily at 6am UTC
-      timezone: UTC
-      entrypoint: LEDGER_INGEST
+# (governance.schedules merged into the unified `governance` section above)

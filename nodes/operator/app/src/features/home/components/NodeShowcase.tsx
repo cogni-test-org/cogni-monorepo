@@ -3,10 +3,16 @@
 
 /**
  * Module: `@features/home/components/NodeShowcase`
- * Purpose: Homepage section showcasing live nodes as clickable homepage-thumbnail tiles.
+ * Purpose: Homepage section showcasing the node roster as clickable tiles, each rendered from the node's
+ *   OWN self-described identity (title=name, blurb=mission/hook, thumbnail, brand color) + an honest live/down
+ *   health badge. node-template IS the fork target (shown as its own "Node Template" card), so there is
+ *   no separate "launch your own" tile — that would duplicate it.
  * Scope: Presentational. Maps resolved NodeSummary → the shared NodeTile. Does not fetch data.
- * Invariants: Inherits the homepage background (no surface tint); each tile links to the node's live
- *   homepage in a new tab. Token-only styling. Responsive grid.
+ * Invariants:
+ *   - NO_OPERATOR_IDENTITY_LITERALS: roster tiles carry zero hardcoded node identity — every display
+ *     field is passed through from the NodeSummary (the node's own well-known projection).
+ *   - Inherits the homepage background (no surface tint); roster tiles link out in a new tab. Token-only
+ *     styling (the brand-color tint is a per-node value the node itself supplies). Responsive grid.
  * Side-effects: none
  * Links: src/features/nodes/components/NodeTile.tsx, src/app/(public)/page.tsx
  * @public
@@ -15,6 +21,7 @@
 import type { ReactElement } from "react";
 
 import { NodeTile } from "@/features/nodes/components/NodeTile";
+import { nodeSummaryToTileView } from "@/features/nodes/components/nodeTileView";
 import type { NodeSummary } from "@/ports";
 
 export function NodeShowcase({
@@ -40,13 +47,10 @@ export function NodeShowcase({
           {nodes.map((node) => (
             <NodeTile
               key={node.slug}
-              node={{
-                title: node.title,
-                tagline: node.tagline,
-                thumbnailUrl: node.thumbnailUrl,
-                href: node.href,
+              node={nodeSummaryToTileView(node, {
                 external: true,
-              }}
+                density: "compact",
+              })}
             />
           ))}
         </div>

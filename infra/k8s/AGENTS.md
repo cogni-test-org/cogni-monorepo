@@ -51,8 +51,8 @@ k8s/
 │                              # rendered by scripts/ci/render-node-appset.sh (LANE_ISOLATION)
 ├── base/                    # Kustomize bases
 │   ├── node-app/            # Shared base for operator, poly, resy
-│   ├── scheduler-worker/    # Temporal worker service
-│   └── sandbox-openclaw/    # OpenClaw gateway service
+│   ├── openfga-external/    # Operator opt-in bridge to Compose OpenFGA
+│   └── scheduler-worker/    # Temporal worker service
 ├── overlays/                # Environment-specific patches
 │   ├── staging/{app}/       # Per-app staging overlays (image digests, NodePorts)
 │   └── production/{app}/    # Per-app production overlays

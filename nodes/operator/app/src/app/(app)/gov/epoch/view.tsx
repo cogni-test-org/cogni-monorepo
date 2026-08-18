@@ -5,7 +5,7 @@
  * Module: `@app/(app)/gov/epoch/view`
  * Purpose: Unified epoch page — current epoch with countdown at top, past epochs (review + finalized) expandable below.
  * Scope: Renders all epoch data via useEpochsPage hook. Does not perform server-side logic.
- * Invariants: BigInt units displayed via Number() for presentation only. No credit math in UI.
+ * Invariants: Credit/unit strings stay BigInt-safe through sorting and integer formatting.
  * Side-effects: IO (via useEpochsPage hook)
  * Links: docs/spec/epoch-ledger.md, src/features/governance/types.ts
  * @public
@@ -13,6 +13,7 @@
 
 "use client";
 
+import type { DistributionLifecycleOutput } from "@cogni/node-contracts";
 import { CheckCircle, Clock, Eye } from "lucide-react";
 import type { ReactElement } from "react";
 import { useMemo } from "react";
@@ -28,9 +29,28 @@ import {
 } from "@/components";
 import { EpochCountdown } from "@/features/governance/components/EpochCountdown";
 import { EpochDetail } from "@/features/governance/components/EpochDetail";
+import { EpochLifecycleProgress } from "@/features/governance/components/EpochLifecycleProgress";
 import { useEpochsPage } from "@/features/governance/hooks/useEpochsPage";
 import { buildPieChartData } from "@/features/governance/lib/build-pie-data";
 import type { EpochView } from "@/features/governance/types";
+
+function compareUnitsDescending(
+  left: EpochView["contributors"][number],
+  right: EpochView["contributors"][number]
+): number {
+  const leftUnits = BigInt(left.units);
+  const rightUnits = BigInt(right.units);
+  return leftUnits === rightUnits ? 0 : leftUnits > rightUnits ? -1 : 1;
+}
+
+function formatCredits(value: string | null): string {
+  if (value === null) return "—";
+  try {
+    return BigInt(value).toLocaleString();
+  } catch {
+    return value;
+  }
+}
 
 function StatusBadge({
   status,
@@ -72,17 +92,24 @@ function StatusBadge({
 
 function CurrentEpochSection({
   epoch,
+  evidence,
 }: {
   readonly epoch: EpochView;
+  readonly evidence: DistributionLifecycleOutput;
 }): ReactElement {
   const sorted = useMemo(
-    () =>
-      [...epoch.contributors].sort((a, b) => Number(b.units) - Number(a.units)),
+    () => [...epoch.contributors].sort(compareUnitsDescending),
     [epoch.contributors]
   );
 
   const totalPoints = useMemo(
-    () => sorted.reduce((s, c) => s + Math.round(Number(c.units) / 1000), 0),
+    () =>
+      sorted
+        .reduce((sum, contributor) => {
+          const roundedPoints = (BigInt(contributor.units) + 500n) / 1000n;
+          return sum + roundedPoints;
+        }, 0n)
+        .toLocaleString(),
     [sorted]
   );
 
@@ -107,6 +134,10 @@ function CurrentEpochSection({
           {new Date(epoch.periodStart).toLocaleDateString()} —{" "}
           {new Date(epoch.periodEnd).toLocaleDateString()}
         </p>
+      </div>
+
+      <div className="rounded-lg border bg-card px-3 py-4">
+        <EpochLifecycleProgress epoch={epoch} evidence={evidence} />
       </div>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -146,8 +177,10 @@ function CurrentEpochSection({
 
 function PastEpochsSection({
   epochs,
+  evidence,
 }: {
   readonly epochs: readonly EpochView[];
+  readonly evidence: DistributionLifecycleOutput;
 }): ReactElement {
   if (epochs.length === 0) {
     return (
@@ -162,7 +195,7 @@ function PastEpochsSection({
 
   return (
     <div className="rounded-lg border">
-      <Table>
+      <Table className="min-w-2xl">
         <TableHeader>
           <TableRow>
             <TableHead className="w-8" />
@@ -175,9 +208,6 @@ function PastEpochsSection({
         </TableHeader>
         <TableBody>
           {epochs.map((epoch) => {
-            const credits = epoch.poolTotalCredits
-              ? Number(epoch.poolTotalCredits)
-              : null;
             return (
               <ExpandableTableRow
                 key={epoch.id}
@@ -189,7 +219,17 @@ function PastEpochsSection({
                   "text-right",
                   "text-right",
                 ]}
-                expandedContent={<EpochDetail epoch={epoch} />}
+                expandedContent={
+                  <div className="space-y-4">
+                    <div className="rounded-lg border bg-card px-3 py-4">
+                      <EpochLifecycleProgress
+                        epoch={epoch}
+                        evidence={evidence}
+                      />
+                    </div>
+                    <EpochDetail epoch={epoch} />
+                  </div>
+                }
                 cells={[
                   <span key="id" className="font-bold text-foreground/60">
                     {epoch.id}
@@ -202,7 +242,7 @@ function PastEpochsSection({
                     {epoch.contributors.length}
                   </span>,
                   <span key="credits" className="text-right font-mono text-xs">
-                    {credits != null ? credits.toLocaleString() : "—"}
+                    {formatCredits(epoch.poolTotalCredits)}
                   </span>,
                   <div key="status" className="flex justify-end">
                     <StatusBadge status={epoch.status} />
@@ -250,7 +290,11 @@ export function CurrentEpochView(): ReactElement {
   return (
     <div className="space-y-10">
       {data.current ? (
-        <CurrentEpochSection epoch={data.current} />
+        <CurrentEpochSection
+          key={data.current.id}
+          epoch={data.current}
+          evidence={data.distributionLifecycle}
+        />
       ) : (
         <div className="rounded-lg border bg-card p-12 text-center">
           <p className="text-muted-foreground">No active epoch</p>
@@ -267,10 +311,13 @@ export function CurrentEpochView(): ReactElement {
               Past Epochs
             </h2>
             <p className="text-muted-foreground text-sm">
-              Previous epochs with signed credit distributions
+              Review and finalized epochs with their full distribution state
             </p>
           </div>
-          <PastEpochsSection epochs={data.pastEpochs} />
+          <PastEpochsSection
+            epochs={data.pastEpochs}
+            evidence={data.distributionLifecycle}
+          />
         </div>
       )}
     </div>

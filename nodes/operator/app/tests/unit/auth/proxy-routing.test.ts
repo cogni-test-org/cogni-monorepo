@@ -4,7 +4,7 @@
 /**
  * Module: `@tests/unit/auth/proxy-routing`
  * Purpose: Unit tests for proxy.ts auth routing — the single authority for redirect logic.
- * Scope: Tests page-level routing (authed on / → /chat, unauthed on app routes → /) and API protection. Does not test NextAuth internals.
+ * Scope: Tests page-level routing (authed on / → /chat, unauthed on app routes → sign-in prompt) and API protection. Does not test NextAuth internals.
  * Invariants: Single authority for auth routing; no client-side redirect logic.
  * Side-effects: none (mocked getToken)
  * Links: src/proxy.ts, docs/spec/security-auth.md
@@ -25,6 +25,17 @@ vi.mock("next-auth/jwt", () => ({
 vi.mock("@/auth", () => ({
   authSecret: "test-secret",
   authOptions: { secret: "test-secret" },
+}));
+
+// Perimeter observability — keep this a true unit (no pino/prom-client) and
+// capture the denial event the proxy emits before any route handler runs.
+const mockLoggerInfo = vi.fn();
+vi.mock("@/shared/observability", () => ({
+  EVENT_NAMES: { AUTH_PERIMETER_DENIED: "auth.perimeter.denied" },
+  makeLogger: () => ({ info: mockLoggerInfo }),
+}));
+vi.mock("@/shared/config", () => ({
+  getNodeId: () => "test-node",
 }));
 
 // Import after mocks
@@ -50,6 +61,15 @@ function expectRedirectTo(res: Response, pathname: string): void {
   expect(new URL(location).pathname).toBe(pathname);
 }
 
+function expectSignInRedirectTo(res: Response, callbackUrl: string): void {
+  expect(res.status).toBe(307);
+  const location = res.headers.get("location") ?? "";
+  const url = new URL(location);
+  expect(url.pathname).toBe("/");
+  expect(url.searchParams.get("signIn")).toBe("1");
+  expect(url.searchParams.get("callbackUrl")).toBe(callbackUrl);
+}
+
 // --- Tests ---
 
 describe("proxy — page-level routing", () => {
@@ -73,28 +93,75 @@ describe("proxy — page-level routing", () => {
     expect(res.status).toBe(200);
   });
 
-  it("redirects unauthenticated user on /chat to /", async () => {
+  it("redirects unauthenticated user on /nodes to sign-in with callback", async () => {
+    mockGetToken.mockResolvedValue(null);
+
+    const res = await proxy(makeRequest("/nodes"));
+
+    expectSignInRedirectTo(res, "/nodes");
+  });
+
+  it("passes through authenticated user on /nodes", async () => {
+    mockGetToken.mockResolvedValue({ id: "user-1" });
+
+    const res = await proxy(makeRequest("/nodes"));
+
+    expect(res.status).toBe(200);
+  });
+
+  it("passes through public /explore/nodes without checking auth", async () => {
+    mockGetToken.mockResolvedValue(null);
+
+    const res = await proxy(makeRequest("/explore/nodes"));
+
+    expect(res.status).toBe(200);
+    expect(mockGetToken).not.toHaveBeenCalled();
+  });
+
+  it("redirects unauthenticated user on /chat to sign-in with callback", async () => {
     mockGetToken.mockResolvedValue(null);
 
     const res = await proxy(makeRequest("/chat"));
 
-    expectRedirectTo(res, "/");
+    expectSignInRedirectTo(res, "/chat");
   });
 
-  it("redirects unauthenticated user on /profile to /", async () => {
+  it("redirects unauthenticated user on /profile to sign-in with callback", async () => {
     mockGetToken.mockResolvedValue(null);
 
     const res = await proxy(makeRequest("/profile"));
 
-    expectRedirectTo(res, "/");
+    expectSignInRedirectTo(res, "/profile");
   });
 
-  it("redirects unauthenticated user on /chat/some-id to /", async () => {
+  it.each([
+    "/dashboard",
+    "/knowledge",
+    "/knowledge/entry-1",
+    "/nodes/payments",
+    "/nodes/11111111-1111-4111-8111-111111111111",
+  ])("redirects unauthenticated user on %s to sign-in with callback", async (path) => {
+    mockGetToken.mockResolvedValue(null);
+
+    const res = await proxy(makeRequest(path));
+
+    expectSignInRedirectTo(res, path);
+  });
+
+  it("preserves query params in app-route sign-in callbacks", async () => {
+    mockGetToken.mockResolvedValue(null);
+
+    const res = await proxy(makeRequest("/nodes/payments?nodeId=node-1"));
+
+    expectSignInRedirectTo(res, "/nodes/payments?nodeId=node-1");
+  });
+
+  it("redirects unauthenticated user on /chat/some-id to sign-in with callback", async () => {
     mockGetToken.mockResolvedValue(null);
 
     const res = await proxy(makeRequest("/chat/some-id"));
 
-    expectRedirectTo(res, "/");
+    expectSignInRedirectTo(res, "/chat/some-id");
   });
 
   it("passes through authenticated user on /chat", async () => {
@@ -112,11 +179,26 @@ describe("proxy — page-level routing", () => {
 
     expect(res.status).toBe(200);
   });
+
+  it.each([
+    "/dashboard",
+    "/knowledge",
+    "/knowledge/entry-1",
+    "/nodes/payments",
+    "/nodes/11111111-1111-4111-8111-111111111111",
+  ])("passes through authenticated user on %s", async (path) => {
+    mockGetToken.mockResolvedValue({ id: "user-1" });
+
+    const res = await proxy(makeRequest(path));
+
+    expect(res.status).toBe(200);
+  });
 });
 
 describe("proxy — API route protection", () => {
   beforeEach(() => {
     mockGetToken.mockReset();
+    mockLoggerInfo.mockReset();
   });
 
   it("allows /api/v1/public/* without auth", async () => {
@@ -138,6 +220,23 @@ describe("proxy — API route protection", () => {
     expect(mockGetToken).not.toHaveBeenCalled();
   });
 
+  it("rejects unauthenticated on /api/v1/cognition", async () => {
+    mockGetToken.mockResolvedValue(null);
+
+    const res = await proxy(makeRequest("/api/v1/cognition"));
+
+    expect(res.status).toBe(401);
+  });
+
+  it("allows agent bearer on /api/v1/cognition", async () => {
+    mockGetToken.mockResolvedValue(null);
+
+    const res = await proxy(makeAgentRequest("/api/v1/cognition"));
+
+    expect(res.status).toBe(200);
+    expect(mockGetToken).not.toHaveBeenCalled();
+  });
+
   it("rejects unauthenticated on /api/v1/*", async () => {
     mockGetToken.mockResolvedValue(null);
 
@@ -146,6 +245,35 @@ describe("proxy — API route protection", () => {
     expect(res.status).toBe(401);
     const body = await res.json();
     expect(body.error).toBe("Unauthorized");
+  });
+
+  it("logs a perimeter denial event when rejecting an unauthenticated /api/v1 request", async () => {
+    mockGetToken.mockResolvedValue(null);
+
+    const res = await proxy(makeRequest("/api/v1/users/me"));
+
+    expect(res.status).toBe(401);
+    expect(mockLoggerInfo).toHaveBeenCalledTimes(1);
+    const [fields, msg] = mockLoggerInfo.mock.calls[0];
+    expect(msg).toBe("auth.perimeter.denied");
+    expect(fields).toMatchObject({
+      event: "auth.perimeter.denied",
+      routeId: "auth.perimeter",
+      route: "/api/v1/users/me",
+      method: "GET",
+      reason: "no_session",
+      status: 401,
+    });
+    expect(typeof fields.reqId).toBe("string");
+  });
+
+  it("does NOT log a perimeter denial when an agent bearer is allowed through", async () => {
+    mockGetToken.mockResolvedValue(null);
+
+    const res = await proxy(makeAgentRequest("/api/v1/cognition"));
+
+    expect(res.status).toBe(200);
+    expect(mockLoggerInfo).not.toHaveBeenCalled();
   });
 
   it("allows authenticated on /api/v1/*", async () => {

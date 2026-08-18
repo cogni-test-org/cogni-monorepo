@@ -273,6 +273,119 @@ export const EXTERNAL_API_ACTIVITY_OPTIONS: ActivityOptions = {
 };
 ```
 
+### Recurring work for a node (the suggested way)
+
+This is the **canonical pattern for a node to run recurring or scheduled work** on the Cogni
+Temporal substrate. The substrate is **one shared generic worker** the operator runs and
+provisions once; for this path a node runs **no worker** and writes **no** Temporal/workflow
+code. Direct, standardized Temporal access for every node — the node holds a Temporal
+**client**, exactly like it holds a Postgres DSN. The model is three parts: **declare →
+create → execute.**
+
+**1. Declare** the recurring jobs as `schedules[]` in the node's repo-spec (`route` XOR
+`graph` per entry):
+
+```yaml
+# .cogni/repo-spec.yaml — the node-author-facing contract
+schedules:
+  - id: metrics-ingest # stable id → scheduleId + workflowId
+    cron: "*/15 * * * *"
+    timezone: UTC
+    route: /api/internal/ops/metrics-ingest # http-dispatch: a RELATIVE path on the node's OWN host
+    payload: { window: "15m" } # opaque to the operator; the node's route owns its meaning
+  - id: nightly-report
+    cron: "0 0 * * *"
+    graph: my-node:report # OR run a graph instead of POSTing a route
+```
+
+**2. Create — node-direct.** The node's app holds its own Temporal **client** (ESO-provisioned,
+namespace-scoped creds) and creates the schedule against its **own** per-node task queue
+(`scheduler-tasks-<nodeId>`), with `action = NodeTaskWorkflow` (for `route`) or
+`GraphRunWorkflow` (for `graph`). The operator is **out of the create path**. Bind the create
+backend behind a small **`RecurringWorkPort`** (`schedule`/`cancel`) so a day-1 node-local cron
+(no Temporal client yet) and the Temporal-client backend are swappable with **zero
+product-code change**.
+
+> **As-built today:** schedule creation is still operator-side (the operator's
+> `ScheduleControlPort`); `RecurringWorkPort` + the node's own client are the **target**,
+> reached by provisioning the node a Temporal client + ESO namespace creds — gated on a real
+> consumer, not built on principle. The **system tenant** (operator governance / epochs)
+> creates its own schedules via `syncGovernanceSchedules` — **wired and live; epochs run on
+> exactly this path and are unaffected** (see
+> [Governance Schedule Sync](./governance-scheduling.md) for declaring system-tenant /
+> DAO schedules in repo-spec). `syncNodeSchedules` (`@cogni/scheduler-core`) is the same
+> reconcile capability, now **wired for the operator's own node-task schedules**
+> (`runNodeSchedulesSyncJob`, story.5008) as the first node-task consumer — triggered via
+> the internal node-schedules sync endpoint; a node-held client is the next step.
+
+**3. Execute — the shared worker.** On each tick the shared generic worker runs the generic
+workflow under the node's tenant identity: `NodeTaskWorkflow` POSTs the node's `route` (the
+node's route does the work); `GraphRunWorkflow` runs the node's `graph`. The node provides a
+**client** (to create), an **HTTP route or graph** (the work), and a **per-node dispatch
+credential** (to authenticate inbound dispatch) — not a worker, not custom workflow code.
+
+#### Create → execute flow
+
+```
+RecurringWorkPort.schedule(entry)   (node-direct: node's Temporal client → its own queue)
+  → ensure per-node ExecutionGrant (scope: task:dispatch:<route> | graph:execute:<id>)
+  → schedule.create on scheduler-tasks-<nodeId>
+       scheduleId = workflowId = node-task:{nodeId}:{scheduleId}   (WORKFLOW_ID_STABILITY)
+       overlap=SKIP, catchupWindow=0s                              (operator-fixed platform invariants)
+       route → NodeTaskWorkflow   |   graph → GraphRunWorkflow      (workflowType inferred)
+
+NodeTaskWorkflow(input: NodeTaskInput)                              (the generic shared-worker workflow)
+  scheduledFor = TemporalScheduledStartTime search attr            (SCHEDULED_TIME_FROM_TEMPORAL)
+  → validateGrantActivity(actor, nodeId, grantId, "task:dispatch:<route>")
+  → dispatchNodeTaskActivity: POST {nodeUrl}{route}, principal = per-node token (fail-closed)
+       Idempotency-Key: {nodeId}/{scheduleId}/{scheduledFor}       (the node route MUST dedup on it)
+```
+
+> The system tenant reaches the identical Temporal Schedule via `syncGovernanceSchedules` /
+> `syncNodeSchedules` (operator reconcile, `SYSTEM_OPS_ONLY`, advisory-locked) instead of a
+> node-held client — same workflowId, queue, and invariants; only the creator differs.
+
+#### Durable multi-step / HITL roadmap, then per-node-worker escape hatch
+
+If recurring work needs durable state **between** route/graph steps — signals, long human
+waits, or multi-step orchestration that cannot honestly be collapsed into one graph run — the
+target is a generic shared-worker step-list engine, not a per-node worker by default. It would
+interpret node-owned data such as `run graph → await signal → run graph → branch` while every
+node-specific step still dispatches into the node.
+
+Graduate to your **own** per-node worker only when that generic engine cannot express the
+workflow. The worker registers your custom workflows + activities and polls **your** per-node
+queue; execution is fully in-node, operator out of it. This is **opt-in** (it costs a worker
+pod per node) and is **never the default** — see
+[substrate-temporal.md](./substrate-temporal.md) § durable multi-step / HITL roadmap and the
+escape hatch.
+
+#### Invariants specific to node-as-tenant
+
+| Invariant                             | Rule                                                                                                                                                                                                                                         |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **WORKFLOWTYPE_FROM_ROUTE_XOR_GRAPH** | The node declares `route` XOR `graph`; the workflowType is _inferred_ from which is present. There is no node-facing `target` enum — that is operator vocabulary.                                                                            |
+| **PLATFORM_OVERLAP_AND_CATCHUP**      | `overlap`/`catchupWindow` are NOT in the node-facing schema. The operator fixes `skip`/`0s`; a node cannot tune them.                                                                                                                        |
+| **REAL_CRON_DRIFT**                   | Cron drift is detected against the **stored cron** (DB row), never `describeSchedule().cron` — Temporal compiles crons to calendars and returns null. (The governance equivalent skips cron entirely; that is a latent bug this path fixes.) |
+| **NODE_ID_PINNED (M8)**               | A schedule's `nodeId` is pinned to the repo-spec's own `node_id`; a repo-spec cannot author a foreign-node schedule. `route` is relative to the node's own host (SSRF / cross-tenant guard).                                                 |
+| **TENANT_PRINCIPAL_FAIL_CLOSED**      | Dispatch uses a per-node principal resolved at runtime; an unprovisioned node throws — there is no shared-token fallback.                                                                                                                    |
+| **TEARDOWN_REVOKES (M7)**             | Node decommission pauses the node's schedules **and** `revokedAt`s its grants in one saga; validation fails closed on revoked grants.                                                                                                        |
+
+#### Idempotency is a two-sided contract
+
+The operator forwards `Idempotency-Key: {nodeId}/{scheduleId}/{scheduledFor}`; the node's
+route **must** dedup on it. A key the receiver ignores does not make a POST idempotent. The
+MVP retry profile is `maximumAttempts: 1` precisely because the dedup contract is the node's
+responsibility — a retry profile is gated on that contract being proven.
+
+> **Ownership:** the `NodeTaskInput` schema and `NodeTaskWorkflow` / `dispatchNodeTaskActivity`
+> live in `packages/temporal-workflows` (SINGLE_INPUT_CONTRACT, owned by the workflow-bundle
+> work). The repo-spec `schedules` block + `syncNodeSchedules` + teardown live in
+> `@cogni/repo-spec` and `@cogni/scheduler-core`. See
+> [substrate-temporal.md](./substrate-temporal.md) for the node-direct create model (it
+> supersedes the operator-dispatch framing in the now-retired
+> node-temporal-tenant-interface.md).
+
 ### LangGraph vs Temporal Boundary
 
 The boundary between LangGraph and Temporal is **durability and runtime semantics**, not DAG shape or AI-vs-non-AI. Both systems can express DAGs; the question is whether a step needs crash recovery, idempotency, and cross-process coordination (Temporal) or in-process intelligence and dataflow (LangGraph).
@@ -351,17 +464,54 @@ This violates ONE_RUN_EXECUTION_PATH. The graph run is invisible to the dashboar
 
 #### Namespaces
 
-| Namespace          | Purpose                                                   |
-| ------------------ | --------------------------------------------------------- |
-| `cogni-governance` | Governance workflows (signal collection, routing, agents) |
-| `cogni-scheduler`  | User-created scheduled graph executions                   |
+One **shared** Temporal namespace per environment — tenant isolation comes from per-node task
+queues, not separate namespaces.
+
+| Namespace     | Purpose                                                                                                                                    |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cogni-<env>` | One namespace per env (`cogni-candidate-a` / `cogni-preview` / `cogni-production`). All nodes + the operator's governance/epochs share it. |
 
 #### Task Queues
 
-| Queue              | Workers             | Workflows                 |
-| ------------------ | ------------------- | ------------------------- |
-| `governance-tasks` | `governance-worker` | Collection, Router, Agent |
-| `scheduler-tasks`  | `scheduler-worker`  | ScheduledGraphRun         |
+**Rule: tenancy lives in the workflow payload, not in the queue topology.** The shape is
+**ONE shared worker** (a fixed, horizontally-scaled pod set — not one pod per node) polling a
+**bounded set of workload-typed queues**, with `nodeId` carried in the workflow input
+(`NodeTaskWorkflow` / `GraphRunWorkflow` already carry it). Queue count is `O(workload classes)`,
+**never** `O(nodes)`. This is what [substrate-temporal.md](./substrate-temporal.md) §19/§94 means
+by "ONE shared worker, no per-node worker"; a queue (or worker) **per node** is reserved for the
+opt-in **sovereign escape hatch** ([substrate-temporal.md](./substrate-temporal.md) § escape hatch),
+never the default.
+
+Noisy-neighbor isolation comes from **workload-class queues + per-worker concurrency limits**, not
+from one-queue-per-tenant. Pre-sharding a queue per node is the anti-pattern that produced the
+2026-06-25 fleet-wide prod-502 (the shared worker webpack-built one ~3MB bundle _per per-node queue_
+at startup → event-loop block → liveness SIGKILL → crashloop; fixed by PR #1860 + #1862).
+
+| Queue (target)                      | Worker                         | Workflows                                                    |
+| ----------------------------------- | ------------------------------ | ------------------------------------------------------------ |
+| `dispatch` (light HTTP fan-out)     | shared `scheduler-worker` pool | `NodeTaskWorkflow` (nodeId in payload)                       |
+| `graph-exec` (heavy LLM)            | shared `scheduler-worker` pool | `GraphRunWorkflow` (nodeId in payload)                       |
+| `governance`                        | shared `scheduler-worker` pool | operator governance workflows                                |
+| `ledger-tasks`                      | dedicated `ledger-worker`      | `CollectEpochWorkflow` / epoch pipeline (already this shape) |
+| `scheduler-tasks-<nodeId>` (escape) | a node's **own** opt-in worker | custom durable workflows for that sovereign node only        |
+
+> **As-built today (divergence — `ci-cd.md` treats spec-vs-workflow divergence as a bug to close).**
+> The shared `scheduler-worker` pod currently runs one Temporal **poller per per-node queue**
+> (`scheduler-tasks-<nodeId>`, derived from `COGNI_NODE_ENDPOINTS`) plus a legacy `scheduler-tasks`
+> drain queue — `O(nodes)` pollers. After PR #1860 they all **share one pre-built workflow bundle**,
+> so the pollers are now cheap (the storm is gone); this is an efficiency/clarity wart, no longer a
+> reliability risk. Epochs already run correctly on the dedicated **`ledger-tasks`** queue via a
+> separate always-on `ledger-worker` — they do **not** ride `scheduler-tasks-operator` (the old
+> table claim was wrong) and are **out of scope** of the collapse.
+>
+> **Migration to the target is staged, not a single cutover** — a naive rename orphans every live
+> schedule, including `chat.completions` (which rides `scheduler-tasks-<nodeId>` via
+> `GraphRunWorkflow`). Prerequisite + phases: **(P0)** leave `ledger-tasks`/epochs untouched;
+> **(P1)** worker dual-polls new workload queues _and_ existing per-node queues; **(P2)** re-point
+> producers to workload queues **and fix the drift detector** — `syncGovernanceSchedules` /
+> `syncNodeSchedules` currently never compare `action.taskQueue` and `describeSchedule` does not even
+> surface it, so a reconcile silently skips and leaves schedules on the dead queue — then run the
+> reconcile on deploy; **(P3)** drop per-node polling only once zero schedules point at the old queues.
 
 #### Search Attributes
 

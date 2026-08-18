@@ -37,7 +37,6 @@ export interface FormationFlowDialogProps {
   daoTxHash: string | null;
   signalTxHash: string | null;
   errorMessage: string | null;
-  repoSpecYaml: string | null;
   addresses: VerifiedAddresses | null;
   tokenName: string | null;
   isInFlight: boolean;
@@ -63,7 +62,7 @@ function getPhaseMessage(phase: FormationPhase): string {
     case "VERIFYING":
       return "Verifying on-chain results...";
     case "SUCCESS":
-      return "DAO published successfully";
+      return "DAO verified successfully";
     case "ERROR":
       return "Formation failed";
   }
@@ -137,7 +136,6 @@ export function FormationFlowDialog({
   daoTxHash,
   signalTxHash,
   errorMessage,
-  repoSpecYaml,
   addresses,
   tokenName,
   isInFlight,
@@ -216,7 +214,7 @@ export function FormationFlowDialog({
                 <CheckCircle2 className="h-16 w-16 text-success" />
                 <div className="text-center">
                   <p className="font-semibold text-foreground text-xl">
-                    DAO Published
+                    DAO Verified
                   </p>
                   {tokenName && (
                     <p className="mt-1 text-muted-foreground">{tokenName}</p>
@@ -264,18 +262,6 @@ export function FormationFlowDialog({
                 >
                   Done
                 </Button>
-
-                {/* Copy YAML button */}
-                {repoSpecYaml && (
-                  <Button
-                    variant="outline"
-                    onClick={() => {
-                      void navigator.clipboard.writeText(repoSpecYaml);
-                    }}
-                  >
-                    Copy repo-spec.yaml
-                  </Button>
-                )}
 
                 {/* Transaction link */}
                 {displayTxHash && explorerUrl && (

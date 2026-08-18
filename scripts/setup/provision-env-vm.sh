@@ -141,7 +141,7 @@ done
 
 # Deploy identity (B1 + B2). Source the catalog library to get NODE_TARGETS,
 # then derive the deploy repo coordinates from origin. Both replace the
-# Cogni-DAO/cogni + operator|poly|resy hardcodes the canary tripped on.
+# cogni-dao/cogni + operator|poly|resy hardcodes the canary tripped on.
 # shellcheck source=../ci/lib/image-tags.sh
 . "$REPO_ROOT/scripts/ci/lib/image-tags.sh"
 # Idempotent Cloudflare A-record upsert — shared with scripts/ci/reconcile-node-dns.sh.
@@ -149,7 +149,7 @@ done
 . "$REPO_ROOT/scripts/ci/lib/cloudflare-dns.sh"
 
 # Runs on any repo that owns its deploy state on origin: the hub
-# (Cogni-DAO/cogni — multi-node) and downstream forks (single- or multi-node)
+# (cogni-dao/cogni — multi-node) and downstream forks (single- or multi-node)
 # alike. The script is already monorepo-shaped: NODE_TARGETS comes from
 # image-tags.sh, COGNI_NODE_DBS loops every node, and node identity resolves
 # per-node-spec-first. Only the bare upstream public template is rejected — it
@@ -159,9 +159,10 @@ done
 # tenant isolation.
 GH_REPO=$(git -C "$REPO_ROOT" remote get-url origin \
   | sed -E 's#.*github.com[:/]([^/]+/[^/.]+).*#\1#')
-if [[ -z "$GH_REPO" || "$GH_REPO" =~ ^Cogni-DAO/standalone-node$ ]]; then
+GH_REPO_LOWER=$(printf "%s" "$GH_REPO" | tr '[:upper:]' '[:lower:]')
+if [[ -z "$GH_REPO" || "$GH_REPO_LOWER" == "cogni-dao/standalone-node" ]]; then
   log_error "origin is the bare upstream template ($GH_REPO) or is undetectable."
-  log_error "Provision from the hub (Cogni-DAO/cogni) or a configured fork — the"
+  log_error "Provision from the hub (cogni-dao/cogni) or a configured fork — the"
   log_error "bootstrap pushes deploy state to origin, which the template cannot own."
   exit 1
 fi
@@ -343,7 +344,7 @@ COGNI_REPO_REF="$BRANCH"
 # included as keys to match the scheduler-worker ConfigMap convention
 # (services/scheduler-worker resolves either form).
 PLACEHOLDER_NODE_ID="00000000-0000-4000-a000-000000000000"
-# Upstream Cogni-DAO/standalone-node's committed node_id. Forks that haven't
+# Upstream cogni-dao/standalone-node's committed node_id. Forks that haven't
 # minted their own inherit this. Bumped here in lockstep when upstream rotates.
 UPSTREAM_NODE_ID="4ff8eac1-4eba-4ed0-931b-b1fe4f64713d"
 COGNI_NODE_ENDPOINTS_PARTS=()
@@ -376,12 +377,13 @@ for node in "${NODE_TARGETS[@]}"; do
   # Upstream-inheritance check: a fork running with upstream's UUID is also
   # running with upstream's DAO/wallet/payments — cross-tenant leak, not a
   # usable deployment. Legitimate owners of this UUID are the hub
-  # (Cogni-DAO/cogni — operator's node_id IS the canonical identity, not an
-  # inheritance) and the upstream template's own canary (Cogni-DAO/standalone-node).
+  # (cogni-dao/cogni — operator's node_id IS the canonical identity, not an
+  # inheritance) and the upstream template's own canary (cogni-dao/standalone-node).
   # Only true downstream forks must mint their own via the DAO setup wizard.
   if [[ "$nid" == "$UPSTREAM_NODE_ID" ]]; then
     origin_url=$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || echo "")
-    if [[ "$origin_url" != *"Cogni-DAO/standalone-node"* && "$origin_url" != *"Cogni-DAO/cogni"* ]]; then
+    origin_url_lower=$(printf "%s" "$origin_url" | tr '[:upper:]' '[:lower:]')
+    if [[ "$origin_url_lower" != *"cogni-dao/standalone-node"* && "$origin_url_lower" != *"cogni-dao/cogni"* ]]; then
       log_error "node_id for '${node}' equals upstream's UUID — your fork inherited"
       log_error "upstream's IDENTITY (DAO contracts, operator wallet, approvers, payments_in)."
       log_error "Deploying as-is would route real value through upstream's contracts."
@@ -430,7 +432,7 @@ log_step "Phase 3: Provision VM"
 # for a VM in a sibling project — Cherry SSH keys are ACCOUNT-scoped,
 # not project-scoped. Per-fork namespacing eliminates the collision class.
 #
-# Cogni-DAO/standalone-node       → cogni-dao-node-template
+# cogni-dao/standalone-node       → cogni-dao-node-template
 # i-am-coco/cogni-node-20260517 → i-am-coco-cogni-node-20260517
 VM_NAME_PREFIX=$(echo "${GH_REPO//\//-}" | tr '[:upper:]' '[:lower:]')
 log_info "VM/SSH-key prefix: ${VM_NAME_PREFIX} (from \$GH_REPO=${GH_REPO})"
@@ -849,7 +851,7 @@ log_step "Phase 4c: Patch EndpointSlice IPs to $VM_IP on $DEPLOY_BRANCH"
 DEPLOY_TMP=$(mktemp -d)
 # B1 — push to the fork's own deploy branch, NOT the upstream template.
 # Last canary's auto-flight here was a `fatal: 403` because the bot account
-# had no write access to Cogni-DAO/cogni. Use the same GHCR PAT we already
+# had no write access to cogni-dao/cogni. Use the same GHCR PAT we already
 # have (it doubles as a Contents:Write PAT on the fork; bootstrap.sh's
 # pre-flight check guarantees that).
 REPO_URL="https://${GHCR_USERNAME:-${GITHUB_ADMIN_USERNAME:-Cogni-1729}}:${GHCR_TOKEN}@github.com/${GH_REPO}.git"
@@ -1088,8 +1090,6 @@ DATABASE_URL=${DATABASE_URL}
 DATABASE_SERVICE_URL=${DATABASE_SERVICE_URL}
 POSTHOG_API_KEY=${POSTHOG_API_KEY}
 POSTHOG_HOST=${POSTHOG_HOST}
-OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
-OPENCLAW_GITHUB_RW_TOKEN=placeholder-not-started
 SCHEDULER_WORKER_IMAGE=placeholder:not-started
 MIGRATOR_IMAGE=placeholder:not-started
 APP_IMAGE=placeholder:not-started
@@ -1217,11 +1217,17 @@ phase_5b_timeout() {
 }
 
 # ── 5b.1 Register Argo Applications for the substrate ─────────────────────
-# Substitute ${FORK_REPO} + ${DEPLOY_BRANCH} placeholders, apply the two
-# Application CRs into the argocd namespace, then wait for both to complete
-# their first sync. Argo's repo-server clones the deploy branch, runs
+# Substitute ${FORK_REPO} + ${DEPLOY_BRANCH} placeholders, apply the
+# Application CRs into the argocd namespace, then wait for each to complete
+# its first sync. Argo's repo-server clones the deploy branch, runs
 # `kustomize build --enable-helm` (per the bootstrap argocd-cm patch), and
 # applies server-side.
+#
+# The substrate list (openbao external-secrets reloader) is mirrored in
+# scripts/setup/register-substrate-apps.sh, which BACKFILLS a substrate app
+# onto an already-running cluster that was last provisioned before that app
+# existed in-repo (e.g. prod predates the `reloader` Application — bug.5040).
+# Keep the two lists in sync.
 log_info "Enabling --enable-helm in argocd-cm for kustomize-with-helm substrate..."
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=15 root@"$VM_IP" '
   kubectl -n argocd patch cm argocd-cm --type merge \
@@ -1491,6 +1497,41 @@ HCL
     token_max_ttl=10m \
     token_num_uses=3" >/dev/null
   log_info "  gha-${DEPLOY_ENV}-writer (jwt) role bound — sub=repo:${GH_REPO}:environment:${DEPLOY_ENV} → ${DEPLOY_ENV}-writer policy"
+
+  # ── 5b.4d <env>-node-secrets-writer (operator pod's OWN identity; node self-serve) ──
+  # Ships the runtime writer role the operator POD self-logins as to fulfil node
+  # self-serve secret writes (POST /api/v1/nodes/<id>/secrets → OpenBaoSecretsAdapter,
+  # design.node-self-serve-secrets §1.B). Without it a FRESH env comes up missing the
+  # role and the operator's k8s-auth login fast-fails `openbao_login_failed` (a 502 at
+  # write) even though RBAC + seeded/ESO secrets all work — the paths are independent.
+  #
+  # Distinct from ${DEPLOY_ENV}-writer above: bound to the operator-secrets-writer SA
+  # in the cogni-${DEPLOY_ENV} namespace (where the operator actually runs — NOT
+  # default), audience cogni-openbao, and explicit-DENY on the two shared paths a
+  # per-node grant must never reach. The SA + projected token are created by the
+  # operator overlay, not here.
+  #
+  # ⚠️ KEEP IN SYNC with scripts/setup/reconcile-env-substrate.sh:131-151 (the
+  # substrate-only heal path) — this policy+role is duplicated across both cold-start
+  # (here) and reconcile (there). Converging Phase 5b onto reconcile-env-substrate.sh
+  # is the tracked DRY fast-follow; until then, edit BOTH copies together.
+  log_info "Writing ${DEPLOY_ENV}-node-secrets-writer policy + role binding..."
+  ssh $SSH_OPTS root@"$VM_IP" \
+    "kubectl exec -i -n openbao openbao-0 -- env BAO_TOKEN='${ROOT_TOKEN}' BAO_ADDR=http://127.0.0.1:8200 bao policy write ${DEPLOY_ENV}-node-secrets-writer -" <<HCL
+path "cogni/data/${DEPLOY_ENV}/*"             { capabilities = ["read", "create", "update", "patch"] }
+path "cogni/metadata/${DEPLOY_ENV}/*"         { capabilities = ["read", "list"] }
+path "cogni/data/${DEPLOY_ENV}/_system/*"     { capabilities = ["deny"] }
+path "cogni/data/${DEPLOY_ENV}/_shared/*"     { capabilities = ["deny"] }
+path "cogni/metadata/${DEPLOY_ENV}/_system/*" { capabilities = ["deny"] }
+path "cogni/metadata/${DEPLOY_ENV}/_shared/*" { capabilities = ["deny"] }
+HCL
+  bao_exec "write auth/kubernetes/role/${DEPLOY_ENV}-node-secrets-writer \
+    bound_service_account_names=operator-secrets-writer \
+    bound_service_account_namespaces=cogni-${DEPLOY_ENV} \
+    audience=cogni-openbao \
+    policies=${DEPLOY_ENV}-node-secrets-writer \
+    ttl=1h" >/dev/null
+  log_info "  ${DEPLOY_ENV}-node-secrets-writer role bound — operator pod self-serve secret writes (SA operator-secrets-writer @ cogni-${DEPLOY_ENV})"
 else
   log_warn "No root token at $OPENBAO_ROOT_TOKEN_LOCAL — skipping KV mount + auth setup. Re-run provision after recovering init artifacts."
 fi
@@ -1521,22 +1562,44 @@ log_info "Applied ClusterSecretStore openbao-backend"
 # ══════════════════════════════════════════════════════════════
 # seed_kv: <service> <KEY> <value> → cogni/${DEPLOY_ENV}/<service>
 # File-scope helper used by Phase 5c (app secrets) AND Phase 5e (auto-mint).
-# No-op when value is empty. First write creates the path (put); later writes
-# patch so existing keys are preserved. Requires ROOT_TOKEN to be set by the
-# caller (read from $OPENBAO_ROOT_TOKEN_LOCAL after Phase 5b.2 produces it).
+# No-op when value is empty. Requires ROOT_TOKEN to be set by the caller (read
+# from $OPENBAO_ROOT_TOKEN_LOCAL after Phase 5b.2 produces it).
+#
+# bug.5068: `cogni/<env>/<service>` is a SHARED bucket (~35 keys for operator) and
+# `bao kv put` REPLACES every key at the path. The old shape chose put/patch off a
+# `kv metadata get` precheck — a TRANSIENT precheck failure (this helper runs many
+# times over ssh during provision) against an already-seeded path would `put` one
+# key and wipe every sibling. Fix: `patch` FIRST (merges — never clobbers), and only
+# fall back to a destructive `put` on a POSITIVE "does not exist" signal in patch's
+# OWN output. Any other failure returns non-zero without clobbering.
 seed_kv() {
   local svc="$1" k="$2" v="$3"
   [[ -z "$v" ]] && return 0
-  local path="cogni/${DEPLOY_ENV}/${svc}"
-  local op="patch"
-  if ! ssh $SSH_OPTS root@"$VM_IP" \
-    "kubectl exec -n openbao openbao-0 -- env BAO_TOKEN='${ROOT_TOKEN}' BAO_ADDR=http://127.0.0.1:8200 bao kv metadata get '${path}'" \
-    >/dev/null 2>&1; then
-    op="put"
+  local path="cogni/${DEPLOY_ENV}/${svc}" out rc
+  set +e
+  out="$(printf '%s' "$v" | ssh $SSH_OPTS root@"$VM_IP" \
+    "kubectl exec -i -n openbao openbao-0 -- env BAO_TOKEN='${ROOT_TOKEN}' BAO_ADDR=http://127.0.0.1:8200 bao kv patch '${path}' '${k}=-'" \
+    2>&1)"
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
+    return 0
   fi
-  printf '%s' "$v" | ssh $SSH_OPTS root@"$VM_IP" \
-    "kubectl exec -i -n openbao openbao-0 -- env BAO_TOKEN='${ROOT_TOKEN}' BAO_ADDR=http://127.0.0.1:8200 bao kv ${op} '${path}' '${k}=-'" \
-    >/dev/null
+  # A `bao kv patch` on a never-written KV v2 path returns HTTP `Code: 404` with an
+  # EMPTY raw message (no "not found" text) — the unambiguous absent signal on a FRESH
+  # OpenBao. Without matching it, the very first seed_kv on a clean env aborts the whole
+  # provision (a 404 means the path doesn't exist yet → no siblings → put is safe).
+  if printf '%s' "$out" | grep -qiE 'no value found|does not exist|not found|code: 404'; then
+    # Genuinely absent — safe to create; no siblings to clobber.
+    printf '%s' "$v" | ssh $SSH_OPTS root@"$VM_IP" \
+      "kubectl exec -i -n openbao openbao-0 -- env BAO_TOKEN='${ROOT_TOKEN}' BAO_ADDR=http://127.0.0.1:8200 bao kv put '${path}' '${k}=-'" \
+      >/dev/null
+    return $?
+  fi
+  # Transient/unknown failure — NEVER put (would wipe siblings at this shared path).
+  printf 'seed_kv: bao kv patch on %s failed (rc=%s) without a positive "absent" signal; refusing to put (would clobber siblings): %s\n' \
+    "$path" "$rc" "$out" >&2
+  return 1
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -1586,6 +1649,54 @@ else
   done
   log_info "Seeding cogni/${DEPLOY_ENV}/scheduler-worker/*..."
   for k in "${SCHEDULER_WORKER_KEYS[@]}"; do seed_kv scheduler-worker "$k" "${!k:-}"; done
+
+  # Shared-infra OpenFGA DB-role password (OpenBao custody, Invariant 15). OpenFGA is
+  # infra, not a node, so it carries no static catalog entry (the loader allowlist is
+  # node-domain — openfga-substrate-unification.md §Move-1); provision auto-generates it
+  # here, closing the "auto-generation on fresh provision" follow-up that left every
+  # clean reprovision unable to bind OPENFGA_DB_PASSWORD (deploy-infra Phase 5f abort).
+  # SET-ONCE: reuse the existing OpenBao value on every re-provision so it never diverges
+  # from the persisted openfga Postgres role (the Temporal-superuser-drift class, bug.5002).
+  # deploy-infra reads this via the ${env}-db-reader seam and renders the role + DSN.
+  OPENFGA_DB_PASSWORD="$(bao_get_field openfga OPENFGA_DB_PASSWORD)"
+  if [[ -n "$OPENFGA_DB_PASSWORD" ]]; then
+    log_info "Seeding cogni/${DEPLOY_ENV}/openfga/* — OPENFGA_DB_PASSWORD present, reusing (set-once)"
+  else
+    OPENFGA_DB_PASSWORD="$(randHex 32)"
+    log_info "Seeding cogni/${DEPLOY_ENV}/openfga/* — minting fresh OPENFGA_DB_PASSWORD"
+  fi
+  seed_kv openfga OPENFGA_DB_PASSWORD "$OPENFGA_DB_PASSWORD"
+
+  # TEMPORAL_DB_PASSWORD is the same shared-infra DB-cred class: the dedicated
+  # temporal-postgres superuser, baked into the volume at first-init and read by
+  # deploy-infra via the ${env}-db-reader seam (cogni/<env>/_shared). bootstrap.sh
+  # generates it, but provision never seeded it to _shared → deploy-infra's fresh-env
+  # read (SSOT off) found nothing → set -u abort (same failure as OPENFGA). Seed it,
+  # SET-ONCE: reuse the existing OpenBao value so it never diverges from the persisted
+  # temporal-postgres volume (the 2026-06-11 password-drift outage).
+  existing_temporal_pw="$(bao_get_field _shared TEMPORAL_DB_PASSWORD)"
+  [[ -n "$existing_temporal_pw" ]] && TEMPORAL_DB_PASSWORD="$existing_temporal_pw"
+  seed_kv _shared TEMPORAL_DB_PASSWORD "$TEMPORAL_DB_PASSWORD"
+
+  # DOLTGRES_PASSWORD — the doltgres `postgres` superuser, baked into the volume at
+  # first-init and IMMUTABLE post-init (doltgres can't ALTER the superuser; databases.md
+  # §5.2). Same shared-infra DB-cred class as OPENFGA/TEMPORAL above and MUST be seeded the
+  # same SET-ONCE way. It was the one left out: deploy-infra falls back to
+  # `derive_secret doltgres-root` = sha256(POSTGRES_ROOT_PASSWORD) when OpenBao is empty, so
+  # a root rotation (or genesis-derive ≠ later value) drifts the rendered password from the
+  # volume's frozen superuser → provision.sh `-U postgres` fails → dead knowledge plane
+  # (preview 2026-08-04). Mint ONCE (randHex, NOT derived) + reuse forever → the superuser
+  # can never drift, so NO in-place reset (impossible on doltgres) and NO volume recreate
+  # (never destroy a DB to fix a credential) is ever needed. Seeded at cogni/<env>/operator
+  # (the path deploy-infra reads via openbao_get_field).
+  DOLTGRES_PASSWORD="$(bao_get_field operator DOLTGRES_PASSWORD)"
+  if [[ -n "$DOLTGRES_PASSWORD" ]]; then
+    log_info "Seeding cogni/${DEPLOY_ENV}/operator/DOLTGRES_PASSWORD — present, reusing (set-once)"
+  else
+    DOLTGRES_PASSWORD="$(randHex 32)"
+    log_info "Seeding cogni/${DEPLOY_ENV}/operator/DOLTGRES_PASSWORD — minting fresh (set-once)"
+  fi
+  seed_kv operator DOLTGRES_PASSWORD "$DOLTGRES_PASSWORD"
   log_info "OpenBao paths seeded for ${DEPLOY_ENV}"
 
   # Write runtime/.env LAST so the VM gets reconciled values, not Phase-2
@@ -1666,6 +1777,20 @@ else
                PROMETHEUS_REMOTE_WRITE_URL PROMETHEUS_USERNAME PROMETHEUS_PASSWORD; do
         seed_kv _shared "$k" "${MINTED[$k]}"
       done
+      # Born-observable: the operator node-log proxy (createLokiReader) reads
+      # GRAFANA_URL + GRAFANA_SERVICE_ACCOUNT_TOKEN from the OPERATOR pod, via the
+      # operator ExternalSecret that extracts cogni/<env>/operator. These two keys
+      # were reclassified to service: operator (source: human) and previously had
+      # to be wired BY HAND post-provision. Mirror the minted read creds to the
+      # operator path so the proxy is wired at birth, not by hand (bug.5041 Gap 2).
+      # Same single glsa_ read token + stack URL the _shared seed got (one Grafana
+      # stack for every env; env is just a Loki label). For an env provisioned
+      # BEFORE this seed existed, the day-2 heal routes through the standard secret
+      # lane (re-run a provision, or seed cogni/<env>/operator/GRAFANA_* via the
+      # secret-materialize / substrate path) — no bespoke observability script.
+      log_info "Seeding operator Grafana read creds to cogni/${DEPLOY_ENV}/operator (born-observable)"
+      seed_kv operator GRAFANA_URL "${MINTED[GRAFANA_URL]}"
+      seed_kv operator GRAFANA_SERVICE_ACCOUNT_TOKEN "${MINTED[GRAFANA_SERVICE_ACCOUNT_TOKEN]}"
       # Export under the names deploy-infra.sh + provision-grafana-postgres-
       # datasources.sh expect (deploy-infra writes runtime/.env's
       # LOKI_*/PROMETHEUS_* from these GRAFANA_CLOUD_* runner-env names; the
@@ -1814,10 +1939,11 @@ log_step "Phase 6: Apply ExternalSecret manifests"
 # canonical pattern called out in .claude/skills/cicd-secrets-expert
 # anti-patterns ("ssh root@vm kubectl ... — use local kubectl").
 #
-# Leaves are enumerated from the two SSOT trees per secrets-classification.md:
-#   - infra/k8s/secrets/external-secrets/<env>/<svc>/    (operator-domain)
+# Leaves are enumerated from the single SSOT tree per secrets-classification.md:
 #   - nodes/<node>/k8s/external-secrets/<env>/           (node-domain, A2)
-# An aggregator kustomization is deliberately absent — every prior incarnation
+# Every node carries its own ExternalSecret leaf in-repo (north-star per-node
+# substrate). The pre-wizard operator-domain tree was purged; there is now ONE
+# convention. An aggregator kustomization is deliberately absent — every prior incarnation
 # leaked a relative-up ref (../../../../../nodes/...) which broke remote
 # apply paths. Self-contained leaves compose without that smell.
 #
@@ -1830,15 +1956,6 @@ KUBECONFIG="$KUBECONFIG_LOCAL" kubectl create namespace "$K8S_NAMESPACE" \
   KUBECONFIG="$KUBECONFIG_LOCAL" kubectl apply -f -
 
 ES_APPLIED=0
-
-# Operator-domain leaves: infra/k8s/secrets/external-secrets/<env>/<svc>/
-for svc_dir in "$REPO_ROOT"/infra/k8s/secrets/external-secrets/"${DEPLOY_ENV}"/*/; do
-  [[ -d "$svc_dir" && -f "$svc_dir/kustomization.yaml" ]] || continue
-  svc=$(basename "${svc_dir%/}")
-  KUBECONFIG="$KUBECONFIG_LOCAL" kubectl -n "$K8S_NAMESPACE" apply -k "$svc_dir"
-  log_info "  applied operator-domain ExternalSecret: $svc"
-  ES_APPLIED=$((ES_APPLIED + 1))
-done
 
 # Node-domain leaves: nodes/<node>/k8s/external-secrets/<env>/
 for node_es_dir in "$REPO_ROOT"/nodes/*/k8s/external-secrets/"${DEPLOY_ENV}"/; do
@@ -1853,8 +1970,7 @@ done
 if [[ $ES_APPLIED -eq 0 ]]; then
   log_warn "No ExternalSecret manifests applied for ${DEPLOY_ENV}."
   log_warn "Pods consuming envFrom: secretRef will CrashLoop until the operator"
-  log_warn "adds an ExternalSecret kustomization under either"
-  log_warn "  infra/k8s/secrets/external-secrets/${DEPLOY_ENV}/<svc>/, or"
+  log_warn "adds an ExternalSecret kustomization under"
   log_warn "  nodes/<node>/k8s/external-secrets/${DEPLOY_ENV}/"
 else
   log_info "Applied ${ES_APPLIED} ExternalSecret manifest(s) for ${DEPLOY_ENV}"
@@ -1883,30 +1999,38 @@ log_step "Phase 7: Apply ApplicationSets (triggers Argo sync)"
 # operator's local checkout is the source of truth — it has the files they intend to deploy.
 # This also avoids the chicken-and-egg: you can provision preview before the files are
 # promoted to staging.
-# Per-node AppSets (bug.0378 / #1465) replaced the monolithic
-# ${DEPLOY_ENV}-applicationset.yaml with one ${DEPLOY_ENV}-<node>-applicationset.yaml
-# per node (operator/node-template/resy/canary/scheduler-worker). Discover all
-# of them; fall back to the monolith (candidate-b still ships one) for envs not
-# yet migrated. Applying a single ${DEPLOY_ENV}-applicationset.yaml was the
-# Phase-7 break that orphaned the first candidate-a re-provision.
+# PER-ENV ROOT app-of-apps (story.5020): each env applies ONLY its own
+# cogni-${DEPLOY_ENV}-control-plane SEED, whose source path is the env-scoped
+# control-plane/${DEPLOY_ENV}/ dir (holding that env's cogni-${DEPLOY_ENV}-appsets
+# app-of-apps). The seed is the ONLY apply-once surface; from it Argo continuously
+# reconciles the app-of-apps layer, which reconciles appsets/${DEPLOY_ENV}/ with
+# prune — so a merged change to the app-of-apps reaches the cluster WITHOUT a
+# re-provision, a catalog-removed node's AppSet auto-prunes, and (crucially) NO
+# foreign env's app-of-apps is ever fanned onto THIS cluster.
+#
+# This replaces the prior step that applied the cogni-${DEPLOY_ENV}-appsets
+# app-of-apps DIRECTLY (itself apply-once → a merged control-plane change never
+# reached a live cluster until re-provision; proven 2026-06-30). candidate-b still
+# ships its own monolithic ${APPSET_FILE} (not yet migrated to the seed).
 APPSET_DIR="$REPO_ROOT/infra/k8s/argocd"
+APP_OF_APPS="$APPSET_DIR/control-plane/roots/${DEPLOY_ENV}-control-plane-application.yaml"
 APPSET_LOCALS=()
-for f in "$APPSET_DIR/${DEPLOY_ENV}"-*-applicationset.yaml; do
-  [ -f "$f" ] && APPSET_LOCALS+=("$f")
-done
-if [ ${#APPSET_LOCALS[@]} -eq 0 ] && [ -f "$APPSET_DIR/${APPSET_FILE}" ]; then
+if [ -f "$APP_OF_APPS" ]; then
+  APPSET_LOCALS+=("$APP_OF_APPS")
+elif [ -f "$APPSET_DIR/${APPSET_FILE}" ]; then
+  # Pre-seed env (e.g. candidate-b) still ships a monolithic AppSet.
   APPSET_LOCALS+=("$APPSET_DIR/${APPSET_FILE}")
 fi
 if [ ${#APPSET_LOCALS[@]} -eq 0 ]; then
-  log_error "No ApplicationSet files for ${DEPLOY_ENV} in $APPSET_DIR"
-  log_error "Expected per-node ${DEPLOY_ENV}-<node>-applicationset.yaml or monolithic ${APPSET_FILE}."
+  log_error "No control-plane root seed for ${DEPLOY_ENV} in $APPSET_DIR"
+  log_error "Expected control-plane/roots/${DEPLOY_ENV}-control-plane-application.yaml or monolithic ${APPSET_FILE}."
   log_error "Run this script from the repo root on a branch that has infra/k8s/argocd/."
   exit 1
 fi
-log_info "Applying ${#APPSET_LOCALS[@]} ApplicationSet(s) for ${DEPLOY_ENV}: $(printf '%s ' "${APPSET_LOCALS[@]##*/}")"
+log_info "Applying ${#APPSET_LOCALS[@]} app-of-apps for ${DEPLOY_ENV}: $(printf '%s ' "${APPSET_LOCALS[@]##*/}")"
 
 # B1 (deploy machinery) — substitute repoURL to point at the FORK, not the
-# upstream. AppSet files commit with the canonical Cogni-DAO/standalone-node
+# upstream. AppSet files commit with the canonical cogni-dao/standalone-node
 # URL; provision rewrites at apply time so Argo CD syncs from the fork's
 # own deploy/* branches. Idempotent for the canonical operator (no-op).
 for APPSET_LOCAL in "${APPSET_LOCALS[@]}"; do
@@ -1924,22 +2048,44 @@ for APPSET_LOCAL in "${APPSET_LOCALS[@]}"; do
 done
 log_info "All ApplicationSets applied — Argo syncing from deploy/* branches"
 
-# Poll for apps to sync (up to 5 min)
-log_info "Waiting for Argo to sync apps..."
+# ── Provision health GATES (assert-or-fail, not apply-and-hope) ──────────────
+# A fresh provision must PROVE it is honest + self-pruning, else fail loudly. The
+# prior "≥3 apps Healthy" poll silently passed a control plane with no prune loop
+# (the 2026-07-16 fleet-502: a node born dishonest + a control plane with no root
+# app-of-apps → zombie pods that never pruned). These two gates would have caught it.
+
+# Gate 1 — honest allocatable: the kubelet system-reserved reservation must be in
+# effect on the fresh node (bootstrap.sh asserts it inline at first boot; re-assert
+# here from the provisioner so the gate is explicit, not only a bootstrap.ok
+# side-channel). See docs/design/operator-fleet-safety.md SLA#1.
+log_info "Gate 1: honest allocatable (system-reserved in effect)..."
+scp $SSH_OPTS "$REPO_ROOT/scripts/ci/assert-honest-allocatable.sh" root@"$VM_IP":/tmp/assert-honest-allocatable.sh
+if ! ssh $SSH_OPTS root@"$VM_IP" 'rc=0; bash /tmp/assert-honest-allocatable.sh || rc=$?; rm -f /tmp/assert-honest-allocatable.sh; exit $rc'; then
+  log_error "GATE FAILED: allocatable == capacity — kubelet system-reserved NOT in effect."
+  log_error "A fresh node must boot honest or it over-commits and cascades to a fleet-502."
+  log_error "Fix /etc/rancher/k3s/config.yaml kubelet-arg (system_reserved_memory) and reprovision."
+  exit 1
+fi
+
+# Gate 2 — control-plane root app-of-apps: the per-env seed
+# (cogni-${DEPLOY_ENV}-control-plane) is what continuously reconciles the AppSet
+# layer WITH PRUNE. Without it Synced/Healthy, decommissions never prune. Assert it
+# explicitly (up to 5 min) — no "some apps healthy" fallback.
+ROOT_APP="cogni-${DEPLOY_ENV}-control-plane"
+log_info "Gate 2: control-plane root app-of-apps (${ROOT_APP}) Synced/Healthy..."
+ROOT_STATE=""
 for attempt in $(seq 1 30); do
-  HEALTHY=$(ssh $SSH_OPTS root@"$VM_IP" 'kubectl -n argocd get applications -o jsonpath="{range .items[*]}{.status.health.status}{\" \"}{end}"' 2>/dev/null)
-  HEALTHY_COUNT=$(echo "$HEALTHY" | tr ' ' '\n' | grep -c "Healthy" || true)
-  TOTAL=$(echo "$HEALTHY" | tr ' ' '\n' | grep -c '.' || true)
-  log_info "  Apps healthy: ${HEALTHY_COUNT}/${TOTAL} (${attempt}0s)"
-  if [[ "$HEALTHY_COUNT" -ge 3 ]]; then
-    log_info "Core apps healthy!"
-    break
-  fi
-  if [[ $attempt -eq 30 ]]; then
-    log_warn "Timeout waiting for apps — check scorecard for details"
-  fi
+  ROOT_STATE=$(ssh $SSH_OPTS root@"$VM_IP" "kubectl -n argocd get application ${ROOT_APP} -o jsonpath='{.status.sync.status}/{.status.health.status}'" 2>/dev/null || true)
+  log_info "  ${ROOT_APP}: ${ROOT_STATE:-<absent>} (${attempt}0s)"
+  [[ "$ROOT_STATE" == "Synced/Healthy" ]] && break
   sleep 10
 done
+if [[ "$ROOT_STATE" != "Synced/Healthy" ]]; then
+  log_error "GATE FAILED: ${ROOT_APP} is '${ROOT_STATE:-absent}', not Synced/Healthy."
+  log_error "The env would have no continuous prune loop — decommissions leave orphaned pods."
+  exit 1
+fi
+log_info "Both gates PASS — node is honest and the control-plane prune loop is live."
 
 # ══════════════════════════════════════════════════════════════
 # Phase 8: Deployment Status Report
@@ -2060,45 +2206,70 @@ kubectl -n ${K8S_NAMESPACE} get events --sort-by=.lastTimestamp 2>&1 | tail -40
   fi
 }
 
-log_step "Phase 9: Verify /readyz on all nodes (up to 5 min)"
+log_step "Phase 9: Report node /readyz (SOFT — substrate is gated by Phases 5-8)"
 
-READYZ_OK=true
+# WHY SOFT + PARALLEL + GLOBAL-BUDGETED (the 60-min-timeout / orphaned-VM fix):
+# provision-env owns the SUBSTRATE (VM, k3s, Argo, OpenBao/ESO, Compose, AppSets,
+# DB-cred gate) — all gated, fail-loud, in Phases 3-8. App `/readyz 200` depends on
+# node IMAGES, which the PROMOTE lane ships, not provision. On a fresh env the images
+# aren't promoted yet, so gating provision success on per-node `/readyz` is asserting
+# a postcondition this job's scope cannot satisfy. The old loop made it worse: it
+# polled each declared node 5 min SEQUENTIALLY, so as the catalog grew (~12 nodes) the
+# phase alone exceeded GitHub's 60-min job cap → SIGKILL mid-run → the init-artifact
+# (kubeconfig + VM key) never got encrypted → an ORPHANED, unreachable VM every time.
+# Now: poll all declared nodes IN PARALLEL inside ONE wall-clock budget, then REPORT
+# (warn, never exit 1). Substrate-green provision completes in minutes and finalizes
+# VM_HOST + the init artifact; `/readyz 200` is proven by the promote lane afterwards.
+PHASE_9_BUDGET_SECS="${PHASE_9_BUDGET_SECS:-300}"
+
+# Resolve the declared (env-scoped) node → port set once. Per-env membership
+# (candidate-b 2026-06-04): NODE_TARGETS is the GLOBAL catalog, but an env deploys
+# only the nodes with an overlay under infra/k8s/overlays/${OVERLAY_DIR}/.
+declare -a RZ_NODES=() RZ_PORTS=()
 for node in "${NODE_TARGETS[@]}"; do
-  # Per-env node membership (bug: candidate-b 2026-06-04). NODE_TARGETS is the
-  # GLOBAL catalog (every type:node), but an env deploys only the nodes its
-  # ApplicationSet declares — i.e. the nodes with an overlay under
-  # infra/k8s/overlays/${OVERLAY_DIR}/ (the same env-scoped set Phase 4b.5 uses).
-  # Verifying an undeclared node (candidate-b is a 3-node OpenBao-proof env, no
-  # operator/resy overlay) reds a correctly-provisioned env. Skip what this env
-  # doesn't deploy.
   if [[ ! -d "$REPO_ROOT/infra/k8s/overlays/${OVERLAY_DIR}/${node}" ]]; then
-    log_info "  ${node}: not in ${DEPLOY_ENV} overlays — not deployed here, skipping /readyz"
+    log_info "  ${node}: not in ${DEPLOY_ENV} overlays — not deployed here, skipping"
     continue
   fi
   catalog_file="$REPO_ROOT/infra/catalog/${node}.yaml"
   node_port=$(yq -N '.node_port // ""' "$catalog_file" 2>/dev/null)
   if [[ -z "$node_port" || "$node_port" == "null" ]]; then
-    log_warn "  ${node}: no node_port in ${catalog_file}; skipping /readyz"
+    log_warn "  ${node}: no node_port in ${catalog_file}; skipping"
     continue
   fi
-  NODE_OK=false
-  for attempt in $(seq 1 30); do
-    STATUS=$(ssh $SSH_OPTS root@"$VM_IP" "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 http://localhost:${node_port}/readyz" 2>/dev/null || echo "000")
-    if [[ "$STATUS" == "200" ]]; then
-      log_info "  ${node} (${node_port}): /readyz 200 ✅"
-      NODE_OK=true
-      break
-    fi
-    if (( attempt % 6 == 0 )); then
-      log_info "  ${node} (${node_port}): waiting... (${attempt}0s, last status: ${STATUS})"
-    fi
-    sleep 10
-  done
-  if [[ "$NODE_OK" != "true" ]]; then
-    log_error "  ${node} (${node_port}): /readyz FAILED after 5 min ❌"
-    READYZ_OK=false
+  RZ_NODES+=("$node"); RZ_PORTS+=("$node_port")
+done
+
+RZ_TOTAL=${#RZ_NODES[@]}
+RZ_RESULT_DIR=$(mktemp -d)
+# One backgrounded poller per node; each retries up to the GLOBAL budget, so total
+# wall-clock is ~PHASE_9_BUDGET_SECS regardless of node count (not budget × N).
+for i in "${!RZ_NODES[@]}"; do
+  node="${RZ_NODES[$i]}"; port="${RZ_PORTS[$i]}"
+  (
+    deadline=$(( $(date +%s) + PHASE_9_BUDGET_SECS ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      st=$(ssh $SSH_OPTS root@"$VM_IP" "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 http://localhost:${port}/readyz" 2>/dev/null || echo "000")
+      [ "$st" = "200" ] && { echo "200" > "$RZ_RESULT_DIR/$node"; exit 0; }
+      sleep 10
+    done
+    echo "timeout" > "$RZ_RESULT_DIR/$node"
+  ) &
+done
+wait
+
+RZ_SERVING=0; RZ_NOT=()
+for i in "${!RZ_NODES[@]}"; do
+  node="${RZ_NODES[$i]}"; port="${RZ_PORTS[$i]}"
+  if [[ "$(cat "$RZ_RESULT_DIR/$node" 2>/dev/null)" == "200" ]]; then
+    log_info "  ${node} (${port}): /readyz 200 ✅"
+    RZ_SERVING=$((RZ_SERVING + 1))
+  else
+    log_warn "  ${node} (${port}): not serving /readyz yet (app image lands via promote)"
+    RZ_NOT+=("$node")
   fi
 done
+rm -rf "$RZ_RESULT_DIR"
 
 # ══════════════════════════════════════════════════════════════
 # Phase 9a: Verify public /readyz via Cloudflare → Caddy → app
@@ -2148,12 +2319,14 @@ else
 fi
 
 echo ""
-if [[ "$READYZ_OK" == "true" ]]; then
-  log_info "═══ ALL DECLARED NODES HEALTHY — ${DEPLOY_ENV} IS GREEN ═══"
-  exit 0
-else
-  log_error "═══ SOME NODES FAILED /readyz — ${DEPLOY_ENV} PROVISION IS RED ═══"
-  phase_9_diagnostic
-  log_error "Debug: ssh -i .local/${DEPLOY_ENV}-vm-key root@$VM_IP 'kubectl -n ${K8S_NAMESPACE} logs -l app.kubernetes.io/name=node-app --tail=20'"
-  exit 1
+# Provision success = SUBSTRATE provisioned (gated fail-loud in Phases 3-8). App
+# `/readyz` is a soft report: not-yet-serving nodes mean images haven't been promoted
+# yet, which is the promote lane's job — NOT a provision failure. Exiting non-zero here
+# is what SIGKILLed the run before init-artifact custody and orphaned the VM.
+log_info "═══ ${DEPLOY_ENV} SUBSTRATE PROVISIONED ═══"
+log_info "  /readyz serving: ${RZ_SERVING}/${RZ_TOTAL} declared nodes"
+if [[ "${#RZ_NOT[@]}" -gt 0 ]]; then
+  log_warn "  not-yet-serving (promote app images to finish): ${RZ_NOT[*]}"
+  log_warn "  Debug a node: ssh -i .local/${DEPLOY_ENV}-vm-key root@$VM_IP 'kubectl -n ${K8S_NAMESPACE} get pods'"
 fi
+exit 0

@@ -246,12 +246,13 @@ done
 # Detect repo from origin (works for forks)
 ORIGIN_URL=$(git -C "$REPO_ROOT" remote get-url origin)
 GH_REPO=$(echo "$ORIGIN_URL" | sed -E 's#.*github.com[:/]([^/]+/[^/.]+).*#\1#')
+GH_REPO_LOWER=$(printf "%s" "$GH_REPO" | tr '[:upper:]' '[:lower:]')
 log "GitHub repo: ${BOLD}${GH_REPO}${NC}"
 
 # Refuse to run inside the upstream node template. Bootstrap mutates secrets,
 # environments, and deploy branches — it must target a repo that owns its
-# deploy state. The hub (Cogni-DAO/cogni) is valid; the bare template is not.
-if [[ "$GH_REPO" == "Cogni-DAO/standalone-node" ]]; then
+# deploy state. The hub (cogni-dao/cogni) is valid; the bare template is not.
+if [[ "$GH_REPO_LOWER" == "cogni-dao/standalone-node" ]]; then
   err "origin points at the upstream node template (${GH_REPO}). Bootstrap must run inside the hub or a fork."
   err "Fork first for node-template: see docs/runbooks/fork-quickstart.md"
   exit 2
@@ -294,7 +295,7 @@ log "Admin role verified for ${GITHUB_ADMIN_USERNAME}"
 # asking. Two consumers read it: CI build workflows via
 # `${{ vars.FORK_IMAGE_NAME || upstream-default }}`, and provision-env-vm.sh via
 # the exported env below. (bug.5083)
-if [[ "$GH_REPO" == "Cogni-DAO/cogni" ]]; then
+if [[ "$GH_REPO_LOWER" == "cogni-dao/cogni" ]]; then
   log "Hub repo detected; image namespace remains catalog/default-driven"
 else
   FORK_IMAGE_NAME=$(fork_image_name "$REPO_ROOT")
@@ -363,7 +364,6 @@ declare_or_gen() {
 }
 declare_or_gen AUTH_SECRET                "rand64 32"
 declare_or_gen LITELLM_MASTER_KEY         "echo sk-cogni-$(randHex 24)"
-declare_or_gen OPENCLAW_GATEWAY_TOKEN     "rand64 32"
 declare_or_gen SCHEDULER_API_TOKEN        "rand64 32"
 declare_or_gen BILLING_INGEST_TOKEN       "rand64 32"
 declare_or_gen INTERNAL_OPS_TOKEN         "rand64 32"
@@ -374,7 +374,6 @@ declare_or_gen APP_DB_PASSWORD            "randHex 32"
 declare_or_gen APP_DB_SERVICE_PASSWORD    "randHex 32"
 declare_or_gen APP_DB_READONLY_PASSWORD   "randHex 32"
 declare_or_gen TEMPORAL_DB_PASSWORD       "randHex 32"
-declare_or_gen OPENCLAW_GITHUB_RW_TOKEN   "echo $GITHUB_ADMIN_PAT"  # v1: reuse admin PAT
 declare_or_gen CONNECTIONS_ENCRYPTION_KEY "randHex 32"
 declare_or_gen POLY_WALLET_AEAD_KEY_HEX   "randHex 32"
 POLY_WALLET_AEAD_KEY_ID="${POLY_WALLET_AEAD_KEY_ID:-v1}"
@@ -395,8 +394,6 @@ APP_DB_READONLY_PASSWORD=${GEN[APP_DB_READONLY_PASSWORD]}
 TEMPORAL_DB_PASSWORD=${GEN[TEMPORAL_DB_PASSWORD]}
 AUTH_SECRET=${GEN[AUTH_SECRET]}
 LITELLM_MASTER_KEY=${GEN[LITELLM_MASTER_KEY]}
-OPENCLAW_GATEWAY_TOKEN=${GEN[OPENCLAW_GATEWAY_TOKEN]}
-OPENCLAW_GITHUB_RW_TOKEN=${GEN[OPENCLAW_GITHUB_RW_TOKEN]}
 SCHEDULER_API_TOKEN=${GEN[SCHEDULER_API_TOKEN]}
 BILLING_INGEST_TOKEN=${GEN[BILLING_INGEST_TOKEN]}
 INTERNAL_OPS_TOKEN=${GEN[INTERNAL_OPS_TOKEN]}
@@ -467,7 +464,7 @@ set_env_secret GH_ADMIN_PAT         "$GITHUB_ADMIN_PAT"
 set_env_secret GH_ADMIN_USERNAME    "$GITHUB_ADMIN_USERNAME"
 
 log "Env-level agent-generated secrets:"
-for k in AUTH_SECRET LITELLM_MASTER_KEY OPENCLAW_GATEWAY_TOKEN OPENCLAW_GITHUB_RW_TOKEN \
+for k in AUTH_SECRET LITELLM_MASTER_KEY \
          SCHEDULER_API_TOKEN BILLING_INGEST_TOKEN INTERNAL_OPS_TOKEN METRICS_TOKEN \
          GH_WEBHOOK_SECRET CONNECTIONS_ENCRYPTION_KEY \
          POLY_WALLET_AEAD_KEY_HEX POSTGRES_ROOT_PASSWORD \

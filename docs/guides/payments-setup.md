@@ -22,7 +22,7 @@ You need to configure or test the USDC-based credit top-up payment system. This 
 
 ## Preconditions
 
-- [ ] `.cogni/repo-spec.yaml` configured with `cogni_dao.chain_id` and `payments_in.credits_topup.receiving_address`
+- [ ] `.cogni/repo-spec.yaml` configured with `governance.chain_id` and `payments_in.credits_topup.receiving_address`
 - [ ] `src/shared/web3/chain.ts` constants match repo-spec (`CHAIN_ID`, `USDC_TOKEN_ADDRESS`, `MIN_CONFIRMATIONS`)
 - [ ] Database migrations applied (`pnpm db:migrate`)
 - [ ] Wallet connected via RainbowKit to a supported chain (Sepolia for testing, Base mainnet for production)
@@ -33,14 +33,16 @@ You need to configure or test the USDC-based credit top-up payment system. This 
 
 **`.cogni/repo-spec.yaml`** (governance-managed):
 
-- `cogni_dao.chain_id` — Chain ID as string (e.g., `"11155111"` for Sepolia, `"8453"` for Base)
+- `governance.chain_id` — Chain ID as string (e.g., `"11155111"` for Sepolia, `"8453"` for Base)
 - `payments_in.credits_topup.receiving_address` — DAO wallet receiving address
 - `payments_in.credits_topup.allowed_chains` — Chain names (e.g., `["Sepolia"]`)
 - `payments_in.credits_topup.allowed_tokens` — Token names (e.g., `["USDC"]`)
+- `payments_in.credits_topup.markup_factor` — Purchase-side funding multiplier (default `1.10803324099723`, tuned for 95% provider top-up / 5% DAO Split margin after the 5% provider fee); governance config, was the env `USER_PRICE_MARKUP_FACTOR`. Drives the OpenRouter top-up + the 0xSplits allocation. Distinct from the spend-side LLM markup.
+- `payments_in.credits_topup.revenue_share` — System-tenant (DAO) bonus-credit fraction `0–1` (**default `0`**); was env `SYSTEM_TENANT_REVENUE_SHARE`. `0` = no system-account credit increase — the DAO earns USDC margin via the Split, not free minted AI credits. A node opts back in by setting it explicitly. **Note:** changing the actual on-chain DAO margin (the at-cost markup flip) additionally requires a matching 0xSplits allocation update — config alone does not move the deployed Split.
 
 **`src/shared/web3/chain.ts`** (hardcoded constants):
 
-- `CHAIN_ID` — Must match `cogni_dao.chain_id` from repo-spec
+- `CHAIN_ID` — Must match `governance.chain_id` from repo-spec
 - `USDC_TOKEN_ADDRESS` — Token contract address for configured chain
 - `MIN_CONFIRMATIONS` — Required block confirmations
 - `VERIFY_THROTTLE_SECONDS` — GET polling throttle (default 10s)

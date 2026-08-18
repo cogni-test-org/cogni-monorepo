@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
 # SPDX-FileCopyrightText: 2025 Cogni-DAO
 #
-# sync-app-webhook-secret.sh — push a `source: external` webhook secret to the
-# GitHub App's webhook config so the pod's value and the App's value match.
+# sync-app-webhook-secret.sh — push the generated webhook secret to the GitHub
+# App's webhook config so the pod's value and the App's value match.
 #
-# WHY: GH_WEBHOOK_SECRET is `source: external` (secrets-management.md) — it is
-# agent-GENERATED (bootstrap.sh::declare_or_gen) but must byte-equal the GitHub
+# WHY: GH_WEBHOOK_SECRET is `source: agent` + `syncTo: github-app-webhook`
+# (secrets-management.md) — we generate it, and it must byte-equal the GitHub
 # App's webhook secret, which lives on GitHub's side. Provisioning owns BOTH
-# copies: it writes the value to the pod (k8s Secret / OpenBao) AND pushes it to
-# the App here, via the App's own key. Without this, every webhook fails HMAC
-# verification silently and `deploy-infra` re-breaks it on each redeploy.
+# copies: it writes the value to OpenBao / the pod Secret and pushes it to the
+# App here, via the App's own key. Without this, every webhook fails HMAC
+# verification silently and a Secret re-apply can re-break it on each redeploy.
 # See `.claude/skills/cicd-secrets-expert/SKILL.md` "Dual-plane secrets".
 #
 # No human, self-healing: agent generates → agent pushes → both sides converge.
@@ -52,6 +52,21 @@ api="https://api.github.com"
 slug="$(curl -fsS -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" "$api/app" 2>/dev/null | sed -n 's/.*"slug":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
 [[ -n "$slug" ]] || { err "FATAL: App JWT rejected (check GH_REVIEW_APP_ID matches the private key)"; exit 1; }
 err "syncing webhook secret to App '${slug}' (id ${APP_ID})"
+
+# Cross-env clobber guard (bug.5012 follow-on, incident 2026-08-14): an env
+# holding ANOTHER env's App credentials would PATCH that env's App and 401 its
+# webhooks (candidate-a carried prod's App creds and broke prod for 4 min).
+# The App's hook URL names its one true receiver — refuse to PATCH an App that
+# does not deliver to THIS env. Skip (exit 0), loudly: the creds misconfig is
+# its own bug; this sync must never be the blast radius.
+if [[ -n "${EXPECTED_WEBHOOK_HOST:-}" ]]; then
+  hook_url="$(curl -fsS -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" "$api/app/hook/config" 2>/dev/null | sed -n 's/.*"url":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  hook_host="${hook_url#*://}"; hook_host="${hook_host%%/*}"
+  if [[ "$hook_host" != "$EXPECTED_WEBHOOK_HOST" ]]; then
+    err "REFUSING cross-env sync — App '${slug}' delivers to '${hook_host}', this env is '${EXPECTED_WEBHOOK_HOST}' (env holds another env's App creds — fix the creds, not the App)"
+    exit 0
+  fi
+fi
 
 code="$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
   -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \

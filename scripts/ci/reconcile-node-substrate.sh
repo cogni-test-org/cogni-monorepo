@@ -269,6 +269,66 @@ app_db_service_password="$(bao_get_field "$TARGET_NODE" APP_DB_SERVICE_PASSWORD)
   || fail "per-node DB creds absent at cogni/${DEPLOY_ENVIRONMENT}/${TARGET_NODE} — run secret-materialize first (it owns per-node APP_DB_PASSWORD/APP_DB_SERVICE_PASSWORD)"
 mark_row db_creds read "read per-node DB creds from OpenBao (key names only)"
 
+# Doltgres superuser password — the OpenBao-custodied SSOT at the canonical operator
+# path (cogni/<env>/operator/DOLTGRES_PASSWORD). The superuser is shared env-wide
+# (one server, every node's knowledge_<node> DB), so operator holds the single
+# authoritative value and all consumers read it there — mirrors the #1613
+# OPENFGA_DB_PASSWORD pattern. It is immutable post-init (Doltgres 0.56.3 cannot
+# ALTER it — databases.md §5.2); a restored/rotated volume is reconciled to the live
+# value via `pnpm secrets:set <env> operator DOLTGRES_PASSWORD` (secrets-rotate.md),
+# never re-derived. Passed to doltgres-provision so it connects as the live superuser.
+# Fail-loud if the SSOT is empty — never silently fall back to a poisoned VM .env.
+doltgres_superuser_password="$(bao_get_field operator DOLTGRES_PASSWORD)"
+[[ -n "$doltgres_superuser_password" ]] \
+  || fail "doltgres superuser SSOT absent at cogni/${DEPLOY_ENVIRONMENT}/operator/DOLTGRES_PASSWORD — run secret-materialize, or seed/reconcile it via 'pnpm secrets:set ${DEPLOY_ENVIRONMENT} operator DOLTGRES_PASSWORD' (never fall back to a derived/.env value)"
+dg_pw_env="-e DOLTGRES_PASSWORD='${doltgres_superuser_password}'"
+
+# DoltHub knowledge-mirror creds — env-global (one doltgres server + one DoltHub
+# identity per env), so read from the operator-canonical bank (cogni/<env>/operator),
+# the same SSOT idiom as DOLTGRES_PASSWORD just above (#1613 pattern). secret-materialize
+# already materializes these _shared/source:human keys into every node bank (they are in
+# NODE_BASELINE_KEYS), so the db-reader token resolves them here with zero new writes.
+#
+# WHY HERE (Option B — substrate lane, not deploy-infra): the doltgres Compose service
+# reads DOLT_CREDS_JWK/KEYID from the VM runtime .env via install-creds.sh at container
+# start. Only deploy-infra wrote them there, but an app-only promote runs skip_infra and
+# skips deploy-infra — so a fresh env that pasted DOLT_CREDS via THE PATH + a normal
+# promote got the app code but a credless doltgres, and dolt_push failed silently. This
+# folds the SAME render-.env + recreate-doltgres primitive deploy-infra runs into the
+# always-on substrate-readiness lane (Axiom 22), so the mirror comes up on EVERY flight/
+# promote with no separate infra run — the exact shape bug.5041 used for the Alloy config.
+#
+# FAIL-CLOSED: absent JWK/KEYID ⇒ mirror stays disabled (install-creds.sh is a no-op when
+# unset). NEVER a hardcoded fallback. Key names only in logs; values never echoed.
+# PROD-ONLY blast-radius guard (bug.5003): the DoltHub push identity (JWK/KEYID) +
+# repo-create PAT are ONE shared, PROD-CAPABLE credential (push rights to cogni-dao).
+# A non-prod env must NEVER hold it in the doltgres — not even a value left over from a
+# pre-guard materialize or a prior flight's render. So ONLY production reads + delivers
+# the mirror creds; every other env actively STRIPS them from the VM runtime .env +
+# recreates doltgres (fail-closed = actively disabled, not merely not-rendered). This
+# is the VM-side complement to the reconcile-secrets.sh _node_gets_key prod-only guard
+# (which stops future bank writes but cannot remove an already-delivered VM cred).
+dolt_mirror_enabled=false
+dolt_mirror_purge=false
+if [[ "$DEPLOY_ENVIRONMENT" == "production" ]]; then
+  dolt_creds_jwk="$(bao_get_field operator DOLT_CREDS_JWK)"
+  dolt_creds_keyid="$(bao_get_field operator DOLT_CREDS_KEYID)"
+  dolthub_owner="$(bao_get_field operator DOLTHUB_OWNER)"
+  dolthub_api_token="$(bao_get_field operator DOLTHUB_API_TOKEN)"
+  if [[ -n "$dolt_creds_jwk" && -n "$dolt_creds_keyid" ]]; then
+    dolt_mirror_enabled=true
+    mark_row dolt_mirror_creds read "read DoltHub mirror creds from OpenBao (key names only)"
+    log "DoltHub mirror creds present — will render to VM runtime .env + recreate doltgres"
+  else
+    mark_row dolt_mirror_creds skipped "DoltHub mirror creds absent — mirror stays disabled (no fallback)"
+    log "DoltHub mirror creds absent at cogni/${DEPLOY_ENVIRONMENT}/operator — mirror disabled (fail-closed, no fallback)"
+  fi
+else
+  dolt_mirror_purge=true
+  mark_row dolt_mirror_creds purged "non-prod: DoltHub mirror is prod-only — creds withheld + stripped from VM .env (bug.5003)"
+  log "non-prod (${DEPLOY_ENVIRONMENT}): DoltHub mirror is prod-only — stripping any mirror creds from VM runtime .env + recreating doltgres if present"
+fi
+
 # DSN seeding removed: secret-materialize composes + writes the per-node DSNs
 # (DATABASE_URL/DATABASE_SERVICE_URL/DOLTGRES_URL) to cogni/<env>/<node>. This phase
 # holds a read-only db-reader token and performs zero OpenBao writes — it consumes
@@ -277,11 +337,30 @@ mark_row db_creds read "read per-node DB creds from OpenBao (key names only)"
 CURRENT_ROW="externalsecret"
 external_secret_file="${APP_SOURCE_DIR}/nodes/${TARGET_NODE}/k8s/external-secrets/${DEPLOY_ENVIRONMENT}/external-secret.yaml"
 if [[ -f "$external_secret_file" ]]; then
+  expected_secret_name="${TARGET_NODE}-env-secrets"
+  legacy_target="$(remote "kubectl -n 'cogni-${DEPLOY_ENVIRONMENT}' get externalsecret env-secrets -o jsonpath='{.spec.target.name}' 2>/dev/null || true")"
+  if [[ "$legacy_target" == "$expected_secret_name" ]]; then
+    remote "kubectl -n 'cogni-${DEPLOY_ENVIRONMENT}' delete externalsecret env-secrets --wait=true >/dev/null"
+    log "deleted legacy ExternalSecret env-secrets targeting ${expected_secret_name}"
+    mark_row externalsecret_legacy pruned "deleted legacy ExternalSecret env-secrets targeting ${expected_secret_name}"
+  elif [[ -n "$legacy_target" ]]; then
+    log "leaving legacy ExternalSecret env-secrets in place; target is ${legacy_target}, expected ${expected_secret_name}"
+  fi
   remote "kubectl create namespace 'cogni-${DEPLOY_ENVIRONMENT}' --dry-run=client -o yaml | kubectl apply -f - >/dev/null"
   copy_to_remote "$external_secret_file" "/tmp/${DEPLOY_ENVIRONMENT}-${TARGET_NODE}-external-secret.yaml"
   remote "kubectl -n 'cogni-${DEPLOY_ENVIRONMENT}' apply -f '/tmp/${DEPLOY_ENVIRONMENT}-${TARGET_NODE}-external-secret.yaml' >/dev/null && rm -f '/tmp/${DEPLOY_ENVIRONMENT}-${TARGET_NODE}-external-secret.yaml'"
   log "applied ExternalSecret ${TARGET_NODE}-env-secrets"
   mark_row externalsecret updated "applied ExternalSecret ${TARGET_NODE}-env-secrets"
+  remote "set -euo pipefail
+    ns='cogni-${DEPLOY_ENVIRONMENT}'
+    es='${expected_secret_name}'
+    marker=\$(date +%s)
+    kubectl -n \"\$ns\" annotate externalsecret \"\$es\" force-sync=\"\$marker\" --overwrite >/dev/null
+    kubectl -n \"\$ns\" wait --for=condition=Ready \"externalsecret/\$es\" --timeout=120s >/dev/null
+    kubectl -n \"\$ns\" get secret \"\$es\" >/dev/null
+    sleep 5"
+  log "force-refreshed ExternalSecret ${TARGET_NODE}-env-secrets"
+  mark_row externalsecret_refresh refreshed "force-refreshed ExternalSecret ${TARGET_NODE}-env-secrets"
 else
   fail "missing node ExternalSecret leaf: $external_secret_file"
 fi
@@ -305,12 +384,66 @@ fi
 copy_to_remote "$caddy_tmp" "/tmp/Caddyfile.${DEPLOY_ENVIRONMENT}.${TARGET_NODE}.tmpl"
 mark_row caddyfile updated "rendered + staged Caddyfile route for ${node_host}"
 
+# Shared VM-side edge-Caddy reconcile helper (same logic deploy-infra runs):
+# start-if-down + hash-gated force-recreate. Staged here, invoked in the heredoc.
+copy_to_remote "$REPO_ROOT/scripts/ci/reconcile-edge-caddy.remote.sh" "/tmp/reconcile-edge-caddy.remote.sh"
+
+# Born-observable: re-push the Alloy runtime config (the nodeId→`node` Loki
+# stream-label promotion, task.5028) + the shared hash-gated restart helper, so
+# the node-log proxy's forced {node="<id>"} selector resolves on EVERY env. The
+# promote pipeline runs deploy-infra (which already does this) only when
+# skip_infra=false, so an app-only promote never re-pushed it; folding the same
+# rsync + checksum-restart primitive into this always-on substrate-readiness lane
+# (Axiom 22) closes that gap with no new workflow / bespoke script (bug.5041).
+# Idempotent: the hash-gate makes an unchanged config a no-op, and N per-node
+# invocations of one env-global config collapse to one push + restart.
+copy_to_remote "$REPO_ROOT/infra/compose/runtime/configs/alloy-config.metrics.alloy" "/tmp/alloy-config.metrics.${DEPLOY_ENVIRONMENT}.${TARGET_NODE}.alloy"
+copy_to_remote "$REPO_ROOT/scripts/ci/reconcile-alloy-config.remote.sh" "/tmp/reconcile-alloy-config.remote.sh"
+
+# DoltHub mirror creds → VM runtime .env + hash-gated doltgres recreate (Option B).
+# Staged only when the creds are present in OpenBao; absent ⇒ mirror stays disabled.
+# dolt_mirror_reconcile_snippet is spliced into the remote heredoc's doltgres block
+# below (empty string when disabled → the heredoc is byte-identical to before).
+dolt_mirror_reconcile_snippet=""
+if "$dolt_mirror_purge"; then
+  # Non-prod: strip any DoltHub mirror creds from the VM runtime .env + hash-gated
+  # recreate so a prod-capable cred can never linger on a test VM (bug.5003). No
+  # values transit — MODE=purge only removes keys. Byte-identical no-op when the
+  # .env already lacks them.
+  copy_to_remote "$REPO_ROOT/scripts/ci/reconcile-dolt-mirror-creds.remote.sh" "/tmp/reconcile-dolt-mirror-creds.remote.sh"
+  dolt_mirror_reconcile_snippet="    RUNTIME_ENV=\"\$runtime_env\" \\
+    RUNTIME_COMPOSE_BIN=\"docker compose --project-name cogni-runtime --env-file \$runtime_env -f /opt/cogni-template-runtime/docker-compose.yml\" \\
+    HASH_DIR=/var/lib/cogni \\
+    MODE=purge \\
+      bash /tmp/reconcile-dolt-mirror-creds.remote.sh
+"
+elif "$dolt_mirror_enabled"; then
+  copy_to_remote "$REPO_ROOT/scripts/ci/reconcile-dolt-mirror-creds.remote.sh" "/tmp/reconcile-dolt-mirror-creds.remote.sh"
+  # base64 the values CI-side so the single-line-JSON JWK never touches a sed/shell
+  # interpolation path (no injection; never echoed). Decoded VM-side by the helper.
+  dolt_creds_jwk_b64="$(printf '%s' "$dolt_creds_jwk" | base64 | tr -d '\n')"
+  dolt_creds_keyid_b64="$(printf '%s' "$dolt_creds_keyid" | base64 | tr -d '\n')"
+  dolthub_owner_b64="$(printf '%s' "$dolthub_owner" | base64 | tr -d '\n')"
+  dolthub_api_token_b64="$(printf '%s' "$dolthub_api_token" | base64 | tr -d '\n')"
+  # Runs after doltgres is up: render the creds into the runtime .env then hash-gated
+  # force-recreate so install-creds.sh re-runs. base64 values transit the SSH command
+  # (VM-local, not echoed to CI logs). Leading newline keeps the heredoc line-clean.
+  dolt_mirror_reconcile_snippet="    RUNTIME_ENV=\"\$runtime_env\" \\
+    RUNTIME_COMPOSE_BIN=\"docker compose --project-name cogni-runtime --env-file \$runtime_env -f /opt/cogni-template-runtime/docker-compose.yml\" \\
+    HASH_DIR=/var/lib/cogni \\
+    DOLT_CREDS_JWK_B64='${dolt_creds_jwk_b64}' \\
+    DOLT_CREDS_KEYID_B64='${dolt_creds_keyid_b64}' \\
+    DOLTHUB_OWNER_B64='${dolthub_owner_b64}' \\
+    DOLTHUB_API_TOKEN_B64='${dolthub_api_token_b64}' \\
+      bash /tmp/reconcile-dolt-mirror-creds.remote.sh
+"
+fi
+
 CURRENT_ROW="remote_reconcile"
 remote "set -euo pipefail
   edge_env=/opt/cogni-template-edge/.env
   runtime_env=/opt/cogni-template-runtime/.env
   caddyfile=/opt/cogni-template-edge/configs/Caddyfile.tmpl
-  edge_compose=(docker compose --project-name cogni-edge --env-file \"\$edge_env\" -f /opt/cogni-template-edge/docker-compose.yml)
   runtime_compose=(docker compose --project-name cogni-runtime --env-file \"\$runtime_env\" -f /opt/cogni-template-runtime/docker-compose.yml)
 
   mkdir -p /opt/cogni-template-edge/configs
@@ -340,9 +473,28 @@ remote "set -euo pipefail
   fi
   rm -f \"\$runtime_env.bak\"
 
-  if \"\${edge_compose[@]}\" ps -q caddy >/dev/null 2>&1; then
-    \"\${edge_compose[@]}\" up -d --force-recreate caddy >/dev/null
-  fi
+  # Edge reconcile — the SAME shared helper deploy-infra runs: start-if-down on a
+  # fresh substrate (first node, no caddy yet), else hash-gated force-recreate so
+  # a new node's <SLUG>_DOMAIN actually lands (graceful 'caddy reload' resolves it
+  # to empty — Caddy's env is frozen at container start). The hash-gate means an
+  # unchanged Caddyfile + edge .env is a no-op, so per-flight reconciles no longer
+  # bounce the shared edge for every sibling (task.5078 follow-up, now folded).
+  EDGE_COMPOSE_BIN=\"docker compose --project-name cogni-edge --env-file \$edge_env -f /opt/cogni-template-edge/docker-compose.yml\" \\
+  CADDYFILE=\"\$caddyfile\" \\
+  EDGE_ENV_FILE=\"\$edge_env\" \\
+  HASH_DIR=/var/lib/cogni \\
+    bash /tmp/reconcile-edge-caddy.remote.sh >/dev/null
+
+  # Alloy node-label reconcile — stage the fresh config (rsync's restart-on-change
+  # half) then the SAME hash-gated restart deploy-infra runs. Born-observable on
+  # the normal flow even when deploy-infra is skipped (bug.5041). Idempotent.
+  mkdir -p /opt/cogni-template-runtime/configs
+  mv '/tmp/alloy-config.metrics.${DEPLOY_ENVIRONMENT}.${TARGET_NODE}.alloy' /opt/cogni-template-runtime/configs/alloy-config.metrics.alloy
+  RUNTIME_COMPOSE_BIN=\"docker compose --project-name cogni-runtime --env-file \$runtime_env -f /opt/cogni-template-runtime/docker-compose.yml\" \\
+  ALLOY_CONFIG=/opt/cogni-template-runtime/configs/alloy-config.metrics.alloy \\
+  HASH_DIR=/var/lib/cogni \\
+    bash /tmp/reconcile-alloy-config.remote.sh >/dev/null
+
   \"\${runtime_compose[@]}\" up -d postgres >/dev/null
   # Single-node db-provision: override COGNI_NODE_DBS to THIS node and inject its
   # per-node OpenBao passwords (read above) via -e, so provision.sh reconciles the
@@ -356,8 +508,15 @@ remote "set -euo pipefail
     db-provision >/dev/null
   if \"\${runtime_compose[@]}\" config --services 2>/dev/null | grep -q '^doltgres$'; then
     \"\${runtime_compose[@]}\" up -d doltgres >/dev/null
-    \"\${runtime_compose[@]}\" --profile bootstrap run --rm doltgres-provision >/dev/null
-  fi"
+    # bug.5033: node-scope doltgres-provision with -e COGNI_NODE_DBS='${node_db}',
+    # symmetric with db-provision above. Otherwise doltgres-provision relied on the
+    # env-file COGNI_NODE_DBS (whole fleet) and the surrounding grep gate silently
+    # skips on any compose hiccup → knowledge_<node> uncreated → node-app
+    # Init:CrashLoopBackOff. Scoping to THIS node is deterministic + idempotent.
+    \"\${runtime_compose[@]}\" --profile bootstrap run --rm \
+      -e COGNI_NODE_DBS='${node_db}' \
+      ${dg_pw_env} doltgres-provision >/dev/null
+${dolt_mirror_reconcile_snippet}  fi"
 
 mark_row remote_reconcile updated "edge route, DB inventory, and DB provisioners reconciled on VM"
 log "substrate ready inputs reconciled for ${TARGET_NODE} (${DEPLOY_ENVIRONMENT})"

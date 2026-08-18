@@ -3,8 +3,8 @@
 
 /**
  * Module: `@cogni/scheduler-worker-service/activities/ledger`
- * Purpose: Temporal Activities for the full ledger pipeline — ingestion, selection, allocation, pool, epoch transition, and finalization.
- * Scope: Plain async functions that perform I/O (DB, GitHub API, EIP-712 verification). Called by CollectEpochWorkflow and FinalizeEpochWorkflow. Does not contain deterministic orchestration logic.
+ * Purpose: Temporal Activities for the ledger collect pipeline — ingestion, selection, allocation, pool, and epoch transition. Finalization runs IN-PROCESS in the node app (story.5007), NOT here.
+ * Scope: Plain async functions that perform I/O (DB, GitHub API). Called by CollectEpochWorkflow. Does not contain deterministic orchestration logic.
  * Invariants:
  *   - NO_DOMAIN_LOGIC_HERE: this file must never contain selection policies, allocation formulas, enrichment logic, or source-specific branching (e.g. `if eventType === "pr_merged"`). It loads data, dispatches to contracts/plugins, and writes results.
  *   - Per RECEIPT_IDEMPOTENT: All activities idempotent via PK constraints or upsert
@@ -18,10 +18,9 @@
  *   - Per USER_PROJECTIONS_RECOMPUTABLE: upsertUserProjections persists recomputable user projections only
  *   - Per CONFIG_LOCKED_AT_REVIEW: transitionEpochForWindow pins allocationAlgoRef + weightConfigHash when closing stale epoch
  *   - Per EVALUATION_FINAL_ATOMIC: transitionEpochForWindow passes evaluations to store.transitionEpochForWindow for atomic close + create
- *   - Per EPOCH_FINALIZE_IDEMPOTENT: finalizeEpoch returns existing statement if already finalized
- *   - Per FINALIZE_CLAIMANT_AWARE: finalizeEpoch loads locked claimant rows from epoch_receipt_claimants, dispatches the pinned allocator, explodes to claimant allocations, and stores claimant metadata in attribution statement lines
- * Side-effects: IO (database, GitHub API, viem EIP-712 verification)
- * Links: docs/spec/attribution-ledger.md, docs/spec/temporal-patterns.md
+ *   - FINALIZE_IS_IN_PROCESS (story.5007): epoch finalization + the R3 cumulative fold no longer run here — they run synchronously in the operator app's finalize route via `runFinalizeEpoch` (@cogni/attribution-pipeline-plugins). This module holds NO distribution/wallet/config deps.
+ * Side-effects: IO (database, GitHub API)
+ * Links: docs/spec/attribution-ledger.md, docs/spec/temporal-patterns.md, packages/attribution-pipeline-plugins/src/finalize/run-finalize-epoch.ts
  * @internal
  */
 
@@ -30,18 +29,10 @@ import type {
   UnselectedReceipt,
 } from "@cogni/attribution-ledger";
 import {
-  applyReceiptWeightOverrides,
-  buildEIP712TypedData,
-  buildReceiptWeightOverrideSnapshots,
-  claimantKey,
   computeApproverSetHash,
-  computeAttributionStatementLines,
-  computeFinalClaimantAllocationSetHash,
   computeWeightConfigHash,
   estimatePoolComponentsV0,
-  explodeToClaimants,
   sha256OfCanonicalJson,
-  toReviewSubjectOverrides,
   validateWeightConfig,
 } from "@cogni/attribution-ledger";
 import {
@@ -51,8 +42,6 @@ import {
 } from "@cogni/attribution-pipeline-contracts";
 import type { DefaultRegistries } from "@cogni/attribution-pipeline-plugins";
 import type { ActivityEvent } from "@cogni/ingestion-core";
-
-import { verifyTypedData } from "viem";
 
 import type { Logger } from "../observability/logger.js";
 import type {
@@ -69,7 +58,6 @@ export interface AttributionActivityDeps {
   readonly registries: DefaultRegistries;
   readonly nodeId: string;
   readonly scopeId: string;
-  readonly chainId: number;
   readonly logger: Logger;
 }
 
@@ -271,25 +259,6 @@ export interface TransitionEpochForWindowOutput {
 }
 
 /**
- * Input for finalizeEpoch compound activity.
- */
-export interface FinalizeEpochInput {
-  readonly epochId: string; // bigint serialized
-  readonly signature: string; // EIP-712 hex
-  readonly signerAddress: string; // from SIWE session
-}
-
-/**
- * Output from finalizeEpoch compound activity.
- */
-export interface FinalizeEpochOutput {
-  readonly statementId: string;
-  readonly poolTotalCredits: string; // bigint serialized
-  readonly finalAllocationSetHash: string;
-  readonly statementLineCount: number;
-}
-
-/**
  * Creates ledger activity functions with injected dependencies.
  * Follows the same DI pattern as createActivities() in activities/index.ts.
  */
@@ -300,7 +269,6 @@ export function createAttributionActivities(deps: AttributionActivityDeps) {
     registries,
     nodeId,
     scopeId,
-    chainId,
     logger,
   } = deps;
 
@@ -661,12 +629,21 @@ export function createAttributionActivities(deps: AttributionActivityDeps) {
           },
         ]);
         newSelections++;
-      } else if (resolvedUserId) {
-        await attributionStore.updateSelectionUserId(
+      } else {
+        // Existing rows re-sync the policy-owned `included` flag each pass
+        // (idempotency); admin-owned weight/note are preserved.
+        await attributionStore.updateSelectionIncluded(
           epochId,
           receipt.receiptId,
-          resolvedUserId
+          included
         );
+        if (resolvedUserId) {
+          await attributionStore.updateSelectionUserId(
+            epochId,
+            receipt.receiptId,
+            resolvedUserId
+          );
+        }
       }
 
       if (resolvedUserId) {
@@ -1045,272 +1022,6 @@ export function createAttributionActivities(deps: AttributionActivityDeps) {
 
   /**
    * Compound activity: atomically finalize an epoch with signature verification.
-   * EPOCH_FINALIZE_IDEMPOTENT: returns existing statement if already finalized.
-   * CONFIG_LOCKED_AT_REVIEW: verifies allocation_algo_ref and weight_config_hash are set.
-   */
-  async function finalizeEpoch(
-    input: FinalizeEpochInput
-  ): Promise<FinalizeEpochOutput> {
-    const epochId = BigInt(input.epochId);
-
-    logger.info(
-      { epochId: input.epochId, signerAddress: input.signerAddress },
-      "Finalizing epoch"
-    );
-
-    // 1. Load epoch — verify exists and is review (or finalized for idempotency)
-    const epoch = await attributionStore.getEpoch(epochId);
-    if (!epoch) {
-      throw new Error(`finalizeEpoch: epoch ${input.epochId} not found`);
-    }
-
-    // EPOCH_FINALIZE_IDEMPOTENT: already finalized → repair via atomic method
-    if (epoch.status === "finalized") {
-      logger.info(
-        { epochId: input.epochId },
-        "Epoch already finalized — repairing via finalizeEpochAtomic"
-      );
-      const existing = await attributionStore.getStatementForEpoch(epochId);
-      if (!existing) {
-        throw new Error(
-          `finalizeEpoch: epoch ${input.epochId} is finalized but no statement found`
-        );
-      }
-
-      // Repair: ensure this signer's signature exists via atomic method
-      await attributionStore.finalizeEpochAtomic({
-        epochId,
-        poolTotal: existing.poolTotalCredits,
-        finalClaimantAllocations: await attributionStore
-          .getFinalClaimantAllocationsForEpoch(epochId)
-          .then((allocations) =>
-            allocations.map((allocation) => ({
-              nodeId: allocation.nodeId,
-              epochId: allocation.epochId,
-              claimantKey: allocation.claimantKey,
-              claimant: allocation.claimant,
-              finalUnits: allocation.finalUnits,
-              receiptIds: allocation.receiptIds,
-            }))
-          ),
-        statement: {
-          nodeId,
-          finalAllocationSetHash: existing.finalAllocationSetHash,
-          poolTotalCredits: existing.poolTotalCredits,
-          statementLines: existing.statementLines,
-        },
-        signature: {
-          nodeId,
-          signerWallet: input.signerAddress,
-          signature: input.signature,
-          signedAt: new Date(),
-        },
-        expectedFinalAllocationSetHash: existing.finalAllocationSetHash,
-      });
-
-      return {
-        statementId: existing.id,
-        poolTotalCredits: existing.poolTotalCredits.toString(),
-        finalAllocationSetHash: existing.finalAllocationSetHash,
-        statementLineCount: existing.statementLines.length,
-      };
-    }
-
-    if (epoch.status !== "review") {
-      throw new Error(
-        `finalizeEpoch: epoch ${input.epochId} is '${epoch.status}', expected 'review'`
-      );
-    }
-
-    // 2. CONFIG_LOCKED_AT_REVIEW: verify config is locked
-    if (!epoch.allocationAlgoRef || !epoch.weightConfigHash) {
-      throw new Error(
-        `finalizeEpoch: epoch ${input.epochId} missing allocation_algo_ref or weight_config_hash (CONFIG_LOCKED_AT_REVIEW violated)`
-      );
-    }
-
-    // 3. Verify signer is in pinned approvers (APPROVERS_PINNED_AT_REVIEW)
-    if (!epoch.approvers || epoch.approvers.length === 0) {
-      throw new Error(
-        `finalizeEpoch: epoch ${input.epochId} has no pinned approvers (APPROVERS_PINNED_AT_REVIEW violated)`
-      );
-    }
-    const signerLower = input.signerAddress.toLowerCase();
-    const approversLower = epoch.approvers.map((a) => a.toLowerCase());
-    if (!approversLower.includes(signerLower)) {
-      throw new Error(
-        `finalizeEpoch: signer ${input.signerAddress} not in approvers`
-      );
-    }
-    // Self-consistent integrity check: recompute hash from pinned list
-    const pinnedApproverSetHash = await computeApproverSetHash(epoch.approvers);
-    if (epoch.approverSetHash !== pinnedApproverSetHash) {
-      throw new Error(
-        `finalizeEpoch: approver set hash integrity failure — stored hash ${epoch.approverSetHash} does not match recomputed ${pinnedApproverSetHash}`
-      );
-    }
-
-    // 4. Load pool components → pool_total = SUM(amount_credits)
-    const poolComponents =
-      await attributionStore.getPoolComponentsForEpoch(epochId);
-    if (poolComponents.length === 0) {
-      throw new Error(
-        `finalizeEpoch: epoch ${input.epochId} has no pool components (POOL_REQUIRES_BASE)`
-      );
-    }
-    const hasBaseIssuance = poolComponents.some(
-      (c) => c.componentId === "base_issuance"
-    );
-    if (!hasBaseIssuance) {
-      throw new Error(
-        `finalizeEpoch: epoch ${input.epochId} missing base_issuance component (POOL_REQUIRES_BASE)`
-      );
-    }
-
-    const poolTotal = poolComponents.reduce(
-      (sum, c) => sum + c.amountCredits,
-      0n
-    );
-
-    // 5. Load locked claimants + receipt weights + overrides → explode to claimant allocations
-    const lockedClaimants = await attributionStore.loadLockedClaimants(epochId);
-    if (lockedClaimants.length === 0) {
-      throw new Error(
-        `finalizeEpoch: epoch ${input.epochId} has no locked claimant rows`
-      );
-    }
-
-    const [selections, overrideRecords] = await Promise.all([
-      attributionStore.getSelectedReceiptsForAllocation(epochId),
-      attributionStore.getReviewSubjectOverridesForEpoch(epochId),
-    ]);
-    const rawWeights = await dispatchAllocator(
-      registries.allocators,
-      epoch.allocationAlgoRef,
-      {
-        receipts: selections,
-        weightConfig: epoch.weightConfig,
-        evaluations: toEvaluationPayloadMap(
-          await attributionStore.getEvaluationsForEpoch(epochId, "locked")
-        ),
-        profileConfig: null,
-      }
-    );
-    const overrides = toReviewSubjectOverrides(overrideRecords);
-    const receiptWeights = applyReceiptWeightOverrides(rawWeights, overrides);
-
-    const finalClaimantAllocations = explodeToClaimants(
-      receiptWeights,
-      lockedClaimants,
-      overrides
-    );
-    if (finalClaimantAllocations.length === 0) {
-      throw new Error(
-        `finalizeEpoch: epoch ${input.epochId} has no claimant allocations`
-      );
-    }
-
-    // Build override audit trail for statement persistence
-    const reviewOverrideSnapshots = buildReceiptWeightOverrideSnapshots(
-      rawWeights,
-      lockedClaimants,
-      overrides
-    );
-
-    // 6. Compute statement lines from final allocations
-    const statementLines = computeAttributionStatementLines(
-      finalClaimantAllocations,
-      poolTotal
-    );
-
-    // 7. Compute allocation set hash (deterministic)
-    const finalAllocationSetHash = await computeFinalClaimantAllocationSetHash(
-      finalClaimantAllocations
-    );
-
-    // 8. Build EIP-712 typed data and verify signature
-    const typedData = buildEIP712TypedData({
-      nodeId,
-      scopeId,
-      epochId: input.epochId,
-      finalAllocationSetHash,
-      poolTotalCredits: poolTotal.toString(),
-      chainId,
-    });
-
-    const isValid = await verifyTypedData({
-      address: input.signerAddress as `0x${string}`,
-      domain: typedData.domain,
-      types: typedData.types,
-      primaryType: typedData.primaryType,
-      message: typedData.message,
-      signature: input.signature as `0x${string}`,
-    });
-    if (!isValid) {
-      throw new Error(
-        `finalizeEpoch: signature verification failed for signer ${input.signerAddress}`
-      );
-    }
-
-    // 9. Atomic finalize — epoch transition + statement + signature in one transaction
-    const { epoch: finalizedEpoch, statement } =
-      await attributionStore.finalizeEpochAtomic({
-        epochId,
-        poolTotal,
-        finalClaimantAllocations: finalClaimantAllocations.map(
-          (allocation) => ({
-            nodeId,
-            epochId,
-            claimantKey: claimantKey(allocation.claimant),
-            claimant: allocation.claimant,
-            finalUnits: allocation.finalUnits,
-            receiptIds: [...(allocation.receiptIds ?? [])],
-          })
-        ),
-        statement: {
-          nodeId,
-          finalAllocationSetHash,
-          poolTotalCredits: poolTotal,
-          statementLines: statementLines.map((line) => ({
-            claimant_key: line.claimantKey,
-            claimant: line.claimant,
-            final_units: line.finalUnits.toString(),
-            pool_share: line.poolShare,
-            credit_amount: line.creditAmount.toString(),
-            receipt_ids: [...line.receiptIds],
-          })),
-          reviewOverrides:
-            reviewOverrideSnapshots.length > 0 ? reviewOverrideSnapshots : null,
-        },
-        signature: {
-          nodeId,
-          signerWallet: input.signerAddress,
-          signature: input.signature,
-          signedAt: new Date(),
-        },
-        expectedFinalAllocationSetHash: finalAllocationSetHash,
-      });
-
-    logger.info(
-      {
-        epochId: input.epochId,
-        statementId: statement.id,
-        poolTotalCredits: poolTotal.toString(),
-        finalAllocationSetHash: `${finalAllocationSetHash.slice(0, 12)}...`,
-        statementLineCount: statementLines.length,
-        status: finalizedEpoch.status,
-      },
-      "Epoch finalized"
-    );
-
-    return {
-      statementId: statement.id,
-      poolTotalCredits: poolTotal.toString(),
-      finalAllocationSetHash,
-      statementLineCount: statementLines.length,
-    };
-  }
-
   /**
    * Resolve stream IDs for a source by querying the adapter's self-declared streams.
    */
@@ -1319,9 +1030,21 @@ export function createAttributionActivities(deps: AttributionActivityDeps) {
   ): Promise<ResolveStreamsOutput> {
     const registration = sourceRegistrations.get(input.source);
     if (!registration?.poll) {
-      throw new Error(
-        `[SOURCE_NO_ADAPTER] No poll adapter registered for source "${input.source}" — check env vars (GH_REVIEW_APP_ID, GH_REVIEW_APP_PRIVATE_KEY_BASE64, GH_REPOS)`
+      // No poll adapter for this source. The common case is a webhook-only source
+      // (e.g. github: receipts arrive via the operator's GitHub App webhook receiver,
+      // and the scheduler-worker holds no GH App key by design). Skip the poll plane
+      // gracefully — returning no streams means CollectSources contributes nothing for
+      // this source and the epoch proceeds to SELECT the webhook-deposited receipts.
+      //
+      // This is NOT silent: bootstrap cross-checks repo-spec activity_sources against
+      // registered adapters and logs CONFIG_SOURCE_NO_ADAPTER at error level for true
+      // coverage gaps. Reverts the fatal-throw regression from #519, which made a
+      // missing poll adapter kill CollectEpoch before selection ever ran.
+      logger.warn(
+        { source: input.source, event: "attribution.poll_skipped_no_adapter" },
+        `No poll adapter for source "${input.source}" — skipping poll (webhook-only ingestion, or a coverage gap flagged at bootstrap as CONFIG_SOURCE_NO_ADAPTER)`
       );
+      return { streams: [] };
     }
     const streams = registration.poll.streams().map((s) => s.id);
     logger.info(
@@ -1342,7 +1065,6 @@ export function createAttributionActivities(deps: AttributionActivityDeps) {
     ensurePoolComponents,
     findStaleOpenEpoch,
     transitionEpochForWindow,
-    finalizeEpoch,
     resolveStreams,
   };
 }

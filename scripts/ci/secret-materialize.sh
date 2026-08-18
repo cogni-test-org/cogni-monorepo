@@ -8,9 +8,10 @@
 # docs/spec/secrets-management.md Invariants 15/16 and
 # docs/design/node-wizard-secret-setting.md, AS BUILT today:
 #   - input is the secrets catalog ONLY; it never reads the VM runtime .env;
-#   - read-once → diff → write-missing-only: one prefetch of the node + ancestor
+#   - read-once → diff → write-missing-mostly: one prefetch of the node + ancestor
 #     paths, a single batched write of just the absent keys, O(1) ssh per node.
-#     A re-flight of a born node writes NOTHING (created=0; 0 pod churn);
+#     Canonical composed values overwrite only on drift. A re-flight of a born,
+#     converged node writes NOTHING (created=0; 0 pod churn);
 #   - shared/human values are inherited transitionally (see inherit_shared_value);
 #   - it logs key NAMES only, never values.
 #
@@ -133,7 +134,6 @@ CACHE_DIR="$(mktemp -d -t materialize-cache.XXXXXX)"
 BATCH_DIR="${CACHE_DIR}/.batch"
 mkdir -p "$BATCH_DIR"
 trap 'rm -rf "$CACHE_DIR"' EXIT
-NODE_PATH_EXISTS=false
 
 bao_exec() {
   remote "kubectl exec ${1} -n openbao openbao-0 -- env BAO_TOKEN='${BAO_TOKEN}' BAO_ADDR=http://127.0.0.1:8200 bao ${2}"
@@ -175,19 +175,44 @@ seed_kv() {
   printf '%s' "$v" > "${CACHE_DIR}/${TARGET_NODE}/${k}"
 }
 
-# One write for all missing keys. put when the node path is new, patch (merge —
-# never clobbers sibling keys) when it exists. JSON is built locally via jq
-# --rawfile so no secret value ever lands on a command line.
+# One write for all missing keys. JSON is built locally via jq --rawfile so no
+# secret value ever lands on a command line.
+#
+# bug.5068: `cogni/<env>/<node>` is a SHARED bucket (baseline keys + any self-serve
+# secrets a node-owner set via the operator API). `bao kv put` REPLACES the whole
+# bucket. The old shape chose put/patch off NODE_PATH_EXISTS, which is set from a
+# `kv metadata get` precheck — a TRANSIENT failure of that precheck against a
+# populated bucket flipped it to `put` and clobbered every key not in this batch.
+# Fix: `patch` FIRST (merges — never clobbers siblings) regardless of the precheck,
+# and only fall back to a destructive `put` on a POSITIVE "does not exist" signal in
+# patch's OWN output. Any other failure returns non-zero without clobbering.
 flush_batch() {
   local files=( "$BATCH_DIR"/* )
   [[ -e "${files[0]}" ]] || return 0
-  local op="patch"; "$NODE_PATH_EXISTS" || op="put"
-  local json='{}' f k
+  local json='{}' f k out rc
   for f in "${files[@]}"; do
     k="$(basename "$f")"
     json="$(jq --arg k "$k" --rawfile v "$f" '.[$k]=$v' <<<"$json")"
   done
-  printf '%s' "$json" | bao_exec "-i" "kv ${op} 'cogni/${DEPLOY_ENVIRONMENT}/${TARGET_NODE}' -" >/dev/null
+  set +e
+  out="$(printf '%s' "$json" | bao_exec "-i" "kv patch 'cogni/${DEPLOY_ENVIRONMENT}/${TARGET_NODE}' -" 2>&1)"
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
+    return 0
+  fi
+  # A kv patch on a never-written KV v2 path returns `Code: 404` with an EMPTY raw
+  # message (no "not found" text) — unambiguous absence on a FRESH node/env, so put
+  # cannot clobber siblings (mirrors provision seed_kv fix a54f24809b).
+  if printf '%s' "$out" | grep -qiE 'no value found|does not exist|not found|code: 404'; then
+    # Genuinely absent — safe to create; no siblings to clobber.
+    printf '%s' "$json" | bao_exec "-i" "kv put 'cogni/${DEPLOY_ENVIRONMENT}/${TARGET_NODE}' -" >/dev/null
+    return $?
+  fi
+  # Transient/unknown failure — NEVER put (would wipe sibling keys at this shared
+  # node path). Fail loud so materialize is retried against an intact bucket.
+  printf '%s\n' "$out" >&2
+  fail "bao kv patch on cogni/${DEPLOY_ENVIRONMENT}/${TARGET_NODE} failed (rc=${rc}) without a positive 'absent' signal; refusing to put (would clobber sibling keys)"
 }
 
 # Is this key minted fresh per-node (source:agent random)? Such keys are NEVER
@@ -216,26 +241,33 @@ key_is_agent_generated() {
 DSN_DEFER_KEYS=" "
 
 # The per-node Postgres DSNs are COMPOSED from the per-node app_<node>/service_<node>
-# role (#1584). They are recomposed authoritatively every run and overwritten ONLY
-# on drift — e.g. a pre-#1584 DATABASE_URL still naming the legacy shared `app_user`
-# instead of `app_<node>`. Compare-then-write keeps a correct DSN byte-stable, so
-# healthy nodes see zero churn while a half-migrated node self-heals; the embedded
-# passwords stay write-missing (generate-once).
+# role (#1584). DOLTGRES_URL is composed from the operator-canonical Doltgres
+# superuser (cogni/<env>/operator/DOLTGRES_PASSWORD), which is shared env-wide and
+# immutable post-init (Doltgres 0.56.3 can't ALTER it; databases.md §5.2).
 #
-# DOLTGRES_URL is deliberately EXCLUDED: its password is the env Doltgres SUPERUSER
-# (immutable post-init — Doltgres 0.56.3 can't ALTER it; databases.md §5.2), NOT a
-# per-node app role, so it is not a #1584 victim. Authoritatively recomposing it from
-# the derived DOLTGRES_PASSWORD clobbers the live superuser on any env whose Doltgres
-# was initialized before the current derivation (candidate-a drift) → 28P01. That
-# derived-vs-live reconciliation is the separate Doltgres-reinit lane, not this fix.
-COMPOSED_DSN_KEYS=" DATABASE_URL DATABASE_SERVICE_URL "
+# All three DSNs are recomposed authoritatively every run and overwritten ONLY on
+# drift. Compare-then-write keeps a correct DSN byte-stable, so healthy nodes see
+# zero churn while a half-migrated node self-heals. This includes stale per-node
+# DOLTGRES_URL copies: node-substrate provisions with the operator SSOT, so the pod
+# must receive a URL derived from that same SSOT or the migrator 28P01s.
+COMPOSED_DSN_KEYS=" DATABASE_URL DATABASE_SERVICE_URL DOLTGRES_URL "
 
 # Transitional shared/human inheritance — the blind ancestor scan the north star
 # replaces with explicit catalog `inheritFrom` (catalog-custody lane). Now serves
 # from the prefetched cache, and only runs for non-agent keys.
 inherit_shared_value() {
-  local k="$1" v=""
+  local k="$1" v="" from=""
   [[ -n "${!k:-}" ]] && return 0
+  # Explicit catalog `inheritFrom: <service>` — the canonical-custody lane that
+  # replaces the blind ancestor scan for keys whose value must byte-match ONE
+  # owner (e.g. SCHEDULER_API_TOKEN must equal the token the worker SENDS, which
+  # deploy-infra writes into scheduler-worker-secrets from cogni/<env>/operator). bug.5021.
+  from="$(_cat_field "$k" '.inheritFrom')"
+  if [[ -n "$from" && "$from" != "null" ]]; then
+    v="$(bao_get_field "$from" "$k")"
+    [[ -n "$v" ]] && export "${k}=${v}"
+    return 0
+  fi
   for svc in node-template operator _shared; do
     v="$(bao_get_field "$svc" "$k")"
     if [[ -n "$v" ]]; then export "${k}=${v}"; return 0; fi
@@ -243,10 +275,12 @@ inherit_shared_value() {
   return 0
 }
 
-# One prefetch: node-path existence + node/ancestor key maps (O(1) ssh).
-if bao_exec "" "kv metadata get 'cogni/${DEPLOY_ENVIRONMENT}/${TARGET_NODE}'" >/dev/null 2>&1; then
-  NODE_PATH_EXISTS=true
-fi
+# One prefetch: node/ancestor key maps (O(1) ssh). operator is the inheritFrom
+# source for SCHEDULER_API_TOKEN (bug.5021) and is already in the prefetch set
+# below, so bao_get_field (cache-only) resolves it.
+# (bug.5068: the old `kv metadata get` node-path-existence precheck was removed —
+# flush_batch now derives create-vs-merge from patch's own output, so a transient
+# precheck failure can no longer flip a merge into a bucket-clobbering put.)
 for svc in "$TARGET_NODE" node-template operator _shared; do
   prefetch_path "$svc"
 done
@@ -270,6 +304,26 @@ for k in "${NODE_BASELINE_KEYS[@]}"; do
     rm -f "${CACHE_DIR}/${TARGET_NODE}/${k}"   # clear stale cache so seed_kv writes
     seed_kv "$TARGET_NODE" "$k" "$v"
     log "  recomposed ${k} (drift corrected)"
+    created=$((created + 1))
+    continue
+  fi
+  # inheritFrom keys: a single canonical owner holds the authoritative value
+  # (SCHEDULER_API_TOKEN ← operator, the exact token the worker SENDS).
+  # The node MUST byte-match it, so — like composed DSNs — we overwrite-on-drift
+  # instead of preserve-existing. A freshly-formed node that inherited a
+  # divergent ancestor self-heals on the next materialize, killing the
+  # worker→node 401 (bug.5021). No-op when already equal (no pod churn).
+  inherit_from="$(_cat_field "$k" '.inheritFrom')"
+  if [[ -n "$inherit_from" && "$inherit_from" != "null" ]]; then
+    v="$(bao_get_field "$inherit_from" "$k")"
+    [[ -z "$v" ]] && continue
+    if [[ "$(bao_get_field "$TARGET_NODE" "$k")" == "$v" ]]; then
+      unchanged=$((unchanged + 1))
+      continue
+    fi
+    rm -f "${CACHE_DIR}/${TARGET_NODE}/${k}"
+    seed_kv "$TARGET_NODE" "$k" "$v"
+    log "  inherited ${k} from ${inherit_from} (drift corrected)"
     created=$((created + 1))
     continue
   fi

@@ -13,10 +13,14 @@
 
 import {
   extractChainId,
+  extractDaoTokenDistributionConfig,
   extractGovernanceConfig,
+  extractKnowledgeConfig,
   extractLedgerApprovers,
   extractLedgerConfig,
   extractNodeId,
+  extractNodeMission,
+  extractNodeName,
   extractOperatorWalletConfig,
   extractPaymentConfig,
   extractScopeId,
@@ -31,15 +35,31 @@ const TEST_CHAIN_ID = 8453;
 
 /** Builds a minimal valid RepoSpec for testing */
 function buildSpec(overrides: Partial<RepoSpec> = {}): RepoSpec {
+  const activeDistributionLedger =
+    overrides.distributions?.status === "active" && !overrides.activity_ledger
+      ? {
+          activity_ledger: {
+            epoch_length_days: 7,
+            pool_config: { base_issuance_credits: "10000" },
+            activity_sources: {
+              github: {
+                attribution_pipeline: "cogni-v0.0",
+                source_refs: ["cogni-dao/test"],
+              },
+            },
+          },
+        }
+      : {};
   return parseRepoSpec({
     node_id: TEST_NODE_ID,
-    cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
+    governance: { chain_id: String(TEST_CHAIN_ID) },
     payments_in: {
       credits_topup: {
         provider: "cogni-usdc-backend-v1",
         receiving_address: "0x1111111111111111111111111111111111111111",
       },
     },
+    ...activeDistributionLedger,
     ...overrides,
   });
 }
@@ -50,7 +70,6 @@ function buildFullSpec(): RepoSpec {
     node_id: TEST_NODE_ID,
     scope_id: TEST_SCOPE_ID,
     scope_key: "default",
-    cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
     payments_in: {
       credits_topup: {
         provider: "cogni-usdc-backend-v1",
@@ -69,6 +88,7 @@ function buildFullSpec(): RepoSpec {
       },
     },
     governance: {
+      chain_id: String(TEST_CHAIN_ID),
       schedules: [
         {
           charter: "HEARTBEAT",
@@ -84,6 +104,37 @@ function buildFullSpec(): RepoSpec {
 describe("extractNodeId", () => {
   it("returns node_id from spec", () => {
     expect(extractNodeId(buildSpec())).toBe(TEST_NODE_ID);
+  });
+});
+
+describe("extractNodeName", () => {
+  it("returns intent.name when present", () => {
+    const spec = buildSpec({ intent: { name: "beacon" } });
+    expect(extractNodeName(spec)).toBe("beacon");
+  });
+
+  it("falls back to node_id for pre-intent specs", () => {
+    expect(extractNodeName(buildSpec())).toBe(TEST_NODE_ID);
+  });
+});
+
+describe("extractNodeMission", () => {
+  it("returns intent.mission when present", () => {
+    const spec = buildSpec({
+      intent: {
+        name: "operator",
+        mission: "Coordinate code, deploys, and validation for Cogni nodes.",
+      },
+    });
+
+    expect(extractNodeMission(spec)).toBe(
+      "Coordinate code, deploys, and validation for Cogni nodes."
+    );
+  });
+
+  it("returns null when mission is absent", () => {
+    const spec = buildSpec({ intent: { name: "operator" } });
+    expect(extractNodeMission(spec)).toBeNull();
   });
 });
 
@@ -108,7 +159,7 @@ describe("extractChainId", () => {
   it("handles numeric chain_id", () => {
     const spec = parseRepoSpec({
       node_id: TEST_NODE_ID,
-      cogni_dao: { chain_id: 8453 },
+      governance: { chain_id: 8453 },
       payments_in: {
         credits_topup: {
           provider: "test",
@@ -122,7 +173,7 @@ describe("extractChainId", () => {
   it("throws on non-numeric string", () => {
     const spec = parseRepoSpec({
       node_id: TEST_NODE_ID,
-      cogni_dao: { chain_id: "not-a-number" },
+      governance: { chain_id: "not-a-number" },
       payments_in: {
         credits_topup: {
           provider: "test",
@@ -130,7 +181,7 @@ describe("extractChainId", () => {
         },
       },
     });
-    expect(() => extractChainId(spec)).toThrow(/Invalid cogni_dao\.chain_id/);
+    expect(() => extractChainId(spec)).toThrow(/Invalid governance\.chain_id/);
   });
 });
 
@@ -141,6 +192,8 @@ describe("extractPaymentConfig", () => {
       chainId: TEST_CHAIN_ID,
       receivingAddress: "0x1111111111111111111111111111111111111111",
       provider: "cogni-usdc-backend-v1",
+      markupFactor: 1.10803324099723,
+      revenueShare: 0,
     });
   });
 
@@ -153,7 +206,7 @@ describe("extractPaymentConfig", () => {
   it("trims whitespace from address and provider", () => {
     const spec = parseRepoSpec({
       node_id: TEST_NODE_ID,
-      cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
+      governance: { chain_id: String(TEST_CHAIN_ID) },
       payments_in: {
         credits_topup: {
           provider: " cogni-usdc-backend-v1 ",
@@ -163,6 +216,112 @@ describe("extractPaymentConfig", () => {
     });
     const config = extractPaymentConfig(spec, TEST_CHAIN_ID);
     expect(config.provider).toBe("cogni-usdc-backend-v1");
+  });
+});
+
+describe("extractDaoTokenDistributionConfig", () => {
+  it("returns undefined while distributions are pending", () => {
+    const spec = buildSpec({
+      distributions: { status: "pending_activation" },
+      governance: {
+        chain_id: String(TEST_CHAIN_ID),
+        token_contract: "0x2222222222222222222222222222222222222222",
+      },
+    });
+
+    expect(
+      extractDaoTokenDistributionConfig(spec, TEST_CHAIN_ID)
+    ).toBeUndefined();
+  });
+
+  it("returns active token distribution config when inventory holder is present", () => {
+    const spec = buildSpec({
+      distributions: { status: "active" },
+      governance: {
+        chain_id: String(TEST_CHAIN_ID),
+        token_contract: "0x2222222222222222222222222222222222222222",
+        emissions_holder: "0x3333333333333333333333333333333333333333",
+      },
+    });
+
+    // bug.5031: an active spec with no explicit pattern defaults to the vendored
+    // distributor the activation flow deploys (1inch CumulativeMerkleDrop) — NOT
+    // the legacy non-cumulative uniswap pattern.
+    expect(extractDaoTokenDistributionConfig(spec, TEST_CHAIN_ID)).toEqual({
+      chainId: TEST_CHAIN_ID,
+      tokenAddress: "0x2222222222222222222222222222222222222222",
+      emissionsHolderAddress: "0x3333333333333333333333333333333333333333",
+      claimContractPattern: "1inch.cumulative-merkle-drop.v1",
+    });
+  });
+
+  it("passes through the recorded claim pattern and distributor address", () => {
+    const spec = buildSpec({
+      distributions: {
+        status: "active",
+        claim_contract_pattern: "1inch.cumulative-merkle-drop.v1",
+        distributor_address: "0x6666666666666666666666666666666666666666",
+      },
+      governance: {
+        chain_id: String(TEST_CHAIN_ID),
+        token_contract: "0x2222222222222222222222222222222222222222",
+        emissions_holder: "0x3333333333333333333333333333333333333333",
+      },
+    });
+
+    expect(extractDaoTokenDistributionConfig(spec, TEST_CHAIN_ID)).toEqual({
+      chainId: TEST_CHAIN_ID,
+      tokenAddress: "0x2222222222222222222222222222222222222222",
+      emissionsHolderAddress: "0x3333333333333333333333333333333333333333",
+      claimContractPattern: "1inch.cumulative-merkle-drop.v1",
+      distributorAddress: "0x6666666666666666666666666666666666666666",
+    });
+  });
+
+  it("throws when distributions are active without an emissions holder", () => {
+    const spec = buildSpec({
+      distributions: { status: "active" },
+      governance: {
+        chain_id: String(TEST_CHAIN_ID),
+        token_contract: "0x2222222222222222222222222222222222222222",
+      },
+    });
+
+    expect(() =>
+      extractDaoTokenDistributionConfig(spec, TEST_CHAIN_ID)
+    ).toThrow(/governance\.token_contract or governance\.emissions_holder/);
+  });
+});
+
+describe("extractKnowledgeConfig", () => {
+  it("returns undefined when knowledge is absent", () => {
+    expect(extractKnowledgeConfig(buildSpec())).toBeUndefined();
+  });
+
+  it("returns the node knowledge database and Cogni-owned DoltHub remote", () => {
+    const spec = buildSpec({
+      knowledge: {
+        database: "knowledge_my_node",
+        remote: {
+          provider: "dolthub",
+          owner: "cogni-dao-test",
+          repo: "my-node",
+          url: "https://doltremoteapi.dolthub.com/cogni-dao-test/my-node",
+          custody: "cogni-owned",
+        },
+      },
+    });
+
+    expect(extractKnowledgeConfig(spec)).toEqual({
+      database: "knowledge_my_node",
+      remote: {
+        provider: "dolthub",
+        owner: "cogni-dao-test",
+        repo: "my-node",
+        url: "https://doltremoteapi.dolthub.com/cogni-dao-test/my-node",
+        custody: "cogni-owned",
+      },
+    });
   });
 });
 
@@ -208,7 +367,7 @@ describe("extractLedgerConfig", () => {
   it("returns null when scope_id is missing", () => {
     const spec = parseRepoSpec({
       node_id: TEST_NODE_ID,
-      cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
+      governance: { chain_id: String(TEST_CHAIN_ID) },
       payments_in: {
         credits_topup: {
           provider: "test",
@@ -233,7 +392,7 @@ describe("extractLedgerConfig", () => {
       node_id: TEST_NODE_ID,
       scope_id: TEST_SCOPE_ID,
       scope_key: "default",
-      cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
+      governance: { chain_id: String(TEST_CHAIN_ID) },
       payments_in: {
         credits_topup: {
           provider: "test",
@@ -270,7 +429,7 @@ describe("extractLedgerApprovers", () => {
       node_id: TEST_NODE_ID,
       scope_id: TEST_SCOPE_ID,
       scope_key: "default",
-      cogni_dao: { chain_id: String(TEST_CHAIN_ID) },
+      governance: { chain_id: String(TEST_CHAIN_ID) },
       payments_in: {
         credits_topup: {
           provider: "test",
