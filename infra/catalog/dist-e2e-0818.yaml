@@ -1,0 +1,22 @@
+name: dist-e2e-0818
+type: node
+port: 3200
+node_port: 31100
+dockerfile: nodes/dist-e2e-0818/app/Dockerfile
+image_tag_suffix: "-dist-e2e-0818"
+migrator_tag_suffix: "-dist-e2e-0818-migrate"
+source_repo: https://github.com/cogni-test-org/dist-e2e-0818.git
+image_repository: ghcr.io/cogni-test-org/dist-e2e-0818
+source_sha: e2533e6c3c50b47e3d34d6ac598b2c5ab14b1580
+candidate_a_branch: deploy/candidate-a-dist-e2e-0818
+preview_branch: deploy/preview-dist-e2e-0818
+production_branch: deploy/production-dist-e2e-0818
+# task.5017/5025 — per-env node-set (deploy ⊆ provisioned). A wizard birth enters
+# candidate-a only; preview/production are explicit post-validation transitions.
+envs: [candidate-a]
+# task.5025 generation 1 — candidate-a is the fixed activity authority; v1 has no cutover verb.
+activity_env: candidate-a
+# Stable binding only; the reconciler resolves an env-local users.id by wallet.
+owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
+path_prefix: nodes/dist-e2e-0818/
+node_id: e5584a46-5b8c-45fb-8292-e0e465ef875b
