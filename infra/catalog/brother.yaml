@@ -12,4 +12,6 @@ preview_branch: deploy/preview-brother
 production_branch: deploy/production-brother
 path_prefix: nodes/brother/
 envs: [candidate-a, preview, production]
+activity_env: candidate-a
+owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
 node_id: 9565871a-cb82-444e-ba18-fed9f6ea3ce1

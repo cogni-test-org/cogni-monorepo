@@ -13,3 +13,5 @@ preview_branch: deploy/preview-resy
 production_branch: deploy/production-resy
 path_prefix: nodes/resy/
 envs: ["candidate-a"]
+activity_env: candidate-a
+owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
