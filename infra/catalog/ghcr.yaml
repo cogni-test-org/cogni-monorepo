@@ -12,4 +12,6 @@ preview_branch: deploy/preview-ghcr
 production_branch: deploy/production-ghcr
 path_prefix: nodes/ghcr/
 envs: [candidate-a, preview, production]
+activity_env: candidate-a
+owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
 node_id: 21d7ae14-210c-4495-ab6c-6fe5caad34a6

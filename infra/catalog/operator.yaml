@@ -35,3 +35,5 @@ path_prefix: nodes/operator/
 # wait-for-candidate-ready / smoke-candidate / verify-buildsha.
 is_primary_host: true
 envs: ["candidate-a"]
+activity_env: candidate-a
+owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"

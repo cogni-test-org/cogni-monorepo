@@ -12,4 +12,6 @@ preview_branch: deploy/preview-yo
 production_branch: deploy/production-yo
 path_prefix: nodes/yo/
 envs: [candidate-a, preview, production]
+activity_env: candidate-a
+owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
 node_id: bb5abfa8-5435-47e8-8725-3ae5e0762791
