@@ -18,6 +18,7 @@ resources:
   - candidate-a-operator-applicationset.yaml
   - candidate-a-resy-applicationset.yaml
   - candidate-a-scheduler-worker-applicationset.yaml
+  - candidate-a-spawny-boi-applicationset.yaml
   - candidate-a-test-cog-applicationset.yaml
   - candidate-a-toks2-applicationset.yaml
   - candidate-a-yo-applicationset.yaml
