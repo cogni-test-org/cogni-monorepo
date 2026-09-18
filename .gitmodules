@@ -19,3 +19,6 @@
 [submodule "nodes/toks2"]
 	path = nodes/toks2
 	url = https://github.com/cogni-test-org/toks2.git
+[submodule "nodes/spawny-boi"]
+	path = nodes/spawny-boi
+	url = https://github.com/cogni-test-org/spawny-boi.git
