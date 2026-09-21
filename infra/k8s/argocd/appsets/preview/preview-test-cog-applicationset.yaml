@@ -13,7 +13,7 @@ spec:
   goTemplate: true
   generators:
     - git:
-        repoURL: https://github.com/cogni-dao/cogni.git
+        repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
         revision: deploy/preview-test-cog
         files:
           - path: "infra/catalog/test-cog.yaml"
@@ -26,7 +26,7 @@ spec:
     spec:
       project: default
       source:
-        repoURL: https://github.com/cogni-dao/cogni.git
+        repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
         targetRevision: "deploy/preview-{{.name}}"
         path: "infra/k8s/overlays/preview/{{.name}}"
       destination:

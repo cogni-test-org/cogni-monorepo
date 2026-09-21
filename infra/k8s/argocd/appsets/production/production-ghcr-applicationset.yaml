@@ -13,7 +13,7 @@ spec:
   goTemplate: true
   generators:
     - git:
-        repoURL: https://github.com/cogni-dao/cogni.git
+        repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
         revision: deploy/production-ghcr
         files:
           - path: "infra/catalog/ghcr.yaml"
@@ -26,7 +26,7 @@ spec:
     spec:
       project: default
       source:
-        repoURL: https://github.com/cogni-dao/cogni.git
+        repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
         targetRevision: "deploy/production-{{.name}}"
         path: "infra/k8s/overlays/production/{{.name}}"
       destination:
