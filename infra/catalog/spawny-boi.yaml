@@ -20,6 +20,9 @@ envs: [candidate-a, production]
 deployment_provider:
   candidate-a: akash
   production: akash
+compute_egress_cidrs:
+  - cidr: 80.200.246.35/32
+    comment: shared egress NAT of Akash providers zencloud + digitalfrontier (story.5016)
 # task.5097 — WHICH authority reconciles the workload. Crossplane
 # (infra/crossplane/xcomputeworkload) owns every generic concern; the only Cogni-specific
 # piece left is the private Akash transaction actuator. A born node never touches the
