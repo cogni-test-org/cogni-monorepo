@@ -210,19 +210,26 @@ bao_exec() {
 # bug.5159 — a TRANSPORT failure (ssh drop, exec hiccup, OpenBao down) must never read
 # as an EMPTY BUCKET: that lie cascades into "key absent" errors downstream, and worse,
 # a false-empty cache would let materialize re-mint values that already exist. Only the
-# explicit "No value found" answer (a genuinely unborn path) maps to {}; anything else
-# is retried and then fatal, naming the transport.
+# unborn path — signalled EITHER by the "No value found" text (table mode) OR by bao
+# exit status 2 under -format=json — maps to {}; every other non-zero is retried and
+# then fatal, naming the transport.
 prefetch_path() {
-  local svc="$1" env="${2:-$DEPLOY_ENVIRONMENT}" ns="${3:-$1}" json raw attempt
+  local svc="$1" env="${2:-$DEPLOY_ENVIRONMENT}" ns="${3:-$1}" json raw attempt rc
   raw=""
   for attempt in 1 2 3; do
-    if raw="$(bao_exec "" "kv get -format=json 'cogni/${env}/${svc}'" 2>&1)"; then
-      break
-    fi
+    raw="$(bao_exec "" "kv get -format=json 'cogni/${env}/${svc}'" 2>&1)" && break
+    rc=$?
+    # bug.5159 — a TRANSPORT failure must never read as an empty bucket. An ABSENT path is
+    # two equivalent signals: the "No value found" text (table mode), OR bao's own exit
+    # status 2 ("no value found at path") — the ONLY thing an unborn path surfaces under
+    # `-format=json`, where kubectl exec relays it as "command terminated with exit code 2"
+    # and DROPS the text (bug.5206: silently failed the candidate flight of a never-in-prod
+    # node). Every OTHER non-zero (ssh 255, kubectl 1, OpenBao down) still retries+fatals.
     case "$raw" in
       *"No value found"*) raw='{}'; break ;;
     esac
-    echo "[secret-materialize] OpenBao read cogni/${env}/${svc} attempt ${attempt}/3 failed: $(printf '%s' "$raw" | tail -1)" >&2
+    [[ "$rc" -eq 2 ]] && { raw='{}'; break; }
+    echo "[secret-materialize] OpenBao read cogni/${env}/${svc} attempt ${attempt}/3 failed (rc=${rc}): $(printf '%s' "$raw" | tail -1)" >&2
     [[ "$attempt" == 3 ]] && { echo "::error::secret-materialize: transport failure reading cogni/${env}/${svc} after 3 attempts — NOT an absent path (bug.5159)" >&2; exit 1; }
     sleep $((attempt * 5))
   done
