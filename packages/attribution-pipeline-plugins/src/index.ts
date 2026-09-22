@@ -16,6 +16,18 @@
  * @public
  */
 
+// Finalize-in-process (story.5007) — runtime-agnostic epoch finalization + R3 fold
+export {
+  type FinalizeDistributionConfigResolver,
+  FinalizeEpochError,
+  type FinalizeEpochErrorCode,
+  type FinalizeEpochInput,
+  type FinalizeEpochOutput,
+  type FinalizeLogger,
+  isFinalizeEpochError,
+  type RunFinalizeEpochDeps,
+  runFinalizeEpoch,
+} from "./finalize/run-finalize-epoch";
 export { createEchoAdapter } from "./plugins/echo/adapter";
 // Echo plugin
 export {
@@ -31,6 +43,13 @@ export {
   INCLUDE_ALL_SELECTION_POLICY,
   INCLUDE_ALL_SELECTION_POLICY_REF,
 } from "./plugins/include-all-selection/descriptor";
+export type { MainMergeSelectionConfig } from "./plugins/main-merge-selection/descriptor";
+// Main-merge selection policy (direct-to-main: a PR merged to main is the contribution)
+export {
+  createMainMergeSelectionPolicy,
+  MAIN_MERGE_SELECTION_POLICY,
+  MAIN_MERGE_SELECTION_POLICY_REF,
+} from "./plugins/main-merge-selection/descriptor";
 export type { PromotionSelectionConfig } from "./plugins/promotion-selection/descriptor";
 // Promotion selection policy
 export {

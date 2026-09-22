@@ -1,0 +1,200 @@
+// SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
+// SPDX-FileCopyrightText: 2025 Cogni-DAO
+
+/**
+ * Module: `@app/_facades/deploy/node-preview-promote.server`
+ * Purpose: Node-merge → preview tie. On a spawned node-repo PR merge, promote the node to
+ *   preview the same way production promotes — the operator dispatches promote-and-deploy at
+ *   env=preview SOURCE-ADDRESSED by the merged node head sha (`node_source_sha`), writing ZERO
+ *   commits to main. Gives node spawns the same merge→preview model in-repo nodes get, out of
+ *   the box.
+ * Scope: Webhook-triggered facade. Resolves the node, delegates the source-addressed dispatch
+ *   to the operator deploy plane (ONE_PROMOTION_PRIMITIVE; task.5022 — no main write; the pin
+ *   lands on deploy/preview).
+ * Invariants:
+ *   - SPAWNED_NODES_ONLY: acts only when the merged-PR repo resolves to a registered node
+ *     row by slug. The parent monorepo and in-repo nodes are unregistered here, so their
+ *     merges never double-process — flight-preview.yml owns them. Every registered node
+ *     (including node-template, a seeded registry row since story.5009 that deploys via the
+ *     monorepo catalog — task.5087 retired its external-repo carve-out) promotes preview
+ *     through this hook.
+ *   - MERGED_ONLY: fires on `pull_request` action=closed with `merged===true`.
+ *   - PIN_IS_PR_HEAD_SHA: pins the PR head SHA — the build the node's PR CI published as
+ *     `sha-<headSha>` (the SHA candidate-a already flights). The squash-merge commit on the
+ *     node's main has no guaranteed image.
+ *   - V0_NO_RBAC: a node cleared auth to reach candidate-a; preview-on-merge rides that grant.
+ *     A `node.promote` gate is vNext if a node can earn preview without candidate-a.
+ * Side-effects: IO (DB read, GitHub REST/GraphQL via DeployPlanePort). Fire-and-forget.
+ * Links: docs/spec/ci-cd.md, docs/spec/node-ci-cd-contract.md,
+ *   src/ports/deploy-plane.port.ts, .github/workflows/promote-and-deploy.yml
+ * @public
+ */
+
+import { eq } from "drizzle-orm";
+import type { Logger } from "pino";
+import { createOperatorDeployPlane } from "@/bootstrap/capabilities/operator-deploy-plane";
+import { resolveServiceDb } from "@/bootstrap/container";
+import { nodes } from "@/shared/db/nodes";
+import type { ServerEnv } from "@/shared/env";
+import { EVENT_NAMES } from "@/shared/observability";
+
+interface MergedPrContext {
+  readonly owner: string;
+  readonly repo: string;
+  readonly prNumber: number;
+  readonly headSha: string;
+}
+
+/** Narrow a GitHub `pull_request` webhook payload to a merged-PR context, or null. */
+function extractMergedPr(
+  payload: Record<string, unknown>
+): MergedPrContext | null {
+  if (payload.action !== "closed") return null;
+  const pr = payload.pull_request as Record<string, unknown> | undefined;
+  const repo = payload.repository as Record<string, unknown> | undefined;
+  if (!pr || !repo || pr.merged !== true) return null;
+
+  const head = pr.head as Record<string, unknown> | undefined;
+  const repoOwner = (repo.owner as Record<string, unknown> | undefined)?.login;
+  const repoName = repo.name;
+  const prNumber = pr.number;
+  const headSha = head?.sha;
+  if (
+    typeof repoOwner !== "string" ||
+    typeof repoName !== "string" ||
+    typeof prNumber !== "number" ||
+    typeof headSha !== "string"
+  ) {
+    return null;
+  }
+  return { owner: repoOwner, repo: repoName, prNumber, headSha };
+}
+
+/**
+ * Dispatch a node-merge preview promotion from a GitHub `pull_request` webhook payload.
+ * Fire-and-forget: errors are logged, never thrown (the webhook 200s regardless).
+ */
+export function dispatchNodePreviewPromote(
+  payload: Record<string, unknown>,
+  env: ServerEnv,
+  log: Logger
+): void {
+  const ctx = extractMergedPr(payload);
+  if (!ctx) return;
+
+  if (!env.GH_REVIEW_APP_ID || !env.GH_REVIEW_APP_PRIVATE_KEY_BASE64) {
+    log.debug(
+      "node preview promote skipped — GH_REVIEW_APP_ID/PRIVATE_KEY not configured"
+    );
+    return;
+  }
+  if (!env.NODE_SUBMODULE_PARENT_OWNER || !env.NODE_SUBMODULE_PARENT_REPO) {
+    log.debug(
+      "node preview promote skipped — NODE_SUBMODULE_PARENT_{OWNER,REPO} not configured"
+    );
+    return;
+  }
+
+  void promoteNodeToPreview(ctx, env, log);
+}
+
+async function promoteNodeToPreview(
+  ctx: MergedPrContext,
+  env: ServerEnv,
+  log: Logger
+): Promise<void> {
+  try {
+    const db = resolveServiceDb();
+    const rows = await db
+      .select({
+        id: nodes.id,
+        slug: nodes.slug,
+        deployEnvs: nodes.deployEnvs,
+      })
+      .from(nodes)
+      // A wizard node's fork is named after its slug (`forkFromTemplate` → `name: slug`), and the
+      // seeded node-template row's repo name == its slug — so the merged-PR repo name == the node
+      // slug. `nodes.repoOwner/repoName` may be the PARENT deploy monorepo, NOT the node's own
+      // source repo — so resolve by slug. Every registered node deploys via the monorepo catalog
+      // (node-template's own-repo carve-out retired by task.5087), so any row that resolves here
+      // gets the same merge→preview promote.
+      .where(eq(nodes.slug, ctx.repo))
+      .limit(1);
+    const node = rows[0];
+    // SPAWNED_NODES_ONLY: an unregistered repo (parent monorepo, in-repo node) is handled
+    // by flight-preview.yml directly — nothing to do here.
+    if (!node) return;
+
+    // DISPATCH THE ENV THE CATALOG DECLARES, never a hardcoded one (bug.5203). This facade
+    // was written when spawned nodes had a preview slot; #2238 retired every one of them, so
+    // each fleet row is now envs:[production] and the dispatch resolved ZERO targets — the run
+    // skipped to a green conclusion having deployed nothing. Proven twice on 2026-09-17
+    // (beacon run 35175805389, toks5 run 35176388003): a node owner merged a fix, saw green,
+    // and nothing shipped.
+    //
+    // `deploy_envs` is the catalog projection (CATALOG_ENVS_ARE_PROJECTED), so it is the same
+    // selector the promote workflow filters on — asking it here is what keeps the two from
+    // disagreeing.
+    //
+    // A node with NO preview env gets NO dispatch, and deliberately does NOT fall through to
+    // production: auto-promoting every node merge to production would ship unreviewed code
+    // past the human gate that makes production a manual dispatch. Silence here is correct;
+    // the SILENT part is what was wrong, so it is logged as its own terminal outcome.
+    const deployEnvs = node.deployEnvs ?? [];
+    if (!deployEnvs.includes("preview")) {
+      log.info(
+        {
+          event: EVENT_NAMES.NODE_PREVIEW_PROMOTE_COMPLETE,
+          nodeId: node.id,
+          slug: node.slug,
+          repo: `${ctx.owner}/${ctx.repo}`,
+          prNumber: ctx.prNumber,
+          sourceSha8: ctx.headSha.slice(0, 8),
+          status: "skipped_no_preview_env",
+          deployEnvs,
+        },
+        "node preview promote skipped — node does not deploy to preview"
+      );
+      return;
+    }
+
+    const parentOwner = env.NODE_SUBMODULE_PARENT_OWNER as string;
+    const parentRepo = env.NODE_SUBMODULE_PARENT_REPO as string;
+
+    const result = await createOperatorDeployPlane(env).promoteNode({
+      env: "preview",
+      parentOwner,
+      parentRepo,
+      slug: node.slug,
+      sourceSha: ctx.headSha,
+    });
+
+    // Operator-local event (not in @cogni/node-shared's EventName) → log via the plain
+    // logger, the same pattern as NODE_ACCESS_REQUEST_COMPLETE. No reqId: this is a
+    // fire-and-forget webhook dispatch, not a request-scoped handler.
+    log.info(
+      {
+        event: EVENT_NAMES.NODE_PREVIEW_PROMOTE_COMPLETE,
+        nodeId: node.id,
+        slug: node.slug,
+        repo: `${ctx.owner}/${ctx.repo}`,
+        prNumber: ctx.prNumber,
+        sourceSha8: ctx.headSha.slice(0, 8),
+        status: result.status,
+        workflowUrl: result.workflowUrl,
+      },
+      EVENT_NAMES.NODE_PREVIEW_PROMOTE_COMPLETE
+    );
+  } catch (error) {
+    log.error(
+      {
+        event: EVENT_NAMES.NODE_PREVIEW_PROMOTE_COMPLETE,
+        repo: `${ctx.owner}/${ctx.repo}`,
+        prNumber: ctx.prNumber,
+        sourceSha8: ctx.headSha.slice(0, 8),
+        error: String(error),
+      },
+      "node preview promote failed"
+    );
+  }
+}

@@ -50,6 +50,8 @@ declare -A _image_tags_node_id_cache=()
 declare -A _image_tags_type_cache=()
 declare -A _image_tags_pathprefix_cache=()
 declare -A _image_tags_source_repo_cache=()
+declare -A _image_tags_provider_cache=()
+declare -A _image_tags_envs_cache=()
 for _t in "${ALL_TARGETS[@]}"; do
   _ty=$(yq -N '.type' "${_image_tags_catalog_root}/${_t}.yaml")
   _image_tags_type_cache["$_t"]="$_ty"
@@ -66,6 +68,15 @@ for _t in "${ALL_TARGETS[@]}"; do
   _image_tags_pathprefix_cache["$_t"]="$_pp"
   _sr=$(yq -N '.source_repo // ""' "${_image_tags_catalog_root}/${_t}.yaml")
   _image_tags_source_repo_cache["$_t"]="$_sr"
+  # Per-env PLACEMENT (story.5016 `deployment_provider`), cached as an
+  # `env=provider;env=provider` string so a lookup costs no extra yq.
+  _dp=$(yq -N '.deployment_provider // {} | to_entries | map(.key + "=" + .value) | join(";")' "${_image_tags_catalog_root}/${_t}.yaml")
+  _image_tags_provider_cache["$_t"]="$_dp"
+  # Per-row ENV MEMBERSHIP (`envs:`), cached as `;env;env;` so a lookup is one
+  # substring test. This is the row's REACH — which environments actually deploy
+  # it — and is a different axis from DEPLOY_BRANCH_ENVS above (task.5017).
+  _ev=$(yq -N '.envs // [] | join(";")' "${_image_tags_catalog_root}/${_t}.yaml")
+  _image_tags_envs_cache["$_t"]=";${_ev};"
   _rs="${_image_tags_spec_root}/${_pp}.cogni/repo-spec.yaml"
   if [ -n "$_pp" ] && [ -f "$_rs" ]; then
     # In-repo node: repo-spec is the readable identity SSOT (REPO_SPEC_IS_IDENTITY_SSOT).
@@ -78,12 +89,107 @@ for _t in "${ALL_TARGETS[@]}"; do
   fi
   _image_tags_node_id_cache["$_t"]="$_nid"
 done
-unset _t _ty _s _p _np _pp _sr _rs _nid
+unset _t _ty _s _p _np _pp _sr _dp _ev _rs _nid
 
 # True for type:infra targets — built in CI but deployed via Compose-on-VM,
 # not k8s/Argo. Overlay / promotion / gitops-coverage loops skip these.
 is_infra_target() {
   [ "${_image_tags_type_cache[$1]:-}" = "infra" ]
+}
+
+# Does this target DEPLOY to `env`, per the catalog's `envs:` membership list
+# (CATALOG_IS_SSOT, infra/catalog/_schema.json)? This is the row's reach, NOT the
+# set of envs that own a deploy branch (DEPLOY_BRANCH_ENVS below) — #2238 retired
+# the preview node slots, so most node rows are `envs: [production]` while the
+# preview branch still exists. Callers that iterate NODE_TARGETS for one env MUST
+# filter on this, or they demand per-env resources for rows that left that env.
+#   target_in_env TARGET ENV   # → 0 when the row deploys there
+target_in_env() {
+  local target="$1" env="${2:-}"
+  if [ -z "${_image_tags_envs_cache[$target]+x}" ]; then
+    echo "[ERROR] image-tags: unknown target: $target" >&2
+    return 2
+  fi
+  [ -n "$env" ] && [[ "${_image_tags_envs_cache[$target]}" == *";${env};"* ]]
+}
+
+# The environments that own a catalog-declared GitOps deploy branch. Deliberately
+# the FIELD SET the catalog declares (candidate_a_branch / preview_branch /
+# production_branch), not the per-row `envs:` membership list — a row's reach is a
+# separate axis (task.5017) and a branch may exist for an env a row has left.
+# shellcheck disable=SC2034
+DEPLOY_BRANCH_ENVS=(candidate-a preview production)
+
+# Resolve the GitOps deploy branch (the ref Argo's per-node Application tracks) for
+# one (target, env) cell, from the ONE place the catalog declares it
+# (CATALOG_IS_SSOT, infra/catalog/_schema.json). Empty — success, not an error —
+# when the row declares no branch for that env: type:infra rows deploy via
+# Compose-on-VM and own no Argo ref at all.
+#   deploy_branch_for_target TARGET ENV   # → deploy/<env>-<target> | ""
+deploy_branch_for_target() {
+  local target="$1" env="${2:-}" field value
+  if [ -z "${_image_tags_primary_cache[$target]+x}" ]; then
+    echo "[ERROR] image-tags: unknown target: $target" >&2
+    return 1
+  fi
+  case "$env" in
+    candidate-a) field="candidate_a_branch" ;;
+    preview) field="preview_branch" ;;
+    production) field="production_branch" ;;
+    *)
+      echo "[ERROR] image-tags: deploy_branch_for_target: unsupported env '${env}' (expected ${DEPLOY_BRANCH_ENVS[*]})" >&2
+      return 1
+      ;;
+  esac
+  value=$(yq -N ".${field} // \"\"" "${_image_tags_catalog_root}/${target}.yaml")
+  [ "$value" = "null" ] && value=""
+  printf '%s' "$value"
+}
+
+# Resolve a target's operator-owned placement for one environment (story.5016).
+# Shell twin of resolveNodeDeploymentProvider() in
+# nodes/operator/app/src/features/compute/node-deployment-provider.ts — ONE
+# placement reader per language, same semantics, so a shell lane can never
+# disagree with the typed planner that drives the flight/promote matrices.
+#
+# K3S_IS_DEFAULT: an absent per-env override resolves to `k3s`, the pre-existing
+# in-cluster lane. Only environments the catalog actually declares divert.
+#   deployment_provider_for_target TARGET ENV   # → k3s | akash
+deployment_provider_for_target() {
+  local target="$1" env="${2:-}" map rest provider
+  if [ -z "${_image_tags_provider_cache[$target]+x}" ]; then
+    echo "[ERROR] image-tags: unknown target: $target" >&2
+    return 1
+  fi
+  if [ -z "$env" ]; then
+    echo "[ERROR] image-tags: deployment_provider_for_target requires an environment for '$target'" >&2
+    return 1
+  fi
+  provider="k3s"
+  map=";${_image_tags_provider_cache[$target]};"
+  case "$map" in
+    *";${env}="*)
+      rest="${map#*";${env}="}"
+      provider="${rest%%;*}"
+      ;;
+  esac
+  case "$provider" in
+    k3s|akash) printf '%s' "$provider" ;;
+    *)
+      echo "[ERROR] image-tags: unsupported deployment_provider '$provider' for '$target' in env '$env' (expected k3s|akash)" >&2
+      return 1
+      ;;
+  esac
+}
+
+# True when <target> deploys to <env> through the in-cluster k3s/Argo lane, i.e.
+# the env VM owns its address, workload, and substrate. False for an externally
+# placed node (akash), whose ComputeWorkload controller owns those instead.
+#   is_k3s_placed TARGET ENV
+is_k3s_placed() {
+  local provider
+  provider="$(deployment_provider_for_target "$1" "$2")" || return 1
+  [ "$provider" = "k3s" ]
 }
 
 canonical_github_repo_key() {
@@ -131,6 +237,44 @@ is_remote_source_artifact_target() {
 
   source_repo="$(source_repo_for_target "$1")"
   [ -n "$source_repo" ] && ! is_built_by_this_repo "$1"
+}
+
+# Resolve the immutable source revision for a remote-source target during
+# promotion. One resolver is shared by artifact digest selection and the
+# node-substrate checkout so they cannot materialize different revisions.
+# Priority: an explicitly dispatched node SHA, preview provenance when
+# forwarding preview to production, then the reviewed catalog snapshot when
+# an operator source SHA addresses that snapshot. Every path fails closed.
+resolve_remote_source_sha() {
+  local target="$1"
+  local explicit_node_sha="${2:-}"
+  local operator_source_sha="${3:-}"
+  local catalog_source_sha="${4:-}"
+  local preview_forward="${5:-false}"
+  local preview_source_sha_map="${6:-}"
+  local resolved=""
+
+  if [ -n "$explicit_node_sha" ]; then
+    resolved="$explicit_node_sha"
+  elif [ "$preview_forward" = "true" ]; then
+    if [ -z "$preview_source_sha_map" ] || [ ! -f "$preview_source_sha_map" ]; then
+      echo "[ERROR] remote-source target ${target}: preview provenance map is required" >&2
+      return 1
+    fi
+    resolved=$(jq -r --arg target "$target" '.[$target] // ""' "$preview_source_sha_map")
+  elif [ -n "$operator_source_sha" ] && [ -n "$catalog_source_sha" ]; then
+    resolved="$catalog_source_sha"
+  else
+    echo "[ERROR] remote-source target ${target}: requires node_source_sha, preview provenance, or an operator source_sha with reviewed catalog source_sha" >&2
+    return 1
+  fi
+
+  if ! [[ "$resolved" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    echo "[ERROR] remote-source target ${target}: resolved source SHA is not 40 hex characters" >&2
+    return 1
+  fi
+
+  printf '%s' "$resolved"
 }
 
 image_name_for_target() {
@@ -248,13 +392,21 @@ default_node_id() {
   return 1
 }
 
+# The database the provisioner CREATES. Must equal the one the DSN composer names
+# (scripts/setup/lib/reconcile-secrets.sh `_compose_node_value`) — two derivations of one
+# name is the bug.5207 defect, so both call `lane_db_suffix`. `provision.sh` then derives
+# app_/service_ roles FROM this name, so it needs no lane logic of its own.
+# Optional $2 is the LANE; omitted (every caller today) yields the historic name exactly.
 node_database_for_target() {
-  local node="$1"
+  local node="$1" lane="${2:-}" sfx=""
   if [ -z "${_image_tags_primary_cache[$node]+x}" ]; then
     echo "[ERROR] image-tags: unknown target: $node" >&2
     return 1
   fi
-  printf 'cogni_%s' "${node//-/_}"
+  if [ -n "$lane" ] && command -v control_env_for >/dev/null 2>&1; then
+    sfx="$(lane_db_suffix "$lane" "$(control_env_for "$lane" "$node")")"
+  fi
+  printf 'cogni_%s%s' "${node//-/_}" "$sfx"
 }
 
 node_database_csv() {
@@ -265,14 +417,131 @@ node_database_csv() {
   done
 }
 
+# Operator-owned per-environment app placement, read from the ONE place the
+# catalog already declares it (`deployment_provider.<env>`, infra/catalog/_schema.json).
+# Absent = k3s, byte-for-byte the same default as resolveNodeDeploymentProvider()
+# in nodes/operator/app/src/features/compute/node-deployment-provider.ts.
+# PLACEMENT_IS_NOT_A_SECOND_LIST: never enumerate "the akash nodes" anywhere —
+# derive placement from the row, so adding/moving a node is one catalog edit.
+deployment_provider_for_target() {
+  local node="$1" env="$2" provider
+  if [ -z "${_image_tags_primary_cache[$node]+x}" ]; then
+    echo "[ERROR] image-tags: unknown target: $node" >&2
+    return 1
+  fi
+  [ -n "$env" ] || { echo "[ERROR] image-tags: deployment_provider_for_target needs an env" >&2; return 1; }
+  provider=$(yq -N ".deployment_provider.\"${env}\" // \"k3s\"" "${_image_tags_catalog_root}/${node}.yaml")
+  [ -n "$provider" ] && [ "$provider" != "null" ] || provider="k3s"
+  case "$provider" in
+    k3s|akash) printf '%s' "$provider" ;;
+    *)
+      echo "[ERROR] image-tags: unsupported deployment_provider '$provider' for '$node' in env '$env'" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Operator-owned per-environment RECONCILIATION AUTHORITY, read from the ONE place the catalog
+# already declares it (`compute_api.<env>`, infra/catalog/_schema.json). Shell twin of
+# resolveNodeComputeApi() in nodes/operator/app/src/features/compute/node-compute-api.ts —
+# ONE authority reader per language, same semantics, so the deploy lane can never disagree with
+# the typed materializer that RENDERS the manifest.
+#
+# LEGACY_IS_DEFAULT: an absent per-env cell resolves to `legacy`, the pre-existing bespoke
+# `compute-workload-controller`. Byte-for-byte the same default as the typed resolver, and the
+# same shape as K3S_IS_DEFAULT above — adding the field changed nothing until a row opted in.
+#
+# AUTHORITY_REQUIRES_AN_INSTALLED_API IS NOT RESTATED HERE: the typed resolver additionally
+# refuses a `crossplane` row in an environment with no Crossplane control plane, rather than
+# degrading it to `legacy`. That check belongs where desired state is BUILT — by the time this
+# lane runs, the materializer has already rendered or already failed. This reader's only job is
+# to name the file that render produced.
+#   compute_api_for_target NODE ENV   # → legacy | crossplane
+compute_api_for_target() {
+  local node="$1" env="${2:-}" api
+  if [ -z "${_image_tags_primary_cache[$node]+x}" ]; then
+    echo "[ERROR] image-tags: unknown target: $node" >&2
+    return 1
+  fi
+  [ -n "$env" ] || { echo "[ERROR] image-tags: compute_api_for_target needs an env" >&2; return 1; }
+  api=$(yq -N ".compute_api.\"${env}\" // \"legacy\"" "${_image_tags_catalog_root}/${node}.yaml")
+  [ -n "$api" ] && [ "$api" != "null" ] || api="legacy"
+  case "$api" in
+    legacy | crossplane) printf '%s' "$api" ;;
+    *)
+      echo "[ERROR] image-tags: unsupported compute_api '$api' for '$node' in env '$env' (expected legacy|crossplane; see infra/catalog/${node}.yaml)" >&2
+      return 1
+      ;;
+  esac
+}
+
+# ONE_AUTHORITY_PER_WORKLOAD (bug.5148), structural half. Shell twin of
+# computeWorkloadManifestFile() in
+# nodes/operator/app/src/features/compute/compute-workload-manifest.ts: each authority renders
+# into its OWN filename, and the materializer's `rsync --delete` means the kind NOT selected is
+# ABSENT from the overlay. So a lane that hardcodes `compute-workload.yaml` is silently
+# asserting the legacy authority — which is why the first real `crossplane` mint failed its
+# flight with the manifest correctly rendered as `xcomputeworkload.yaml` right beside the check.
+#   compute_workload_manifest_file_for_api API   # → the file that authority renders
+compute_workload_manifest_file_for_api() {
+  case "${1:-}" in
+    crossplane) printf 'xcomputeworkload.yaml' ;;
+    legacy) printf 'compute-workload.yaml' ;;
+    *)
+      echo "[ERROR] image-tags: unsupported compute_api '${1:-}' (expected legacy|crossplane)" >&2
+      return 1
+      ;;
+  esac
+}
+
+# The manifest filename a (node, env) cell's rendered desired state is committed under — the
+# one call sites should use. Deploy lanes RESOLVE the name; they never choose it.
+#   compute_workload_manifest_file NODE ENV   # → compute-workload.yaml | xcomputeworkload.yaml
+compute_workload_manifest_file() {
+  local api
+  api="$(compute_api_for_target "$1" "${2:-}")" || return 1
+  compute_workload_manifest_file_for_api "$api"
+}
+
+# bug.5094 — the address a CHERRY-RESIDENT caller must dial to reach a node's app.
+# Placement decides the address, not the caller:
+#   k3s   → the in-cluster Service DNS convention (unchanged; do not regress the fleet)
+#   akash → the node's public canonical URL, i.e. the SAME host the ComputeWorkload
+#           publishes (computeWorkloadPublicHost → hostForNode → host_for_node here),
+#           because a node that left the cluster has no `<slug>-node-app` Service.
+# `domain` is the env's public domain (domain_for_env in scripts/setup/lib/fork-identity.sh);
+# only akash rows need it, so a pure-k3s render may pass "".
+node_app_url_for_target() {
+  local node="$1" env="$2" domain="${3:-}" provider
+  provider="$(deployment_provider_for_target "$node" "$env")" || return 1
+  if [ "$provider" = "akash" ]; then
+    if [ -z "$domain" ]; then
+      echo "[ERROR] image-tags: node '$node' is deployment_provider=akash in '$env' but no domain was supplied to resolve its public URL" >&2
+      return 1
+    fi
+    printf 'https://%s' "$(host_for_node "$node" "$domain")"
+  else
+    printf 'http://%s-node-app:3000' "$node"
+  fi
+}
+
 node_internal_service_endpoint_csv() {
   # Routing (NOT build): the scheduler-worker must poll a queue per repo-spec UUID for
   # EVERY catalog type:node, including submodule nodes this repo does not build.
   # `is_built_by_this_repo` is a build-target filter and belongs only in build selection.
-  local sep="" node node_id url
+  #
+  # With no args this renders the PLACEMENT-DEFAULT (all-k3s) map that lives in the
+  # kustomize BASE ConfigMap — a base default, exactly like TEMPORAL_NAMESPACE and
+  # IMAGE_DIGEST there. With `<env> <domain>` it renders the env's PROVIDER-RESOLVED
+  # map that the per-env overlay patches in, which is the value that reaches a cluster.
+  local env="${1:-}" domain="${2:-}" sep="" node node_id url
   for node in "${NODE_TARGETS[@]}"; do
     node_id="$(node_id_for_target "$node")" || return 1
-    url="http://${node}-node-app:3000"
+    if [ -n "$env" ]; then
+      url="$(node_app_url_for_target "$node" "$env" "$domain")" || return 1
+    else
+      url="http://${node}-node-app:3000"
+    fi
     printf '%s%s=%s,%s=%s' "$sep" "$node" "$url" "$node_id" "$url"
     sep=","
   done
@@ -281,11 +550,23 @@ node_internal_service_endpoint_csv() {
 node_billing_endpoint_csv() {
   # Routing (NOT build): billing attribution resolves a node_id per catalog type:node
   # for EVERY node, submodule or not. Build filtering does not belong here.
-  local host="$1" sep="" node node_id port url
+  #
+  # LiteLLM runs in Compose on the env VM, so a k3s node is reached at the VM's
+  # NodePort. bug.5094: an akash node has no NodePort on that VM — it is reached at
+  # its public URL, resolved from the same catalog placement as every other consumer.
+  local host="$1" env="${2:-}" domain="${3:-}" sep="" node node_id port url provider
   for node in "${NODE_TARGETS[@]}"; do
     node_id="$(node_id_for_target "$node")" || return 1
-    port="$(node_port_for_target "$node")" || return 1
-    url="http://${host}:${port}"
+    provider="k3s"
+    if [ -n "$env" ]; then
+      provider="$(deployment_provider_for_target "$node" "$env")" || return 1
+    fi
+    if [ "$provider" = "akash" ]; then
+      url="$(node_app_url_for_target "$node" "$env" "$domain")" || return 1
+    else
+      port="$(node_port_for_target "$node")" || return 1
+      url="http://${host}:${port}"
+    fi
     printf '%s%s=%s,%s=%s' "$sep" "$node" "$url" "$node_id" "$url"
     sep=","
   done

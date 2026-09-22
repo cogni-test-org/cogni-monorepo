@@ -64,12 +64,40 @@ export interface SchedulerActivities {
     errorMessage?: string;
     errorCode?: string;
   }): Promise<void>;
+
+  // ── NodeTask activities (generic non-graph HTTP dispatch — task.5029) ──
+
+  /**
+   * Validate the execution grant for a node-task dispatch (M1 grant↔node +
+   * M2 scope generalization). Mints the node-bound scope
+   * `task:dispatch:<nodeId>:<route>` and HTTP-validates it. Throws (non-retryable)
+   * on any grant failure.
+   */
+  validateNodeGrantActivity(input: {
+    nodeId: string;
+    grantId: string;
+    route: string;
+  }): Promise<void>;
+
+  /**
+   * Dispatch a node task: POST {nodeUrl}{route} with the per-node principal
+   * (G1 fail-closed) + `Idempotency-Key: ${nodeId}/${scheduleId}/${scheduledFor}`.
+   * The route is bound to the node's OWN resolved host (M3 SSRF guard).
+   */
+  dispatchNodeTaskActivity(input: {
+    nodeId: string;
+    route: string;
+    payload: Record<string, unknown>;
+    scheduleId: string;
+    scheduledFor: string;
+  }): Promise<{ ok: boolean; status?: number }>;
 }
 
 // ---------------------------------------------------------------------------
 // Review Activities (GitHub I/O for PR review workflow)
 // ---------------------------------------------------------------------------
 
+import type { InternalReviewPrContextOutput } from "@cogni/node-contracts";
 import type { OwningNode } from "@cogni/repo-spec";
 
 export interface ReviewActivities {
@@ -80,28 +108,19 @@ export interface ReviewActivities {
     installationId: number;
   }): Promise<number>;
 
+  /**
+   * Returns the worker↔operator review wire contract verbatim — the SSOT lives
+   * in `@cogni/node-contracts` (review.internal.v1), NOT re-typed here. The
+   * output carries `reviewEnabled` (repo-spec `review.enabled` on/off), the
+   * node-selected `modelRef`, gates/rules, evidence, and the resolved
+   * `owningNode` the workflow dispatches on.
+   */
   fetchPrContextActivity(input: {
     owner: string;
     repo: string;
     prNumber: number;
     installationId: number;
-  }): Promise<{
-    evidence: Record<string, unknown>;
-    gatesConfig: { gates: unknown[]; failOnError: boolean };
-    rules: Record<string, unknown>;
-    graphMessages: Array<{ role: string; content: string }>;
-    responseFormat: { prompt: string; schemaId: string };
-    modelRef: { providerKey: string; modelId: string; connectionId?: string };
-    repoSpecYaml?: string;
-    /** Filenames from GitHub `pulls.listFiles`. Used for owning-domain resolution. */
-    changedFiles: string[];
-    /**
-     * Owning domain resolved via `extractOwningNode(rootSpec, changedFiles)`.
-     * Workflow dispatches on `kind`: `single` continues review; `conflict` and
-     * `miss` short-circuit through `postRoutingDiagnosticActivity`.
-     */
-    owningNode: OwningNode;
-  }>;
+  }): Promise<InternalReviewPrContextOutput>;
 
   postReviewResultActivity(input: Record<string, unknown>): Promise<void>;
 
@@ -151,6 +170,99 @@ export interface SweepActivities {
     itemTitle: string;
     outcome: "success" | "error" | "no_op";
     runId: string;
+  }): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Goal-loop Activities (AI goal + KPI loop I/O — docs/design/knowledge-goal-loop.md)
+//
+// All read/write through the owning node's API (EXECUTION_VIA_SERVICE_API); the
+// worker holds no DB creds on this path. `loadGoalStateActivity` projects the
+// goal hypothesis row → Goal/budget + accumulated LoopState (read from the EDO
+// chain + run ledger). `readKpiActivity` reads the KPI via a verifier-INDEPENDENT
+// reader (NEVER recomputeConfidence of the goal's own row). `fileGoalOutcome…`
+// records the validates/invalidates outcome. `recordStepResult…` persists the
+// step accounting (the durable iteration history is the atom + its citation).
+// ---------------------------------------------------------------------------
+
+/** JSON-serializable projection of a Goal (Temporal wire format — dates as ISO strings). */
+export interface GoalWire {
+  hypothesisId: string;
+  domain: string;
+  kpiId: string;
+  target: number;
+  /** ISO timestamp of the row's evaluate_at. */
+  evaluateAt: string;
+}
+
+export interface LoopBudgetWire {
+  maxIterations: number;
+  maxTokens: number;
+  maxRecursionDepth: number;
+  maxStalledIterations: number;
+}
+
+export interface GoalLoopActivities {
+  /**
+   * Project the goal hypothesis row → Goal + budget. Returns null if the row is
+   * not a goal (no `metric:` strategy / undecodable budget). `nowIso` is the
+   * activity's read clock, injected so the workflow's halt guard stays
+   * deterministic. The MVP loop runs internally bounded by `LoopBudget` in
+   * workflow memory, so iteration/token accounting is NOT read back from Dolt —
+   * this activity loads only the static goal + budget once at loop start.
+   */
+  loadGoalActivity(input: { nodeId: string; hypothesisId: string }): Promise<{
+    goal: GoalWire;
+    budget: LoopBudgetWire;
+    /** Graph the per-tick step runs (from `goal-step-graph` tag, else null). */
+    stepGraphId: string | null;
+    nowIso: string;
+  } | null>;
+
+  /**
+   * Read the goal's KPI via its verifier-INDEPENDENT reader (0–100). Per
+   * KPI_VERIFIER_INDEPENDENT the implementation MUST resolve through the
+   * `KpiReaderRegistry` independent read (which refuses a non-independent reader
+   * for a real goal); it MUST NEVER return `recomputeConfidence` of the goal's
+   * own row — that is the self-grading trap the loop exists to avoid.
+   */
+  readKpiActivity(input: {
+    nodeId: string;
+    hypothesisId: string;
+  }): Promise<number>;
+
+  /**
+   * Take ONE loop step: file ONE `evidence_for`-cited atom onto the goal's
+   * chain. Per ACTIVITY_IDEMPOTENCY the atom id is keyed on the stable business
+   * key `${hypothesisId}/${iteration}` so a Temporal retry reuses the same atom
+   * rather than double-writing. Returns the tokens the step spent (for the
+   * in-workflow budget accounting). `stepGraphId` is goal-level config (any
+   * graph can drive a goal); the implementation runs that graph to produce the
+   * finding, or falls back to a deterministic finding for the MVP.
+   */
+  runStepActivity(input: {
+    nodeId: string;
+    hypothesisId: string;
+    domain: string;
+    /** Stable business key `${hypothesisId}/${iteration}` — writes this atom once. */
+    idempotencyKey: string;
+    iteration: number;
+    stepGraphId: string;
+  }): Promise<{ ok: boolean; atomId: string; tokensSpent: number }>;
+
+  /**
+   * File the goal's outcome (validates|invalidates) + recompute confidence.
+   * Per ACTIVITY_IDEMPOTENCY the implementation MUST key on `${hypothesisId}`
+   * (one outcome per goal) so a Temporal retry cannot file a second outcome.
+   */
+  fileGoalOutcomeActivity(input: {
+    nodeId: string;
+    hypothesisId: string;
+    domain: string;
+    edge: "validates" | "invalidates";
+    reason: string;
+    lastKpi: number;
+    target: number;
   }): Promise<void>;
 }
 
@@ -266,17 +378,6 @@ export interface LedgerActivities {
   }): Promise<{
     totalAllocations: number;
     totalProposedUnits: string;
-  }>;
-
-  finalizeEpoch(input: {
-    epochId: string;
-    signature: string;
-    signerAddress: string;
-  }): Promise<{
-    statementId: string;
-    poolTotalCredits: string;
-    finalAllocationSetHash: string;
-    statementLineCount: number;
   }>;
 }
 

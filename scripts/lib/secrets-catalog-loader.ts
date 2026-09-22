@@ -118,6 +118,34 @@ const TransformSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("append-path"), path: z.string() }),
 ]);
 
+const SyncTargetSchema = z.enum(["github-app-webhook", "litellm-virtual-key"]);
+export type SyncTarget = z.infer<typeof SyncTargetSchema>;
+
+/**
+ * Non-node PLATFORM SERVICES that own their own OpenBao bucket + ExternalSecret.
+ *
+ * A "node" is a bundle of services (node-baas-architecture.md), and Invariant 1 makes
+ * `<service>` the catalog name in `cogni/<env>/<service>/<KEY>` — so a service whose blast
+ * radius must NOT be the owning node's gets its own `<service>` rather than borrowing the
+ * node's. That is the whole point: the operator app consumes the ENTIRE `cogni/<env>/operator`
+ * bucket via `dataFrom: extract`, so anything parked there is readable by the public app.
+ *
+ * Membership is a SECURITY BOUNDARY, not a convenience — adding a name here declares a new
+ * OpenBao path that needs its own dedicated ExternalSecret + least-privilege pod projection.
+ * Keep it short and justify every entry.
+ *
+ * - `akash-tx-actuator`: the private Akash transaction actuator (task.5102). It holds the
+ *   operator sponsor wallet's Console credential and the bearer token that unlocks it; an
+ *   operator-app compromise must not reach either (story.5016 secret-boundary amendments).
+ *
+ * These are NOT nodes: they receive no node DNS, no node DB, and no NODE_BASELINE_KEYS
+ * fan-out. `_node_gets_key` already drops a `service:`-pinned key from every node whose name
+ * does not match, so declaring one here cannot leak it into a node bucket.
+ */
+export const PLATFORM_SERVICES: ReadonlySet<string> = new Set([
+  "akash-tx-actuator",
+]);
+
 const CatalogEntrySchema = z
   .object({
     name: z.string().regex(/^[A-Z_][A-Z0-9_]*$/),
@@ -150,7 +178,7 @@ const CatalogEntrySchema = z
     // must keep in lockstep? A generated value can still need mirroring outward
     // (e.g. the GitHub App webhook secret: source: agent + syncTo: the App).
     // deploy-infra runs the matching push (scripts/secrets/sync-app-webhook-secret.sh).
-    syncTo: z.enum(["github-app-webhook"]).optional(),
+    syncTo: SyncTargetSchema.optional(),
     description: z.string(),
     steps: z.array(z.string()),
     url: z.string().url().optional(),
@@ -183,7 +211,7 @@ export interface Secret {
   category: string;
   description: string;
   source: "agent" | "human";
-  syncTo?: "github-app-webhook";
+  syncTo?: SyncTarget;
   url?: string;
   steps: string[];
   generate?: () => string;
@@ -283,6 +311,7 @@ export function loadSecretsCatalog(opts: LoadOptions): LoadResult {
     "_system",
     ...knownNodes,
     ...CANONICAL_FUTURE_DOMAINS,
+    ...PLATFORM_SERVICES,
   ]);
 
   const operatorAbs = join(opts.repoRoot, operatorCatalogPath);
@@ -380,6 +409,7 @@ function catalogEntryToSecret(entry: CatalogEntry): Secret {
     steps: entry.steps,
   };
   if (entry.url !== undefined) secret.url = entry.url;
+  if (entry.syncTo !== undefined) secret.syncTo = entry.syncTo;
   if (entry.perEnv !== undefined) secret.perEnv = entry.perEnv;
   if (entry.repoLevel !== undefined) secret.repoLevel = entry.repoLevel;
   if (entry.generate !== undefined) {

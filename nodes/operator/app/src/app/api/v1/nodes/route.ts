@@ -4,9 +4,10 @@
 /**
  * Module: `@app/api/v1/nodes`
  * Purpose: List + create rows in the operator's node registry.
- * Scope: Owner-scoped reads via RLS; writes use a session-derived owner_user_id. v0 nodes are
- *   monorepo-internal — a node lives at `nodes/<slug>/` in the operator's own repo (Cogni-DAO/cogni).
- * Invariants: OWNER_GATING, NODES_TABLE_SCOPE (monorepo-internal — slug, not external URL), USER_ROW_ENSURED.
+ * Scope: Owner-scoped reads via RLS; writes use a session-derived owner_user_id. Managed nodes get
+ *   their own repo and a deployment pin at `nodes/<slug>/` in the operator's repo.
+ * Invariants: OWNER_GATING, NODES_TABLE_SCOPE (env-local catalog projection plus wizard working state),
+ *   USER_ROW_ENSURED.
  * Side-effects: IO (Postgres)
  * Links: task.5083
  * @public
@@ -25,6 +26,10 @@ import { parseNodeSlug } from "@/features/nodes/node-slug";
 import { getServerSessionUser } from "@/lib/auth/server";
 import { getGithubRepo } from "@/shared/config";
 import { nodes } from "@/shared/db/nodes";
+import {
+  NODE_FORMATION_ACTIVITY_ENV,
+  NODE_FORMATION_ENVS,
+} from "@/shared/node-app-scaffold/gens/envs";
 import {
   createRequestContext,
   EVENT_NAMES,
@@ -139,6 +144,11 @@ export async function POST(request: Request) {
           repoName: monorepo.repo,
           repoVisibility: "public",
           ownerUserId: session.id,
+          // BORN_PRODUCTION (story.5025) — the registry row mirrors what the formation PR
+          // will actually render, read from the ONE birth-set constant rather than a second
+          // hardcoded literal that can drift from `gens/catalog.ts`.
+          deployEnvs: [...NODE_FORMATION_ENVS],
+          activityEnv: NODE_FORMATION_ACTIVITY_ENV,
           chainId: parsed.data.chainId,
           status: "dao_pending",
         })

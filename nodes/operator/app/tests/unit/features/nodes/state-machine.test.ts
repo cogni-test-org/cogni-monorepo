@@ -12,20 +12,21 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  NODE_PROGRESS_STEPS,
   type NodeEvent,
+  progressIndexForStatus,
   transition,
   wizardUrlForStatus,
 } from "@/features/nodes/state-machine";
 import { NODE_STATUSES, type NodeStatus } from "@/shared/db/nodes";
 
 describe("transition — happy path", () => {
-  it("walks dao_pending → dao_formed → published → wallet_ready → payments_ready → active", () => {
+  it("walks dao_pending to wallet_ready, then verified activation to active", () => {
     let s: NodeStatus = "dao_pending";
     for (const ev of [
       "dao_verified",
       "spec_published",
       "wallet_provisioned",
-      "payments_configured",
       "activation_published",
     ] as const) {
       const r = transition(s, { type: ev });
@@ -81,7 +82,6 @@ describe("transition — totality", () => {
       { type: "dao_verified" },
       { type: "spec_published" },
       { type: "wallet_provisioned" },
-      { type: "payments_configured" },
       { type: "activation_published" },
       { type: "fail", reason: "test" },
     ];
@@ -94,15 +94,36 @@ describe("transition — totality", () => {
   });
 });
 
+describe("progress display", () => {
+  it("shows wallet_ready and legacy payments_ready as the payments step", () => {
+    expect(NODE_PROGRESS_STEPS.map((step) => step.label)).toEqual([
+      "Register",
+      "DAO",
+      "Repo",
+      "Handoff",
+      "Payments",
+    ]);
+    expect(
+      NODE_PROGRESS_STEPS[progressIndexForStatus("published")]?.label
+    ).toBe("Handoff");
+    expect(
+      NODE_PROGRESS_STEPS[progressIndexForStatus("wallet_ready")]?.label
+    ).toBe("Payments");
+    expect(
+      NODE_PROGRESS_STEPS[progressIndexForStatus("payments_ready")]?.label
+    ).toBe("Payments");
+  });
+});
+
 describe("wizardUrlForStatus", () => {
   it("routes each status to the canonical wizard page", () => {
     const id = "abc-123";
-    expect(wizardUrlForStatus(id, "dao_pending")).toBe(`/setup/nodes/${id}`);
-    expect(wizardUrlForStatus(id, "dao_formed")).toBe(`/setup/nodes/${id}`);
-    expect(wizardUrlForStatus(id, "published")).toBe(`/setup/nodes/${id}`);
-    expect(wizardUrlForStatus(id, "wallet_ready")).toBe(`/setup/nodes/${id}`);
-    expect(wizardUrlForStatus(id, "payments_ready")).toBe(`/setup/nodes/${id}`);
-    expect(wizardUrlForStatus(id, "active")).toBe(`/setup/nodes/${id}`);
-    expect(wizardUrlForStatus(id, "failed")).toBe(`/setup/nodes/${id}`);
+    expect(wizardUrlForStatus(id, "dao_pending")).toBe(`/nodes/${id}`);
+    expect(wizardUrlForStatus(id, "dao_formed")).toBe(`/nodes/${id}`);
+    expect(wizardUrlForStatus(id, "published")).toBe(`/nodes/${id}`);
+    expect(wizardUrlForStatus(id, "wallet_ready")).toBe(`/nodes/${id}`);
+    expect(wizardUrlForStatus(id, "payments_ready")).toBe(`/nodes/${id}`);
+    expect(wizardUrlForStatus(id, "active")).toBe(`/nodes/${id}`);
+    expect(wizardUrlForStatus(id, "failed")).toBe(`/nodes/${id}`);
   });
 });

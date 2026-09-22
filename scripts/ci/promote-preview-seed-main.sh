@@ -9,7 +9,7 @@
 #   promote-build-payload.sh (deploy-branch + .promote-state coupling).
 #
 # Tri-state per image (affected-only merges):
-#   1) If `preview-{mergeSha}{suffix}` resolves in GHCR → use that digest.
+#   1) If `sha-{mergeSha}{suffix}` resolves in GHCR → use that digest.
 #   2) Else retain current pin from kustomization; verify it still resolves.
 #   3) Else fail (broken overlay).
 #
@@ -46,7 +46,10 @@ if ! docker buildx version >/dev/null 2>&1; then
   exit 1
 fi
 
-BASE_TAG="preview-${MERGE_SHA}"
+# ONE identity: pr-build publishes `<image>:sha-<mergeSha>` on push:main /
+# merge_group (SOURCE_SHA_IS_DEPLOY_IDENTITY) — the legacy preview-<sha> re-tag
+# is purged, so the seed reads the same sha- digest the deploy consumes.
+BASE_TAG="sha-${MERGE_SHA}"
 
 resolve_digest_ref() {
   local tag="$1"
@@ -94,7 +97,17 @@ promote_if_changed() {
 
 echo "ℹ️  promote-preview-seed-main: MERGE_SHA=${MERGE_SHA:0:12} BASE_TAG=${BASE_TAG}"
 
+# ONLY rows the catalog says still DEPLOY to preview (CATALOG_IS_SSOT). #2238
+# retired the preview node slots and deleted those overlays, but this loop kept
+# iterating every `type: node` row — so the first retired node (beacon) failed
+# the seed on EVERY merge to main, blocking the preview lane fleet-wide. A row
+# that has left preview is a SKIP; a row that is still in preview with no
+# overlay remains a hard error, because that one is genuinely broken.
 for node in "${NODE_TARGETS[@]}"; do
+  if ! target_in_env "$node" preview; then
+    echo "  skipped: $node (catalog envs: not in preview)"
+    continue
+  fi
   d_app=$(desired_digest_for_target "$node") || exit 1
   promote_if_changed "$node" "$d_app"
 done

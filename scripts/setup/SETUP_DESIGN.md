@@ -123,15 +123,14 @@ pnpm setup github --env production
      - `EVM_RPC_URL` (prompt if not in local env — Base-chain RPC from alchemy.com or infura.io)
      - `POLYGON_RPC_URL` (optional, Polygon mainnet RPC from alchemy.com — required for poly-node `/api/v1/poly/wallet/balance` to return live data; falls back to public polygon-rpc.com when absent)
      - `TAVILY_API_KEY` (optional — Tavily web-search API key from app.tavily.com; without it `WebSearchCapability` is disabled and any AI tool calling `core__web_search` will fail)
-     - `OPENCLAW_GATEWAY_TOKEN` (generated random, ≥32 chars — gateway WS auth)
-     - `OPENCLAW_GITHUB_RW_TOKEN` (GitHub PAT with Contents:Write + Pull requests:Write — host-side git relay)
      - `DISCORD_BOT_TOKEN` (Discord bot token — from discord.com/developers/applications → Bot → Reset Token)
      - **OAuth providers (optional — provider silently skipped if missing):**
        - `GH_OAUTH_CLIENT_ID` + `GH_OAUTH_CLIENT_SECRET` (from github.com/settings/developers → OAuth Apps)
        - `DISCORD_OAUTH_CLIENT_ID` + `DISCORD_OAUTH_CLIENT_SECRET` (from discord.com/developers/applications → OAuth2)
        - `GOOGLE_OAUTH_CLIENT_ID` + `GOOGLE_OAUTH_CLIENT_SECRET` (from console.cloud.google.com/apis/credentials)
        - **DoltHub mirror (v0 push job — task.5069):** see [`docs/runbooks/dolthub-remote-bootstrap.md`](../../docs/runbooks/dolthub-remote-bootstrap.md) for the one-time setup. Three secrets needed for push:
-         - `DOLTHUB_REMOTE_URL` — gates the push job (e.g. `https://doltremoteapi.dolthub.com/cogni-dao/knowledge-operator`)
+         - `DOLT_CREDS_*` — authenticate push to the repo-spec `knowledge.remote`
+         - `DOLTHUB_OWNER` — env-scoped owner for node knowledge repos; production uses `cogni-dao`, test/preview must use a non-production DoltHub org
          - `DOLT_CREDS_JWK` — full contents of the `.jwk` file produced by `dolt creds new`
          - `DOLT_CREDS_KEYID` — the keyid from `dolt creds new`
        - `DOLTHUB_API_TOKEN` (from dolthub.com → Settings → API Tokens, scope `api_read_write`; **REST/SQL HTTP API only** — does not authenticate the Dolt push protocol. Used by future librarian / x402 reads. Per task.5069 spike findings.)

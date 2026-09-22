@@ -49,10 +49,12 @@ System setup installers were moved to `scripts/bootstrap/` and are out of scope 
 - **Exports:**
   - `verifySystemTenant(serviceAccountService)` - Startup healthcheck: fails fast if cogni_system billing account missing (per SYSTEM_TENANT_STARTUP_CHECK)
   - `runGovernanceSchedulesSyncJob()` - Job: advisory lock + governance schedule sync via container
+  - `runCatalogNodeRegistryReconcileJob()` - Job: App-read catalog projection into env-local Postgres + OpenFGA
+  - `startCatalogRegistryReconcileOnBoot()`, `triggerCatalogRegistryReconcile()` - Immediate/poll registry trigger lifecycle
   - `getContainer()` - Singleton DI container with logger and config
   - `resetContainer()` - Reset singleton (tests only)
   - `startOperatorPublishers(deps)` - Start health probe publisher (60s interval, publishes to node stream)
-  - `Container` interface - Ports + logger + config (includes accountsForUser(userId), serviceAccountService, metricsQuery, metricsCapability, repoCapability, toolSource, threadPersistenceForUser(userId), modelCatalog, providerResolver, nodeStream; no usageService)
+  - `Container` interface - Ports + logger + config (includes accountsForUser(userId), serviceAccountService, metricsQuery, metricsCapability, repoCapability, toolSource, threadPersistenceForUser(userId), authorization, modelCatalog, providerResolver, nodeStream; no usageService)
   - `ContainerConfig` interface - Runtime config (unhandledErrorPolicy, rateLimitBypass, DEPLOY_ENVIRONMENT)
   - `UnhandledErrorPolicy` type - `"rethrow" | "respond_500"`
   - `getTemporalWorkflowClient()` - Process-wide Temporal WorkflowClient singleton (race-safe init, cleaned up by resetContainer)
@@ -61,13 +63,14 @@ System setup installers were moved to `scripts/bootstrap/` and are out of scope 
   - `createScopedGraphExecutor({ executor, billing, preflightCheckFn, resolver, actorId, abortSignal?, broker?, commitByoUsage? })` - Per-run wrapper: resolves LlmService from ModelProviderResolverPort, applies billing/preflight/observability/usage-commit decorators, seeds ALS ExecutionScope
   - `runGraphWithScope({ executor, req, ctx?, billing, llmService, abortSignal? })` - App-local helper that seeds per-run ALS scope with resolved LlmService
   - `createAgentCatalog()`, `listAgentsForApi()` - Discovery factory (from `agent-discovery.ts`)
+  - `resolveIdentityAttestationDependencies(signingKey)` - Identity issuer port composition; policy remains in the feature service
   - `wrapRouteHandlerWithLogging()` - Route logging wrapper with metrics (from `http/`)
   - `wrapPublicRoute()` - Lazy singleton wrapper for public routes with rate limiting (from `http/`)
   - `makeWrapPublicRoute()` - Pure factory for testing (from `http/wrapPublicRoute`)
   - `RateLimitBypassConfig` - Test bypass config type (from `http/wrapPublicRoute`)
   - `TokenBucketRateLimiter`, `publicApiLimiter`, `extractClientIp` - Rate limiting utilities (from `http/`)
 - **Env/Config keys:** none (uses `@/shared/env`)
-- **Files considered API:** `container.ts`, `graph-executor.factory.ts`, `agent-discovery.ts`, `http/index.ts`, `http/wrapPublicRoute.ts`, `http/rateLimiter.ts`
+- **Files considered API:** `container.ts`, `graph-executor.factory.ts`, `agent-discovery.ts`, `identity-attestation.ts`, `http/index.ts`, `http/wrapPublicRoute.ts`, `http/rateLimiter.ts`
 
 **Subdirectories:**
 
@@ -84,6 +87,8 @@ System setup installers were moved to `scripts/bootstrap/` and are out of scope 
   - Sandbox provider registration (LazySandboxGraphProvider + SandboxAgentCatalogProvider, gated by LITELLM_MASTER_KEY; sandbox adapter loaded via dynamic import to avoid Turbopack bundling native deps)
   - Discovery factory for agent listing (listAgentsForApi per DISCOVERY_PIPELINE invariant)
   - Environment-based adapter selection (APP_ENV=test → fakes, production → real adapters including RipgrepAdapter)
+  - OpenFGA authorization adapter wiring when `OPENFGA_API_URL` and `OPENFGA_STORE_ID` are configured
+  - Env-local catalog registry projection at boot and on a fallback interval
   - Logger initialization (one per process)
   - Route logging wrapper with type-safe auth config (envelope-only)
   - Public API rate limiting (10 req/min/IP + burst 5) with test bypass via wrapPublicRoute()

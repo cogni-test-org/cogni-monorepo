@@ -36,6 +36,7 @@ export {
   type ExecutionRequest,
   type ExecutionRequestPort,
   GrantExpiredError,
+  GrantNodeMismatchError,
   GrantNotFoundError,
   GrantRevokedError,
   GrantScopeMismatchError,
@@ -44,6 +45,7 @@ export {
   InvalidCronExpressionError,
   InvalidTimezoneError,
   isGrantExpiredError,
+  isGrantNodeMismatchError,
   isGrantNotFoundError,
   isGrantRevokedError,
   isGrantScopeMismatchError,
@@ -66,17 +68,46 @@ export {
   type ScheduleWorkerPort,
   type UpdateScheduleInput,
 } from "./ports";
+// Grant scope mint + checker (M1 grant↔node binding + M2 scope generalization)
+export {
+  graphExecuteScope,
+  graphExecuteWildcardScope,
+  nodeTaskScope,
+  nodeTaskWildcardScope,
+  parseNodeTaskScope,
+  type ScopeCheckResult,
+  validateGrantScope,
+} from "./scopes";
 // Services (pure orchestration — no adapters, no I/O beyond ports)
 export {
   type GovernanceScheduleConfig,
   type GovernanceScheduleEntry,
   type GovernanceScheduleSyncDeps,
   type GovernanceScheduleSyncResult,
+  governancePrunePrefix,
   governanceScheduleId,
+  isLegacyGovernanceScheduleId,
   type LedgerScheduleConfig,
+  legacyGovernanceScheduleId,
   syncGovernanceSchedules,
   type UpsertGovernanceScheduleRowParams,
 } from "./services/syncGovernanceSchedules";
+export {
+  ForeignNodeScheduleError,
+  isForeignNodeScheduleError,
+  type NodeScheduleEntry,
+  type NodeScheduleRowState,
+  type NodeScheduleSyncDeps,
+  type NodeScheduleSyncResult,
+  type NodeScheduleTeardownDeps,
+  type NodeScheduleTeardownResult,
+  type NodeTaskInputEnvelope,
+  nodeScheduleId,
+  nodeScheduleIdPrefix,
+  syncNodeSchedules,
+  teardownNodeSchedules,
+  type UpsertNodeScheduleRowParams,
+} from "./services/syncNodeSchedules";
 // Types
 export {
   type ExecutionGrant,

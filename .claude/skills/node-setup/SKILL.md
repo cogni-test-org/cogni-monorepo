@@ -12,9 +12,9 @@ You are an infrastructure setup agent. Your job: take a fresh Cogni fork from cl
 - [Node Formation Guide](../../../docs/guides/node-formation-guide.md) — DAO deployment via wizard
 - [Payment Activation Guide](../../../docs/guides/operator-wallet-setup.md) — Privy wallet + Split contract
 - [SETUP_DESIGN.md](../../../scripts/setup/SETUP_DESIGN.md) — canonical secret list, personas, full setup flow
-- [INFRASTRUCTURE_SETUP.md](../../../docs/runbooks/INFRASTRUCTURE_SETUP.md) — VM provisioning runbook
-- [server-env.ts](../../../apps/web/src/shared/env/server-env.ts) — app runtime env schema (source of truth)
-- [deploy.sh](../../../scripts/ci/deploy.sh) — deploy script required secrets
+- [ci-cd.md Axiom 23](../../../docs/spec/ci-cd.md) — `AKASH_IS_NODE_APP_TARGET` (gated north star): new node apps target Akash via the operator compute API; Cherry k3s = state substrate
+
+> ⚠️ Parts of this skill predate the k3s + Akash split (it references retired paths); verify against `docs/spec/cd-pipeline-e2e.md` before trusting a step.
 
 ## Pre-flight
 
@@ -36,7 +36,7 @@ Check `payments.status` in `.cogni/repo-spec.yaml` to determine current state.
 1. Direct user to https://cognidao.org/setup/dao
 2. User copies generated YAML into `.cogni/repo-spec.yaml`
 3. Follow [Node Formation Guide](../../../docs/guides/node-formation-guide.md) for details
-4. **Gate:** `.cogni/repo-spec.yaml` has valid `cogni_dao.chain_id` and `payments.status: pending_activation`
+4. **Gate:** `.cogni/repo-spec.yaml` has valid `governance.chain_id` and `payments.status: pending_activation`
 
 ### Phase 1: Repo Identity
 
@@ -59,16 +59,15 @@ Derive `REPO_SLUG` (e.g., `my-cogni-node`) and `REPO_SNAKE` (e.g., `my_cogni_nod
 1. Copy `.env.local.example` → `.env.local`, update DB names and `COGNI_REPO_URL`
 2. Prompt user for credentials they must create (see [SETUP_DESIGN.md](../../../scripts/setup/SETUP_DESIGN.md) for full list):
 
-   | Secret                     | Where to create                                                                         |
-   | -------------------------- | --------------------------------------------------------------------------------------- |
-   | `CHERRY_AUTH_TOKEN`        | https://portal.cherryservers.com/settings/api-keys                                      |
-   | `OPENROUTER_API_KEY`       | https://openrouter.ai/settings/keys                                                     |
-   | `EVM_RPC_URL`              | https://dashboard.alchemy.com/apps (Base Mainnet)                                       |
-   | `GHCR_DEPLOY_TOKEN`        | https://github.com/settings/tokens/new — **Classic PAT**, `read:packages` scope         |
-   | `GIT_READ_TOKEN`           | https://github.com/settings/personal-access-tokens/new — Fine-grained, `Contents: Read` |
-   | `OPENCLAW_GITHUB_RW_TOKEN` | https://github.com/settings/tokens/new — Classic PAT, `repo` scope                      |
+   | Secret               | Where to create                                                                         |
+   | -------------------- | --------------------------------------------------------------------------------------- |
+   | `CHERRY_AUTH_TOKEN`  | https://portal.cherryservers.com/settings/api-keys                                      |
+   | `OPENROUTER_API_KEY` | https://openrouter.ai/settings/keys                                                     |
+   | `EVM_RPC_URL`        | https://dashboard.alchemy.com/apps (Base Mainnet)                                       |
+   | `GHCR_DEPLOY_TOKEN`  | https://github.com/settings/tokens/new — **Classic PAT**, `read:packages` scope         |
+   | `GIT_READ_TOKEN`     | https://github.com/settings/personal-access-tokens/new — Fine-grained, `Contents: Read` |
 
-3. Auto-generate: `LITELLM_MASTER_KEY`, `AUTH_SECRET`, `OPENCLAW_GATEWAY_TOKEN` via `openssl rand`
+3. Auto-generate: `LITELLM_MASTER_KEY`, `AUTH_SECRET` via `openssl rand`
 4. Start dev infrastructure: `pnpm dev:infra`
 5. Provision database + run migrations: `pnpm dev:setup`
 6. Start dev server: `pnpm dev`

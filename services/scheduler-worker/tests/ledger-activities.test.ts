@@ -15,22 +15,14 @@ import type {
   IngestionCursor,
   UnselectedReceipt,
 } from "@cogni/attribution-ledger";
-import {
-  computeApproverSetHash,
-  computeEpochWindowV1,
-} from "@cogni/attribution-ledger";
+import { computeEpochWindowV1 } from "@cogni/attribution-ledger";
 import { createDefaultRegistries } from "@cogni/attribution-pipeline-plugins";
 import type {
   ActivityEvent,
   CollectResult,
   DataSourceRegistration,
 } from "@cogni/ingestion-core";
-import { verifyTypedData } from "viem";
 import { describe, expect, it, vi } from "vitest";
-
-vi.mock("viem", () => ({
-  verifyTypedData: vi.fn(),
-}));
 
 import { createAttributionActivities } from "../src/activities/ledger.js";
 
@@ -96,6 +88,7 @@ function makeMockStore(
     finalizeEpochAtomic: vi.fn(),
     getSelectionCandidates: vi.fn().mockResolvedValue([]),
     updateSelectionUserId: vi.fn(),
+    updateSelectionIncluded: vi.fn(),
     upsertReviewSubjectOverride: vi.fn(),
     batchUpsertReviewSubjectOverrides: vi.fn().mockResolvedValue([]),
     deleteReviewSubjectOverride: vi.fn(),
@@ -534,6 +527,27 @@ describe("loadCursor", () => {
   });
 });
 
+// ── resolveStreams ──────────────────────────────────────────────
+
+describe("resolveStreams", () => {
+  it("skips gracefully (no throw, empty streams) when the source has no poll adapter — reverts the #519 fatal-throw regression so webhook-only sources don't kill CollectEpoch", async () => {
+    const { resolveStreams } = createAttributionActivities({
+      attributionStore: makeMockStore(),
+      // webhook-only reality: github receipts arrive via the operator webhook
+      // receiver; the scheduler-worker registers no github poll adapter.
+      sourceRegistrations: new Map(),
+      registries,
+      nodeId: NODE_ID,
+      scopeId: SCOPE_ID,
+      chainId: 8453,
+      logger: mockLogger,
+    });
+
+    const result = await resolveStreams({ source: "github" });
+    expect(result.streams).toEqual([]);
+  });
+});
+
 // ── collectFromSource ───────────────────────────────────────────
 
 describe("collectFromSource", () => {
@@ -807,9 +821,25 @@ describe("materializeSelection", () => {
   });
 
   it("creates new selection rows with resolved userId", async () => {
+    // cogni-v0.0 now uses main-merge-selection: a PR merged to `main` IS the
+    // contribution (included: true). Give the fixtures baseBranch=main so they are
+    // included; metadata is replaced wholesale by the override (not merged).
+    const mainMergeMeta = (title: string) => ({
+      title,
+      baseBranch: "main",
+      repo: "test/repo",
+    });
     const unselected = [
-      makeUnselectedReceipt({ receiptId: "ev1", platformUserId: "111" }),
-      makeUnselectedReceipt({ receiptId: "ev2", platformUserId: "222" }),
+      makeUnselectedReceipt({
+        receiptId: "ev1",
+        platformUserId: "111",
+        metadata: mainMergeMeta("PR 1"),
+      }),
+      makeUnselectedReceipt({
+        receiptId: "ev2",
+        platformUserId: "222",
+        metadata: mainMergeMeta("PR 2"),
+      }),
     ];
     const identityMap = new Map([["111", "user-aaa"]]);
     const { store, materializeSelection } = makeDeps({
@@ -948,6 +978,39 @@ describe("materializeSelection", () => {
       "user-aaa"
     );
     // insertSelectionDoNothing (which overwrites all fields) is NOT called for existing rows
+    expect(store.insertSelectionDoNothing).not.toHaveBeenCalled();
+  });
+
+  it("re-syncs policy-owned `included` flag on existing rows (idempotency)", async () => {
+    // Regression for the candidate-a bug: an existing selection row persisted
+    // included=false under the old policy must be re-synced to the CURRENT
+    // policy decision (main-merge → included=true) without touching weight/note.
+    const unselected = [
+      makeUnselectedReceipt({
+        receiptId: "ev1",
+        platformUserId: "111",
+        hasExistingSelection: true,
+        metadata: {
+          title: "PR 1",
+          baseBranch: "main",
+          repo: "test/repo",
+        },
+      }),
+    ];
+    const identityMap = new Map([["111", "user-aaa"]]);
+    const { store, materializeSelection } = makeDeps({
+      getSelectionCandidates: vi.fn().mockResolvedValue(unselected),
+      resolveIdentities: vi.fn().mockResolvedValue(identityMap),
+    });
+
+    await materializeSelection({
+      epochId: "1",
+      attributionPipeline: "cogni-v0.0",
+    });
+
+    // Existing row → policy-owned included flag is re-persisted (=true now)
+    expect(store.updateSelectionIncluded).toHaveBeenCalledWith(1n, "ev1", true);
+    // No re-insert; admin weight/note untouched (only `included` is written)
     expect(store.insertSelectionDoNothing).not.toHaveBeenCalled();
   });
 
@@ -1377,146 +1440,5 @@ describe("computeAllocations", () => {
         weightConfig: { "github:pr_merged": 1000 },
       })
     ).rejects.toThrow(/requires evaluations \[cogni\.echo\.v0\]/);
-  });
-});
-
-describe("finalizeEpoch", () => {
-  it("finalizes using claimant allocations and preserves unresolved identities", async () => {
-    vi.mocked(verifyTypedData).mockResolvedValue(true);
-
-    const signer = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const reviewEpoch = makeEpoch({
-      status: "review",
-      allocationAlgoRef: "weight-sum-v0",
-      weightConfigHash: "weight-hash",
-      approvers: [signer],
-      approverSetHash: await computeApproverSetHash([signer]),
-    });
-
-    const finalizeEpochAtomic = vi.fn().mockImplementation(async (params) => ({
-      epoch: {
-        ...reviewEpoch,
-        status: "finalized",
-        poolTotalCredits: params.poolTotal,
-        closedAt: new Date(),
-      },
-      statement: {
-        id: "stmt-1",
-        nodeId: NODE_ID,
-        epochId: reviewEpoch.id,
-        finalAllocationSetHash: params.statement.finalAllocationSetHash,
-        poolTotalCredits: params.statement.poolTotalCredits,
-        statementLines: params.statement.statementLines,
-        supersedesStatementId: null,
-        createdAt: new Date(),
-      },
-    }));
-
-    const store = makeMockStore({
-      getEpoch: vi.fn().mockResolvedValue(reviewEpoch),
-      loadLockedClaimants: vi.fn().mockResolvedValue([
-        {
-          id: "claimant-1",
-          nodeId: NODE_ID,
-          epochId: reviewEpoch.id,
-          receiptId: "receipt-1",
-          status: "locked" as const,
-          resolverRef: "cogni.default-author.v0",
-          algoRef: "default-author-v0",
-          inputsHash: "inputs-hash-1",
-          claimantKeys: ["user:user-1"],
-          createdAt: new Date(),
-          createdBy: "system",
-        },
-        {
-          id: "claimant-2",
-          nodeId: NODE_ID,
-          epochId: reviewEpoch.id,
-          receiptId: "receipt-2",
-          status: "locked" as const,
-          resolverRef: "cogni.default-author.v0",
-          algoRef: "default-author-v0",
-          inputsHash: "inputs-hash-2",
-          claimantKeys: ["identity:github:42"],
-          createdAt: new Date(),
-          createdBy: "system",
-        },
-      ]),
-      getSelectedReceiptsForAllocation: vi.fn().mockResolvedValue([
-        {
-          receiptId: "receipt-1",
-          userId: "user-1",
-          source: "github",
-          eventType: "pr_merged",
-          included: true,
-          weightOverrideMilli: null,
-        },
-        {
-          receiptId: "receipt-2",
-          userId: "user-1",
-          source: "github",
-          eventType: "pr_merged",
-          included: true,
-          weightOverrideMilli: null,
-        },
-      ]),
-      getEvaluationsForEpoch: vi.fn().mockResolvedValue([
-        makeEvaluation({
-          status: "locked",
-          epochId: reviewEpoch.id,
-          payloadJson: {
-            totalEvents: 2,
-            byEventType: { pr_merged: 2 },
-            byUserId: { "user-1": 2 },
-          },
-        }),
-      ]),
-      getPoolComponentsForEpoch: vi.fn().mockResolvedValue([
-        {
-          id: "pool-1",
-          nodeId: NODE_ID,
-          epochId: reviewEpoch.id,
-          componentId: "base_issuance",
-          algorithmVersion: "v1",
-          inputsJson: { base_amount: 10000 },
-          amountCredits: 10000n,
-          evidenceRef: null,
-          computedAt: new Date(),
-        },
-      ]),
-      finalizeEpochAtomic,
-    });
-
-    const activities = createAttributionActivities({
-      attributionStore: store,
-      sourceRegistrations: new Map(),
-      registries,
-      nodeId: NODE_ID,
-      scopeId: SCOPE_ID,
-      chainId: 8453,
-      logger: mockLogger,
-    });
-
-    const result = await activities.finalizeEpoch({
-      epochId: reviewEpoch.id.toString(),
-      signature: "0xdeadbeef",
-      signerAddress: signer,
-    });
-
-    expect(result.statementLineCount).toBe(2);
-    expect(finalizeEpochAtomic).toHaveBeenCalledTimes(1);
-
-    const finalizeParams = finalizeEpochAtomic.mock.calls[0]?.[0];
-    // Both receipts have equal weight (same eventType, no override), each claimant owns one receipt
-    expect(finalizeParams.statement.statementLines).toEqual([
-      expect.objectContaining({
-        claimant_key: "identity:github:42",
-        final_units: expect.any(String),
-      }),
-      expect.objectContaining({
-        claimant_key: "user:user-1",
-        final_units: expect.any(String),
-      }),
-    ]);
   });
 });

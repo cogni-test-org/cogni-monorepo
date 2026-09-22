@@ -14,6 +14,24 @@
  * @public
  */
 
+// Compute-substrate capability (per cicd-platform-boundary spec § typed operator control plane;
+// read half — provider-agnostic balance awareness; sibling of DeployCapability)
+export type {
+  ComputeBalance,
+  ComputeResourcePort,
+  ProvisionOutput,
+  ProvisionServiceSpec,
+  ProvisionSpec,
+  ProvisionState,
+} from "./compute";
+// Deploy capability (per cicd-platform-boundary spec § typed operator control plane; sibling of VcsCapability)
+export type {
+  DeployCapability,
+  EnvSummary,
+  NodeDeployState,
+  NodeHealthState,
+  ReplicaCounts,
+} from "./deploy";
 // Hypothesis-loop capability (per knowledge-syntropy spec § The Hypothesis Loop)
 export type {
   ChainDirection,
@@ -73,6 +91,7 @@ export type {
 } from "./types";
 // VCS capability (per VCS_WRITE_CAPABLE)
 export type {
+  ApproveWorkflowRunsResult,
   CheckInfo,
   CiStatusResult,
   CreateBranchResult,

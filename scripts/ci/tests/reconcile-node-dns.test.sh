@@ -81,6 +81,15 @@ if method == "PUT" and m:
 
 if method == "POST" and url and url.endswith("/dns_records"):
     b = json.loads(data)
+    # Real Cloudflare: a CNAME is EXCLUSIVE on its name — creating an A over a
+    # live CNAME (or vice versa) is rejected with error 81053. Model it, so a
+    # probe that misreads a CNAME as "absent" fails here exactly as in prod.
+    for r in s["records"]:
+        if r["name"] == b["name"] and "CNAME" in (r["type"], b.get("type", "A")):
+            print(json.dumps({"success": False, "errors": [
+                {"code": 81053,
+                 "message": "An A, AAAA, or CNAME record with that host already exists."}]}))
+            sys.exit(0)
     rid = "rec%d" % s["next_id"]; s["next_id"] += 1
     s["records"].append({"id": rid, "name": b["name"], "content": b["content"],
                          "proxied": bool(b["proxied"]), "type": b.get("type", "A")})
@@ -141,20 +150,20 @@ printf '{"records":[],"next_id":1}' >"$CF_STORE"
 # Seed the apex (operator) record — reconcile reads its content as the VM IP.
 cf_upsert_a_record test-token zone123 test.cognidao.org "$VM_IP_FIXTURE" true >/dev/null
 
-assert_eq "$(cf_upsert_a_record test-token zone123 resy-test.cognidao.org "$VM_IP_FIXTURE" true)" \
+assert_eq "$(cf_upsert_a_record test-token zone123 node-template-test.cognidao.org "$VM_IP_FIXTURE" true)" \
   "created" "upsert creates when absent"
-assert_eq "$(cf_upsert_a_record test-token zone123 resy-test.cognidao.org "$VM_IP_FIXTURE" true)" \
+assert_eq "$(cf_upsert_a_record test-token zone123 node-template-test.cognidao.org "$VM_IP_FIXTURE" true)" \
   "unchanged" "upsert is a no-op when content+proxied match"
-assert_eq "$(cf_a_record_content test-token zone123 resy-test.cognidao.org)" \
+assert_eq "$(cf_a_record_content test-token zone123 node-template-test.cognidao.org)" \
   "$VM_IP_FIXTURE" "content read returns the record IP"
-id_before="$(id_of resy-test.cognidao.org)"
-assert_eq "$(cf_upsert_a_record test-token zone123 resy-test.cognidao.org 10.0.0.9 true)" \
+id_before="$(id_of node-template-test.cognidao.org)"
+assert_eq "$(cf_upsert_a_record test-token zone123 node-template-test.cognidao.org 10.0.0.9 true)" \
   "updated" "upsert UPDATES IN PLACE when content drifts (no delete-then-create)"
-assert_eq "$(cf_a_record_content test-token zone123 resy-test.cognidao.org)" \
+assert_eq "$(cf_a_record_content test-token zone123 node-template-test.cognidao.org)" \
   "10.0.0.9" "drifted record now resolves to the new IP"
-assert_eq "$(id_of resy-test.cognidao.org)" "$id_before" \
+assert_eq "$(id_of node-template-test.cognidao.org)" "$id_before" \
   "in-place update preserves the record id (never deletes the healthy record)"
-assert_eq "$(count_name resy-test.cognidao.org)" "1" "update leaves exactly one record"
+assert_eq "$(count_name node-template-test.cognidao.org)" "1" "update leaves exactly one record"
 
 # ── Lib: PROTECTED guard — never clobber the zone apex / www ──────────────────
 # FORK_DOMAIN_ROOT=cognidao.org → apex + www are refused by default.
@@ -174,34 +183,86 @@ assert_eq "$(CF_ALLOW_PROTECTED=1 cf_upsert_a_record test-token zone123 cognidao
   "created" "CF_ALLOW_PROTECTED=1 permits deliberate apex provisioning"
 
 # ── Script: reconcile fans one record per non-primary node ────────────────────
+# Isolated fixture catalog (COGNI_CATALOG_ROOT), NOT the live infra/catalog/ —
+# a synthetic primary + non-primary node so this section's expectations can
+# never drift when a real catalog row's placement/env-set changes (this exact
+# class of break: node-template's candidate-a flipped to akash, story.5016).
+EARLY_FIXTURE_CATALOG="$TMPROOT/catalog-early"
+mkdir -p "$EARLY_FIXTURE_CATALOG"
+cat >"$EARLY_FIXTURE_CATALOG/primarynode.yaml" <<'YAML'
+name: primarynode
+type: node
+port: 3900
+node_port: 32100
+dockerfile: nodes/primarynode/app/Dockerfile
+image_tag_suffix: "-primarynode"
+migrator_tag_suffix: ""
+path_prefix: nodes/primarynode/
+envs: [candidate-a, production]
+activity_env: candidate-a
+is_primary_host: true
+YAML
+cat >"$EARLY_FIXTURE_CATALOG/k3snode.yaml" <<'YAML'
+name: k3snode
+type: node
+port: 3901
+node_port: 32101
+dockerfile: nodes/k3snode/app/Dockerfile
+image_tag_suffix: "-k3snode"
+migrator_tag_suffix: ""
+path_prefix: nodes/k3snode/
+envs: [candidate-a, production]
+activity_env: candidate-a
+YAML
+
 printf '{"records":[],"next_id":1}' >"$CF_STORE"
 cf_upsert_a_record test-token zone123 test.cognidao.org "$VM_IP_FIXTURE" true >/dev/null
 
+summary_file="$TMPROOT/dns-reconcile-summary.json"
+COGNI_CATALOG_ROOT="$EARLY_FIXTURE_CATALOG" \
+DNS_RECONCILE_SUMMARY_FILE="$summary_file" \
+DNS_RECONCILE_CANDIDATE_SHA="0123456789abcdef0123456789abcdef01234567" \
+DNS_RECONCILE_HEAD_SHA="abcdef0123456789abcdef0123456789abcdef01" \
+DNS_RECONCILE_NODE_SOURCE_SHA="0123456789abcdef0123456789abcdef01234567" \
+DNS_RECONCILE_NODE_SLUG="k3snode" \
+GITHUB_RUN_ID="12345" \
+GITHUB_RUN_ATTEMPT="2" \
+GITHUB_REF_NAME="main" \
 bash scripts/ci/reconcile-node-dns.sh candidate-a >/dev/null \
   || { echo "FAIL reconcile exited non-zero"; fail=$((fail + 1)); }
 
 # host_for_node(node, test.cognidao.org) → <node>-test.cognidao.org for non-primary.
-for host in resy-test.cognidao.org node-template-test.cognidao.org canary-test.cognidao.org; do
+for host in k3snode-test.cognidao.org; do
   assert_eq "$(cf_a_record_content test-token zone123 "$host")" "$VM_IP_FIXTURE" \
     "reconcile created $host → VM IP"
 done
-# operator is is_primary_host (apex) — it must NOT get an operator-test record.
-assert_eq "$(count_name operator-test.cognidao.org)" "0" "primary node skipped (no operator-test record)"
+assert_eq "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["type"])' "$summary_file")" \
+  "dns_reconcile_summary" "reconcile writes Grafana DNS summary type"
+assert_eq "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["states"].get("created", 0) > 0)' "$summary_file")" \
+  "True" "Grafana DNS summary records created states"
+assert_eq "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(any(r.get("host") == "k3snode-test.cognidao.org" and r.get("state") == "created" for r in d["records"]))' "$summary_file")" \
+  "True" "Grafana DNS summary includes per-host state"
+assert_eq "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_sha8"])' "$summary_file")" \
+  "01234567" "Grafana DNS summary carries candidate SHA correlation in JSON"
+assert_eq "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$summary_file")" \
+  "12345" "Grafana DNS summary carries run correlation in JSON"
+# primarynode is is_primary_host (apex) — it must NOT get a primarynode-test record.
+assert_eq "$(count_name primarynode-test.cognidao.org)" "0" "primary node skipped (no primarynode-test record)"
 
 # Re-run is idempotent (no growth).
-bash scripts/ci/reconcile-node-dns.sh candidate-a >/dev/null
-assert_eq "$(count_name resy-test.cognidao.org)" "1" "second reconcile is idempotent"
+COGNI_CATALOG_ROOT="$EARLY_FIXTURE_CATALOG" bash scripts/ci/reconcile-node-dns.sh candidate-a >/dev/null
+assert_eq "$(count_name k3snode-test.cognidao.org)" "1" "second reconcile is idempotent"
 # Node records mirror the apex proxy state (apex seeded proxied=true above).
-assert_eq "$(proxied_of resy-test.cognidao.org)" "true" "node record mirrors proxied apex"
+assert_eq "$(proxied_of k3snode-test.cognidao.org)" "true" "node record mirrors proxied apex"
 
 # Apex unproxied (candidate-a today) → node records created unproxied, not flipped.
 printf '{"records":[],"next_id":1}' >"$CF_STORE"
 cf_upsert_a_record test-token zone123 test.cognidao.org "$VM_IP_FIXTURE" false >/dev/null
-bash scripts/ci/reconcile-node-dns.sh candidate-a >/dev/null
-assert_eq "$(proxied_of resy-test.cognidao.org)" "false" "node record mirrors UNPROXIED apex (no flip)"
+COGNI_CATALOG_ROOT="$EARLY_FIXTURE_CATALOG" bash scripts/ci/reconcile-node-dns.sh candidate-a >/dev/null
+assert_eq "$(proxied_of k3snode-test.cognidao.org)" "false" "node record mirrors UNPROXIED apex (no flip)"
 
 # ── Script: --check drift gate ────────────────────────────────────────────────
-if bash scripts/ci/reconcile-node-dns.sh candidate-a --check >/dev/null 2>&1; then
+if COGNI_CATALOG_ROOT="$EARLY_FIXTURE_CATALOG" bash scripts/ci/reconcile-node-dns.sh candidate-a --check >/dev/null 2>&1; then
   printf 'OK   --check passes when all node records present\n'; pass=$((pass + 1))
 else
   printf 'FAIL --check should pass when all present\n'; fail=$((fail + 1))
@@ -210,11 +271,121 @@ fi
 # Drop one node record → --check must fail.
 printf '{"records":[],"next_id":1}' >"$CF_STORE"
 cf_upsert_a_record test-token zone123 test.cognidao.org "$VM_IP_FIXTURE" true >/dev/null
-if bash scripts/ci/reconcile-node-dns.sh candidate-a --check >/dev/null 2>&1; then
+if COGNI_CATALOG_ROOT="$EARLY_FIXTURE_CATALOG" bash scripts/ci/reconcile-node-dns.sh candidate-a --check >/dev/null 2>&1; then
   printf 'FAIL --check should fail when node records missing\n'; fail=$((fail + 1))
 else
   printf 'OK   --check fails (non-zero) when node records missing\n'; pass=$((pass + 1))
 fi
+
+# ── Placement decides DNS ownership (story.5016) ──────────────────────────────
+# A node the catalog places on an EXTERNAL provider has its public host CNAME'd to
+# the provider by the operator's ComputeWorkload DNS reconciler. This loop maps
+# hosts onto the env VM, so it must not touch that record — two writers on one
+# name is a Cloudflare type conflict that hard-fails the whole env's promote.
+FIXTURE_CATALOG="$TMPROOT/catalog"
+mkdir -p "$FIXTURE_CATALOG"
+cat >"$FIXTURE_CATALOG/k3snode.yaml" <<'YAML'
+name: k3snode
+type: node
+port: 3901
+node_port: 32101
+dockerfile: nodes/k3snode/app/Dockerfile
+image_tag_suffix: "-k3snode"
+migrator_tag_suffix: ""
+path_prefix: nodes/k3snode/
+envs: [candidate-a, production]
+activity_env: candidate-a
+YAML
+# Placement is declared for candidate-a ONLY: production falls back to k3s
+# (K3S_IS_DEFAULT), so this one row proves the skip is per-ENV, not per-node.
+cat >"$FIXTURE_CATALOG/akashnode.yaml" <<'YAML'
+name: akashnode
+type: node
+port: 3902
+node_port: 32102
+dockerfile: nodes/akashnode/app/Dockerfile
+image_tag_suffix: "-akashnode"
+migrator_tag_suffix: ""
+path_prefix: nodes/akashnode/
+envs: [candidate-a, production]
+deployment_provider:
+  candidate-a: akash
+activity_env: candidate-a
+YAML
+
+# Store: apex A + the LIVE CNAME the compute controller owns for the akash node.
+CF_STORE="$CF_STORE" python3 -c '
+import json, os
+json.dump({"records": [
+    {"id": "apex", "name": "test.cognidao.org", "content": "84.32.9.111",
+     "proxied": False, "type": "A"},
+    {"id": "cn1", "name": "akashnode-test.cognidao.org",
+     "content": "provider.zencloud.akash.pub", "proxied": True, "type": "CNAME"},
+], "next_id": 9}, open(os.environ["CF_STORE"], "w"))'
+
+placement_summary="$TMPROOT/placement-summary.json"
+if COGNI_CATALOG_ROOT="$FIXTURE_CATALOG" DNS_RECONCILE_SUMMARY_FILE="$placement_summary" \
+  bash scripts/ci/reconcile-node-dns.sh candidate-a >"$TMPROOT/placement.out" 2>&1; then
+  printf 'OK   reconcile succeeds with an externally-placed node in the catalog\n'; pass=$((pass + 1))
+else
+  printf 'FAIL reconcile must not fail on an externally-placed node\n'; cat "$TMPROOT/placement.out"; fail=$((fail + 1))
+fi
+assert_eq "$(cf_record_type test-token zone123 akashnode-test.cognidao.org)" "CNAME" \
+  "externally-placed host keeps its controller-owned CNAME (never A-clobbered)"
+assert_eq "$(count_name akashnode-test.cognidao.org)" "1" \
+  "no second record was created alongside the CNAME"
+assert_eq "$(cf_a_record_content test-token zone123 k3snode-test.cognidao.org)" "84.32.9.111" \
+  "k3s-placed sibling in the same catalog still reconciles to the VM IP"
+assert_eq "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(r["state"] for r in d["records"] if r["node"] == "akashnode"))' "$placement_summary")" \
+  "external" "Grafana DNS summary reports the skipped node as state=external"
+
+# --check must be GREEN, not "MISSING": the record exists, it is just not ours.
+if COGNI_CATALOG_ROOT="$FIXTURE_CATALOG" \
+  bash scripts/ci/reconcile-node-dns.sh candidate-a --check >/dev/null 2>&1; then
+  printf 'OK   --check is green when an externally-placed node holds a CNAME\n'; pass=$((pass + 1))
+else
+  printf 'FAIL --check must not flag an externally-placed node as missing DNS\n'; fail=$((fail + 1))
+fi
+
+# Same row, production env: no placement declared there → K3S_IS_DEFAULT applies
+# and the node IS this loop's to own. (DOMAIN is pinned so only placement varies.)
+CF_STORE="$CF_STORE" python3 -c '
+import json, os
+json.dump({"records": [
+    {"id": "apex", "name": "test.cognidao.org", "content": "84.32.9.111",
+     "proxied": False, "type": "A"},
+], "next_id": 9}, open(os.environ["CF_STORE"], "w"))'
+COGNI_CATALOG_ROOT="$FIXTURE_CATALOG" DOMAIN=test.cognidao.org \
+  bash scripts/ci/reconcile-node-dns.sh production >/dev/null 2>&1
+assert_eq "$(cf_a_record_content test-token zone123 akashnode-test.cognidao.org)" "84.32.9.111" \
+  "an env with NO placement override still reconciles (K3S_IS_DEFAULT)"
+
+# ── Lib: the existence probe is type-aware, so a CNAME is never "absent" ──────
+# Pre-fix the probe pinned ?type=A, read a live CNAME as absent, and POSTed an A
+# that Cloudflare rejects with 81053 — surfacing only as a bare "upsert failed".
+CF_STORE="$CF_STORE" python3 -c '
+import json, os
+json.dump({"records": [
+    {"id": "cn2", "name": "foreign-test.cognidao.org", "content": "provider.example",
+     "proxied": True, "type": "CNAME"},
+], "next_id": 9}, open(os.environ["CF_STORE"], "w"))'
+assert_eq "$(cf_record_type test-token zone123 foreign-test.cognidao.org)" "CNAME" \
+  "cf_record_type sees a record the type-A read cannot"
+assert_eq "$(cf_a_record_content test-token zone123 foreign-test.cognidao.org)" "" \
+  "cf_a_record_content still reports only A records (apex VM-IP read unchanged)"
+set +e
+upsert_out="$(cf_upsert_a_record test-token zone123 foreign-test.cognidao.org 84.32.9.111 true 2>&1)"
+upsert_rc=$?
+set -e
+assert_eq "$upsert_rc" "3" "upsert REFUSES (rc=3) a host already owned by a foreign record type"
+case "$upsert_out" in
+  *"already holds a CNAME record"*)
+    printf 'OK   refusal names the conflicting record type\n'; pass=$((pass + 1)) ;;
+  *)
+    printf 'FAIL refusal must name the conflicting record type — got %q\n' "$upsert_out"; fail=$((fail + 1)) ;;
+esac
+assert_eq "$(cf_record_type test-token zone123 foreign-test.cognidao.org)" "CNAME" \
+  "the foreign record survives the refused upsert"
 
 echo "---"
 echo "pass=$pass fail=$fail"

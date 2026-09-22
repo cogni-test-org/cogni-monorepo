@@ -22,6 +22,37 @@ tags: [governance, attribution, overview]
 
 Provide a single document that explains the full attribution pipeline end-to-end: from `repo-spec.yaml` configuration through activity ingestion, enrichment, allocation, admin review, and EIP-712 signed credit statements. Serve as the entry point for onboarding and for deciding where a change belongs.
 
+## DAO Ownership Token Distribution
+
+The first crypto-distribution primitive is an ownership token merkle manifest,
+not an automatic payout executor. It does not deploy or fund a MerkleDistributor
+contract yet. DAO formation now separates the DAO's long-run policy supply from
+the concrete genesis mint. Current P0 templates mint only a small, explicit
+genesis amount to a known holder; the remaining policy supply is future supply,
+not minted inventory, and cannot fund claims until a DAO-controlled emissions
+holder or funded distributor exists. It does not yet encode contributor,
+reserve, or ecosystem sub-allocations. After attribution epochs produce signed
+claimant allocations, those signed credit entitlements can be transformed into a
+deterministic token claim manifest:
+
+1. Group finalized claimant allocations by claimant key and resolved claim
+   address.
+2. Convert signed `credit_amount` entitlements into ERC20 base-unit amounts
+   against the distribution amount using integer largest-remainder rounding.
+3. Hash each claim in the selected distributor's claim shape and build proofs
+   with pinned OSS Merkle tooling; do not introduce custom distributor
+   contracts in the MVP path.
+4. Publish a scope-bound settlement manifest with `node_id`, `scope_id`,
+   `epochId`, `statementHash`, `merkleRoot`, `totalAmount`, funding metadata,
+   and per-claim proofs for a future MerkleDistributor contract or
+   operator-mediated claim route.
+
+This keeps today's ledger signing flow unchanged while giving the next iteration
+a stable bridge from signed attribution statements to token ownership claims.
+Until the distributor contract, funding transaction, and claim UI/API exist,
+`/gov/holdings` remains attribution-ledger ownership with placeholders for
+actual token distribution and attributed-vs-claimed diffs.
+
 ## Non-Goals
 
 - Schema definitions — see [attribution-ledger](./attribution-ledger.md)
@@ -33,12 +64,13 @@ Provide a single document that explains the full attribution pipeline end-to-end
 
 This spec introduces no new invariants. All behavioral guarantees are defined in the detailed specs above. The key invariants that govern the pipeline flow are:
 
-| Rule                    | Summary                                              |
-| ----------------------- | ---------------------------------------------------- |
-| EPOCH_THREE_PHASE       | `open → review → finalized`, no backward transitions |
-| ADMIN_FINALIZES_ONCE    | Human reviews, optionally overrides, then signs once |
-| STATEMENT_DETERMINISTIC | Same inputs → byte-for-byte identical statement      |
-| SIGNATURE_SCOPE_BOUND   | EIP-712 covers nodeId + scopeId + hash (no replay)   |
+| Rule                       | Summary                                                 |
+| -------------------------- | ------------------------------------------------------- |
+| EPOCH_THREE_PHASE          | `open → review → finalized`, no backward transitions    |
+| ADMIN_FINALIZES_ONCE       | Human reviews, optionally overrides, then signs once    |
+| STATEMENT_DETERMINISTIC    | Same inputs → byte-for-byte identical statement         |
+| SIGNATURE_SCOPE_BOUND      | EIP-712 covers nodeId + scopeId + epoch + allocation    |
+| SIGNATURE_DEPLOYMENT_BOUND | EIP-712 v2 covers server-derived deployment environment |
 
 ## Design
 
@@ -56,7 +88,8 @@ This spec introduces no new invariants. All behavioral guarantees are defined in
  │  │   activity_sources:                                                │  │
  │  │     github:                                                        │  │
  │  │       attribution_pipeline: cogni-v0.0  ◄── selects profile        │  │
- │  │       source_refs: ["org/repo"]                                    │  │
+ │  │       source_refs: ["org/repo"]  ◄── selection-time repo allowlist  │  │
+ │  │                                      (fail-open when empty/missing)  │  │
  │  └────────────────────────────────────────────────────────────────────┘  │
  │                                     │                                    │
  └─────────────────────────────────────┼────────────────────────────────────┘
@@ -137,17 +170,19 @@ This spec introduces no new invariants. All behavioral guarantees are defined in
                                        │
                                        ▼
  ┌─────────────────────────────────────────────────────────────────────────┐
- │  FINALIZE  (admin signs, Temporal executes)                             │
+ │  FINALIZE  (admin signs, node finalizes in-process)                     │
  │                                                                         │
  │  1. GET /sign-data  →  builds EIP-712 typed data:                       │
  │     Load locked claimants + selected receipts + locked evaluations      │
  │     dispatchAllocator() → applyReceiptWeightOverrides()                 │
  │       → explodeToClaimants() → computeFinalClaimantAllocationSetHash()  │
- │     Return typed data: { nodeId, scopeId, epochId, hash, poolTotal }   │
+ │     Return EIP-712 v2 typed data:                                       │
+ │       { nodeId, scopeId, epochId, deploymentEnvironment, hash, poolTotal }│
+ │     deploymentEnvironment comes from server DEPLOY_ENVIRONMENT only     │
  │                                                                         │
  │  2. Admin wallet signs EIP-712 typed data (MetaMask / WalletConnect)    │
  │                                                                         │
- │  3. POST /finalize  →  starts FinalizeEpochWorkflow:                    │
+ │  3. POST /finalize  →  finalizes in-process on the node's own DB:       │
  │     • Recompute identical hash (same allocator dispatch path as sign-data)│
  │     • Verify EIP-712 signature against approvers[]                      │
  │     • Atomic DB transaction:                                            │
@@ -162,12 +197,28 @@ This spec introduces no new invariants. All behavioral guarantees are defined in
  │  │  { claimant_key, final_units, pool_share, credit_amount,        │    │
  │  │    receipt_ids }  ×  N claimants                                 │    │
  │  │  + finalAllocationSetHash (SHA-256)                              │    │
- │  │  + EIP-712 signature (scope-bound, replay-resistant)             │    │
+ │  │  + EIP-712 v2 signature (scope + deployment-bound)               │    │
  │  │  + review_overrides_json (audit trail)                           │    │
  │  └─────────────────────────────────────────────────────────────────┘    │
  │                                                                         │
  └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+### `source_refs` — selection-time repo allowlist (fail-open)
+
+`activity_sources.github.source_refs` is **not** a poll-only declaration. With git ingested webhook-only (the operator GitHub App is the live ingest path; the scheduler-worker holds no GH App key), `source_refs` is consumed at the **selection** layer by the `main-merge-selection.v0` policy: a receipt whose `metadata.repo` is not in the list is excluded — but **only when the list is non-empty**. An empty or missing `source_refs` applies no repo filter (fail-open), so a misconfigured allowlist cannot silently zero out claimants. The repo-spec is the SSOT for which repos' merged PRs earn attribution (candidate-a: `cogni-test-org/test-cog`; prod: `cogni-dao/cogni`, kept as a commented swap line in the runtime repo-spec). Because `included` is re-synced every pass (SELECTION_INCLUDED_IDEMPOTENT), editing `source_refs` propagates to already-materialized receipts on the next collect.
+
+### Contributor visibility — GitHub identity, no linked account required
+
+A receipt that the selection policy **selects** shows up as a contributor regardless of whether its GitHub identity is linked to a Cogni user account. Unresolved identities surface as identity-claimants (`identity:github:<id>`) and appear in the open epoch's contributor list — even at 0 points. Linking a GitHub identity to a Cogni user account is only required **later, to claim distributions**, not to be visible as a contributor.
+
+There is an agent-first read surface (all accept a bearer token):
+
+| Method | Route                                          | Purpose                                                               |
+| ------ | ---------------------------------------------- | --------------------------------------------------------------------- |
+| GET    | `/api/v1/attribution/epochs`                   | List epochs (including the open one)                                  |
+| GET    | `/api/v1/attribution/epochs/[id]/activity`     | Ingestion receipts + selection join for the epoch                     |
+| GET    | `/api/v1/attribution/epochs/[id]/contributors` | Epoch #, window, active policy, and contributions grouped by identity |
 
 ## Epoch State Machine
 
@@ -279,6 +330,14 @@ No changes to the framework, scheduler-worker, or core ledger code.
 
 Dependency direction is strict: `plugins → contracts → ledger`. Never reverse.
 
+## Roadmap (vNext)
+
+Forward direction (not yet specced — captured here so the next step is obvious):
+
+- **Single operator repo-spec.** Collapse the operator's split repo-spec into one file. Today root `/.cogni/repo-spec.yaml` carries monorepo identity, while the runtime attribution spec lives at `nodes/operator/.cogni/repo-spec.yaml` (where `source_refs` is read). One file per node removes the "which repo-spec is authoritative" footgun.
+- **GitHub → Cogni identity-link + claim flow.** A self-serve path for a contributor to link their GitHub identity to a Cogni user account, converting visible identity-claimants (`identity:github:<id>`) into claimable user-claimants. Visibility already works without this; claiming does not.
+- **Distribution / signing over identity-claimants.** Extend the signed-statement + distribution path to settle to identity-claimants directly (or resolve them at claim time), so attribution can pay out even before every contributor has linked an account.
+
 ## Key Code Paths
 
 | Pipeline Phase                  | Primary Code Location                                                  |
@@ -305,4 +364,4 @@ Every step from allocation to statement is fully reproducible from stored data:
 3. **Integer math only**: BIGINT throughout, largest-remainder rounding for exact sums
 4. **Verification endpoint**: `GET /verify/epoch/:id` recomputes from stored data and compares
 
-The signed `finalAllocationSetHash` is a SHA-256 of the sorted final claimant allocations. Combined with the EIP-712 signature binding `nodeId + scopeId + epochId + hash + poolTotal`, the statement is tamper-evident and scope-bound.
+The signed `finalAllocationSetHash` is a SHA-256 of the sorted final claimant allocations. Combined with the EIP-712 v2 signature binding `nodeId + scopeId + epochId + deploymentEnvironment + hash + poolTotal`, the statement is tamper-evident, scope-bound, and non-replayable across candidate-a, preview, and production. Both sign-data generation and finalize verification derive the environment server-side; missing or unsupported configuration fails closed.

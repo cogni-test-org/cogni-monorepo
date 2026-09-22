@@ -25,9 +25,167 @@ command -v yq >/dev/null 2>&1 || fail "yq is required to read catalog targets"
 catalog_file="${COGNI_CATALOG_ROOT}/${TARGET}.yaml"
 [ -f "$catalog_file" ] || fail "missing catalog file: $catalog_file"
 target_type="$(yq -N '.type // ""' "$catalog_file")"
+deployment_provider="${DEPLOYMENT_PROVIDER:-k3s}"
+case "$deployment_provider" in
+  k3s|akash) ;;
+  *) fail "unsupported DEPLOYMENT_PROVIDER '$deployment_provider' for '$TARGET'" ;;
+esac
 
 # shellcheck disable=SC1091 source=./scripts/ci/lib/image-tags.sh
 source "${SCRIPT_DIR}/lib/image-tags.sh"
+# shellcheck disable=SC1091 source=./scripts/ci/lib/ssh-retry.sh
+source "${SCRIPT_DIR}/lib/ssh-retry.sh"
+
+assert_external_compute_preconditions() {
+local node="$TARGET"
+local vm_host="${VM_HOST:-}"
+local domain="${DOMAIN:-}"
+local ssh_bin="${ASSERT_TARGET_SUBSTRATE_SSH_BIN:-ssh}"
+local ssh_opts_raw="${SSH_OPTS:--i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o ServerAliveInterval=10 -o ServerAliveCountMax=6}"
+local repo_spec="${APP_SOURCE_DIR}/nodes/${node}/.cogni/repo-spec.yaml"
+local egress_allowlist="${ASSERT_TARGET_SUBSTRATE_EGRESS_ALLOWLIST:-/etc/cogni/compute-egress-allowlist}"
+
+[ -n "$vm_host" ] || fail "VM_HOST is required for external-compute target '$node'"
+[ -n "$domain" ] || fail "DOMAIN is required for external-compute target '$node'"
+[ -f "$repo_spec" ] || fail "repo-spec missing for external-compute target '$node': $repo_spec"
+
+service_count="$(yq -N '.deployment.services | length' "$repo_spec")"
+[ "$service_count" -gt 0 ] 2>/dev/null \
+  || fail "external-compute target '$node' must declare deployment.services"
+required_keys="$(yq -r '(.deployment.services[]?.secret_refs[]?.key // "") | select(. != "")' "$repo_spec" | sort -u)"
+required_keys_csv="$(paste -sd, - <<<"$required_keys")"
+
+egress_cidrs="$(yq -r '.compute_egress_cidrs[]?.cidr' "$catalog_file" | sort -u)"
+[ -n "$egress_cidrs" ] \
+  || fail "external-compute target '$node' has no compute_egress_cidrs"
+egress_cidrs_csv="$(paste -sd, - <<<"$egress_cidrs")"
+
+# task.5104 / task.5138 — WHICH AUTHORITY owns this row's workload in this environment.
+# Shell twin of resolveNodeComputeApi() in
+# nodes/operator/app/src/features/compute/node-compute-api.ts, read from the SAME
+# catalog cell (`compute_api.<env>`, infra/catalog/_schema.json). The legacy
+# compute-workload-controller is RETIRED (story.5016 removed it from every overlay),
+# so for an external-compute row the only assertable authority is crossplane — an
+# absent cell fails loudly here rather than resolving to a dead authority.
+local compute_api
+compute_api="$(yq -N ".compute_api.\"${DEPLOY_ENVIRONMENT}\"" "$catalog_file")"
+[ -n "$compute_api" ] && [ "$compute_api" != "null" ] || compute_api="legacy"
+case "$compute_api" in
+  crossplane) ;;
+  *) fail "compute_api.'${DEPLOY_ENVIRONMENT}' for external-compute row '$node' is '${compute_api}': the legacy authority is retired, declare compute_api.${DEPLOY_ENVIRONMENT}: crossplane" ;;
+esac
+
+local ssh_opts=()
+read -r -a ssh_opts <<< "$ssh_opts_raw"
+# This whole external-compute assertion is read-only, so replaying it is safe.
+# The shared helper buffers this heredoc and retries only the OpenBao Kubernetes
+# login transient; stable 403 authz drift still fails after one fresh-JWT check.
+cogni_openbao_kubernetes_login_retry "$ssh_bin" "${ssh_opts[@]}" "root@${vm_host}" bash -s -- \
+  "$DEPLOY_ENVIRONMENT" "$node" "$required_keys_csv" "$egress_cidrs_csv" \
+  "$egress_allowlist" "$compute_api" <<'REMOTE'
+set -euo pipefail
+env_name="$1"
+node="$2"
+required_keys_csv="$3"
+egress_cidrs_csv="$4"
+egress_allowlist="$5"
+authority="$6"
+namespace="cogni-${env_name}"
+actuator="operator-akash-tx-actuator"
+xcw_crd="xcomputeworkloads.compute.cogni.io"
+xcw_composition="xcomputeworkload-akash"
+xcw_provider_config="cogni-http"
+actuator_auth_secret="akash-tx-actuator-auth"
+actuator_env_secret="akash-tx-actuator-env-secrets"
+
+fail() { echo "::error::assert-target-substrate: $*" >&2; exit 1; }
+mark_ok() { echo "[OK] $*"; }
+
+echo "[INFO] compute authority for ${node} in ${env_name}: compute_api=${authority}"
+
+if [ "$authority" = "crossplane" ]; then
+  # Crossplane owns the workload here. Assert the control plane (XRD + Composition +
+  # ClusterProviderConfig) and the ONE writer it dials (the private Akash transaction
+  # actuator) — never the legacy controller, which this overlay no longer ships.
+  established="$(kubectl get crd "$xcw_crd" -o jsonpath='{.status.conditions[?(@.type=="Established")].status}' 2>/dev/null || true)"
+  [ "$established" = "True" ] \
+    || fail "compute_api=crossplane for ${node} in ${env_name}: XRD-backed CRD ${xcw_crd} is not Established (condition='${established:-absent}'); apply infra/crossplane/xcomputeworkload before flighting this row"
+  mark_ok "crossplane authority: CRD ${xcw_crd} is Established"
+
+  kubectl get composition "$xcw_composition" >/dev/null 2>&1 \
+    || fail "compute_api=crossplane for ${node} in ${env_name}: Composition ${xcw_composition} is missing; nothing would reconcile the XComputeWorkload the materializer renders"
+  mark_ok "crossplane authority: Composition ${xcw_composition} exists"
+
+  kubectl get clusterproviderconfigs.http.m.crossplane.io "$xcw_provider_config" >/dev/null 2>&1 \
+    || fail "compute_api=crossplane for ${node} in ${env_name}: ClusterProviderConfig/${xcw_provider_config} (http.m.crossplane.io/v1alpha2) is missing; provider-http has no config to send actuator requests under"
+  mark_ok "crossplane authority: ClusterProviderConfig/${xcw_provider_config} exists"
+
+  available="$(kubectl -n "$namespace" get deployment "$actuator" -o jsonpath='{.status.availableReplicas}' 2>/dev/null || true)"
+  [ "${available:-0}" -ge 1 ] 2>/dev/null \
+    || fail "compute_api=crossplane for ${node} in ${env_name}: akash transaction actuator is not available: ${namespace}/${actuator} (availableReplicas='${available:-0}'); every OBSERVE would fail connection-refused and no lease can be minted"
+  mark_ok "crossplane authority: ${namespace}/${actuator} is available"
+
+  kubectl -n "$namespace" get secret "$actuator_auth_secret" >/dev/null 2>&1 \
+    || fail "compute_api=crossplane for ${node} in ${env_name}: Secret ${namespace}/${actuator_auth_secret} is missing; the Composition placeholder {{ ${actuator_auth_secret}:${namespace}:token }} cannot resolve"
+  [ -n "$(kubectl -n "$namespace" get secret "$actuator_auth_secret" -o jsonpath='{.data.token}' 2>/dev/null || true)" ] \
+    || fail "compute_api=crossplane for ${node} in ${env_name}: Secret ${namespace}/${actuator_auth_secret} carries no 'token' key; the Composition placeholder {{ ${actuator_auth_secret}:${namespace}:token }} cannot resolve"
+  mark_ok "crossplane authority: Secret ${namespace}/${actuator_auth_secret} carries key 'token'"
+
+  kubectl -n "$namespace" get secret "$actuator_env_secret" >/dev/null 2>&1 \
+    || fail "compute_api=crossplane for ${node} in ${env_name}: Secret ${namespace}/${actuator_env_secret} is missing; the actuator has no wallet credential and refuses to boot"
+  mark_ok "crossplane authority: Secret ${namespace}/${actuator_env_secret} exists"
+
+  # AKASH_ALLOWED_PROVIDERS is NOT a secret and NOT reachable by exec-ing the deleted
+  # controller. The actuator receives it as a plain, by-name env var on its own
+  # Deployment (infra/k8s/base/akash-tx-actuator/deployment.yaml, pinned per overlay),
+  # and nodes/operator/app/src/bootstrap/akash-tx-actuator.ts splits that value into the
+  # provider allowlist — empty rejects EVERY bid. So read it off the pod spec, which is
+  # exactly the value the process will see, and needs no exec at all.
+  allowed_providers="$(kubectl -n "$namespace" get deployment "$actuator" -o jsonpath='{.spec.template.spec.containers[?(@.name=="actuator")].env[?(@.name=="AKASH_ALLOWED_PROVIDERS")].value}' 2>/dev/null || true)"
+  [ -n "$allowed_providers" ] \
+    || fail "compute_api=crossplane for ${node} in ${env_name}: AKASH_ALLOWED_PROVIDERS is empty or unset on ${namespace}/${actuator}; an empty allowlist rejects every Akash provider bid"
+  mark_ok "crossplane authority: AKASH_ALLOWED_PROVIDERS is non-empty on ${namespace}/${actuator}"
+else
+  # RETIRED AUTHORITY (task.5138 purge; deletion tracked by task.5098). The bespoke
+  # compute-workload-controller is deleted from every environment, so a row still
+  # resolving to it cannot be asserted, deployed, or paid. Fail loudly instead of
+  # asserting a Deployment that exists nowhere.
+  fail "compute_api resolved to '${authority}' for ${node} in ${env_name}: the legacy compute-workload-controller is RETIRED. Declare compute_api.${env_name}: crossplane on the catalog row."
+fi
+
+# Everything below is AUTHORITY-INDEPENDENT: the OpenBao secret bank the workload's
+# declared secret refs must be materialized into, and the installed compute-egress
+# boundary. Both hold identically for legacy and crossplane rows.
+jwt="$(kubectl create token db-provisioner -n default)"
+token="$(kubectl exec -n openbao openbao-0 -- env BAO_ADDR=http://127.0.0.1:8200 \
+  bao write -field=token auth/kubernetes/login role="${env_name}-db-reader" jwt="$jwt")"
+[ -n "$token" ] || fail "could not mint ${env_name}-db-reader token"
+secret_json="$(kubectl exec -n openbao openbao-0 -- env BAO_ADDR=http://127.0.0.1:8200 BAO_TOKEN="$token" \
+  bao kv get -format=json "cogni/${env_name}/${node}")"
+IFS=',' read -r -a required_keys <<< "$required_keys_csv"
+for key in "${required_keys[@]}"; do
+  [ -n "$key" ] || continue
+  jq -e --arg key "$key" '.data.data[$key] | type == "string" and length > 0' <<<"$secret_json" >/dev/null \
+    || fail "materialized node secret bank is missing declared key: $key"
+done
+mark_ok "all declared workload secret refs are materialized"
+
+[ -s "$egress_allowlist" ] \
+  || fail "installed compute egress allowlist is missing"
+IFS=',' read -r -a egress_cidrs <<< "$egress_cidrs_csv"
+for cidr in "${egress_cidrs[@]}"; do
+  # render-compute-egress-allowlist.sh emits "<cidr>:<ports>" per line, so match the
+  # CIDR anchored at line start followed by its port list (or end of line). Never
+  # `grep -Fx` on the bare CIDR: that can never match a rendered line, so it fails
+  # closed on a correctly configured host.
+  grep -Eq "^${cidr//./\\.}(:|\$)" "$egress_allowlist" \
+    || fail "installed compute egress allowlist is missing catalog CIDR: $cidr"
+done
+mark_ok "catalog compute egress CIDRs are installed"
+
+echo "External compute preconditions ready for ${node} in ${env_name} (compute_api=${authority})."
+REMOTE
+}
 
 assert_node_target_substrate() {
 local node="$TARGET"
@@ -53,7 +211,12 @@ done
 "$contains_node" || fail "target '$node' is not a type=node catalog target"
 
 overlay_dir="${APP_SOURCE_DIR}/infra/k8s/overlays/${DEPLOY_ENVIRONMENT}/${node}"
-appset_file="${APP_SOURCE_DIR}/infra/k8s/argocd/${DEPLOY_ENVIRONMENT}-${node}-applicationset.yaml"
+# THE definition, never rebuilt from the env (bug.5204): an akash node's non-production
+# lane is reconciled by the PRODUCTION cluster, so its AppSet lives in appsets/production/.
+# Asserting the env-only path here would fail a perfectly healthy lane.
+# shellcheck source=scripts/ci/lib/appset-paths.sh
+CATALOG_DIR="${COGNI_CATALOG_ROOT:-${APP_SOURCE_DIR}/infra/catalog}" . "$(dirname "${BASH_SOURCE[0]}")/lib/appset-paths.sh"
+appset_file="${APP_SOURCE_DIR}/$(CATALOG_DIR="${COGNI_CATALOG_ROOT:-${APP_SOURCE_DIR}/infra/catalog}" appset_rel_path "$DEPLOY_ENVIRONMENT" "$node")"
 
 [ -d "$overlay_dir" ] || fail "missing overlay dir: $overlay_dir"
 [ -f "$appset_file" ] || fail "missing per-target AppSet file: $appset_file"
@@ -100,6 +263,7 @@ namespace="cogni-${env_name}"
 app_name="${env_name}-${node}"
 appset_name="cogni-${env_name}-${node}"
 workload_name="${node}-node-app"
+expected_secret_name="${node}-env-secrets"
 edge_env="${remote_root}/opt/cogni-template-edge/.env"
 caddyfile="${remote_root}/opt/cogni-template-edge/configs/Caddyfile.tmpl"
 runtime_env="${remote_root}/opt/cogni-template-runtime/.env"
@@ -179,10 +343,16 @@ if [ -z "$consumed_secret_names" ]; then
 else
   while IFS= read -r consumed_secret; do
     [ -n "$consumed_secret" ] || continue
+    if [ "$consumed_secret" = "${node}-node-app-secrets" ]; then
+      mark_fail "Deployment consumes legacy plain Secret ${consumed_secret}; expected ${expected_secret_name}"
+    elif [ "$consumed_secret" != "$expected_secret_name" ]; then
+      mark_fail "Deployment consumes unexpected Secret ${consumed_secret}; expected ${expected_secret_name}"
+    fi
+
     if kubectl -n "$namespace" get secret "$consumed_secret" >/dev/null 2>&1; then
       mark_ok "Deployment-consumed Secret exists: $consumed_secret"
     else
-      mark_fail "Deployment-consumed Secret missing: $consumed_secret"
+      mark_fail "ESO-synced Secret missing: $consumed_secret"
     fi
 
     if kubectl -n "$namespace" get externalsecret "$consumed_secret" >/dev/null 2>&1; then
@@ -192,8 +362,24 @@ else
       else
         mark_fail "Deployment-consumed ExternalSecret not Ready=True: $consumed_secret"
       fi
+    else
+      mark_fail "ExternalSecret missing for Deployment-consumed Secret: $consumed_secret"
     fi
   done <<< "$consumed_secret_names"
+fi
+
+# DSN keys must be materialized into the node Secret (reconcile seeds all three
+# today; secret-materialize owns them once per-node DB creds land). Fail loud if
+# the ESO-synced Secret lacks any DSN so a missing/empty-DSN node can never ship
+# green (DATABASE_SERVICE_URL → scheduler-worker, DOLTGRES_URL → knowledge).
+if kubectl -n "$namespace" get secret "$expected_secret_name" >/dev/null 2>&1; then
+  for dsn_key in DATABASE_URL DATABASE_SERVICE_URL DOLTGRES_URL; do
+    if [ -n "$(kubectl -n "$namespace" get secret "$expected_secret_name" -o jsonpath="{.data.${dsn_key}}" 2>/dev/null)" ]; then
+      mark_ok "node Secret carries DSN key: ${dsn_key}"
+    else
+      mark_fail "node Secret ${expected_secret_name} missing DSN key ${dsn_key}; materialize/reconcile did not write it"
+    fi
+  done
 fi
 
 if [ -f "$edge_env" ]; then
@@ -207,8 +393,18 @@ else
 fi
 
 if [ -f "$caddyfile" ]; then
-  if grep -Fq "{\$${edge_key}:" "$caddyfile" && grep -Fq "host.docker.internal:${node_port}" "$caddyfile"; then
-    mark_ok "Caddyfile declares route for $node_host -> host.docker.internal:${node_port}"
+  # The primary node (edge_key=*_UPSTREAM) renders as the bare {$DOMAIN} block with a
+  # {$<SLUG>_UPSTREAM:app:3000} default — host.docker.internal:<port> is the per-env
+  # edge .env override, NOT the rendered-template default. Only non-primary nodes bake
+  # it into the template, so assert it only for them; the live-config check below
+  # covers the primary's real route. (Same fix as reconcile-node-substrate.sh / #1598.)
+  caddy_route_ok=true
+  grep -Fq "{\$${edge_key}:" "$caddyfile" || caddy_route_ok=false
+  if [[ "$edge_key" != *_UPSTREAM ]]; then
+    grep -Fq "host.docker.internal:${node_port}" "$caddyfile" || caddy_route_ok=false
+  fi
+  if "$caddy_route_ok"; then
+    mark_ok "Caddyfile declares route for $node_host (edge_key=$edge_key)"
   else
     mark_fail "Caddyfile missing route for ${node_host} / node_port ${node_port}"
   fi
@@ -287,7 +483,11 @@ return "$ssh_rc"
 
 case "$target_type" in
   node)
-    assert_node_target_substrate
+    if [ "$deployment_provider" = "akash" ]; then
+      assert_external_compute_preconditions
+    else
+      assert_node_target_substrate
+    fi
     ;;
   service)
     fail "type=service substrate assertion is not implemented yet for target '$TARGET'; declare the service k8s/Argo/Secret/ExternalSecret/ConfigMap contract before enabling app-flight substrate assertions for services"

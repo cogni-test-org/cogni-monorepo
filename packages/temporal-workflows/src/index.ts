@@ -22,7 +22,10 @@ export {
 // Activity type interfaces
 export type {
   EnrichmentActivities,
+  GoalLoopActivities,
+  GoalWire,
   LedgerActivities,
+  LoopBudgetWire,
   ReviewActivities,
   SchedulerActivities,
   SweepActivities,
@@ -49,12 +52,23 @@ export {
   formatThreshold,
 } from "./domain/review.js";
 export type { AttributionIngestRunV1 } from "./workflows/collect-epoch.workflow.js";
-export type { FinalizeEpochWorkflowInput } from "./workflows/finalize-epoch.workflow.js";
 // Workflow input/output types
+export {
+  DEFAULT_GOAL_STEP_GRAPH_ID,
+  type GoalLoopWorkflowInput,
+  GoalLoopWorkflowInputSchema,
+} from "./workflows/goal-loop.schema.js";
+export type { GoalLoopResult } from "./workflows/goal-loop.workflow.js";
 export type {
   GraphRunResult,
   GraphRunWorkflowInput,
 } from "./workflows/graph-run.workflow.js";
+export {
+  NodeRouteSchema,
+  type NodeTaskInput,
+  NodeTaskInputSchema,
+} from "./workflows/node-task.schema.js";
+export type { NodeTaskResult } from "./workflows/node-task.workflow.js";
 export {
   type PrReviewWorkflowInput,
   PrReviewWorkflowInputSchema,

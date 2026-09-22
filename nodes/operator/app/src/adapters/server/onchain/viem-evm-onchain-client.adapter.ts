@@ -24,7 +24,7 @@ import {
   type TransactionReceipt,
 } from "viem";
 
-import { getPaymentConfig } from "@/shared/config/repoSpec.server";
+import { getDaoConfig } from "@/shared/config/repoSpec.server";
 import { serverEnv } from "@/shared/env";
 import { CHAIN, ERC20_ABI } from "@/shared/web3";
 import type { EvmOnchainClient } from "@/shared/web3/onchain/evm-onchain-client.interface";
@@ -36,24 +36,13 @@ import type { EvmOnchainClient } from "@/shared/web3/onchain/evm-onchain-client.
 export class ViemEvmOnchainClient implements EvmOnchainClient {
   private client: PublicClient | null = null;
 
-  private getClient(): PublicClient {
+  /** RPC transport health depends only on the configured chain endpoint. */
+  private getRpcClient(): PublicClient {
     if (this.client) {
       return this.client;
     }
 
     const env = serverEnv();
-    const config = getPaymentConfig();
-    if (!config) {
-      throw new Error("[ViemEvmOnchainClient] Payment rails not activated");
-    }
-
-    // Validate chain ID matches repo-spec
-    if (config.chainId !== CHAIN.id) {
-      throw new Error(
-        `[ViemEvmOnchainClient] Chain mismatch: repo-spec declares ${config.chainId}, CHAIN constant is ${CHAIN.id}`
-      );
-    }
-
     // Require EVM_RPC_URL in production/preview/dev
     if (!env.EVM_RPC_URL) {
       throw new Error(
@@ -68,6 +57,24 @@ export class ViemEvmOnchainClient implements EvmOnchainClient {
     });
 
     return this.client;
+  }
+
+  /** Business reads additionally require the node's declared DAO chain identity. */
+  private getClient(): PublicClient {
+    const dao = getDaoConfig();
+    if (!dao) {
+      throw new Error(
+        "[ViemEvmOnchainClient] Node DAO identity not configured (governance section incomplete)"
+      );
+    }
+
+    if (Number(dao.chain_id) !== CHAIN.id) {
+      throw new Error(
+        `[ViemEvmOnchainClient] Chain mismatch: repo-spec governance.chain_id declares ${dao.chain_id}, CHAIN constant is ${CHAIN.id}`
+      );
+    }
+
+    return this.getRpcClient();
   }
 
   async getTransaction(txHash: `0x${string}`): Promise<Transaction | null> {
@@ -107,7 +114,8 @@ export class ViemEvmOnchainClient implements EvmOnchainClient {
   }
 
   async getBlockNumber(): Promise<bigint> {
-    const client = this.getClient();
+    // Baseline RPC reachability must be provable before optional DAO formation.
+    const client = this.getRpcClient();
     return client.getBlockNumber();
   }
 

@@ -1,50 +1,43 @@
-# AGENTS.md — Cogni-Template
+# AGENTS.md — Cogni-Template (session-start bootstrap)
 
 > Repo-wide orientation. Subdir `AGENTS.md` extends; closest file wins ([agents.md spec](https://agents.md/)). Each `nodes/<node>/AGENTS.md` defines that node's rules — read it once you know your scope.
 
-You are an agent inside a multi-agent system. The **operator** (`https://cognidao.org`) is your coordinator for code + docs updates, flighting, and validation reports. Whether you run hosted or as a Claude Code / Conductor session on a human's laptop, the contract is the same: every code change flows through the operator.
+You are an agent inside a multi-agent system. The **operator** (`https://cognidao.org`) is your coordinator for code + docs updates, flighting, and validation. Whether you run hosted or as a Claude Code / Conductor session on a laptop, the contract is the same: **every code change flows through the operator.**
 
-## Required Loop
+## Your cognition is a substrate — delivered at session start, not stored here
 
-1. Adopt one work item, **one node** (`single-node-scope` is a CI gate; cross-node ⇒ separate item). Read `nodes/<node>/AGENTS.md` for that node's rules. **Recall the node's knowledge hub before designing or researching** — a prior agent may already have the finding (`RECALL_BEFORE_WRITE`; see [`/contribute-knowledge-to-cogni`](.claude/skills/contribute-knowledge-to-cogni/SKILL.md)).
-2. Claim + heartbeat + link PR via `/api/v1/work/items/$ID/{claims,heartbeat,pr,coordination}`. **`coordination.nextAction` is authoritative** — it overrides your plan.
-3. Implement on a worktree branch. Push — **CI is your verification.** Watch `gh pr checks`; iterate file-scoped fixes if red.
-4. After CI green + reviewed implementation: `POST /api/v1/vcs/flight { prNumber }`. The build lands at `https://<node>-test.cognidao.org`.
-5. Run [`/validate-candidate`](.claude/skills/validate-candidate/SKILL.md) against the deployed build. Adherence to its validation flow and scorecard format is strict — that's how the system confirms you followed the contract.
-6. Hit a contract blocker (auth, broken endpoint, invariant you can't satisfy)? File a bug: `POST /api/v1/work/items {type:'bug', node:'operator'}`, link from your active item.
+This file is deliberately short. The operator serves your working cognition — the
+irreducible tooling invariants, the live skills index, and the knowledge-domain
+pointers — as a **kickstart bundle** from the node's knowledge endpoint, injected
+into your context at session start. It is the source of truth, not this file.
 
-> Bearer token expected. New contributors register once via [`/contribute-to-cogni`](.claude/skills/contribute-to-cogni/SKILL.md); existing agents reuse the saved token.
+- **Bundle:** `GET https://cognidao.org/api/v1/cognition` (authed, index-only — needs a principal)
+- **Discovery:** `GET https://cognidao.org/.well-known/agent.json` → `cognition` + `endpoints`
+- **If it didn't load** (no SessionStart hook, no key in `.env.cogni`, or the hub was unreachable), self-serve — register for a NODE agent key first (the one public seam), save it as `COGNI_NODE_API_KEY` in `.env.cogni`, then fetch with it:
+  ```bash
+  KEY=$(curl -fsS -X POST https://cognidao.org/api/v1/agent/register \
+    -H 'content-type: application/json' -d '{"name":"my-agent"}' | jq -r .apiKey)
+  printf 'COGNI_NODE_API_KEY=%s\n' "$KEY" >> .env.cogni
+  curl -fsS -H "Authorization: Bearer $KEY" https://cognidao.org/api/v1/cognition | jq -r .markdown
+  ```
 
-## Definition of Done
+SessionStart hooks inject this automatically — Claude Code ([`.claude/settings.json`](.claude/settings.json))
+and Codex ([`.codex/config.toml`](.codex/config.toml)) both run the shared loader
+[`scripts/agent/session-cognition.sh`](scripts/agent/session-cognition.sh) and inject its stdout. The loader
+derives the node URL from `.cogni/repo-spec.yaml` `intent.name` and reads `.env.cogni`
+itself; no per-session URL or key export is required after bootstrap. Operator
+keys such as `COGNI_API_KEY_PROD` are for CI/CD authority and are not sufficient
+for session cognition; bootstrap must write `COGNI_NODE_API_KEY`.
+**Codex needs a one-time trust** of the `.codex/` layer (approve via `/hooks`). Conductor/other
+runtimes: run the self-serve `curl` above. Why this shape: see
+[`docs/spec/node-baas-architecture.md`](docs/spec/node-baas-architecture.md) § Cognition Substrate.
 
-`status: done` ⇔ code merged. **Code only merges after both**:
+## The irreducible loop
 
-1. Full green: reviewed implementation + CI green on the PR.
-2. `deploy_verified: true` — flighted to candidate-a, `/validate-candidate` scorecard posted, your own request observed in Loki at the deployed SHA.
-
-Two named human stops: `needs_review` post-`/design`, `needs_human_qa` post-flight. Drive yourself between them.
-
-Durable learning the work produced is **refined back into the hub** (recall → refine in place > write new), not buried in the PR — see [`/contribute-knowledge-to-cogni`](.claude/skills/contribute-knowledge-to-cogni/SKILL.md). Rare by design: most work teaches nothing reusable, and that's correct. Not a merge gate — a loop expectation.
-
-## Principles
-
-- **Reuse + reproducibility.** Find existing code (this repo or OSS) that meets your need before writing new. When you do code, code for reuse. For deployments, reproducibility is non-negotiable — no ad-hoc actions; solve each problem once and capture it in git.
-- **Search before designing.** `docs/spec/`, `docs/guides/`, `.claude/skills/`, `.claude/commands/`, and the operator API (work items + projects + knowledge) hold prior thinking, designs, and priorities. Refine + simplify + clean what exists rather than add parallel artifacts.
-- **Goal-driven execution.** Up front, with the user, identify the before/after I/O that will be clearly testable by a human or an agent. Before closing the work item, you must be able to prove the starting goal is met.
-- **Clean architecture.** Hexagonal layering. Strongly-typed boundaries (Zod). Systemic observability (Pino → Loki). Idempotent operations. Strict typing — no `any`.
-- **Purge legacy.** Backwards-compat shims are debt unless the user explicitly asks for them.
-- **Clarity, conciseness, syntropy.** Code and prose alike — fewer words, sharper meaning, aligned with what already exists. Entropy creeps in through volume.
-
-## Anti-patterns
-
-- Adding backwards-compatibility unless specifically user-instructed. Purge legacy in place.
-- Inline comments narrating _what_ code does, or verbose prose. More text, more entropy — names + types are the docs.
-- Ending a turn before `deploy_verified` without an armed `Monitor`/`ScheduleWakeup` on the gating signal (CI, flight, `/version`). Silent end-of-turn = work lost.
+The tooling invariants (ONE work item + node, RECALL_BEFORE_WRITE, branch→CI→candidate-a validation, Definition of Done) are **served in the session-start cognition bundle** — the single source of truth. They are deliberately NOT duplicated here; read them from the bundle each session.
 
 ## Pointers
 
-- [Development Lifecycle](docs/spec/development-lifecycle.md) · [CI/CD](docs/spec/ci-cd.md) · [Agent-First API Validation](docs/guides/agent-api-validation.md) · [`/validate-candidate`](.claude/skills/validate-candidate/SKILL.md)
 - [`/contribute-to-cogni`](.claude/skills/contribute-to-cogni/SKILL.md) — registration + executable contributor contract
-- [`/contribute-knowledge-to-cogni`](.claude/skills/contribute-knowledge-to-cogni/SKILL.md) — recall + refine the Dolt knowledge hub (the _why_ behind the code; never inline comments or `docs/*.md` sprawl)
-- [Architecture](docs/spec/architecture.md) · [Style](docs/spec/style.md) · [Common Mistakes](docs/guides/common-mistakes.md) · [Work Management](work/README.md)
-- **Stuck?** File a bug against the operator (above), or read [`/contribute-to-cogni`](.claude/skills/contribute-to-cogni/SKILL.md) end-to-end.
+- [Development Lifecycle](docs/spec/development-lifecycle.md) · [CI/CD](docs/spec/ci-cd.md) · [Architecture](docs/spec/architecture.md) · [Style](docs/spec/style.md) · [Common Mistakes](docs/guides/common-mistakes.md)
+- **Stuck?** File a bug: `POST /api/v1/work/items {type:'bug', node:'operator'}`, link it from your active item.

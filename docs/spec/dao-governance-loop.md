@@ -18,6 +18,11 @@ tags: [governance, web3, review, dao, alchemy]
 
 > A PR that fails automated review can only be merged through a DAO governance vote. The full loop: review bot flags a PR → developer creates an on-chain proposal → DAO members vote → passed proposal emits a CogniAction event → cogni-template verifies on-chain and executes the GitHub action.
 
+> [!NOTE]
+> **This loop is the _governance-override_ authorization class of [Development Lifecycle §8 — Operator Merge Authority](./development-lifecycle.md#8-request-merge--the-operator-is-the-merge-authority).** Routine merges (CI green + `deploy_verified`) and node-formation merges (capacity gate) are authorized there; this on-chain path is the escape hatch when automated gates fail. Per `SINGLE_MERGE_CHOKEPOINT`, the `mergeChange()` handler must execute through `VcsCapability.mergePr` rather than its own Octokit `pulls/merge` call.
+>
+> **Stale paths below:** the `File Pointers` tables predate the monorepo `nodes/` migration. Current layout is `nodes/operator/app/src/` (not `apps/operator/src/`); the three subsystems are co-located as `features/review/`, `features/governance/`, and the propose pages under `app/`. Verified governance files: `nodes/operator/app/src/features/governance/{actions,signal-handler,signal-dispatch,signal-parser,signal-types}.ts` and the receiver `nodes/operator/app/src/app/api/internal/webhooks/[source]/route.ts`.
+
 ### Key References
 
 |             |                                                                                       |                                     |
@@ -150,7 +155,7 @@ sequenceDiagram
 
 ```
 .cogni/repo-spec.yaml          ← DAO-governed, committed to git
-├── cogni_dao:
+├── governance:
 │   ├── dao_contract:    0x...  ← Aragon DAO address
 │   ├── plugin_contract: 0x...  ← TokenVoting plugin address
 │   ├── signal_contract: 0x...  ← CogniSignal address

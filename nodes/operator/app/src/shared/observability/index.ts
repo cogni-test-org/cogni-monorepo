@@ -10,6 +10,49 @@
  * @public
  */
 
+import { EVENT_NAMES as NODE_SHARED_EVENT_NAMES } from "@cogni/node-shared";
+
+export const EVENT_NAMES = {
+  ...NODE_SHARED_EVENT_NAMES,
+  ADAPTER_GITHUB_REPO_WRITE_ERROR: "adapter.github_repo_write.error",
+  NODE_PUBLISH_SECRET_SHAPE_GENERATED:
+    "feature.node_publish.secret_shape_generated",
+  NODE_ACCESS_REQUEST_COMPLETE: "feature.node_access_request.complete",
+  NODE_SECRET_WRITE_COMPLETE: "feature.node_secret_write.complete",
+  NODE_PREVIEW_PROMOTE_COMPLETE: "feature.node_preview_promote.complete",
+  // Env-membership merge → lane reconcile (task.5132). One terminal event per merged
+  // `cogni-operator/node-env-<slug>-<env>` PR, including the no-dispatch outcomes. Adding a
+  // PRE-PROD lane can dispatch a PRODUCTION promote (the custodian owns the lane's substrate),
+  // so this name is how that is found in Loki — never a mystery deploy.
+  LANE_ONBOARD_COMPLETE: "feature.lane_onboard.complete",
+  DEPLOY_INFRA_RECONCILE_COMPLETE: "deploy.infra_reconcile.complete",
+  NODE_SCHEDULES_SYNC_COMPLETE: "feature.node_schedules_sync.complete",
+  NODE_DISTRIBUTION_ACTIVATION_COMPLETE:
+    "feature.node_distribution_activation.complete",
+  NODE_DAO_RESET_COMPLETE: "feature.node_dao_reset.complete",
+  // defineScheduledJob dispatcher: one cron fire of a registered scheduled job.
+  SCHEDULED_JOB_DISPATCH_RECEIVED: "feature.scheduled_job.dispatch_received",
+  SCHEDULED_JOB_DISPATCH_COMPLETE: "feature.scheduled_job.dispatch_complete",
+  // Auth perimeter (proxy): request rejected before reaching any route handler,
+  // so the request-scoped logger never sees it — emitted directly from the proxy.
+  AUTH_PERIMETER_DENIED: "auth.perimeter.denied",
+  // Node env-membership verb (story.5020 W4): the flag-gated DNS reverse-reconcile seam. v0 ships
+  // DNS_REVERSE_RECONCILE off, so a node-env REMOVE only logs the intended Cloudflare prune (the
+  // record lingers until TTL) and a node-env ADD only logs the intended upsert. See W3b.
+  // Identity broker (task.5024): the three legs of one GitHub authorization for a
+  // relying node. These are the tier-1 markers /validate-candidate queries — without
+  // them the broker is unobservable and the feature can never be proven at a SHA.
+  // NEVER log the authorization code, access token, PKCE verifier, or broker cookie.
+  IDENTITY_BROKER_STARTED: "feature.identity_broker.started",
+  IDENTITY_BROKER_AUTHENTICATED: "feature.identity_broker.authenticated",
+  IDENTITY_BROKER_COMPLETE: "feature.identity_broker.complete",
+  IDENTITY_BROKER_REJECTED: "feature.identity_broker.rejected",
+  DNS_REVERSE_RECONCILE_SKIPPED: "dns.reverse_reconcile.skipped",
+  DNS_FORWARD_RECONCILE_SKIPPED: "dns.forward_reconcile.skipped",
+} as const;
+
+export type EventName = (typeof EVENT_NAMES)[keyof typeof EVENT_NAMES];
+
 // --- Extracted: events, context, client (from @cogni/node-shared) ---
 // NOTE: logEvent/logRequestWarn/etc. come through ./server (which re-exports from @cogni/node-shared)
 export {
@@ -21,10 +64,7 @@ export {
   clientLogger,
   // Context
   createRequestContext,
-  // Event registry
-  EVENT_NAMES,
   type EventBase,
-  type EventName,
   type PaymentsConfirmedEvent,
   type PaymentsIntentCreatedEvent,
   type PaymentsStateTransitionEvent,

@@ -184,7 +184,9 @@ module.exports = {
       to: { path: [layers.shared, layers.types] },
     },
 
-    // bootstrap → bootstrap, ports, adapters, shared, types
+    // bootstrap → bootstrap, ports, adapters, shared, types, features
+    // (container.ts composes feature-level services — e.g. the attribution-profile
+    //  resolver — from injected adapters; the feature layer itself stays adapter-free.)
     {
       from: { path: layers.bootstrap },
       to: {
@@ -194,6 +196,7 @@ module.exports = {
           layers.adapters,
           layers.shared,
           layers.types,
+          layers.features,
         ],
       },
     },
@@ -339,7 +342,7 @@ module.exports = {
       name: "no-internal-adapter-imports",
       severity: "error",
       from: {
-        path: "^nodes/operator/app/src/(?!adapters/server/)(?!auth\\.ts$)(?!bootstrap/container\\.ts$)(?!bootstrap/graph-executor\\.factory\\.ts$)(?!bootstrap/agent-discovery\\.ts$)(?!bootstrap/jobs/syncGovernanceSchedules\\.job\\.ts$)",
+        path: "^nodes/operator/app/src/(?!adapters/server/)(?!auth\\.ts$)(?!bootstrap/container\\.ts$)(?!bootstrap/graph-executor\\.factory\\.ts$)(?!bootstrap/agent-discovery\\.ts$)(?!bootstrap/jobs/(syncGovernanceSchedules|reconcileCatalogNodeRegistry)\\.job\\.ts$)",
       },
       to: {
         path: "^nodes/operator/app/src/adapters/server/(?!index\\.ts$).*\\.ts$",
@@ -349,7 +352,7 @@ module.exports = {
         "Exempt: auth.ts (bootstrap), container.ts (trust boundaries), " +
         "graph-executor.factory.ts + agent-discovery.ts (sandbox subpath imports " +
         "to avoid Turbopack bundling dockerode native addon chain), " +
-        "syncGovernanceSchedules.job.ts (needs serviceDb for advisory lock).",
+        "allowlisted bootstrap jobs (need serviceDb for advisory locks).",
     },
 
     // adapters/test: must use @/adapters/test (index.ts), not internal files
@@ -604,13 +607,13 @@ module.exports = {
       from: {
         path: "^nodes/operator/app/src/",
         pathNot:
-          "^nodes/operator/app/src/(auth\\.ts|bootstrap/container\\.ts|bootstrap/jobs/syncGovernanceSchedules\\.job\\.ts)$",
+          "^nodes/operator/app/src/(auth\\.ts|bootstrap/container\\.ts|bootstrap/jobs/(syncGovernanceSchedules|reconcileCatalogNodeRegistry)\\.job\\.ts)$",
       },
       to: {
         path: "^nodes/operator/app/src/adapters/server/db/drizzle\\.service-client\\.ts$",
       },
       comment:
-        "Only auth.ts, container.ts, and governance job may import the service-db adapter (BYPASSRLS singleton)",
+        "Only auth.ts, container.ts, and explicitly allowlisted bootstrap jobs may import the service-db adapter (BYPASSRLS singleton)",
     },
 
     // =========================================================================

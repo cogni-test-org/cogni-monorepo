@@ -23,6 +23,10 @@
 
 import { randomBytes } from "node:crypto";
 import type { ReservedSql, Sql } from "postgres";
+import {
+  initializeConfidence,
+  recomputeConfidence as recomputeConfidenceByPolicy,
+} from "../../domain/confidence-policy.js";
 import type {
   ContributionCommitRecord,
   ContributionDiffEntry,
@@ -31,8 +35,12 @@ import type {
   KnowledgeContributionEdit,
   Principal,
 } from "../../domain/contribution-schemas.js";
+import { stripDangerousControlChars } from "../../domain/sanitize.js";
 import type { CitationType } from "../../domain/schemas.js";
-import { HYPOTHESIS_TARGETED_EDGES } from "../../domain/schemas.js";
+import {
+  HYPOTHESIS_TARGETED_EDGES,
+  isWorkItemEndpointId,
+} from "../../domain/schemas.js";
 import {
   ContributionConflictError,
   ContributionNotFoundError,
@@ -168,10 +176,45 @@ function normalizeDoltCommitRef(ref: string): string {
   return ref.startsWith("{") && ref.endsWith("}") ? ref.slice(1, -1) : ref;
 }
 
+/**
+ * Parse a `SELECT dolt_merge(<branch>)` result into its commit hash and
+ * conflict count. Doltgres returns the merge as the record
+ * `(hash, fast_forward, conflicts, message)`; postgres.js surfaces it as a JS
+ * array on the single `dolt_merge` column. Critically, a data conflict does
+ * NOT throw — Dolt reports it as a non-zero `conflicts` count while leaving the
+ * working set in an uncommittable, conflicted state (bug.5120). Reading only
+ * element [0] as the hash silently drops that signal, so the caller must also
+ * inspect `conflicts` before it commits.
+ */
+function parseDoltMergeResult(row: Record<string, unknown>): {
+  commitHash: string;
+  conflicts: number;
+} {
+  const value = row.dolt_merge;
+  const parts: unknown[] = Array.isArray(value)
+    ? value
+    : String(value).replace(/^\{/, "").replace(/\}$/, "").split(",");
+  const commitHash = normalizeDoltCommitRef(String(parts[0] ?? ""));
+  const rawConflicts = parts.length >= 3 ? Number(parts[2]) : 0;
+  return {
+    commitHash,
+    conflicts: Number.isFinite(rawConflicts) ? rawConflicts : 0,
+  };
+}
+
 function normalizeOptionalDoltCommitRef(value: unknown): string | null {
   const ref = optionalString(value);
   return ref ? normalizeDoltCommitRef(ref) : null;
 }
+
+// Human-facing merge failure copy (bug.5120). These reach an admin in the
+// knowledge inbox UI, so they must say what happened + how to fix it in plain
+// language — never leak the raw Dolt/SQL error (branch refs, dolt_conflicts,
+// @@dolt_allow_commit_conflicts). The remediation for a conflicted contribution
+// is a fresh branch cut from current main, phrased for a human.
+const MERGE_CONFLICT_MESSAGE =
+  "This contribution conflicts with newer entries already on main.";
+const MERGE_FAILED_MESSAGE = "This contribution couldn't be merged.";
 
 async function withReserved<T>(
   sql: Sql,
@@ -216,45 +259,6 @@ async function assertKnowledgeRowExists(
 // DoltgresEdoResolverAdapter, but run on a reserved branch connection so
 // inserts land on contrib/* not main).
 // ---------------------------------------------------------------------------
-
-const EDO_CONFIDENCE_AGENT_DEFAULT = 30;
-
-// Confidence formula constants (knowledge-syntropy § Confidence Is Computed).
-// Duplicated from edo-resolver.ts so the contribution adapter can recompute
-// inside its reserved-branch connection without dragging the whole resolver
-// across packages.
-const SUPPORT_BUMP = 10;
-const SUPPORT_CAP = 50;
-const CONTRADICT_PENALTY = 15;
-const INITIAL_BY_SOURCE: Record<string, number> = {
-  agent: 30,
-  analysis_signal: 40,
-  external: 50,
-  human: 70,
-  derived: 40,
-};
-const INITIAL_DEFAULT = 40;
-
-function initialConfidenceForSource(sourceType: string): number {
-  return INITIAL_BY_SOURCE[sourceType] ?? INITIAL_DEFAULT;
-}
-
-function isSupporting(citationType: string): boolean {
-  return (
-    citationType === "supports" ||
-    citationType === "validates" ||
-    citationType === "evidence_for" ||
-    citationType === "extends"
-  );
-}
-
-function isContradicting(citationType: string): boolean {
-  return citationType === "contradicts" || citationType === "invalidates";
-}
-
-function clampConfidence(n: number): number {
-  return Math.max(0, Math.min(100, n));
-}
 
 function citationIdFor(
   citingId: string,
@@ -322,8 +326,10 @@ async function insertKnowledgeRow(input: {
     throw new HypothesisMissingEvaluateAtError(id);
   }
   await assertDomainRegistered(conn, domain);
+  // PRESERVE_MARKDOWN_WHITESPACE: strip dangerous control chars from free text
+  // at every knowledge write, including the contribution/EDO merge (bug.5062).
   await conn.unsafe(
-    `INSERT INTO knowledge (id, domain, entity_id, title, content, entry_type, confidence_pct, source_type, source_ref, source_node, tags, evaluate_at, resolution_strategy) VALUES (${escapeValue(id)}, ${escapeValue(domain)}, NULL, ${escapeValue(title)}, ${escapeValue(content)}, ${escapeValue(entryType)}, ${escapeValue(confidencePct)}, ${escapeValue(provenance.sourceType)}, ${escapeValue(provenance.sourceRef)}, ${escapeValue(provenance.sourceNode)}, ${tags && tags.length > 0 ? escapeValue(tags) : "NULL"}, ${escapeValue(evaluateAt ?? null)}, ${escapeValue(resolutionStrategy ?? null)})`
+    `INSERT INTO knowledge (id, domain, entity_id, title, content, entry_type, confidence_pct, source_type, source_ref, source_node, tags, evaluate_at, resolution_strategy) VALUES (${escapeValue(id)}, ${escapeValue(domain)}, NULL, ${escapeValue(stripDangerousControlChars(title))}, ${escapeValue(stripDangerousControlChars(content))}, ${escapeValue(entryType)}, ${escapeValue(confidencePct)}, ${escapeValue(provenance.sourceType)}, ${escapeValue(provenance.sourceRef)}, ${escapeValue(provenance.sourceNode)}, ${tags && tags.length > 0 ? escapeValue(tags) : "NULL"}, ${escapeValue(evaluateAt ?? null)}, ${escapeValue(resolutionStrategy ?? null)})`
   );
 }
 
@@ -338,25 +344,124 @@ async function getKnowledgeEntryTypeOnConn(
   return (rows[0] as Record<string, unknown>).entry_type as string;
 }
 
+type CitationEndpoint =
+  | { kind: "knowledge"; entryType: string; onBranch: boolean }
+  | { kind: "work"; onBranch: false };
+
+async function getKnowledgeEntryTypeOnMain(
+  mainSql: Sql,
+  id: string
+): Promise<string | null> {
+  const rows = await mainSql.unsafe(
+    `SELECT entry_type FROM knowledge WHERE id = ${escapeValue(id)} LIMIT 1`
+  );
+  if (rows.length === 0) return null;
+  return (rows[0] as Record<string, unknown>).entry_type as string;
+}
+
+async function workItemExistsOnMain(
+  mainSql: Sql,
+  id: string
+): Promise<boolean> {
+  const rows = await mainSql.unsafe(
+    `SELECT 1 FROM work_items WHERE id = ${escapeValue(id)} LIMIT 1`
+  );
+  return rows.length > 0;
+}
+
+async function resolveCitationEndpoint(
+  branchConn: ReservedSql,
+  mainSql: Sql,
+  id: string
+): Promise<CitationEndpoint | null> {
+  if (isWorkItemEndpointId(id)) {
+    return (await workItemExistsOnMain(mainSql, id))
+      ? { kind: "work", onBranch: false }
+      : null;
+  }
+
+  const onBranch = await getKnowledgeEntryTypeOnConn(branchConn, id);
+  if (onBranch !== null) {
+    return { kind: "knowledge", entryType: onBranch, onBranch: true };
+  }
+
+  const onMain = await getKnowledgeEntryTypeOnMain(mainSql, id);
+  return onMain !== null
+    ? { kind: "knowledge", entryType: onMain, onBranch: false }
+    : null;
+}
+
+function assertCitationEndpointPair(input: {
+  citing: CitationEndpoint;
+  cited: CitationEndpoint;
+  citationType: CitationType;
+  citingId: string;
+  citedId: string;
+}): void {
+  const { citing, cited, citationType, citingId, citedId } = input;
+  const workEndpointCount =
+    (citing.kind === "work" ? 1 : 0) + (cited.kind === "work" ? 1 : 0);
+  if (workEndpointCount > 0) {
+    if (workEndpointCount !== 1) {
+      throw new ContributionConflictError(
+        `cite edge must connect exactly one work item and one knowledge entry: ${citingId} -> ${citedId}`
+      );
+    }
+    if (citationType !== "tracks") {
+      throw new ContributionConflictError(
+        `work-item citation edge must use citation_type='tracks', got '${citationType}'`
+      );
+    }
+    return;
+  }
+
+  if (citationType === "tracks") {
+    throw new ContributionConflictError(
+      "citation_type='tracks' requires exactly one work-item endpoint"
+    );
+  }
+}
+
 async function insertCitationRow(input: {
   conn: ReservedSql;
+  mainSql: Sql;
   citingId: string;
   citedId: string;
   citationType: CitationType;
   context?: string;
-}): Promise<string> {
-  const { conn, citingId, citedId, citationType, context } = input;
-  // CITATION_TARGET_EXISTS_AT_WRITE + EDGE_TYPE_MATCHES_CITED_ENTRY_TYPE.
-  const citedType = await getKnowledgeEntryTypeOnConn(conn, citedId);
-  if (citedType === null) {
+  citedEndpoint?: CitationEndpoint;
+}): Promise<{ id: string; citedEndpoint: CitationEndpoint }> {
+  const {
+    conn,
+    mainSql,
+    citingId,
+    citedId,
+    citationType,
+    context,
+    citedEndpoint,
+  } = input;
+  // CITATION_TARGET_EXISTS_AT_WRITE (main ∪ branch) + EDGE_TYPE_MATCHES_CITED_ENTRY_TYPE.
+  const cited =
+    citedEndpoint ?? (await resolveCitationEndpoint(conn, mainSql, citedId));
+  if (cited === null) {
     throw new CitationTargetNotFoundError(citedId);
   }
-  const expected = expectedCitedEntryTypeFor(citationType);
-  if (expected !== null && citedType !== expected) {
+  if (cited.kind === "work" && citationType !== "tracks") {
+    throw new ContributionConflictError(
+      `work-item citation edge must use citation_type='tracks', got '${citationType}'`
+    );
+  }
+  const expected =
+    cited.kind === "knowledge" ? expectedCitedEntryTypeFor(citationType) : null;
+  if (
+    expected !== null &&
+    cited.kind === "knowledge" &&
+    cited.entryType !== expected
+  ) {
     throw new CitationTypeMismatchError(
       citationType,
       citedId,
-      citedType,
+      cited.entryType,
       expected
     );
   }
@@ -370,7 +475,7 @@ async function insertCitationRow(input: {
     if (!msg.toLowerCase().includes("duplicate")) throw e;
     // Already exists — idempotent.
   }
-  return id;
+  return { id, citedEndpoint: cited };
 }
 
 /**
@@ -391,20 +496,23 @@ async function recomputeConfidenceOnConn(
   }
   const sourceType = (entryRows[0] as Record<string, unknown>)
     .source_type as string;
-  const initial = initialConfidenceForSource(sourceType);
   const incoming = await conn.unsafe(
-    `SELECT citation_type FROM citations WHERE cited_id = ${escapeValue(entryId)}`
+    `SELECT citation_type FROM citations WHERE cited_id = ${escapeValue(entryId)} AND citation_type <> 'tracks'`
   );
-  let supportCount = 0;
-  let contradictCount = 0;
-  for (const r of incoming) {
-    const t = (r as Record<string, unknown>).citation_type as string;
-    if (isSupporting(t)) supportCount++;
-    else if (isContradicting(t)) contradictCount++;
-  }
-  const supportBump = Math.min(SUPPORT_CAP, SUPPORT_BUMP * supportCount);
-  const penalty = CONTRADICT_PENALTY * contradictCount;
-  const next = clampConfidence(initial + supportBump - penalty);
+  const citations = incoming.map((r) => ({
+    citationType: (r as Record<string, unknown>).citation_type as string,
+  }));
+  const next = recomputeConfidenceByPolicy(
+    {
+      sourceType: sourceType as
+        | "human"
+        | "agent"
+        | "analysis_signal"
+        | "external"
+        | "derived",
+    },
+    citations
+  ).confidencePct;
   await conn.unsafe(
     `UPDATE knowledge SET confidence_pct = ${escapeValue(next)} WHERE id = ${escapeValue(entryId)}`
   );
@@ -413,30 +521,110 @@ async function recomputeConfidenceOnConn(
 
 async function applyEdit(input: {
   conn: ReservedSql;
+  mainSql: Sql;
   contributionId: string;
   principal: Principal;
   seq: number;
   edit: KnowledgeContributionEdit;
 }): Promise<void> {
-  const { conn, contributionId, principal, seq, edit } = input;
+  const { conn, mainSql, contributionId, principal, seq, edit } = input;
   const ref = sourceRef(contributionId, seq);
   const sourceNode = principal.id;
-  if (edit.op === "deprecate") {
+  if (edit.op === "delete") {
+    // DELETE_IS_CLEAN: dead knowledge is removed from the live table, not
+    // soft-flagged. Dolt's version history preserves the row's content, every
+    // commit, and the contributor chain — the log IS the tombstone (audit +
+    // attribution survive). The delete itself is attributed via the
+    // surrounding contribution commit (principal + source_ref).
     await assertKnowledgeRowExists(conn, edit.targetRowId);
+    // DAG safety: refuse if a live row cites this one — deleting would dangle
+    // that inbound edge. Repoint/remove those citations first, or refine the
+    // target in place instead of deleting.
+    const inbound = (await conn.unsafe(
+      `SELECT citing_id FROM citations WHERE cited_id = ${escapeValue(edit.targetRowId)} LIMIT 5`
+    )) as Array<{ citing_id: string }>;
+    if (inbound.length > 0) {
+      const citers = inbound.map((r) => r.citing_id).join(", ");
+      throw new ContributionConflictError(
+        `cannot delete '${edit.targetRowId}': cited by ${citers}. Remove or repoint those edges first, or refine the entry in place.`
+      );
+    }
+    // Cascade the dead entry's OWN outbound edges (its claims about others),
+    // then the row. Inbound is guaranteed empty by the guard above.
     await conn.unsafe(
-      `UPDATE knowledge SET status = ${escapeValue("deprecated")}, source_type = ${escapeValue("external")}, source_ref = ${escapeValue(ref)}, source_node = ${escapeValue(sourceNode)}, updated_at = now() WHERE id = ${escapeValue(edit.targetRowId)}`
+      `DELETE FROM citations WHERE citing_id = ${escapeValue(edit.targetRowId)}`
+    );
+    await conn.unsafe(
+      `DELETE FROM knowledge WHERE id = ${escapeValue(edit.targetRowId)}`
     );
     return;
   }
 
+  if (edit.op === "cite") {
+    const citing = await resolveCitationEndpoint(conn, mainSql, edit.citingId);
+    if (citing === null) {
+      throw new CitationTargetNotFoundError(edit.citingId);
+    }
+    const cited = await resolveCitationEndpoint(conn, mainSql, edit.citedId);
+    if (cited === null) {
+      throw new CitationTargetNotFoundError(edit.citedId);
+    }
+    assertCitationEndpointPair({
+      citing,
+      cited,
+      citationType: edit.citationType,
+      citingId: edit.citingId,
+      citedId: edit.citedId,
+    });
+    const workEndpointCount =
+      (citing.kind === "work" ? 1 : 0) + (cited.kind === "work" ? 1 : 0);
+    if (workEndpointCount === 1) {
+      const knowledgeId =
+        citing.kind === "knowledge" ? edit.citingId : edit.citedId;
+      const mainEntryType = await getKnowledgeEntryTypeOnMain(
+        mainSql,
+        knowledgeId
+      );
+      if (mainEntryType === null) {
+        throw new CitationTargetNotFoundError(knowledgeId);
+      }
+    }
+    const { citedEndpoint } = await insertCitationRow({
+      conn,
+      mainSql,
+      citingId: edit.citingId,
+      citedId: edit.citedId,
+      citationType: edit.citationType,
+      context: edit.context,
+      citedEndpoint: cited,
+    });
+    // Recompute the cited row's confidence inside the branch so the reviewer
+    // sees the supports/contradicts effect pre-merge (mirrors the EDO outcome
+    // path). Skip when the target lives only on `main` (cross-plane cite,
+    // bug.5024): there is no branch row to UPDATE, and the edge recomputes on
+    // main's own write path. The edge itself is still recorded on the branch.
+    if (
+      citedEndpoint.kind === "knowledge" &&
+      citedEndpoint.onBranch &&
+      edit.citationType !== "tracks"
+    ) {
+      await recomputeConfidenceOnConn(conn, edit.citedId);
+    }
+    return;
+  }
+
   await assertDomainRegistered(conn, edit.entry.domain);
-  const confidencePct =
-    principal.kind === "agent" ? 30 : (edit.entry.confidencePct ?? 30);
+  const confidencePct = initializeConfidence(
+    {
+      sourceType: "external",
+    },
+    { principalKind: principal.kind }
+  ).confidencePct;
   if (edit.op === "update") {
     await assertKnowledgeRowExists(conn, edit.targetRowId);
     const entryType = edit.entry.entryType ?? "finding";
     const result = await conn.unsafe(
-      `UPDATE knowledge SET domain = ${escapeValue(edit.entry.domain)}, entity_id = ${escapeValue(edit.entry.entityId ?? null)}, title = ${escapeValue(edit.entry.title)}, content = ${escapeValue(edit.entry.content)}, entry_type = ${escapeValue(entryType)}, confidence_pct = ${escapeValue(confidencePct)}, source_type = ${escapeValue("external")}, source_ref = ${escapeValue(ref)}, source_node = ${escapeValue(sourceNode)}, tags = ${edit.entry.tags ? escapeValue(edit.entry.tags) : "NULL"}, updated_at = now() WHERE id = ${escapeValue(edit.targetRowId)}`
+      `UPDATE knowledge SET domain = ${escapeValue(edit.entry.domain)}, entity_id = ${escapeValue(edit.entry.entityId ?? null)}, title = ${escapeValue(stripDangerousControlChars(edit.entry.title))}, content = ${escapeValue(stripDangerousControlChars(edit.entry.content))}, entry_type = ${escapeValue(entryType)}, confidence_pct = ${escapeValue(confidencePct)}, source_type = ${escapeValue("external")}, source_ref = ${escapeValue(ref)}, source_node = ${escapeValue(sourceNode)}, tags = ${edit.entry.tags ? escapeValue(edit.entry.tags) : "NULL"}, updated_at = now() WHERE id = ${escapeValue(edit.targetRowId)}`
     );
     if (result.count === 0) {
       throw new ContributionNotFoundError(
@@ -456,7 +644,7 @@ async function applyEdit(input: {
     edit.entry.id ?? `${contributionId}-${randomBytes(3).toString("hex")}`;
   const entryType = edit.entry.entryType ?? "finding";
   await conn.unsafe(
-    `INSERT INTO knowledge (id, domain, entity_id, title, content, entry_type, confidence_pct, source_type, source_ref, source_node, tags) VALUES (${escapeValue(entryId)}, ${escapeValue(edit.entry.domain)}, ${escapeValue(edit.entry.entityId ?? null)}, ${escapeValue(edit.entry.title)}, ${escapeValue(edit.entry.content)}, ${escapeValue(entryType)}, ${escapeValue(confidencePct)}, ${escapeValue("external")}, ${escapeValue(ref)}, ${escapeValue(sourceNode)}, ${edit.entry.tags ? escapeValue(edit.entry.tags) : "NULL"})`
+    `INSERT INTO knowledge (id, domain, entity_id, title, content, entry_type, confidence_pct, source_type, source_ref, source_node, tags) VALUES (${escapeValue(entryId)}, ${escapeValue(edit.entry.domain)}, ${escapeValue(edit.entry.entityId ?? null)}, ${escapeValue(stripDangerousControlChars(edit.entry.title))}, ${escapeValue(stripDangerousControlChars(edit.entry.content))}, ${escapeValue(entryType)}, ${escapeValue(confidencePct)}, ${escapeValue("external")}, ${escapeValue(ref)}, ${escapeValue(sourceNode)}, ${edit.entry.tags ? escapeValue(edit.entry.tags) : "NULL"})`
   );
 }
 
@@ -500,6 +688,7 @@ export class DoltgresKnowledgeContributionAdapter
         for (const edit of edits) {
           await applyEdit({
             conn,
+            mainSql: this.sql,
             contributionId,
             principal: input.principal,
             seq: 1,
@@ -551,8 +740,12 @@ export class DoltgresKnowledgeContributionAdapter
   ): Promise<ContributionRecord> {
     return this.createEdoBatch(input, async ({ conn, contributionId }) => {
       const provenance = edoBatchProvenance(contributionId, input.principal, 1);
-      const confidencePct =
-        input.entry.confidencePct ?? EDO_CONFIDENCE_AGENT_DEFAULT;
+      const confidencePct = initializeConfidence(
+        {
+          sourceType: provenance.sourceType,
+        },
+        { principalKind: input.principal.kind }
+      ).confidencePct;
       await insertKnowledgeRow({
         conn,
         id: input.entry.id,
@@ -569,6 +762,7 @@ export class DoltgresKnowledgeContributionAdapter
       for (const evidenceId of input.evidenceForIds ?? []) {
         await insertCitationRow({
           conn,
+          mainSql: this.sql,
           citingId: input.entry.id,
           citedId: evidenceId,
           citationType: "evidence_for",
@@ -591,8 +785,12 @@ export class DoltgresKnowledgeContributionAdapter
   ): Promise<ContributionRecord> {
     return this.createEdoBatch(input, async ({ conn, contributionId }) => {
       const provenance = edoBatchProvenance(contributionId, input.principal, 1);
-      const confidencePct =
-        input.entry.confidencePct ?? EDO_CONFIDENCE_AGENT_DEFAULT;
+      const confidencePct = initializeConfidence(
+        {
+          sourceType: provenance.sourceType,
+        },
+        { principalKind: input.principal.kind }
+      ).confidencePct;
       await insertKnowledgeRow({
         conn,
         id: input.entry.id,
@@ -606,6 +804,7 @@ export class DoltgresKnowledgeContributionAdapter
       });
       await insertCitationRow({
         conn,
+        mainSql: this.sql,
         citingId: input.entry.id,
         citedId: input.derivesFromHypothesisId,
         citationType: "derives_from",
@@ -624,9 +823,12 @@ export class DoltgresKnowledgeContributionAdapter
   ): Promise<ContributionRecord> {
     return this.createEdoBatch(input, async ({ conn, contributionId }) => {
       const provenance = edoBatchProvenance(contributionId, input.principal, 1);
-      const confidencePct =
-        input.entry.confidencePct ??
-        initialConfidenceForSource(provenance.sourceType);
+      const confidencePct = initializeConfidence(
+        {
+          sourceType: provenance.sourceType,
+        },
+        { principalKind: input.principal.kind }
+      ).confidencePct;
       await insertKnowledgeRow({
         conn,
         id: input.entry.id,
@@ -640,6 +842,7 @@ export class DoltgresKnowledgeContributionAdapter
       });
       await insertCitationRow({
         conn,
+        mainSql: this.sql,
         citingId: input.entry.id,
         citedId: input.hypothesisId,
         citationType: input.edge,
@@ -747,6 +950,7 @@ export class DoltgresKnowledgeContributionAdapter
         for (const edit of input.edits) {
           await applyEdit({
             conn,
+            mainSql: this.sql,
             contributionId: input.contributionId,
             principal: input.principal,
             seq,
@@ -814,8 +1018,12 @@ export class DoltgresKnowledgeContributionAdapter
   ): Promise<ContributionRecord> {
     return this.appendEdoBatch(input, async ({ conn, contributionId }) => {
       const provenance = edoBatchProvenance(contributionId, input.principal, 1);
-      const confidencePct =
-        input.entry.confidencePct ?? EDO_CONFIDENCE_AGENT_DEFAULT;
+      const confidencePct = initializeConfidence(
+        {
+          sourceType: provenance.sourceType,
+        },
+        { principalKind: input.principal.kind }
+      ).confidencePct;
       await insertKnowledgeRow({
         conn,
         id: input.entry.id,
@@ -832,6 +1040,7 @@ export class DoltgresKnowledgeContributionAdapter
       for (const evidenceId of input.evidenceForIds ?? []) {
         await insertCitationRow({
           conn,
+          mainSql: this.sql,
           citingId: input.entry.id,
           citedId: evidenceId,
           citationType: "evidence_for",
@@ -849,8 +1058,12 @@ export class DoltgresKnowledgeContributionAdapter
   ): Promise<ContributionRecord> {
     return this.appendEdoBatch(input, async ({ conn, contributionId }) => {
       const provenance = edoBatchProvenance(contributionId, input.principal, 1);
-      const confidencePct =
-        input.entry.confidencePct ?? EDO_CONFIDENCE_AGENT_DEFAULT;
+      const confidencePct = initializeConfidence(
+        {
+          sourceType: provenance.sourceType,
+        },
+        { principalKind: input.principal.kind }
+      ).confidencePct;
       await insertKnowledgeRow({
         conn,
         id: input.entry.id,
@@ -864,6 +1077,7 @@ export class DoltgresKnowledgeContributionAdapter
       });
       await insertCitationRow({
         conn,
+        mainSql: this.sql,
         citingId: input.entry.id,
         citedId: input.derivesFromHypothesisId,
         citationType: "derives_from",
@@ -877,9 +1091,12 @@ export class DoltgresKnowledgeContributionAdapter
   ): Promise<ContributionRecord> {
     return this.appendEdoBatch(input, async ({ conn, contributionId }) => {
       const provenance = edoBatchProvenance(contributionId, input.principal, 1);
-      const confidencePct =
-        input.entry.confidencePct ??
-        initialConfidenceForSource(provenance.sourceType);
+      const confidencePct = initializeConfidence(
+        {
+          sourceType: provenance.sourceType,
+        },
+        { principalKind: input.principal.kind }
+      ).confidencePct;
       await insertKnowledgeRow({
         conn,
         id: input.entry.id,
@@ -893,6 +1110,7 @@ export class DoltgresKnowledgeContributionAdapter
       });
       await insertCitationRow({
         conn,
+        mainSql: this.sql,
         citingId: input.entry.id,
         citedId: input.hypothesisId,
         citationType: input.edge,
@@ -1037,10 +1255,13 @@ export class DoltgresKnowledgeContributionAdapter
     const rec = await this.getById(contributionId);
     if (!rec) throw new ContributionNotFoundError(contributionId);
     const toRef = rec.headCommit ?? rec.baseCommit;
+    const entries: ContributionDiffEntry[] = [];
+
+    // --- knowledge entries ---
     const rows = await this.sql.unsafe(
       `SELECT * FROM dolt_diff(${escapeRef(rec.baseCommit)}, ${escapeRef(toRef)}, 'knowledge')`
     );
-    return rows.map((r) => {
+    for (const r of rows) {
       const row = r as Record<string, unknown>;
       const diffType = String(row.diff_type ?? "modified");
       const before: Record<string, unknown> | null = row.from_id
@@ -1061,20 +1282,62 @@ export class DoltgresKnowledgeContributionAdapter
             domain: row.to_domain ?? null,
           }
         : null;
-      const rowId = String(row.to_id ?? row.from_id ?? "");
-      return {
+      // Suppress phantom `modified`: adding a citation recomputes the CITED entry's
+      // confidence (`UPDATE knowledge SET confidence_pct/updated_at WHERE id=<cited>`),
+      // which dolt_diff flags `modified` even though no DISPLAYED field changed —
+      // presenting a pure `cite` as an empty-delta modification of its target (bug.5004).
+      // The citation itself is surfaced below. Author-set confidence is forbidden, so a
+      // display-identical `modified` is always a recompute side-effect, never a real edit.
+      if (
+        diffType === "modified" &&
+        before &&
+        after &&
+        before.title === after.title &&
+        before.content === after.content &&
+        before.entryType === after.entryType &&
+        before.domain === after.domain
+      ) {
+        continue;
+      }
+      entries.push({
         changeType: diffType as ContributionDiffEntry["changeType"],
-        rowId,
+        rowId: String(row.to_id ?? row.from_id ?? ""),
         before,
         after,
-      };
-    });
+      });
+    }
+
+    // --- citations (links live in a SEPARATE table; make them first-class) ---
+    // Diff the citations table so a `cite` edit shows up AS a link
+    // (citation_added / citation_removed) instead of being invisible + mislabeled
+    // as a `modified` on its target (bug.5004).
+    const citeRows = await this.sql.unsafe(
+      `SELECT * FROM dolt_diff(${escapeRef(rec.baseCommit)}, ${escapeRef(toRef)}, 'citations')`
+    );
+    for (const r of citeRows) {
+      const row = r as Record<string, unknown>;
+      const diffType = String(row.diff_type ?? "added");
+      const changeType: ContributionDiffEntry["changeType"] =
+        diffType === "removed" ? "citation_removed" : "citation_added";
+      const side = (p: "from" | "to"): Record<string, unknown> => ({
+        citingId: row[`${p}_citing_id`] ?? null,
+        citedId: row[`${p}_cited_id`] ?? null,
+        citationType: row[`${p}_citation_type`] ?? null,
+      });
+      entries.push({
+        changeType,
+        rowId: String(row.to_id ?? row.from_id ?? ""),
+        before: row.from_id ? side("from") : null,
+        after: row.to_id ? side("to") : null,
+      });
+    }
+
+    return entries;
   }
 
   async merge(input: {
     contributionId: string;
     principal: Principal;
-    confidencePct?: number;
   }): Promise<{ commitHash: string }> {
     const rec = await this.getById(input.contributionId);
     if (!rec) throw new ContributionNotFoundError(input.contributionId);
@@ -1088,26 +1351,38 @@ export class DoltgresKnowledgeContributionAdapter
       await conn.unsafe(`SELECT dolt_checkout('main')`);
 
       let mergeCommit: string;
+      let conflicts: number;
       try {
         const mergeRes = await conn.unsafe(
           `SELECT dolt_merge(${escapeRef(rec.branch)})`
         );
-        const mergeField = (mergeRes[0] as Record<string, unknown>).dolt_merge;
-        mergeCommit = Array.isArray(mergeField)
-          ? String(mergeField[0])
-          : String(mergeField);
+        const parsed = parseDoltMergeResult(
+          mergeRes[0] as Record<string, unknown>
+        );
+        mergeCommit = parsed.commitHash;
+        conflicts = parsed.conflicts;
       } catch (e: unknown) {
+        // Doltgres throws on a conflicted merge (@autocommit rollback). Map it
+        // to the human conflict message; anything else to the generic failure.
         const msg = e instanceof Error ? e.message : String(e);
         throw new ContributionConflictError(
-          `dolt_merge failed for ${rec.branch}: ${msg}`
+          /conflict/i.test(msg) ? MERGE_CONFLICT_MESSAGE : MERGE_FAILED_MESSAGE
         );
       }
 
-      if (input.confidencePct != null) {
-        const refPattern = `${sourceRefPrefix(rec.contributionId)}%`;
-        await conn.unsafe(
-          `UPDATE knowledge SET confidence_pct = ${escapeValue(input.confidencePct)} WHERE source_ref LIKE ${escapeValue(refPattern)}`
-        );
+      // dolt_merge does NOT throw on data conflicts (bug.5120): it returns a
+      // non-zero conflict count and leaves the working set conflicted and
+      // uncommittable. If we proceeded, the later dolt_commit would throw an
+      // untyped error that surfaces as an opaque 500 the inbox UI drops
+      // silently, and the branch would linger as `open`. Abort so the working
+      // set is clean for the next merge, then surface a typed 409.
+      if (conflicts > 0) {
+        try {
+          await conn.unsafe(`SELECT dolt_merge('--abort')`);
+        } catch {
+          // Best-effort cleanup; the withReserved finally also checks out main.
+        }
+        throw new ContributionConflictError(MERGE_CONFLICT_MESSAGE);
       }
 
       await conn.unsafe(

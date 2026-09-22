@@ -6,7 +6,16 @@ set -euo pipefail
 
 BACKUP_ROOT="${DB_BACKUP_ROOT:-/backups}"
 INTERVAL_SECONDS="${DB_BACKUP_INTERVAL_SECONDS:-86400}"
-RETENTION_DAYS="${DB_BACKUP_RETENTION_DAYS:-14}"
+# bug: 2026-09-03 production disk saturation. 14 days x ~1.5 GB/night of full
+# custom-format dumps reached 21 GB on a 97 GB disk shared with k3s (sqlite/kine),
+# postgres, doltgres and temporal. `/` hit 82%, iowait ran 28-35%, jbd2/vda1-8 and
+# postgres sat in uninterruptible D state, and the k3s API server stalled hard enough
+# that the compute-workload controller lost its leader Lease and crash-looped.
+# Age alone does not bound size: dumps grow, so a fixed day count silently grows the
+# footprint. Bound BOTH: a shorter age window AND a hard free-space floor.
+RETENTION_DAYS="${DB_BACKUP_RETENTION_DAYS:-5}"
+MIN_FREE_MB="${DB_BACKUP_MIN_FREE_MB:-15000}"
+MIN_KEEP="${DB_BACKUP_MIN_KEEP:-2}"
 OBSERVABILITY_GRACE_SECONDS="${DB_BACKUP_OBSERVABILITY_GRACE_SECONDS:-90}"
 
 json_escape() {
@@ -64,9 +73,39 @@ write_manifest() {
   )
 }
 
+free_mb() {
+  df -Pm "$1" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+# Age-based prune, then a headroom prune that removes oldest-first until the backup
+# filesystem has MIN_FREE_MB available. Never prunes below MIN_KEEP backups for a
+# cluster: a full disk is an outage, but zero recoverable backups is worse, so the
+# floor wins and we log loudly instead.
 prune_old_backups() {
-  local cluster_dir="$1"
+  local cluster_dir="$1" cluster free oldest remaining
+  cluster="$(basename "$cluster_dir")"
+
   find "$cluster_dir" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" -exec rm -rf {} +
+
+  while :; do
+    free="$(free_mb "$cluster_dir")"
+    [ -n "$free" ] || break
+    [ "$free" -ge "$MIN_FREE_MB" ] && break
+
+    remaining="$(find "$cluster_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d "[:space:]")"
+    if [ "$remaining" -le "$MIN_KEEP" ]; then
+      log_json error db_backup.headroom_floor "$cluster" \
+        "only ${free}MB free but ${remaining} backups is the retention floor; not pruning further" \
+        "$cluster_dir"
+      break
+    fi
+
+    oldest="$(find "$cluster_dir" -mindepth 1 -maxdepth 1 -type d | sort | head -1)"
+    [ -n "$oldest" ] || break
+    log_json warn db_backup.headroom_prune "$cluster" \
+      "only ${free}MB free (floor ${MIN_FREE_MB}MB); pruning oldest backup" "$oldest"
+    rm -rf "$oldest"
+  done
 }
 
 backup_cluster() {
@@ -74,7 +113,19 @@ backup_cluster() {
   local timestamp tmp_dir final_dir dbs db db_file
 
   export PGPASSWORD="$password"
-  wait_for_postgres "$cluster" "$host" "$port" "$user"
+
+  # FAIL-CLOSED CONTRACT (prod 2026-08-05 incident): run_once invokes this as
+  # `backup_cluster … || failed=1`, which DISABLES `set -e` for the entire function
+  # (bash neuters errexit for any command that is the left operand of && / ||). So
+  # every fallible step below is checked EXPLICITLY and returns non-zero on failure.
+  # Without this, a failed dump (e.g. the superuser password drifting so pg_dumpall
+  # gets `password authentication failed` and writes a 0-byte globals.sql) falls
+  # through to the `db_backup.completed` log — a silent-success that makes the
+  # completion event + a Loki hit look like a real backup when nothing was captured.
+  # `db_backup.completed` is emitted ONLY after every dump in this cluster succeeded.
+  if ! wait_for_postgres "$cluster" "$host" "$port" "$user"; then
+    return 1
+  fi
 
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   tmp_dir="$BACKUP_ROOT/.${cluster}.${timestamp}.tmp"
@@ -84,13 +135,28 @@ backup_cluster() {
   mkdir -p "$tmp_dir" "$BACKUP_ROOT/$cluster"
 
   log_json info db_backup.started "$cluster" "starting postgres backup"
-  pg_dumpall -h "$host" -p "$port" -U "$user" --globals-only > "$tmp_dir/globals.sql"
 
-  dbs="$(psql -h "$host" -p "$port" -U "$user" -d postgres -At -c "select datname from pg_database where datallowconn and not datistemplate order by datname")"
+  if ! pg_dumpall -h "$host" -p "$port" -U "$user" --globals-only > "$tmp_dir/globals.sql"; then
+    log_json error db_backup.failed "$cluster" "pg_dumpall --globals-only failed (auth/connectivity?)"
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  if ! dbs="$(psql -h "$host" -p "$port" -U "$user" -d postgres -At \
+      -c "select datname from pg_database where datallowconn and not datistemplate order by datname")"; then
+    log_json error db_backup.failed "$cluster" "enumerating databases failed"
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
   while IFS= read -r db; do
     [ -n "$db" ] || continue
     db_file="$(safe_name "$db").dump"
-    pg_dump -h "$host" -p "$port" -U "$user" -d "$db" --format=custom --file="$tmp_dir/$db_file"
+    if ! pg_dump -h "$host" -p "$port" -U "$user" -d "$db" --format=custom --file="$tmp_dir/$db_file"; then
+      log_json error db_backup.failed "$cluster" "pg_dump of database '$db' failed"
+      rm -rf "$tmp_dir"
+      return 1
+    fi
   done <<< "$dbs"
 
   write_manifest "$tmp_dir"
@@ -117,6 +183,8 @@ run_once() {
 main() {
   require_positive_int DB_BACKUP_INTERVAL_SECONDS "$INTERVAL_SECONDS"
   require_positive_int DB_BACKUP_RETENTION_DAYS "$RETENTION_DAYS"
+  require_positive_int DB_BACKUP_MIN_FREE_MB "$MIN_FREE_MB"
+  require_positive_int DB_BACKUP_MIN_KEEP "$MIN_KEEP"
   require_nonnegative_int DB_BACKUP_OBSERVABILITY_GRACE_SECONDS "$OBSERVABILITY_GRACE_SECONDS"
   mkdir -p "$BACKUP_ROOT"
 

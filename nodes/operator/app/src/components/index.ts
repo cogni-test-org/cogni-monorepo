@@ -111,7 +111,17 @@ export * from "./kit/chat";
 export { Avatar, AvatarFallback, AvatarImage } from "./kit/data-display/Avatar";
 export { Badge } from "./kit/data-display/Badge";
 export { ExpandableTableRow } from "./kit/data-display/ExpandableTableRow";
+export {
+  GitHubIdentity,
+  type GitHubIdentityProps,
+} from "./kit/data-display/GitHubIdentity";
 export { GithubButton } from "./kit/data-display/GithubButton";
+export {
+  LifecycleProgress,
+  type LifecycleProgressProps,
+  type LifecycleProgressState,
+  type LifecycleProgressStep,
+} from "./kit/data-display/LifecycleProgress";
 export {
   PieChart,
   type PieChartDatum,
