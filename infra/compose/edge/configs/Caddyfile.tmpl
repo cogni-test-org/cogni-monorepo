@@ -6,11 +6,7 @@
   log {
     level INFO
     format json
-    output file /data/logs/caddy/caddy.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
 
@@ -37,11 +33,7 @@ www.{$DOMAIN} {
 
   log {
     format json
-    output file /data/logs/caddy/access.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
 
@@ -63,11 +55,7 @@ www.{$DOMAIN} {
 
   log {
     format json
-    output file /data/logs/caddy/access-anotha.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
 
@@ -89,11 +77,7 @@ www.{$DOMAIN} {
 
   log {
     format json
-    output file /data/logs/caddy/access-brother.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
 
@@ -115,11 +99,7 @@ www.{$DOMAIN} {
 
   log {
     format json
-    output file /data/logs/caddy/access-canary.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
 
@@ -141,11 +121,7 @@ www.{$DOMAIN} {
 
   log {
     format json
-    output file /data/logs/caddy/access-ghcr.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
 
@@ -167,11 +143,7 @@ www.{$DOMAIN} {
 
   log {
     format json
-    output file /data/logs/caddy/access-node-template.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
 
@@ -193,11 +165,7 @@ www.{$DOMAIN} {
 
   log {
     format json
-    output file /data/logs/caddy/access-resy.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
 
@@ -219,11 +187,7 @@ www.{$DOMAIN} {
 
   log {
     format json
-    output file /data/logs/caddy/access-spawny-boi.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
 
@@ -245,11 +209,7 @@ www.{$DOMAIN} {
 
   log {
     format json
-    output file /data/logs/caddy/access-test-cog.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
 
@@ -271,11 +231,7 @@ www.{$DOMAIN} {
 
   log {
     format json
-    output file /data/logs/caddy/access-toks2.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
 
@@ -297,10 +253,6 @@ www.{$DOMAIN} {
 
   log {
     format json
-    output file /data/logs/caddy/access-yo.log {
-      roll_size 10MB
-      roll_keep 7
-      roll_keep_for 168h
-    }
+    output stdout
   }
 }
