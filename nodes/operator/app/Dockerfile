@@ -57,6 +57,12 @@ ENV AUTH_SECRET=${AUTH_SECRET_BUILD}
 RUN --mount=type=cache,id=next-cache,target=/app/nodes/operator/app/.next/cache,sharing=locked \
     pnpm --filter operator build
 
+# task.5102 — the Akash transaction actuator. A dedicated process artifact riding in
+# the shared operator image, started by its own Deployment
+# (infra/k8s/base/akash-tx-actuator) rather than by the web entrypoint.
+RUN pnpm --filter operator build:akash-tx-actuator \
+    && pnpm --filter operator smoke:akash-tx-actuator-artifact
+
 # Runner – lean production image
 FROM node:22-alpine AS runner
 WORKDIR /app
@@ -78,6 +84,7 @@ LABEL org.opencontainers.image.title="cogni-template"
 COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/.next/static ./nodes/operator/app/.next/static
 COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/public ./nodes/operator/app/public
+COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/dist-akash-tx-actuator/akash-tx-actuator.mjs ./nodes/operator/app/akash-tx-actuator.mjs
 
 # Repo-spec: node-specific DAO config (node_id, chain, governance).
 # Each node MUST copy its own .cogni — NOT root (which is operator's identity).
@@ -129,3 +136,5 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -fsS http://localhost:3000/livez || exit 1
 
 CMD ["node", "nodes/operator/app/server.js"]
+
+# rebuild: ship #1792 (vcs run-checks + node-scoped merge) to prod via merge queue

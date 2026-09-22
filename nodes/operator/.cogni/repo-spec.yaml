@@ -8,8 +8,44 @@ node_id: "4ff8eac1-4eba-4ed0-931b-b1fe4f64713d"
 scope_id: "a28a8b1e-1f9d-5cd5-9329-569e4819feda"
 scope_key: "default"
 
+# Activity ledger ingestion configuration.
+# The runtime container reads THIS file as /app/.cogni/repo-spec.yaml (Dockerfile
+# copies nodes/operator/.cogni, NOT root), so activity_ledger must live here too or
+# getGovernanceConfig() sees no ledger and pauses governance:ledger_ingest as
+# "removed from repo-spec" — leaving CollectEpoch on a stale schedule. Same class as
+# operator_wallet (bug.5087). Mirrors /.cogni/repo-spec.yaml.
+activity_ledger:
+  epoch_length_days: 7
+  approvers:
+    - "0x070075F1389Ae1182aBac722B36CA12285d0c949" # derekg1729.eth operator wallet
+  pool_config:
+    base_issuance_credits: "10000"
+  activity_sources:
+    github:
+      # cogni-v0.0 selects via main-merge-selection: a PR merged to main IS the
+      # contribution. (The profile was repointed from the old promotion-selection,
+      # which excluded every direct-to-main PR → zero claimants on this repo.)
+      attribution_pipeline: cogni-v0.0
+      # source_refs is a selection-time, fail-open repo allowlist (SSOT for the
+      # repos whose merged PRs earn attribution). Empty/missing → no filtering.
+      source_refs: ["cogni-dao/cogni"]
+      # source_refs: ["cogni-test-org/test-cog"]   # candidate-a test value — swap back for candidate-a attribution testing
+      excluded_logins: ["Cogni-1729"]
+
 intent:
   name: operator
+  # hook: punchy ~5-word gallery/heading line. mission: 1–3 sentence north-star surfaced by the cognition
+  # substrate at session start. brand: self-hosted thumbnail + monogram tint. All projected to
+  # /.well-known/agent.json so the operator gallery reads identity from repo-spec, never hardcodes it.
+  hook: "Optimizing the tooling + CICD for node-template spawns"
+  mission: "Cogni's first node — empowering AI-powered, web3-governed nodes with streamlined CI/CD, knowledge syntropy, and shared infrastructure, so each builds its mission, not its plumbing. An open-source, gitops-native substrate aligning DAO ownership, code, and knowledge into one verifiable lineage; strongest within the network, forkable to run fully sovereign."
+  brand:
+    # `icon` is the SSOT for the node's mark (gallery card, og:image). It is polymorphic: a Lucide
+    # NAME (most nodes) OR a hosted image path (a real logo). The operator IS Cogni, so its mark is
+    # the actual Cogni brain+gear logo the header/footer use — not a generic line icon. `color` tints
+    # the card wash. The gallery renders this directly; /opengraph-image inlines it for social previews.
+    icon: "/TransparentBrainOnly.png"
+    color: "#6366f1"
 
 # Privy-managed operator wallet — the runtime container reads THIS file as
 # /app/.cogni/repo-spec.yaml (Dockerfile copies nodes/operator/.cogni, not root),
@@ -18,7 +54,7 @@ intent:
 operator_wallet:
   address: "0xdCCa8D85603C2CC47dc6974a790dF846f8695056"
 
-cogni_dao:
+governance:
   dao_contract: "0xF61c3fafD4D34b4568e7a500d92b28Ac175e83C6"
   plugin_contract: "0x609B427f04C1C42De3e28898cb7b9Bad329e6b77"
   signal_contract: "0x590FC79B9c925C377fA63F4AaF54cdbF4Ee273A1"
@@ -31,8 +67,22 @@ payments:
 payments_in:
   credits_topup:
     provider: cogni-usdc-backend-v1
-    receiving_address: "0xDe4dE5e40f7215E4606c3e422D28cf01f97C8c66"
+    receiving_address: "0x4C4e559B2117AbA5f8BaE8a37d4B26BBAdc4C294" # Push Split V2o2 — 95.0001% operator / 4.9999% DAO (matches markup_factor 1.10803324099723 / revenue_share 0; on-chain splitHash 0xe62078796d90766dd09550d8997c3e067ba271a25a0c664ea289a1871ecb2943)
     allowed_chains:
       - Base
     allowed_tokens:
       - USDC
+    # Purchase-side economics (governance config; replaces env USER_PRICE_MARKUP_FACTOR / SYSTEM_TENANT_REVENUE_SHARE).
+    # Target default: 95% provider top-up / 5% DAO Split margin, no system-account credit increase.
+    # Activation must point receiving_address at a Split whose on-chain splitHash matches these values.
+    markup_factor: 1.10803324099723
+    revenue_share: 0
+
+# Outbound: human-custodied steward wallet that settles vendor invoices
+# (OpenRouter, Cherry) via manual USDC crypto checkout. The operator wallet funds
+# this one pinned address via withdrawToSteward; a human completes each checkout.
+# MVP: reuse the existing governance approver/admin wallet (0x0700…c949).
+# See docs/design/node-steward-wallet.md.
+payments_out:
+  steward_wallet:
+    address: "0x070075F1389Ae1182aBac722B36CA12285d0c949"

@@ -15,6 +15,10 @@ preview_branch: deploy/preview-node-template
 production_branch: deploy/production-node-template
 path_prefix: nodes/node-template/
 envs: [candidate-a, preview, production]
+deployment_provider:
+  candidate-a: k3s
+  preview: k3s
+  production: k3s
 activity_env: candidate-a
 owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
 node_id: b927a9dd-6132-4fc9-a51e-e3cee2568e3c

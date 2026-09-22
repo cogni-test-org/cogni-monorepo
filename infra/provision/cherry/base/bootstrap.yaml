@@ -6,6 +6,11 @@ packages:
   - curl
   - gnupg
   - lsb-release
+  # Required by the weekly kine-compaction timer below (k3s stores cluster
+  # state in kine, a SQLite revision log). Drift repayment: sqlite3 was
+  # hand-installed on the production VM on 2026-09-09 while diagnosing
+  # bug.5105; declaring it here is what makes a rebuilt VM reproducible.
+  - sqlite3
 
 swap:
   filename: /swapfile
@@ -36,6 +41,12 @@ write_files:
 
   # k3s server config — disable traefik + servicelb (Caddy handles ingress).
   # k3s install script reads this automatically; no INSTALL_K3S_EXEC flags needed.
+  # HONEST_ALLOCATABLE (docs/research/2026-06-10-node-app-scaling-architecture.md):
+  # this VM co-hosts the Compose stack (~2.8GB) k3s can't see, so without a
+  # reservation k3s reports the full VM RAM as allocatable and over-commits
+  # node-app pods → silent OOM/crash-loop. system-reserved subtracts the Compose
+  # footprint so over-commit becomes an honest Pending; eviction-hard is the
+  # safety net. Templated — an infra-split app VM (no Compose on-box) sets it low.
   - path: /etc/rancher/k3s/config.yaml
     owner: root:root
     permissions: "0644"
@@ -43,6 +54,18 @@ write_files:
       disable:
         - traefik
         - servicelb
+      kubelet-arg:
+        - "system-reserved=memory=${system_reserved_memory}"
+        - "eviction-hard=memory.available<${eviction_hard_memory}"
+      # KINE_WRITES_ARE_THE_COST: every Event create/update is a row in kine's
+      # append-only revision history. A flapping probe can emit tens of thousands
+      # of Event updates (2026-09-09: openbao readiness had 20,920) — a major
+      # feeder of the revision history that grew state.db past 10 GB and drove
+      # the node to 45% iowait. The default 1h retention is far longer than
+      # anyone reads an Event; 30m bounds the storm. Retained-history cleanup
+      # is the kine-compact timer below; this bounds the inflow.
+      kube-apiserver-arg:
+        - "event-ttl=30m"
 
   # k3s container registry config — node-level, all pods get access.
   # - ghcr.io: auth for private cogni images (simpler than per-Deployment
@@ -160,6 +183,24 @@ write_files:
       k3s --version
       kubectl get nodes
 
+      # ── HONEST_ALLOCATABLE gate ──────────────────────────────
+      # The kubelet system-reserved arg (config.yaml written by write_files above)
+      # must actually be in effect — else k3s reports raw VM RAM as allocatable and
+      # over-commits node-app pods on this Compose-co-resident box, which is the
+      # fleet-502 readiness-cascade failure mode (2026-07-16; a legacy node that
+      # predated this arg ran with allocatable==capacity). A fresh node MUST boot
+      # honest; fail the bootstrap loudly rather than ship a node that lies about
+      # capacity. See docs/design/operator-fleet-safety.md SLA#1.
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Asserting honest allocatable (system-reserved in effect)..."
+      CAP_MEM=$(kubectl get node -o jsonpath='{.items[0].status.capacity.memory}')
+      ALLOC_MEM=$(kubectl get node -o jsonpath='{.items[0].status.allocatable.memory}')
+      echo "  capacity.memory=$CAP_MEM allocatable.memory=$ALLOC_MEM (expect allocatable < capacity by ~${system_reserved_memory})"
+      if [ -z "$CAP_MEM" ] || [ "$CAP_MEM" = "$ALLOC_MEM" ]; then
+        echo "FATAL: allocatable.memory ($ALLOC_MEM) == capacity.memory ($CAP_MEM) — kubelet system-reserved NOT in effect."
+        echo "  The node would over-commit and cascade to a fleet-502. Check /etc/rancher/k3s/config.yaml kubelet-arg and that k3s read it at start."
+        exit 1
+      fi
+
       # ── Argo CD + ksops ──────────────────────────────────────
       echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Cloning repo for Argo CD manifests..."
       apt-get install -y git
@@ -217,5 +258,100 @@ write_files:
 
       echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Bootstrap complete!"
 
+  # ── kine (SQLite) compaction + page reclamation ──────────────────────────
+  # k3s's default datastore is kine, an append-only revision log in SQLite:
+  # every object update is a NEW row, and superseded revisions are only removed
+  # by kine's own compactor. On 2026-09-09 production state.db reached 10.35 GB
+  # with PRAGMA freelist_count = 0 — ZERO reclaimable free pages. The bloat was
+  # 1,883,352 LIVE rows for only 150,285 distinct keys (~12.5 retained
+  # revisions per key): kine's compaction had failed to keep up. A bare VACUUM
+  # (this timer's first design) would therefore have reclaimed nothing. What
+  # actually fixed production on 2026-09-10 was compaction — delete every
+  # superseded revision, keeping the newest row per name — then VACUUM to
+  # return the freed pages to the OS: 10.35 GB -> 353 MB, disk 91% -> 59%.
+  # Every k8s API call is a query against this file, so a bloated store slows
+  # the API server, which times out probes, which emit Events, which write more
+  # kine. This timer breaks that loop unattended. Pair with event-ttl above
+  # (bounds the write rate) - this bounds the retained history.
+  - path: /usr/local/sbin/k3s-kine-compact.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      DB=/var/lib/rancher/k3s/server/db/state.db
+      # Below this the reclaim cannot pay for the API-server restart it costs.
+      MIN_BYTES=536870912
+      [ -f "$DB" ] || { echo "kine-compact: no state.db; nothing to do"; exit 0; }
+      SIZE=$(stat -c %s "$DB")
+      if [ "$SIZE" -lt "$MIN_BYTES" ]; then
+        echo "kine-compact: state.db is $SIZE bytes, under threshold $MIN_BYTES; skipping"
+        exit 0
+      fi
+      # VACUUM rewrites the entire database, so it needs headroom equal to the
+      # current file. Refuse rather than fill the disk we are trying to protect.
+      # VACUUM rewrites into a transient copy before swapping. SQLite places that
+      # copy in SQLITE_TMPDIR/TMPDIR, which is NOT necessarily the database's
+      # filesystem - so pin it here, otherwise the headroom check below measures
+      # one filesystem while the write lands on another.
+      export SQLITE_TMPDIR=/var/lib/rancher/k3s/server/db
+      AVAIL=$(df -PB1 "$SQLITE_TMPDIR" | awk 'NR==2 {print $4}')
+      if [ "$AVAIL" -lt "$SIZE" ]; then
+        echo "kine-compact: need $SIZE bytes free, have $AVAIL - refusing"
+        exit 1
+      fi
+      echo "kine-compact: state.db $SIZE bytes; stopping k3s"
+      # Armed BEFORE the stop: if `systemctl stop` itself fails under `set -e`,
+      # an unarmed trap would leave the cluster down with no restart.
+      trap 'systemctl start k3s' EXIT
+      systemctl stop k3s
+      ROWS_BEFORE=$(sqlite3 "$DB" 'SELECT count(*) FROM kine;')
+      # Compaction: keep only the newest row per name (that row IS current
+      # state — including delete-tombstones — so this can never remove a live
+      # key) and drop every superseded revision. This is the exact operation
+      # that took production from 1,883,352 rows to ~150K on 2026-09-10; do
+      # not get cleverer than what prod proved.
+      sqlite3 "$DB" 'DELETE FROM kine WHERE id NOT IN (SELECT MAX(id) FROM kine GROUP BY name);'
+      # VACUUM only pays AFTER the delete: it returns the freed pages to the
+      # OS. Alone it reclaims ~nothing (prod freelist_count was 0).
+      sqlite3 "$DB" 'VACUUM;'
+      ROWS_AFTER=$(sqlite3 "$DB" 'SELECT count(*) FROM kine;')
+      NEW=$(stat -c %s "$DB")
+      echo "kine-compact: rows $ROWS_BEFORE -> $ROWS_AFTER; $SIZE -> $NEW bytes (reclaimed $((SIZE - NEW)))"
+
+  - path: /etc/systemd/system/k3s-kine-compact.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Compact superseded k3s kine revisions and reclaim SQLite pages
+      After=k3s.service
+
+      [Service]
+      Type=oneshot
+      # A multi-GB compact+VACUUM on a saturated disk runs far past systemd's
+      # default start timeout, and a timeout SIGKILLs the script - which skips
+      # the EXIT trap and would strand k3s stopped. The script bounds its own
+      # work (size threshold + headroom refusal), so let it finish.
+      TimeoutStartSec=infinity
+      ExecStart=/usr/local/sbin/k3s-kine-compact.sh
+
+  - path: /etc/systemd/system/k3s-kine-compact.timer
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Weekly k3s kine compaction
+
+      [Timer]
+      OnCalendar=Sun *-*-* 04:15:00
+      RandomizedDelaySec=30m
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
 runcmd:
   - bash /opt/cogni-bootstrap.sh
+  - systemctl daemon-reload
+  - systemctl enable --now k3s-kine-compact.timer

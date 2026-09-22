@@ -5,7 +5,7 @@
 ## Metadata
 
 - **Owners:** @derek @core-dev
-- **Last reviewed:** 2026-04-27
+- **Last reviewed:** 2026-09-11
 - **Status:** draft
 
 ## Purpose
@@ -48,21 +48,24 @@ Next.js App Router delivery layer. UI pages and API routes that expose features 
 - **Routes (if any):**
   - Public pages: `/` (homepage via `(public)/page.tsx`)
   - Protected pages: `/chat` (via `(app)/chat/page.tsx`)
+  - Identity broker: `/identity/attest` (authenticated; registered-node canonical return only)
   - Infra: `/health`, `/openapi.json`, `/meta/route-manifest` (via `(infra)/*`)
   - API: `/api/auth/*`, `/api/v1/chat/completions`
   - Internal ops: `/api/internal/ops/governance/schedules/sync` [POST] (deploy-only trigger)
   - Agent discovery: `/.well-known/agent.json` [GET] — public discovery document for machine clients
+  - Production infra reconcile: `/api/v1/deploy/infra-reconcile` [POST] — production-promoter-gated on the operator node; dispatches via the operator GitHub App and preserves the app pin
+  - Attestation JWKS: `/.well-known/jwks.json` [GET] — public keys for verifying operator-signed identity attestations (task.5024)
 - **Files considered API:** layout.tsx, page.tsx, loading.tsx, error.tsx, api/\*\*/route.ts, (infra)/\*\*/route.ts, .well-known/\*\*/route.ts
 - **Suspense / error boundaries:** each route group exposes a
   `loading.tsx` + `error.tsx`. `(app)/loading.tsx` renders a generic
   fallback inside the sidebar shell; high-traffic routes
-  (`/dashboard`, `/chat`, `/work`, `/credits`, `/activity`, `/gov/*`)
+  (`/dashboard`, `/chat`, `/work`, `/credits`, `/activity`, `/gov/*`, `/nodes*`)
   override with a per-route `loading.tsx` that mirrors the page's
   macro layout. `(public)/loading.tsx` renders the marketing-shaped
   skeleton (Hero + cards + feed) used by `/`; `propose/merge`
   overrides with a form skeleton. Reusable primitives
   (`PageHeaderSkeleton`, `TableSkeleton`, `CardGridSkeleton`) live
-  under `kit/layout/`. `/setup/dao*` is left on the generic fallback
+  under `kit/layout/`. `/nodes*` and legacy `/setup/dao*` redirects are left on the generic fallback
   for v0 — wizard-flow shape isn't worth a bespoke skeleton yet.
 
 ## Responsibilities

@@ -59,6 +59,7 @@ next-env.d.ts
 packages/*/dist
 nodes/*/packages/*/dist
 nodes/*/graphs/dist
+nodes/*/app/dist-akash-tx-actuator
 
 # Terraform
 *.tfstate
@@ -120,3 +121,7 @@ docs/research/fixtures/market-cache/
 __pycache__/
 *.pyc
 task5002-import-mapping-*.json
+.harness/
+
+# Session cognition cache (local-first present; refreshed in background)
+.cogni/.cognition-cache.md

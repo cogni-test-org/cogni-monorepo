@@ -23,6 +23,46 @@
       "then": { "required": ["node_port"] }
     },
     {
+      "$comment": "task.5025 — every node carries the stable wallet binding used to project an env-local users row, plus exactly one activity_env. activity_env is the singleton environment allowed to ingest Git receipts and run epoch schedules.",
+      "if": {
+        "properties": { "type": { "const": "node" } },
+        "required": ["type"]
+      },
+      "then": { "required": ["owner_wallet", "activity_env"] }
+    },
+    {
+      "$comment": "ACTIVITY_ENV_IS_DEPLOYED — JSON Schema cannot use $data references portably, so enumerate the three valid membership implications.",
+      "if": {
+        "properties": { "activity_env": { "const": "candidate-a" } },
+        "required": ["activity_env"]
+      },
+      "then": {
+        "properties": {
+          "envs": { "contains": { "const": "candidate-a" } }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "activity_env": { "const": "preview" } },
+        "required": ["activity_env"]
+      },
+      "then": {
+        "properties": { "envs": { "contains": { "const": "preview" } } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "activity_env": { "const": "production" } },
+        "required": ["activity_env"]
+      },
+      "then": {
+        "properties": {
+          "envs": { "contains": { "const": "production" } }
+        }
+      }
+    },
+    {
       "$comment": "REPO_SPEC_IS_IDENTITY_SSOT — node_id lives in nodes/<name>/.cogni/repo-spec.yaml (the web3-anchored authority). A SUBMODULE node (source_repo set) has an unreadable-from-parent repo-spec at render time, so it carries a drift-gated node_id PROJECTION here (verify-scheduler-endpoints.sh asserts catalog.node_id == repo-spec.node_id). An IN-REPO node must NOT duplicate it — its repo-spec is readable.",
       "if": { "required": ["source_repo"] },
       "then": { "required": ["node_id"] },
@@ -50,6 +90,46 @@
       },
       "then": {
         "required": ["image_repository"]
+      }
+    },
+    {
+      "$comment": "task.5052 — compute_egress_cidrs is env-scoped through the row's own envs[]: the renderer unions declarations across rows deployed to an env, so a row declaring egress CIDRs must declare envs.",
+      "if": { "required": ["compute_egress_cidrs"] },
+      "then": { "required": ["envs"] }
+    },
+    {
+      "$comment": "story.5016 — off-cluster placement is operator-owned, node-only policy; source_repo supplies the immutable node artifact lineage.",
+      "if": { "required": ["deployment_provider"] },
+      "then": {
+        "properties": { "type": { "const": "node" } },
+        "required": ["source_repo"]
+      }
+    },
+    {
+      "$comment": "task.5097 — the compute API is a property of an off-cluster workload, so it is only meaningful where deployment_provider already routes the row off-cluster. Declaring it without placement would be an authority with nothing to reconcile.",
+      "if": { "required": ["compute_api"] },
+      "then": { "required": ["deployment_provider"] }
+    },
+    {
+      "$comment": "story.5016 — the lease generation replaces a paid off-cluster lease, so it is only meaningful where deployment_provider already routes the row off-cluster. Declaring it on an on-cluster row would be a counter with no lease to replace.",
+      "if": { "required": ["lease_generation"] },
+      "then": { "required": ["deployment_provider"] }
+    },
+    {
+      "$comment": "bug.5177 — candidate-a no longer ships base/compute-workload-controller (story.5016 step 9 deleted it to hold ONE_WALLET_ONE_ACTIVE_WRITER). LEGACY_IS_DEFAULT means an omitted compute_api.candidate-a resolves to that deleted controller, so an akash-placed candidate-a row without an explicit cell fails 100% of its flights with a confusing 'controller is not available'. node-template and toks4 were both silently broken this way. Make the cell REQUIRED where it is load-bearing rather than defaulting to an authority the environment does not ship.",
+      "if": {
+        "required": ["envs", "deployment_provider"],
+        "properties": {
+          "envs": { "contains": { "const": "candidate-a" } },
+          "deployment_provider": {
+            "required": ["candidate-a"],
+            "properties": { "candidate-a": { "const": "akash" } }
+          }
+        }
+      },
+      "then": {
+        "required": ["compute_api"],
+        "properties": { "compute_api": { "required": ["candidate-a"] } }
       }
     }
   ],
@@ -128,12 +208,78 @@
     },
     "envs": {
       "type": "array",
-      "description": "task.5017 — the per-env deploy set: which environments deploy this node. Consumed by scripts/ci/render-node-appset.sh (emits one ApplicationSet per env in this list) and scripts/ci/reconcile-node-substrate.sh (refuses to provision substrate for an env not listed). deploy ⊆ provisioned: an env only deploys nodes it lists. ATOMIC_PER_ENV — any subset is valid and each env is independent (candidate-a is no different from preview/production); no mandatory env. The empty set (`[]`) is valid — the node is deployed nowhere.",
+      "description": "task.5017/5025 — the non-empty per-env deploy set: which environments deploy this node. Consumed by scripts/ci/render-node-appset.sh and scripts/ci/reconcile-node-substrate.sh. deploy ⊆ provisioned: an env only deploys nodes it lists. Individual env membership is independent, but the final environment cannot be removed; full decommission is a separate lifecycle operation.",
       "items": {
         "type": "string",
         "enum": ["candidate-a", "preview", "production"]
       },
-      "minItems": 0,
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "deployment_provider": {
+      "type": "object",
+      "description": "Operator-owned per-environment app placement. Omitted environments preserve the k3s default; akash routes only the node app workload through the off-cluster ComputeWorkload reconciler.",
+      "additionalProperties": false,
+      "properties": {
+        "candidate-a": { "enum": ["k3s", "akash"] },
+        "preview": { "enum": ["k3s", "akash"] },
+        "production": { "enum": ["k3s", "akash"] }
+      },
+      "minProperties": 1
+    },
+    "compute_api": {
+      "type": "object",
+      "description": "task.5097 — per-environment WHICH-AUTHORITY selector for an akash-placed row. `legacy` (the default for an omitted environment) renders the bespoke ComputeWorkload CR reconciled by the in-cluster compute-workload-controller; `crossplane` renders the XComputeWorkload composite reconciled by Crossplane (infra/crossplane/xcomputeworkload). ONE_AUTHORITY_PER_WORKLOAD: the materializer emits exactly one of the two kinds per (node, environment), and the deploy-branch rsync --delete removes the other in the same commit, so no resource is ever reconciled by both. Flipping this cell is a full re-create, never an import: the legacy CR's finalizer closes its lease on prune and Crossplane mints a fresh one.",
+      "additionalProperties": false,
+      "properties": {
+        "candidate-a": { "enum": ["legacy", "crossplane"] },
+        "preview": { "enum": ["legacy", "crossplane"] },
+        "production": { "enum": ["legacy", "crossplane"] }
+      },
+      "minProperties": 1
+    },
+    "lease_generation": {
+      "type": "object",
+      "description": "story.5016 / task.5122 — per-environment EXPLICIT replacement counter for a terminally closed Akash lease. It is the ONLY varying component of the actuator's wallet-wide idempotence key (`xcw:<namespace>:<name>:<lease-generation>`), and the actuator refuses to re-spend a settled key by design — so once an environment's lease closes terminally, this cell is the one supported way to recreate that node there. A human bumps it by exactly 1 when a closed lease must be REPLACED; nothing bumps it implicitly, because a generation that moved on its own would answer 'no existing resource' after a promote and mint a SECOND PAID LEASE. Omitted environments default to 0 (the value every existing workload already runs under), so this field is inert for every row that has never needed a replacement. Consumed only by the crossplane compute_api authority; the legacy controller keys its lease per k8s metadata.generation and the materializer refuses a nonzero value there. NAME: this cell was `lease_epoch` until task.5122. `epoch` is reserved for the attribution/distribution domain (contributor activity windows, claimants, payouts); a compute-lease replacement counter is a GENERATION. The rename changed no VALUE, so no idempotence key moved.",
+      "additionalProperties": false,
+      "properties": {
+        "candidate-a": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "preview": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "production": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+      },
+      "minProperties": 1
+    },
+    "activity_env": {
+      "type": "string",
+      "enum": ["candidate-a", "preview", "production"],
+      "description": "story.5025 — singleton environment that owns activity ingestion and epoch scheduling for this node. Must also be present in envs. Wizard births are stamped `production` (generation 1), because production is the only environment that receives Git webhooks: a sub-production authority is structurally unable to earn a receipt (bug.5079). Born at the top, the authority never has to move, which is what generation 1 can safely offer — there is no fenced quiesce/activate cutover. Deploying a node in multiple envs never permits multiple activity ledgers; the extra envs are passive."
+    },
+    "owner_wallet": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{40}$",
+      "description": "Stable cross-environment owner binding. Each environment resolves or creates its own users.id by this wallet, then projects the OpenFGA node#admin ownership tuple; env-local user IDs are never copied through git."
+    },
+    "compute_egress_cidrs": {
+      "type": "array",
+      "description": "task.5052 (story.5016) — egress CIDRs of the decentralized-compute infrastructure (e.g. Akash provider NAT) that hosts THIS row's workload, allowed to reach the env VM's substrate ports (5432,5435,6379,4000,7233). Lives on the workload's own row — NOT per-env and NOT a shared infra row — because an egress IP is a property of where the workload runs: the per-env allowlist is the union of compute_egress_cidrs across rows that BOTH list that env in envs[] AND declare deployment_provider.<env>: akash (bug.5191 \u2014 membership alone is not placement, and a k3s-placed row must open no provider hole), so decommissioning the workload, trimming an env from envs[], or moving that env back to k3s closes its holes with it. Rendered by scripts/ci/render-compute-egress-allowlist.sh into the allowlist consumed by infra/provision/cherry/harden-docker-public-ports.sh. Absent/empty = fail-closed: no off-cluster compute reaches the substrate ports. Provider egress NATs are multi-tenant — declare the narrowest CIDR (usually /32).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cidr", "comment"],
+        "properties": {
+          "cidr": {
+            "type": "string",
+            "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$",
+            "description": "IPv4 CIDR (prefix length required; use /32 for a single egress IP)."
+          },
+          "comment": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\n]+$",
+            "description": "Single-line provenance: which provider(s) egress via this CIDR and the work item that added it."
+          }
+        }
+      },
       "uniqueItems": true
     },
     "is_primary_host": {

@@ -47,6 +47,7 @@ export const EVENT_NAMES = {
   PAYMENTS_CONFIRMED: "payments.confirmed",
   PAYMENTS_STATUS_READ: "payments.status_read",
   PAYMENTS_FUNDING_COMPLETE: "payments.funding_complete",
+  PAYMENTS_STEWARD_WITHDRAWAL: "payments.steward_withdrawal",
 
   // Payments Domain - Client
   CLIENT_PAYMENTS_CREDITS_SUMMARY_HTTP_ERROR:
@@ -65,7 +66,18 @@ export const EVENT_NAMES = {
 
   // Node Formation Domain - Server (wizard)
   NODE_FORMATION_CREATE_COMPLETE: "feature.node_formation.create_complete",
+  NODE_FORMATION_UPDATE_COMPLETE: "feature.node_formation.update_complete",
   NODE_PUBLISH_COMPLETE: "feature.node_publish.complete",
+  NODE_PUBLISH_SECRET_SHAPE_GENERATED:
+    "feature.node_publish.secret_shape_generated",
+  NODE_DEVELOPER_DECISION_COMPLETE: "feature.node_developer_decision.complete",
+  NODE_OBSERVABILITY_LOGS_COMPLETE: "feature.node_observability_logs.complete",
+  NODE_OBSERVABILITY_TRACES_COMPLETE:
+    "feature.node_observability_traces.complete",
+  NODE_DEPLOY_STATE_COMPLETE: "feature.node_deploy_state.complete",
+  VCS_FLIGHT_REQUEST_COMPLETE: "feature.vcs_flight.request_complete",
+  VCS_MERGE_REQUEST_COMPLETE: "feature.vcs_merge.request_complete",
+  VCS_RUN_CI_REQUEST_COMPLETE: "feature.vcs_run_ci.request_complete",
 
   // Adapter Events
   ADAPTER_LITELLM_COMPLETION_RESULT: "adapter.litellm.completion_result",
@@ -79,8 +91,6 @@ export const EVENT_NAMES = {
   ADAPTER_RIPGREP_ERROR: "adapter.ripgrep.error",
   ADAPTER_RIPGREP_SEARCH: "adapter.ripgrep.search",
   ADAPTER_RIPGREP_OPEN: "adapter.ripgrep.open",
-  // TODO: remove once all node openclaw-gateway-clients are deleted (per-node PRs)
-  ADAPTER_OPENCLAW_GATEWAY_ERROR: "adapter.openclaw_gateway.error",
   ADAPTER_TIGERBEETLE_ERROR: "adapter.tigerbeetle.error",
 
   // Ledger Domain

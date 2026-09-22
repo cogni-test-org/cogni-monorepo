@@ -8,6 +8,7 @@
  * Invariants:
  * - Per CRUD_IS_TEMPORAL_AUTHORITY: CRUD endpoints control schedule lifecycle
  * - createSchedule: grant → DB → scheduleControl (on fail: rollback)
+ * - NodeTask schedules (input.route set) grant task:dispatch:nodeId:route + route to NodeTaskWorkflow
  * - updateSchedule (enabled): DB → pause/resume (on fail: rollback DB)
  * - deleteSchedule: scheduleControl → DB (on fail: 503, don't delete DB)
  * - Per DB_TIMING_IS_CACHE_ONLY: next_run_at/last_run_at are cache columns
@@ -24,6 +25,7 @@ import {
   type ExecutionGrantUserPort,
   InvalidCronExpressionError,
   InvalidTimezoneError,
+  nodeTaskScope,
   ScheduleAccessDeniedError,
   type ScheduleControlPort,
   ScheduleNotFoundError,
@@ -115,12 +117,37 @@ export class DrizzleScheduleUserAdapter implements ScheduleUserPort {
     // Validate cron and timezone first (fail fast)
     const nextRunAt = computeNextRun(input.cron, input.timezone);
 
+    // NodeTask (http-dispatch) vs graph schedule. `route` xor `graphId` is enforced
+    // upstream by the contract; here we derive the workflow wiring per branch.
+    // NodeTask: grant scope = task:dispatch:<nodeId>:<route>, graphId tunnel = task:<route>,
+    // workflowType = NodeTaskWorkflow (the schedule-control adapter's configured queue is
+    // already this node's per-node queue, so no taskQueueOverride is needed).
+    // Grant scope binds to the schedule's OWN nodeId (input.nodeId), not a ctor
+    // pin — so a non-operator (tenant) schedule dispatches as its own node. The
+    // route layer supplies + authorizes nodeId: the operator's user path passes
+    // getNodeId(); the node-authed create seam passes the caller node's id.
+    const isNodeTask = input.route !== undefined;
+    const route = input.route;
+    const grantScope = isNodeTask
+      ? nodeTaskScope(input.nodeId, route as string)
+      : `graph:execute:${input.graphId}`;
+    const storedGraphId = isNodeTask
+      ? `task:${route as string}`
+      : (input.graphId as string);
+    const workflowType = isNodeTask ? "NodeTaskWorkflow" : undefined;
+    // NodeTask: tunnel {route, payload} inside `input` so the schedule-control
+    // adapter's buildWorkflowArgs unwraps the dispatch route + payload (the user's
+    // `input` IS the opaque NodeTask payload). Graph schedules store `input` as-is.
+    const storedInput = isNodeTask
+      ? { route: route as string, payload: input.input }
+      : input.input;
+
     // Create grant OUTSIDE transaction for atomicity cleanup
     // If schedule insert or scheduleControl fails, we hard-delete the grant
     const grant = await this.grantPort.createGrant({
       userId: callerUserId,
       billingAccountId,
-      scopes: [`graph:execute:${input.graphId}`],
+      scopes: [grantScope],
     });
 
     let row: typeof schedules.$inferSelect | undefined;
@@ -133,8 +160,8 @@ export class DrizzleScheduleUserAdapter implements ScheduleUserPort {
           .values({
             ownerUserId: callerUserId,
             executionGrantId: grant.id,
-            graphId: input.graphId,
-            input: input.input,
+            graphId: storedGraphId,
+            input: storedInput,
             cron: input.cron,
             timezone: input.timezone,
             enabled: true,
@@ -157,13 +184,14 @@ export class DrizzleScheduleUserAdapter implements ScheduleUserPort {
         ownerUserId: callerUserId,
         cron: input.cron,
         timezone: input.timezone,
-        graphId: input.graphId,
+        graphId: storedGraphId,
         executionGrantId: grant.id,
-        input: input.input as JsonValue,
+        input: storedInput as JsonValue,
+        workflowType,
       });
 
       this.logger.info(
-        { scheduleId: row.id, graphId: input.graphId, nextRunAt },
+        { scheduleId: row.id, graphId: storedGraphId, nextRunAt },
         "Created schedule"
       );
 

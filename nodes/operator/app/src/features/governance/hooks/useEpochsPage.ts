@@ -11,13 +11,13 @@
  * @public
  */
 
+import type { DistributionLifecycleOutput } from "@cogni/node-contracts";
 import { type UseQueryResult, useQuery } from "@tanstack/react-query";
 import pLimit from "p-limit";
 import type {
   ApiIngestionReceipt,
   EpochClaimantsDto,
   EpochDto,
-  UserProjectionDto,
 } from "@/features/governance/lib/compose-epoch";
 import {
   composeEpochView,
@@ -28,6 +28,10 @@ import type { EpochView } from "@/features/governance/types";
 export interface EpochsPageData {
   readonly current: EpochView | null;
   readonly pastEpochs: readonly EpochView[];
+  /** Every composed epoch, newest period first. Used by the unified finish workspace. */
+  readonly allEpochs: readonly EpochView[];
+  /** One page-level fold/on-chain read shared by every epoch rail. */
+  readonly distributionLifecycle: DistributionLifecycleOutput;
 }
 
 const limit = pLimit(3);
@@ -46,21 +50,16 @@ async function fetchJson<T>(url: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-/** Compose an open/review epoch using user-projections (live data). */
+/**
+ * Compose an open/review epoch from /activity alone.
+ * ONE_SSOT: contributor units derive entirely from selection + weightConfig —
+ * no user-projections fetch (that path double-counted resolved users).
+ */
 async function composeCurrentEpoch(epoch: EpochDto): Promise<EpochView> {
-  const [userProjectionsRes, activityRes] = await Promise.all([
-    fetchJson<{ userProjections: UserProjectionDto[] }>(
-      `/api/v1/attribution/epochs/${epoch.id}/user-projections`
-    ),
-    fetchJson<{ events: ApiIngestionReceipt[] }>(
-      `/api/v1/attribution/epochs/${epoch.id}/activity?limit=200`
-    ),
-  ]);
-  return composeEpochView(
-    epoch,
-    userProjectionsRes.userProjections,
-    activityRes.events
+  const activityRes = await fetchJson<{ events: ApiIngestionReceipt[] }>(
+    `/api/v1/attribution/epochs/${epoch.id}/activity?limit=200`
   );
+  return composeEpochView(epoch, activityRes.events);
 }
 
 /** Compose a finalized epoch using claimant-based attribution (frozen data). */
@@ -85,9 +84,12 @@ async function composePastEpoch(epoch: EpochDto): Promise<EpochView> {
 }
 
 async function fetchEpochsPage(): Promise<EpochsPageData> {
-  const { epochs } = await fetchJson<{ epochs: EpochDto[] }>(
-    "/api/v1/attribution/epochs?limit=200"
-  );
+  const [{ epochs }, distributionLifecycle] = await Promise.all([
+    fetchJson<{ epochs: EpochDto[] }>("/api/v1/attribution/epochs?limit=200"),
+    fetchJson<DistributionLifecycleOutput>(
+      "/api/v1/attribution/distribution-lifecycle"
+    ),
+  ]);
 
   // Find the current epoch: prefer open, fall back to most recent review
   const current =
@@ -103,18 +105,36 @@ async function fetchEpochsPage(): Promise<EpochsPageData> {
         new Date(b.periodEnd).getTime() - new Date(a.periodEnd).getTime()
     );
 
-  const [currentView, pastViews] = await Promise.all([
-    current ? composeCurrentEpoch(current) : null,
-    Promise.all(past.map((epoch) => limit(() => composePastEpoch(epoch)))),
-  ]);
+  const composed = await Promise.all(
+    epochs.map((epoch) =>
+      limit(() =>
+        epoch.status === "finalized"
+          ? composePastEpoch(epoch)
+          : composeCurrentEpoch(epoch)
+      )
+    )
+  );
+  const byId = new Map(composed.map((epoch) => [epoch.id, epoch]));
+  const currentView = current ? (byId.get(current.id) ?? null) : null;
+  const pastViews = past
+    .map((epoch) => byId.get(epoch.id))
+    .filter((epoch): epoch is EpochView => epoch !== undefined);
+  const allEpochs = [...composed].sort(
+    (a, b) => Date.parse(b.periodEnd) - Date.parse(a.periodEnd)
+  );
 
-  return { current: currentView, pastEpochs: pastViews };
+  return {
+    current: currentView,
+    pastEpochs: pastViews,
+    allEpochs,
+    distributionLifecycle,
+  };
 }
 
 export function useEpochsPage(): UseQueryResult<EpochsPageData, Error> {
   return useQuery({
     queryKey: ["governance", "epochs", "page"],
     queryFn: fetchEpochsPage,
-    staleTime: 60_000,
+    staleTime: 30_000,
   });
 }

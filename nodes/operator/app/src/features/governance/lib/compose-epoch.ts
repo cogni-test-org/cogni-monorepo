@@ -86,6 +86,7 @@ export interface EpochDto {
   readonly periodEnd: string;
   readonly weightConfig: Record<string, number>;
   readonly poolTotalCredits: string | null;
+  readonly approvers?: readonly string[] | null;
 }
 
 /** Minimal projection shape expected from the epoch-user-projections API. */
@@ -226,14 +227,10 @@ function partitionReceipts(receipts: readonly ApiIngestionReceipt[]): {
  */
 export function composeEpochView(
   epoch: EpochDto,
-  userProjections: readonly UserProjectionDto[],
   receipts: readonly ApiIngestionReceipt[]
 ): EpochView {
   const { receiptsById, unresolvedCount, unresolvedActivities } =
     partitionReceipts(receipts);
-  const projectionByUser = new Map(
-    userProjections.map((projection) => [projection.userId, projection])
-  );
   const contributorMap = new Map<
     string,
     {
@@ -265,10 +262,9 @@ export function composeEpochView(
             epoch.weightConfig[`${receipt.source}:${receipt.eventType}`] ?? 0
           );
 
-    if (weight <= 0n) {
-      continue;
-    }
-
+    // SELECTION_IS_THE_GATE: every receipt with selection.included === true is a
+    // contributor — points = summed weight, which may legitimately be 0 (e.g.
+    // github:review_submitted at weight 0). No weight-based drop.
     const mappedReceipt: IngestionReceipt = {
       ...baseReceipt,
       units: weight.toString(),
@@ -284,14 +280,16 @@ export function composeEpochView(
         existing.receiptCount += 1;
         existing.receipts.push(mappedReceipt);
       } else {
-        const projection = projectionByUser.get(userId);
+        // ONE_SSOT: open-epoch contributor units derive 100% from
+        // selection + weightConfig (seed from this receipt's weight). No
+        // projection seed — that double-counted resolved users.
         contributorMap.set(key, {
           claimantKey: key,
           claimantKind: "user",
           displayName: resolveDisplayName(receipt.platformLogin),
           claimantLabel: "Linked account",
-          units: BigInt(projection?.projectedUnits ?? weight),
-          receiptCount: projection?.receiptCount ?? 1,
+          units: weight,
+          receiptCount: 1,
           receipts: [mappedReceipt],
         });
       }
@@ -347,6 +345,7 @@ export function composeEpochView(
     periodStart: epoch.periodStart,
     periodEnd: epoch.periodEnd,
     poolTotalCredits: epoch.poolTotalCredits,
+    approvers: epoch.approvers ?? null,
     contributors,
     unresolvedCount,
     unresolvedActivities,
@@ -426,6 +425,7 @@ export function composeEpochViewFromClaimants(
     periodStart: epoch.periodStart,
     periodEnd: epoch.periodEnd,
     poolTotalCredits: claimants.poolTotalCredits,
+    approvers: epoch.approvers ?? null,
     contributors,
     unresolvedCount,
     unresolvedActivities,

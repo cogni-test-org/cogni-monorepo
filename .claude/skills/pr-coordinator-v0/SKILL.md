@@ -48,19 +48,17 @@ Single-tenant slot. Only one PR on candidate-a at a time.
 
 This coordinator flights PRs to the `test` environment (slot `candidate-a`). Preview and production are downstream promotions owned by the main CI/CD chain — not this skill's problem.
 
-| Node     | URL                            |
-| -------- | ------------------------------ |
-| Operator | https://test.cognidao.org      |
-| Poly     | https://poly-test.cognidao.org |
-| Resy     | https://resy-test.cognidao.org |
+| Node     | URL                              |
+| -------- | -------------------------------- |
+| Operator | https://test.cognidao.org        |
+| <node>   | https://<node>-test.cognidao.org |
 
 ## Observability Anchors
 
 **Primary rollout proof: `/version` endpoint `buildSha` match.** For each affected node, `curl -s https://<url>/version` and confirm `buildSha` equals the PR head SHA. Three endpoints:
 
 - https://test.cognidao.org/version (operator)
-- https://poly-test.cognidao.org/version (poly)
-- https://resy-test.cognidao.org/version (resy)
+- https://<node>-test.cognidao.org/version — one per catalog node; read it live (`GET /api/v1/nodes`, `infra/catalog/*.yaml`, `curl https://<host>/version`) — never hardcode a roster (Dolt `operator-node-catalog`)
 
 `/version` is served by the _app_ (same pod Argo just rolled), not the ingress readyz. A matching buildSha means the new pod is live. Deterministic, always available, no MCP dependency.
 
@@ -133,10 +131,9 @@ Two dispatchable workflows (see "Two Independent Levers" below). Route by what t
 🛩 Flighted to candidate-a (test)
 
 - SHA:        <sha>
-- Images:     pr-<N>-<sha>-* (affected subset of: operator, poly, resy, migrator, scheduler-worker)
+- Images:     pr-<N>-<sha>-* (affected subset — source `scripts/ci/lib/image-tags.sh`, never inline a node list)
 - Operator:   https://test.cognidao.org
-- Poly:       https://poly-test.cognidao.org
-- Resy:       https://resy-test.cognidao.org
+- <node>:     https://<node>-test.cognidao.org
 - Grafana:    <deeplink from mcp__grafana__generate_deeplink, scoped to the flight window>
 - Flight run: <github actions URL>
 
@@ -150,7 +147,8 @@ On flight failure, collect the failing step's logs, summarize, **halt the loop**
 **Primary gate: `/version` buildSha match.** Curl each affected node's `/version`, confirm `buildSha` equals PR head SHA:
 
 ```bash
-for url in test.cognidao.org poly-test.cognidao.org resy-test.cognidao.org; do
+# Derive from the catalog; never hardcode a roster (roster is LIVE STATE — read `GET /api/v1/nodes` / `infra/catalog/*.yaml`, never hardcode; Dolt `operator-node-catalog`)
+for url in test.cognidao.org $(for n in $(yq -r '.name' infra/catalog/*.yaml); do [ "$n" = operator ] || echo "$n-test.cognidao.org"; done); do
   echo "=== $url ==="; curl -s https://$url/version; echo
 done
 ```
@@ -274,7 +272,7 @@ Use the `Agent` tool with `subagent_type: general-purpose`. Give each a tight, s
 - **Trust `/version`, not `/readyz`.** Rollout proof = `/version` buildSha matching PR head SHA. `/readyz` is ingress-layer and flips green before the new pod takes traffic.
 - **Read `flight-preview.yml`'s checks correctly.** On merge to main, two jobs appear in the commit's checks list:
   - `flight ✓` + `deploy-preview ✓` — preview actually deployed. Proof-of-rollout applies to `cogni-preview` pods.
-  - `flight ✓` + `deploy-preview ⊘ skipped` — preview lease was locked (a prior SHA still `reviewing`/`dispatching`). The merged SHA is queued as `deploy/preview:.promote-state/candidate-sha`, **nothing rolled**. Do not proof-of-rollout preview for this SHA — it won't match. Wait for the prior reviewer to release the lease (or `set-preview-review-state.sh unlocked`) for the drain to fire.
+  - `flight ✓` + `deploy-preview ⊘ skipped` — the flight was gated off (a `workflow_dispatch` with a non-PR SHA), so **nothing rolled** for this SHA; don't proof-of-rollout preview for it. A normal merge-to-main always dispatches and deploys (preview is latest-wins; there is no lease/queue).
   - `flight ✗` — hard failure. Escalate.
 - **Never commit `dashboard.md` updates.** Session-scratch runtime state.
 - **Never modify someone's in-flight branch.** Operate only on remote refs and candidate-a overlays.

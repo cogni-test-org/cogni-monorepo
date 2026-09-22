@@ -57,6 +57,25 @@ export type {
   LangfuseSpanHandle,
   RecordInvocationParams,
 } from "./ai-telemetry.port";
+export {
+  type AkashAllocationProbe,
+  type AkashTxActuatorPort,
+  type AkashTxAllocationLedgerPort,
+  type AkashTxAllocationRecord,
+  type AkashTxAllocationState,
+  type AkashTxConsolePort,
+  type AkashTxCreateResult,
+  AkashTxError,
+  type AkashTxErrorCode,
+  type AkashTxMigrationPhase,
+  type AkashTxMigrationPort,
+  type AkashTxMigrationStep,
+  type AkashTxObservation,
+  type AkashTxResource,
+  type AkashTxStaleAllocation,
+  type AkashTxSweepReport,
+  type AkashTxWorkloadIdentity,
+} from "./akash-tx.port";
 export type {
   AttributionEpoch,
   AttributionPoolComponent,
@@ -73,17 +92,99 @@ export type {
   BillingResolver,
   PreflightCreditCheckFn,
 } from "./billing-context";
+export type {
+  CatalogNodeOwnerProjection,
+  CatalogNodeRegistryPort,
+  CatalogNodeRegistryReconcileSummary,
+} from "./catalog-node-registry.port";
 export type { Clock } from "./clock.port";
+export type {
+  ComputeCostAmount,
+  ComputeCostEvidencePort,
+  ComputeCostIntervalState,
+  ComputeCostRate,
+  ComputeCostReport,
+  ComputeCostStorePort,
+  ComputeResourceCostEvidence,
+  ComputeResourceCostIdentity,
+} from "./compute-cost.port";
+export { ComputeCostInvariantError } from "./compute-cost.port";
+export {
+  COMPUTE_WORKLOAD_ATTEMPT_ANNOTATION,
+  COMPUTE_WORKLOAD_FINALIZER,
+  type ComputeWorkload,
+  type ComputeWorkloadArtifact,
+  type ComputeWorkloadAttempt,
+  type ComputeWorkloadAttemptReceipt,
+  type ComputeWorkloadBundle,
+  type ComputeWorkloadCondition,
+  type ComputeWorkloadPhase,
+  type ComputeWorkloadSecretRef,
+  type ComputeWorkloadSource,
+  type ComputeWorkloadSpec,
+  type ComputeWorkloadStatus,
+  computeWorkloadIdempotencyKey,
+  type DeclaredProvisionServiceSpec,
+  type DeclaredProvisionSpec,
+  decodeAttemptReceipt,
+  encodeAttemptReceipt,
+} from "./compute-workload.types";
+export type { ComputeWorkloadDnsPort } from "./compute-workload-dns.port";
+export {
+  ComputeLifecycleError,
+  type ComputeLifecycleFailureKind,
+  type ComputeLifecycleFailureReason,
+  type ComputeWorkloadLifecyclePort,
+} from "./compute-workload-lifecycle.port";
+export type {
+  ComputeWorkloadMigrationInput,
+  ComputeWorkloadMigrationPhase,
+  ComputeWorkloadMigrationPort,
+} from "./compute-workload-migration.port";
+export type { ComputeWorkloadSecretResolverPort } from "./compute-workload-secret-resolver.port";
+export type { ComputeWorkloadStatePort } from "./compute-workload-state.port";
 export type {
   ConnectionBrokerPort,
   ConnectionScope,
   ResolvedConnection,
 } from "./connection-broker.port";
 export type {
+  CandidateFlightDispatchResult,
+  CatalogForkTarget,
+  CatalogNodeDefinition,
+  DeployPlanePort,
+  MirrorCanonicalFilesInput,
+  MirrorCanonicalFilesResult,
+  NodeInfraReconcileResult,
+  NodePromoteResult,
+  PreparedNodeRefCandidateFlight,
+  PrepareNodeRefCandidateFlightInput,
+  PromoteNodeInput,
+  ReconcileNodeInfraInput,
+  ResolvedNodeRepo,
+  ResolveNodeRepoInput,
+  SyncTemplateUpstreamInput,
+  SyncTemplateUpstreamResult,
+} from "./deploy-plane.port";
+export type { EpochsRead } from "./epochs-read.port";
+export { EpochsReadError } from "./epochs-read.port";
+export type {
   GovernanceRun,
   GovernanceStatusPort,
   UpcomingRun,
 } from "./governance-status.port";
+export type {
+  IdentityAttestationGithubIdentity,
+  IdentityAttestationJwtClaims,
+  IdentityAttestationNode,
+  IdentityAttestationRepositoryPort,
+  IdentityAttestationSignerPort,
+} from "./identity-attestation.port";
+export type {
+  LangfuseReaderPort,
+  LangfuseTraceQuery,
+  LangfuseTraceSummary,
+} from "./langfuse-reader.port";
 // LlmError types re-exported for adapters (adapters can only import from ports)
 // Features should import directly from @/core
 export {
@@ -108,6 +209,11 @@ export {
   normalizeErrorToExecutionCode,
 } from "./llm.port";
 export type {
+  LokiLogLine,
+  LokiQueryRange,
+  LokiReaderPort,
+} from "./loki-reader.port";
+export type {
   InstantQueryParams,
   MetricsQueryPort,
   MetricTemplate,
@@ -130,6 +236,20 @@ export type {
   ProviderContext,
 } from "./model-provider.port";
 export type { ModelProviderResolverPort } from "./model-provider-resolver.port";
+export type { NodeAddressPort } from "./node-address.port";
+export { NodeAddressError } from "./node-address.port";
+export type {
+  AssertLiveResult,
+  EnvFlightStatus,
+  FlightEnv,
+  LiveProbes,
+  NodeFlightStatus,
+  NodeIdentity,
+  NodeProber,
+  RunCarriesResult,
+  RungStatus,
+  ServingResult,
+} from "./node-flight.port";
 export type {
   NodeKind,
   NodeRegistryPort,
@@ -141,9 +261,12 @@ export type {
   VerificationStatus,
 } from "./onchain-verifier.port";
 export type {
-  OperatorWalletPort,
-  TransferIntent,
-} from "./operator-wallet.port";
+  OperatorSecretsPlanePort,
+  SecretWriteOp,
+  WriteNodeSecretInput,
+  WriteNodeSecretResult,
+} from "./operator-secrets-plane.port";
+export type { OperatorWalletPort } from "./operator-wallet.port";
 export {
   type CreatePaymentAttemptParams,
   isPaymentAttemptNotFoundPortError,
@@ -159,11 +282,17 @@ export {
   type PaymentErrorCode,
   TxHashAlreadyBoundPortError,
 } from "./payment-attempt.port";
+export {
+  isPaymentRailMisconfiguredPortError,
+  type PaymentRailGuardConfig,
+  type PaymentRailGuardPort,
+  type PaymentRailMisconfigurationCode,
+  PaymentRailMisconfiguredPortError,
+} from "./payment-rail-guard.port";
 export type {
-  ProviderFundingContext,
-  ProviderFundingOutcome,
-  ProviderFundingPort,
-} from "./provider-funding.port";
+  ReceiptDelivery,
+  ReceiptDeliveryTarget,
+} from "./receipt-delivery.port";
 export type {
   ProxyBillingEntry,
   SandboxErrorCode,

@@ -29,13 +29,47 @@ export type NodeKind = "full-app" | "agent-scope";
 export interface NodeSummary {
   /** Stable display key (catalog name for monorepo nodes, slug for wizard nodes). */
   readonly slug: string;
+  /** Deployment identity when known. Used to join derived ledger metrics. */
+  readonly nodeId?: string | undefined;
+  /**
+   * Display title — the node's NAME (`titleCase` of its `intent.name`/slug). NEVER an operator-side
+   * literal, and NEVER the hook or mission (which are supporting copy).
+   */
   readonly title: string;
+  /**
+   * Short pitch — the node's own `intent.hook`, read from its `/.well-known/agent.json` identity.
+   * Empty string when undeclared (no operator literal). `mission` carries the longer repo-spec blurb.
+   */
   readonly tagline: string;
+  /** Repo-spec `intent.mission`, when the node projects it through its well-known identity. */
+  readonly mission?: string | undefined;
   readonly kind: NodeKind;
+  /** Source repository identity when known. */
+  readonly repo?: {
+    readonly owner: string;
+    readonly name: string;
+    readonly url: string;
+  };
   /** Resolved homepage URL (subdomain for full-app; scope-route for agent-scope), or "#". */
   readonly href: string;
-  /** Homepage screenshot/preview served from public/ or a screenshot source. */
-  readonly thumbnailUrl: string;
+  /**
+   * Absolute, host-resolved homepage thumbnail from the node's own `intent.brand.thumbnail`; undefined
+   * for nodes without a shipped thumbnail (tile shows a brand-tinted monogram placeholder).
+   */
+  readonly thumbnailUrl?: string | undefined;
+  /**
+   * Lucide icon NAME (PascalCase) from the node's own `intent.brand.icon` — the SSOT for the card mark.
+   * The gallery renders this big + brand-tinted, in preference to a thumbnail. Undefined → monogram.
+   */
+  readonly icon?: string | undefined;
+  /** Monogram-tint brand color from the node's own `intent.brand.color`; undefined falls back to a token. */
+  readonly brandColor?: string | undefined;
+  /**
+   * Production/env liveness from the cached probe. `undefined` when liveness is unknown (e.g. local dev
+   * with no base domain, where the gallery skips probing). The operator OWNS displaying this — down nodes
+   * are NOT hidden.
+   */
+  readonly health?: "live" | "down" | undefined;
   /** True for the node that serves the bare base domain (operator). */
   readonly primary?: boolean | undefined;
 }

@@ -5,10 +5,14 @@
  * Module: `@shared/db/node-access-requests`
  * Purpose: Tracking rows for AI-agent → node-owner access requests. UX/audit only — OpenFGA role
  *   tuples remain the sole authority (rbac.md §6); the `node.flight` check never reads this table.
- * Scope: One row per (node, agent user). `role` is the OpenFGA relation requested; v0 grants only
- *   `developer` (which confers `can_flight`). Adding `maintainer` (merge) / `releaser` (promote) is
- *   additive: extend the CHECK + the OpenFGA model. Re-requests reopen the single row to `pending`.
- * Invariants: NOT_AUTHORITY, ONE_ROW_PER_AGENT_NODE, ROLE_MAPS_TO_OPENFGA_RELATION.
+ * Scope: One row per (node, agent user). `role` is the OpenFGA relation requested. v0 grants
+ *   `developer` (confers `can_flight`, candidate-a), `secrets_manager` (confers `can_manage_secrets`),
+ *   `production_promoter` (confers `can_promote_production`), or `env_manager` (confers
+ *   `can_manage_envs` — deploy-topology / env-membership authority). Adding a role (e.g.
+ *   `preview_promoter` → `can_promote_preview`) is additive: extend NODE_ACCESS_ROLES + the CHECK +
+ *   the OpenFGA model. Re-requests reopen the row.
+ * Invariants: NOT_AUTHORITY, ONE_ROW_PER_AGENT_NODE_ROLE (an agent can request multiple roles on
+ *   one node — each is its own row), ROLE_MAPS_TO_OPENFGA_RELATION.
  * Side-effects: none
  * Links: docs/spec/rbac.md §6, docs/spec/identity-model.md
  * @public
@@ -38,9 +42,17 @@ export const NODE_ACCESS_REQUEST_STATUSES = [
 export type NodeAccessRequestStatus =
   (typeof NODE_ACCESS_REQUEST_STATUSES)[number];
 
-// The OpenFGA relation a request grants. v0 = `developer` only (confers can_flight). Future roles
-// (maintainer→can_merge, releaser→can_promote) are added here + in the immutable OpenFGA model.
-export const NODE_ACCESS_ROLES = ["developer"] as const;
+// The OpenFGA relation a request grants — one distinct, least-privilege role per
+// capability. `developer`→can_flight (candidate-a); `secrets_manager`→can_manage_secrets;
+// `production_promoter`→can_promote_production (production); `env_manager`→can_manage_envs
+// (deploy-topology / env-membership). A new role is added here + in the immutable OpenFGA
+// model + the CHECK below.
+export const NODE_ACCESS_ROLES = [
+  "developer",
+  "secrets_manager",
+  "production_promoter",
+  "env_manager",
+] as const;
 
 export type NodeAccessRole = (typeof NODE_ACCESS_ROLES)[number];
 
@@ -55,6 +67,11 @@ export const nodeAccessRequests = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     role: text("role").notNull().default("developer"),
+    // The AI agent's own GitHub login, declared at REQUEST time (rbac.md §6a). The agent requests
+    // access for its own GitHub account; on approve the owner-gated grant resolves push-access for
+    // THIS login — the human never supplies a login, they just click Approve. Nullable: a request
+    // with no GitHub identity grants only the OpenFGA role (the fork-PR fallback still applies).
+    githubLogin: text("github_login"),
     status: text("status").notNull().default("pending"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -64,12 +81,19 @@ export const nodeAccessRequests = pgTable(
       .defaultNow(),
   },
   (t) => [
-    unique("node_access_requests_node_agent_key").on(t.nodeId, t.agentUserId),
+    unique("node_access_requests_node_agent_role_key").on(
+      t.nodeId,
+      t.agentUserId,
+      t.role
+    ),
     check(
       "node_access_requests_status_check",
       sql`${t.status} IN ('pending','approved','denied','revoked')`
     ),
-    check("node_access_requests_role_check", sql`${t.role} IN ('developer')`),
+    check(
+      "node_access_requests_role_check",
+      sql`${t.role} IN ('developer','secrets_manager','production_promoter','env_manager')`
+    ),
     index("node_access_requests_node_id_idx").on(t.nodeId),
     index("node_access_requests_agent_user_id_idx").on(t.agentUserId),
   ]

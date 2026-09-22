@@ -15,6 +15,13 @@
 # The VM IP is read from the env apex (operator) A record — node records always
 # point exactly where the operator host points. Override with VM_IP=... .
 #
+# PLACEMENT_OWNS_DNS (story.5016): only a node the catalog places on `k3s` for
+# this env lives at the VM IP. A node placed on an external provider (akash) has
+# its host CNAME'd to the provider by the operator's ComputeWorkload DNS
+# reconciler, so this loop SKIPS it — one writer per record. The workflows also
+# hand this script a k3s-only catalog projection; the skip makes the script
+# correct on its own (it is a documented manual lever too).
+#
 # Idempotent: re-running upserts to the same final state (no-op when records
 # already match). --check is the drift gate: assert every type:node already
 # resolves to the VM IP; non-zero exit lists what is missing.
@@ -25,6 +32,8 @@
 #
 # Env: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE_ID (GH env secrets), FORK_DOMAIN_ROOT
 #      (repo var). DOMAIN + VM_IP derive from <env> but can be overridden.
+#      DNS_RECONCILE_SUMMARY_FILE optionally receives one structured JSON summary
+#      for CI/Grafana.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,6 +57,116 @@ done
 if [ -z "$DEPLOY_ENV" ]; then
   echo "Usage: reconcile-node-dns.sh <env> [--check]" >&2
   exit 1
+fi
+
+records_tmp=""
+if [ -n "${DNS_RECONCILE_SUMMARY_FILE:-}" ]; then
+  records_tmp=$(mktemp -t dns-reconcile-records.XXXXXX)
+fi
+SUMMARY_WRITTEN=false
+
+append_dns_record() {
+  [ -n "$records_tmp" ] || return 0
+  DNS_NODE="$node" \
+    DNS_HOST="$host" \
+    DNS_STATE="${state:-}" \
+    DNS_CONTENT="${content:-}" \
+    DNS_EXPECTED="${expected:-}" \
+    python3 - <<'PY' >>"$records_tmp" || true
+import json
+import os
+
+record = {
+    "node": os.environ["DNS_NODE"],
+    "host": os.environ["DNS_HOST"],
+    "state": os.environ["DNS_STATE"],
+}
+content = os.environ.get("DNS_CONTENT", "")
+if content:
+    record["content"] = content
+expected = os.environ.get("DNS_EXPECTED", "")
+if expected:
+    record["expected"] = expected
+print(json.dumps(record, separators=(",", ":")))
+PY
+}
+
+write_dns_summary() {
+  [ -n "${DNS_RECONCILE_SUMMARY_FILE:-}" ] || return 0
+  local status="$1"
+  local candidate_sha="${DNS_RECONCILE_CANDIDATE_SHA:-}"
+  local candidate_sha8="${candidate_sha:0:8}"
+  DNS_STATUS="$status" \
+    DNS_DEPLOY_ENV="$DEPLOY_ENV" \
+    DNS_DOMAIN="${DOMAIN:-}" \
+    DNS_VM_IP="${VM_IP:-}" \
+    DNS_PROXIED="${PROXIED:-}" \
+    DNS_CHECK="$CHECK" \
+    DNS_WORKFLOW="${GITHUB_WORKFLOW:-}" \
+    DNS_JOB="${GITHUB_JOB:-}" \
+    DNS_RUN_ID="${GITHUB_RUN_ID:-}" \
+    DNS_ATTEMPT="${GITHUB_RUN_ATTEMPT:-}" \
+    DNS_REF="${GITHUB_REF_NAME:-}" \
+    DNS_WORKFLOW_SHA="${GITHUB_SHA:-}" \
+    DNS_CANDIDATE_SHA="$candidate_sha" \
+    DNS_CANDIDATE_SHA8="$candidate_sha8" \
+    DNS_HEAD_SHA="${DNS_RECONCILE_HEAD_SHA:-}" \
+    DNS_NODE_SOURCE_SHA="${DNS_RECONCILE_NODE_SOURCE_SHA:-}" \
+    DNS_PR_NUMBER="${DNS_RECONCILE_PR_NUMBER:-}" \
+    DNS_NODE_SLUG="${DNS_RECONCILE_NODE_SLUG:-}" \
+    DNS_STATUS_URL="${DNS_RECONCILE_STATUS_URL:-}" \
+    python3 - "$records_tmp" <<'PY' >"${DNS_RECONCILE_SUMMARY_FILE}.tmp" || return 0
+import collections
+import datetime
+import json
+import os
+import sys
+
+records = []
+path = sys.argv[1] if len(sys.argv) > 1 else ""
+if path:
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+
+states = collections.Counter(record.get("state", "unknown") for record in records)
+payload = {
+    "schema_version": 1,
+    "type": "dns_reconcile_summary",
+    "status": os.environ["DNS_STATUS"],
+    "deploy_env": os.environ["DNS_DEPLOY_ENV"],
+    "domain": os.environ["DNS_DOMAIN"],
+    "origin_ip": os.environ["DNS_VM_IP"],
+    "proxied": os.environ["DNS_PROXIED"] == "true",
+    "check": os.environ["DNS_CHECK"] == "true",
+    "workflow": os.environ["DNS_WORKFLOW"],
+    "job": os.environ["DNS_JOB"],
+    "run_id": os.environ["DNS_RUN_ID"],
+    "attempt": os.environ["DNS_ATTEMPT"],
+    "ref": os.environ["DNS_REF"],
+    "workflow_sha": os.environ["DNS_WORKFLOW_SHA"],
+    "candidate_sha": os.environ["DNS_CANDIDATE_SHA"],
+    "candidate_sha8": os.environ["DNS_CANDIDATE_SHA8"],
+    "head_sha": os.environ["DNS_HEAD_SHA"],
+    "node_source_sha": os.environ["DNS_NODE_SOURCE_SHA"],
+    "pr_number": os.environ["DNS_PR_NUMBER"],
+    "node_slug": os.environ["DNS_NODE_SLUG"],
+    "status_url": os.environ["DNS_STATUS_URL"],
+    "record_count": len(records),
+    "states": dict(sorted(states.items())),
+    "records": records,
+    "emitted_at": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+}
+print(json.dumps(payload, separators=(",", ":")))
+PY
+  mv "${DNS_RECONCILE_SUMMARY_FILE}.tmp" "$DNS_RECONCILE_SUMMARY_FILE"
+  SUMMARY_WRITTEN=true
+}
+
+if [ -n "${DNS_RECONCILE_SUMMARY_FILE:-}" ]; then
+  trap 'status=$?; if [ "$status" -ne 0 ] && [ "${SUMMARY_WRITTEN:-false}" != "true" ]; then write_dns_summary "failure"; fi; rm -f "${records_tmp:-}"' EXIT
 fi
 
 : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN required (GH env secret)}"
@@ -85,25 +204,53 @@ for node in "${NODE_TARGETS[@]}"; do
   # a per-node concern — skip it here.
   is_primary_host "$node" && continue
   host="$(host_for_node "$node" "$DOMAIN")"
+  expected="$VM_IP"
+  # PLACEMENT_OWNS_DNS (story.5016): this loop maps a node host onto the env VM,
+  # which is only true for a k3s-placed node. A node the catalog places on an
+  # external provider has its host CNAME'd to the provider by the operator's
+  # ComputeWorkload DNS reconciler — two writers on one record is a Cloudflare
+  # type conflict that hard-fails the whole env's promote. Placement decides the
+  # owner; the same reader the flight/promote planner uses decides placement.
+  if ! is_k3s_placed "$node" "$DEPLOY_ENV"; then
+    provider="$(deployment_provider_for_target "$node" "$DEPLOY_ENV")"
+    echo "  external ${host} (placement=${provider}; DNS owned by the compute workload controller)"
+    state="external"
+    content=""
+    expected=""
+    append_dns_record
+    continue
+  fi
   if $CHECK; then
     content=$(cf_a_record_content "$CLOUDFLARE_API_TOKEN" "$CLOUDFLARE_ZONE_ID" "$host")
     if [ "$content" = "$VM_IP" ]; then
       echo "  ok       ${host} → ${VM_IP}"
+      state="ok"
     else
-      echo "  MISSING  ${host} (resolves to '${content:-none}', want ${VM_IP})"
+      # An empty A read is ambiguous: unclaimed, or claimed by a foreign record
+      # type. Name the live type so a mis-placed host reads as a conflict, never
+      # as "just missing" (which would send an operator to run the upsert lane).
+      live_type=""
+      [ -n "$content" ] || live_type=$(cf_record_type "$CLOUDFLARE_API_TOKEN" "$CLOUDFLARE_ZONE_ID" "$host")
+      echo "  MISSING  ${host} (resolves to '${content:-none}'${live_type:+; live ${live_type} record}, want ${VM_IP})"
+      state="missing"
       missing+=("$host")
     fi
+    append_dns_record
   else
     state=$(cf_upsert_a_record "$CLOUDFLARE_API_TOKEN" "$CLOUDFLARE_ZONE_ID" "$host" "$VM_IP" "$PROXIED") \
-      || { echo "[ERROR] upsert failed for ${host}" >&2; exit 1; }
+      || { echo "[ERROR] upsert failed for ${host}" >&2; write_dns_summary "failure"; exit 1; }
     echo "  ${host} → ${VM_IP} (proxied=${PROXIED}): ${state}"
+    content="$VM_IP"
+    append_dns_record
   fi
 done
 
 if $CHECK && [ "${#missing[@]}" -gt 0 ]; then
+  write_dns_summary "failure"
   echo "[ERROR] ${#missing[@]} node host(s) missing DNS: ${missing[*]}" >&2
   echo "        Run: bash scripts/ci/reconcile-node-dns.sh ${DEPLOY_ENV}" >&2
   exit 1
 fi
 
+write_dns_summary "success"
 echo "Node DNS reconciled."

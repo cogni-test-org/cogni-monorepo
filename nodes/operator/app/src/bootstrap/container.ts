@@ -14,6 +14,8 @@
 
 import type { ToolSourcePort } from "@cogni/ai-core";
 import type {
+  ComputeResourcePort,
+  DeployCapability,
   EdoCapability,
   KnowledgeCapability,
   MetricsCapability,
@@ -21,9 +23,24 @@ import type {
   VcsCapability,
   WebSearchCapability,
 } from "@cogni/ai-tools";
-import { CORE_TOOL_BUNDLE } from "@cogni/ai-tools";
+import { CORE_TOOL_BUNDLE, VCS_TOOL_BUNDLE } from "@cogni/ai-tools";
 import type { AttributionStore } from "@cogni/attribution-ledger";
-import { DrizzleAttributionAdapter } from "@cogni/db-client";
+import {
+  createDefaultRegistries,
+  type FinalizeEpochInput,
+  type FinalizeEpochOutput,
+  type FinalizeLogger,
+  type RunFinalizeEpochDeps,
+  runFinalizeEpoch,
+} from "@cogni/attribution-pipeline-plugins";
+import {
+  type AuthorizationPort,
+  OpenFgaAuthorizationAdapter,
+} from "@cogni/authorization-core";
+import {
+  DrizzleAttributionAdapter,
+  DrizzleClaimantWalletResolver,
+} from "@cogni/db-client";
 import type { FinancialLedgerPort } from "@cogni/financial-ledger";
 import { createTigerBeetleAdapter } from "@cogni/financial-ledger/adapters";
 import type { UserId } from "@cogni/ids";
@@ -65,6 +82,7 @@ import {
   Connection as TemporalConnection,
   type WorkflowClient,
 } from "@temporalio/client";
+import { eq, inArray } from "drizzle-orm";
 import Redis from "ioredis";
 import type { Logger } from "pino";
 import {
@@ -72,6 +90,7 @@ import {
   AlchemyWebhookNormalizer,
   type Database,
   DrizzleAiTelemetryAdapter,
+  DrizzleComputeCostStore,
   DrizzleConnectionBrokerAdapter,
   DrizzleExecutionGrantUserAdapter,
   DrizzleExecutionGrantWorkerAdapter,
@@ -89,6 +108,7 @@ import {
   type MimirAdapterConfig,
   MimirMetricsAdapter,
   RedisRunStreamAdapter,
+  SplitPaymentRailGuardAdapter,
   SystemClock,
   TemporalScheduleControlAdapter,
   UserDrizzleAccountService,
@@ -113,8 +133,18 @@ import {
 } from "@/adapters/server/db/doltgres/client";
 import { getServiceDb } from "@/adapters/server/db/drizzle.service-client";
 import { DrizzleWorkItemSessionAdapter } from "@/adapters/server/db/work-item-session.adapter";
+import { createHttpEpochsRead } from "@/adapters/server/ingestion/http-epochs-read";
+import { createHttpReceiptDelivery } from "@/adapters/server/ingestion/http-receipt-delivery";
+import { CompositeNodeRegistryAdapter } from "@/adapters/server/node-registry/composite-node-registry.adapter";
+import { DbNodeRegistryAdapter } from "@/adapters/server/node-registry/db-node-registry.adapter";
+import { LiveNodeRegistryAdapter } from "@/adapters/server/node-registry/live-node-registry.adapter";
+import { NETWORK_NODES } from "@/adapters/server/node-registry/network-nodes.data";
+import {
+  createDrizzleNodePlacementLookup,
+  createNodeAddressResolver,
+} from "@/adapters/server/node-registry/node-address.adapter";
+import { StaticNodeRegistryAdapter } from "@/adapters/server/node-registry/static-node-registry.adapter";
 import { ServiceDrizzlePaymentAttemptRepository } from "@/adapters/server/payments/drizzle-payment-attempt.adapter";
-import { OpenRouterFundingAdapter } from "@/adapters/server/treasury/openrouter-funding.adapter";
 import { SplitTreasurySettlementAdapter } from "@/adapters/server/treasury/split-treasury-settlement.adapter";
 import {
   FakeMetricsAdapter,
@@ -124,34 +154,58 @@ import {
 } from "@/adapters/test";
 import { createToolBindings } from "@/bootstrap/ai/tool-bindings";
 import { createBoundToolSource } from "@/bootstrap/ai/tool-source.factory";
+import { createComputeCapability } from "@/bootstrap/capabilities/compute";
+import {
+  createLeaseReadCapability,
+  type LeaseReadCapability,
+} from "@/bootstrap/capabilities/compute-leases";
+import { createDeployCapability } from "@/bootstrap/capabilities/deploy";
 import {
   createMetricsCapability,
   derivePrometheusQueryUrl,
 } from "@/bootstrap/capabilities/metrics";
+import { createLivenessAccessor } from "@/bootstrap/capabilities/node-registry";
+import { createOperatorDeployPlane } from "@/bootstrap/capabilities/operator-deploy-plane";
 import { createRepoCapability } from "@/bootstrap/capabilities/repo";
 import { createScheduleCapability } from "@/bootstrap/capabilities/schedule";
 import { createVcsCapability } from "@/bootstrap/capabilities/vcs";
 import { createWebSearchCapability } from "@/bootstrap/capabilities/web-search";
 import { createWorkItemCapability } from "@/bootstrap/capabilities/work-item";
+import { startCatalogRegistryReconcileOnBoot } from "@/bootstrap/catalog-registry-reconcile";
 import type { RateLimitBypassConfig } from "@/bootstrap/http/wrapPublicRoute";
+import { resolveNodeKnowledgeRemoteUrl } from "@/bootstrap/knowledge-mirror";
 import { startProcessHealthPublisher } from "@/bootstrap/publishers";
+import { startGovernanceSyncOnBoot } from "@/bootstrap/startup-reconcile";
+import {
+  type AttributionProfileResolver,
+  createAttributionProfileResolver,
+  selectLocalAttributionNodes,
+} from "@/features/nodes/attribution-profile-resolver";
+import {
+  createNodeDistributionConfigResolver,
+  type NodeDistributionConfigResolver,
+} from "@/features/nodes/node-distribution-config";
 import type {
   AccountService,
   AiTelemetryPort,
   Clock,
+  ComputeCostReport,
   ConnectionBrokerPort,
   DataSourceRegistration,
+  EpochsRead,
   GovernanceStatusPort,
   LangfusePort,
   LlmService,
   MetricsQueryPort,
   ModelCatalogPort,
   ModelProviderResolverPort,
+  NodeRegistryPort,
   OnChainVerifier,
   OperatorWalletPort,
   PaymentAttemptServiceRepository,
   PaymentAttemptUserRepository,
-  ProviderFundingPort,
+  PaymentRailGuardPort,
+  ReceiptDelivery,
   RunStreamPort,
   ServiceAccountService,
   ThreadPersistencePort,
@@ -159,6 +213,7 @@ import type {
   TreasurySettlementPort,
   WorkItemSessionPort,
 } from "@/ports";
+import { PaymentRailMisconfiguredPortError } from "@/ports";
 import type {
   ExecutionGrantUserPort,
   ExecutionGrantWorkerPort,
@@ -169,12 +224,21 @@ import type {
 } from "@/ports/server";
 import {
   getDaoTreasuryAddress,
+  getEmissionsHolderAddress,
+  getKnowledgeConfig,
+  getLedgerSelectionConfig,
   getNodeId,
+  getNodeName,
+  getNodeTokenomicsConfig,
   getOperatorWalletConfig,
   getPaymentConfig,
   getScopeId,
+  getStewardWalletConfig,
 } from "@/shared/config";
+import { nodes } from "@/shared/db/nodes";
 import { serverEnv } from "@/shared/env/server-env";
+import { envForApex } from "@/shared/node-registry/deploy-hosts";
+import { baseDomain } from "@/shared/node-registry/resolve";
 import { makeLogger } from "@/shared/observability";
 import { USDC_TOKEN_ADDRESS } from "@/shared/web3";
 import type { EvmOnchainClient } from "@/shared/web3/onchain/evm-onchain-client.interface";
@@ -203,6 +267,8 @@ export interface Container {
   evmOnchainClient: EvmOnchainClient;
   /** True when repo-spec has payments_in config (receiving address + chain). False for nodes pending activation. */
   paymentRailsActive: boolean;
+  /** Fail-closed guard for live payment rail activation before issuing payment intents. */
+  paymentRailGuard: PaymentRailGuardPort;
   metricsQuery: MetricsQueryPort;
   treasuryReadPort: TreasuryReadPort;
   /** AI telemetry DB writer - always wired */
@@ -219,12 +285,29 @@ export interface Container {
   scheduleManager: ScheduleUserPort;
   /** Metrics capability for AI tools - requires PROMETHEUS_URL to be configured */
   metricsCapability: MetricsCapability;
+  /** Compute-substrate balance reads (story.5011) — stub (empty) until CHERRY_AUTH_TOKEN is on the runtime */
+  computeCapability: ComputeResourcePort;
+  /** Read-only paid-lease surface (story.5039) — undefined until AKASH_ACTUATOR_ACCOUNT_ID is pinned on the runtime */
+  leaseReadCapability: LeaseReadCapability | undefined;
+  /**
+   * Akash spend view from the actuator's OWN cost ledger (task.5138): per-node transferred
+   * totals + active rates — "cost rows follow the writer", so the app reads its Postgres,
+   * never a Console credential. Undefined until AKASH_ACTUATOR_ACCOUNT_ID is pinned.
+   */
+  akashSpendReader:
+    | {
+        accountId: string;
+        reportByNode(): Promise<readonly ComputeCostReport[]>;
+      }
+    | undefined;
   /** Web search capability for AI tools - requires TAVILY_API_KEY to be configured */
   webSearchCapability: WebSearchCapability;
   /** Repo capability for AI tools - requires COGNI_REPO_PATH */
   repoCapability: RepoCapability;
   /** VCS capability for GitHub operations - requires GH_REVIEW_APP_ID */
   vcsCapability: VcsCapability;
+  /** Read-only deploy capability (SEE flow) — undefined when no base domain is configured */
+  deployCapability: DeployCapability | undefined;
   /** Tool source with real implementations for AI tool execution */
   toolSource: ToolSourcePort;
   /** External-agent knowledge contribution service — undefined when DOLTGRES_URL is unset */
@@ -251,16 +334,26 @@ export interface Container {
   nodeStream: NodeStreamPort | undefined;
   /** Webhook source registrations — normalizers for webhook ingestion */
   webhookRegistrations: ReadonlyMap<string, DataSourceRegistration>;
+  /**
+   * HTTP delivery of attribution receipts to a FOREIGN owning node's own ledger
+   * (operator-as-gateway; #1924 routing). The operator's OWN repos never route here.
+   */
+  receiptDelivery: ReceiptDelivery;
+  /**
+   * HTTP read of a FOREIGN owning node's own ledger epochs (operator-as-gateway read twin of
+   * `receiptDelivery`; bug.5008). The operator's OWN node reads its local store, never here.
+   */
+  epochsRead: EpochsRead;
   /** Financial ledger — undefined when TIGERBEETLE_ADDRESS not set */
   financialLedger: FinancialLedgerPort | undefined;
   /** Operator wallet — undefined when PRIVY_APP_ID not set */
   operatorWallet: OperatorWalletPort | undefined;
   /** Treasury settlement — undefined when operator wallet not configured */
   treasurySettlement: TreasurySettlementPort | undefined;
-  /** Provider funding — undefined when OPENROUTER_API_KEY not set */
-  providerFunding: ProviderFundingPort | undefined;
   /** Connection broker — undefined when CONNECTIONS_ENCRYPTION_KEY not set */
   connectionBroker: ConnectionBrokerPort | undefined;
+  /** Authorization port — undefined until OpenFGA env is configured */
+  authorization: AuthorizationPort | undefined;
   /** Model catalog — aggregates all providers for model listing */
   modelCatalog: ModelCatalogPort;
   /** Provider resolver — resolves providerKey to ModelProviderPort for runtime dispatch */
@@ -303,6 +396,17 @@ let _workflowClientPromise: Promise<{
 export function getContainer(): Container {
   if (!_container) {
     _container = createContainer();
+    // Project merged catalog intent into THIS environment's Postgres + OpenFGA.
+    // Detached and single-writer guarded; a periodic App-read heals missed push triggers. Only
+    // start governance sync after the first successful projection: its routable-node set is a
+    // consumer of this registry and must never race stale environment/activity authority.
+    void startCatalogRegistryReconcileOnBoot().then(() => {
+      // First container init (e.g. the readyz probe) is the earliest in-bootstrap seam
+      // to self-activate this deploy's governance schedules from repo-spec
+      // (SELF_RECONCILE_ON_BOOT) — instrumentation.ts cannot import bootstrap. Detached,
+      // fire-once, retry-until-Temporal-ready; never blocks the caller.
+      startGovernanceSyncOnBoot();
+    });
   }
   return _container;
 }
@@ -574,6 +678,26 @@ function createContainer(): Container {
   // MetricsCapability for AI tools (requires PROMETHEUS_URL)
   const metricsCapability = createMetricsCapability(env);
 
+  // ComputeResourcePort balance reads (requires CHERRY_AUTH_TOKEN; empty stub otherwise)
+  const computeCapability = createComputeCapability(env);
+
+  // Read-only paid-lease surface (story.5039): the allocation-ledger read scoped to the
+  // actuator wallet's PUBLIC account pin — pure ledger read, no Console credential
+  // (ONE_CONSOLE_KEY_PER_ACCOUNT, task.5138). Undefined until AKASH_ACTUATOR_ACCOUNT_ID
+  // reaches the app runtime.
+  const leaseReadCapability = createLeaseReadCapability(
+    env,
+    async () => serviceDb
+  );
+  const akashActuatorAccountId = env.AKASH_ACTUATOR_ACCOUNT_ID?.trim();
+  const akashSpendReader = akashActuatorAccountId
+    ? {
+        accountId: akashActuatorAccountId,
+        reportByNode: () =>
+          new DrizzleComputeCostStore(async () => serviceDb).reportByNode(),
+      }
+    : undefined;
+
   // WebSearchCapability for AI tools (requires TAVILY_API_KEY)
   const webSearchCapability = createWebSearchCapability(env);
 
@@ -608,6 +732,9 @@ function createContainer(): Container {
   // VcsCapability for AI tools (requires GH_REVIEW_APP_ID)
   const vcsCapability = createVcsCapability(env);
 
+  // DeployCapability (read-only SEE flow) — probe-backed v0; undefined when no base domain.
+  const deployCapability = createDeployCapability(env);
+
   // KnowledgeCapability + EdoCapability for AI tools (require DOLTGRES_URL)
   let knowledgeCapability: KnowledgeCapability;
   let edoCapability: EdoCapability;
@@ -631,14 +758,12 @@ function createContainer(): Container {
     const contributionPort = new DoltgresKnowledgeContributionAdapter({
       sql: doltClient,
     });
-    // Optional post-merge mirror to DoltHub (task.5069). Disabled when
-    // DOLTHUB_REMOTE_URL is unset. Gate-by-secret-presence follows the
-    // established pattern (Langfuse, Privy, PostHog) — DOLTHUB_REMOTE_URL
-    // is only granted to the production GitHub Environment Secret scope, so
-    // candidate-a/preview boot with the hook undefined and never push. v0
-    // invariant: prod is the only writer. Bootstrap: see
-    // docs/runbooks/dolthub-remote-bootstrap.md.
-    const remoteUrl = env.DOLTHUB_REMOTE_URL;
+    const remoteUrl = resolveNodeKnowledgeRemoteUrl({
+      slug: getNodeName(),
+      owner: env.DOLTHUB_OWNER,
+      override: env.KNOWLEDGE_DOLTHUB_REMOTE_URL,
+      repoSpec: getKnowledgeConfig(),
+    });
     const pushMainOnMerge = remoteUrl
       ? wrapPushSafe(
           createDoltgresPusher({
@@ -666,7 +791,7 @@ function createContainer(): Container {
       ...(pushMainOnMerge ? { pushMainOnMerge } : {}),
     });
     log.info(
-      { dolthubMirror: Boolean(env.DOLTHUB_REMOTE_URL) },
+      { dolthubMirror: Boolean(remoteUrl) },
       "Knowledge store + EDO capability configured (Doltgres)"
     );
   } else {
@@ -718,7 +843,8 @@ function createContainer(): Container {
     vcsCapability,
     workItemCapability,
   });
-  const toolSource = createBoundToolSource([...CORE_TOOL_BUNDLE], toolBindings);
+  const operatorToolBundle = [...CORE_TOOL_BUNDLE, ...VCS_TOOL_BUNDLE];
+  const toolSource = createBoundToolSource(operatorToolBundle, toolBindings);
 
   // Config: rethrow in dev/test for diagnosis, respond_500 in production for safety
   const config: ContainerConfig = {
@@ -755,7 +881,7 @@ function createContainer(): Container {
         const treasuryAddress = getDaoTreasuryAddress();
         if (!treasuryAddress) {
           log.warn(
-            "operator_wallet configured but cogni_dao.dao_contract missing — skipping operator wallet"
+            "operator_wallet configured but governance.dao_contract missing — skipping operator wallet"
           );
           return undefined;
         }
@@ -772,6 +898,9 @@ function createContainer(): Container {
           );
           return undefined;
         }
+        // Steward wallet is optional — when payments_out is absent the adapter
+        // fails closed on withdrawToSteward but inbound/distribute still work.
+        const stewardWalletConfig = getStewardWalletConfig();
         return new PrivyOperatorWalletAdapter({
           appId: env.PRIVY_APP_ID,
           appSecret: env.PRIVY_APP_SECRET,
@@ -779,36 +908,66 @@ function createContainer(): Container {
           expectedAddress: operatorWalletConfig.address,
           splitAddress: paymentConfig.receivingAddress,
           treasuryAddress,
-          markupPpm: numberToPpm(env.USER_PRICE_MARKUP_FACTOR),
-          revenueSharePpm: numberToPpm(env.SYSTEM_TENANT_REVENUE_SHARE),
+          markupPpm: numberToPpm(paymentConfig.markupFactor),
+          revenueSharePpm: numberToPpm(paymentConfig.revenueShare),
           maxTopUpUsd: env.OPERATOR_MAX_TOPUP_USD,
           rpcUrl: env.EVM_RPC_URL,
+          ...(stewardWalletConfig
+            ? { stewardAddress: stewardWalletConfig.address }
+            : {}),
         });
       })();
 
-  // ProviderFunding: optional — only when OPENROUTER_API_KEY is configured + operator wallet available
-  // Per MARGIN_PRESERVED: fail fast if pricing constants don't preserve positive margin
-  const providerFunding: ProviderFundingPort | undefined = (() => {
-    if (!env.OPENROUTER_API_KEY || !operatorWallet) return undefined;
-
-    // MARGIN_PRESERVED: markup × (1 - fee) must be > 1 + revenueShare
-    const effectiveMarkup =
-      env.USER_PRICE_MARKUP_FACTOR * (1 - env.OPENROUTER_CRYPTO_FEE);
-    if (effectiveMarkup <= 1 + env.SYSTEM_TENANT_REVENUE_SHARE) {
-      throw new Error(
-        `MARGIN_PRESERVED violation: markup(${env.USER_PRICE_MARKUP_FACTOR}) × (1 - fee(${env.OPENROUTER_CRYPTO_FEE})) ` +
-          `must be > 1 + revenueShare(${env.SYSTEM_TENANT_REVENUE_SHARE}). ` +
-          "DAO would lose money on every purchase."
-      );
+  const paymentRailGuard: PaymentRailGuardPort = (() => {
+    if (env.isTestMode) {
+      return { assertReady: async () => undefined };
     }
 
-    return new OpenRouterFundingAdapter(
-      getServiceDb(),
-      operatorWallet,
-      { apiKey: env.OPENROUTER_API_KEY },
-      log.child({ component: "OpenRouterFundingAdapter" })
-    );
+    const paymentConfig = getPaymentConfig();
+    if (!paymentConfig) {
+      return {
+        assertReady: async () => {
+          throw new PaymentRailMisconfiguredPortError(
+            "PAYMENT_RAIL_UNCONFIGURED",
+            "Payment rails not activated. Run `pnpm node:activate-payments` first."
+          );
+        },
+      };
+    }
+
+    if (!operatorWalletConfig) {
+      return {
+        assertReady: async () => {
+          throw new PaymentRailMisconfiguredPortError(
+            "PAYMENT_RAIL_UNCONFIGURED",
+            "Payment rails misconfigured: operator_wallet missing from repo-spec"
+          );
+        },
+      };
+    }
+
+    const treasuryAddress = getDaoTreasuryAddress();
+    if (!treasuryAddress) {
+      return {
+        assertReady: async () => {
+          throw new PaymentRailMisconfiguredPortError(
+            "PAYMENT_RAIL_UNCONFIGURED",
+            "Payment rails misconfigured: governance.dao_contract missing from repo-spec"
+          );
+        },
+      };
+    }
+
+    return new SplitPaymentRailGuardAdapter(evmOnchainClient, {
+      operatorAddress: operatorWalletConfig.address,
+      treasuryAddress,
+    });
   })();
+
+  // ProviderFunding (OpenRouter/Coinbase top-up) was retired — OpenRouter 410'd
+  // programmatic crypto top-up. Outbound vendor funding now flows through the
+  // operator wallet's withdrawToSteward + a manual human checkout. The post-credit
+  // chain here is now just inbound credit + Split distribute (treasurySettlement below).
 
   // Connection broker — BYO-AI credential resolution
   // Undefined when CONNECTIONS_ENCRYPTION_KEY not set
@@ -829,6 +988,22 @@ function createContainer(): Container {
     });
   })();
 
+  const authorization: AuthorizationPort | undefined =
+    env.OPENFGA_API_URL && env.OPENFGA_STORE_ID
+      ? new OpenFgaAuthorizationAdapter({
+          apiUrl: env.OPENFGA_API_URL,
+          storeId: env.OPENFGA_STORE_ID,
+          timeoutMs: env.OPENFGA_TIMEOUT_MS,
+          writeMaxRetries: env.OPENFGA_WRITE_MAX_RETRIES,
+          ...(env.OPENFGA_API_TOKEN !== undefined
+            ? { apiToken: env.OPENFGA_API_TOKEN }
+            : {}),
+          ...(env.OPENFGA_AUTHORIZATION_MODEL_ID !== undefined
+            ? { authorizationModelId: env.OPENFGA_AUTHORIZATION_MODEL_ID }
+            : {}),
+        })
+      : undefined;
+
   // Redis client for run event streaming (ephemeral stream plane)
   // Per REDIS_IS_STREAM_PLANE: only transient data, no durable state
   const redisClient = new Redis(env.REDIS_URL, {
@@ -837,6 +1012,39 @@ function createContainer(): Container {
   });
   const runStream = new RedisRunStreamAdapter(redisClient);
   const nodeStream = new RedisNodeStreamAdapter(redisClient);
+
+  // PLACEMENT_DECIDES_THE_ADDRESS (bug.5106): both operator→node internal clients resolve a node's
+  // base URL from the placement that node DECLARED in its catalog row and the reconcile job
+  // projected into `nodes.deployment_providers` — in-cluster Service DNS for a k3s node, the public
+  // host for one placed on decentralized compute. ENV_SCOPED_VIEW: this operator dials its OWN
+  // env's addresses, derived from the apex it serves (same accessor the liveness rollup uses).
+  const nodeApex = baseDomain(env);
+  const nodeAddress = createNodeAddressResolver({
+    loadPlacement: (slug) =>
+      createDrizzleNodePlacementLookup(resolveServiceDb())(slug),
+    // No apex (local dev / tests) ⇒ no public addressing exists at all, so every node resolves
+    // through the k3s branch, which ignores `environment`. `envForApex` stays the one total
+    // apex→env function; an akash-placed node with no domain fails loud rather than guessing.
+    environment: envForApex(nodeApex ?? ""),
+    apexDomain: nodeApex,
+  });
+
+  // Attribution operator-gateway: the catalog/profile resolver supplies the authoritative nodeId +
+  // slug pair; delivery resolves that slug's ADDRESS through the placement-aware seam above.
+  const receiptDelivery = createHttpReceiptDelivery({
+    schedulerApiToken: env.SCHEDULER_API_TOKEN,
+    nodeAddress,
+    logger: log.child({ component: "http-receipt-delivery" }),
+  });
+
+  // Attribution operator-gateway READ twin: HTTP read of a FOREIGN owning node's own epochs
+  // (bug.5008). Same resolution + auth as receipt delivery; the operator holds no cross-node DB
+  // creds, so it derives foreign epoch aggregates over the node's internal HTTP API.
+  const epochsRead = createHttpEpochsRead({
+    schedulerApiToken: env.SCHEDULER_API_TOKEN,
+    nodeAddress,
+    logger: log.child({ component: "http-epochs-read" }),
+  });
 
   // Process health publisher (node-local metrics only — external sources use Temporal)
   const publisherAbort = new AbortController();
@@ -864,6 +1072,7 @@ function createContainer(): Container {
     onChainVerifier,
     evmOnchainClient,
     paymentRailsActive: !!getPaymentConfig(),
+    paymentRailGuard,
     metricsQuery,
     treasuryReadPort,
     aiTelemetry,
@@ -876,9 +1085,13 @@ function createContainer(): Container {
     graphRunRepository,
     scheduleManager,
     metricsCapability,
+    computeCapability,
+    leaseReadCapability,
+    akashSpendReader,
     webSearchCapability,
     repoCapability,
     vcsCapability,
+    deployCapability,
     toolSource,
     knowledgeContributionService,
     knowledgeStorePort,
@@ -898,13 +1111,15 @@ function createContainer(): Container {
     get webhookRegistrations() {
       return getWebhookRegistrations();
     },
+    receiptDelivery,
+    epochsRead,
     financialLedger,
     operatorWallet,
     treasurySettlement: operatorWallet
       ? new SplitTreasurySettlementAdapter(operatorWallet, USDC_TOKEN_ADDRESS)
       : undefined,
-    providerFunding,
     connectionBroker,
+    authorization,
     // Multi-provider model ports
     ...(() => {
       const platformProvider = new PlatformModelProvider(llmService);
@@ -989,4 +1204,216 @@ export function resolveAppDb(): Database {
  */
 export function resolveServiceDb(): Database {
   return getServiceDb();
+}
+
+/**
+ * Module-singleton cached liveness+identity accessor for the public gallery. Built once (not per request)
+ * so the short-TTL single-flight cache is shared across all homepage renders — concurrent/repeat
+ * callers share one refresh and NEVER probe the network inline. `undefined` when no base domain is
+ * configured, in which case the gallery skips the liveness+identity enrichment rather than blanking.
+ */
+let cachedLivenessAccessor:
+  | ReturnType<typeof createLivenessAccessor>
+  | undefined;
+let livenessAccessorBuilt = false;
+
+function getLivenessAccessor(): ReturnType<typeof createLivenessAccessor> {
+  if (!livenessAccessorBuilt) {
+    cachedLivenessAccessor = createLivenessAccessor(serverEnv());
+    livenessAccessorBuilt = true;
+  }
+  return cachedLivenessAccessor;
+}
+
+/**
+ * Resolve the public node registry: the SELF-DESCRIBED gallery. The candidate roster (operator's bundled
+ * catalog nodes + the DB wizard projection, `status='active'`) is ENRICHED from a CACHED per-slug probe
+ * that reads each node's liveness (`/readyz`) AND self-described identity (`/.well-known/agent.json`). So
+ * the gallery shows the full roster, each card's title/tagline/thumbnail/color coming from the node's OWN
+ * repo-spec projection (zero operator-side identity literals) plus an honest live/down health badge.
+ * Service-role (non-RLS) DB read; both the DB adapter and the enrichment degrade gracefully so the
+ * homepage never breaks on a transient infra blip.
+ */
+export function resolveNodeRegistry(): NodeRegistryPort {
+  const domain = baseDomain(serverEnv());
+  const log = makeLogger({ service: "cogni-template", nodeId: getNodeId() });
+  const inner = new CompositeNodeRegistryAdapter([
+    new StaticNodeRegistryAdapter(NETWORK_NODES, domain),
+    new DbNodeRegistryAdapter({
+      listListedNodes: async () => {
+        try {
+          const rows = await resolveServiceDb()
+            .select({
+              id: nodes.id,
+              slug: nodes.slug,
+              repoOwner: nodes.repoOwner,
+              repoName: nodes.repoName,
+              repoUrl: nodes.repoUrl,
+            })
+            .from(nodes)
+            .where(eq(nodes.status, "active"));
+          return rows;
+        } catch (err) {
+          // Don't let a projection-read failure blank the homepage silently.
+          log.warn({ err }, "node_registry_projection_read_failed");
+          return [];
+        }
+      },
+      domain,
+    }),
+  ]);
+
+  const getLiveness = getLivenessAccessor();
+  if (!getLiveness) return inner; // No base domain ⇒ no liveness/identity enrichment (dev/local).
+
+  return new LiveNodeRegistryAdapter({ inner, getLiveness });
+}
+
+/**
+ * Statuses a node must be in to route git-attribution webhooks: a node dev's node is `published`
+ * (repo-spec + catalog exist) well before it is promoted to `active`, and both should attribute
+ * receipts from their declared repos. Narrower than the gallery's `active`-only projection.
+ */
+const ROUTABLE_NODE_STATUSES = ["published", "active"] as const;
+
+/**
+ * List every node eligible for git-attribution routing — service-role (non-RLS) read of `{id, slug}`
+ * for nodes in `('published','active')`. Sibling to the gallery's `listListedNodes` (active-only);
+ * kept separate because routing must include pre-activation `published` nodes.
+ */
+async function listRoutableNodes(): Promise<{ id: string; slug: string }[]> {
+  return resolveServiceDb()
+    .select({ id: nodes.id, slug: nodes.slug })
+    .from(nodes)
+    .where(inArray(nodes.status, [...ROUTABLE_NODE_STATUSES]));
+}
+
+/**
+ * Module-singleton attribution-profile resolver. The short-TTL index App-reads merged `main`
+ * catalog intent rather than the operator image's APP_BUILD_SHA: a standard node spawn adds a
+ * catalog row without rebuilding the operator image. Local `deploy_envs` + `activity_env` select
+ * this environment's authority before each selected node's own repo-spec supplies source_refs.
+ */
+let cachedAttributionProfileResolver: AttributionProfileResolver | undefined;
+
+export function resolveAttributionProfileResolver(): AttributionProfileResolver {
+  if (cachedAttributionProfileResolver) return cachedAttributionProfileResolver;
+  const env = serverEnv();
+  const plane = createOperatorDeployPlane(env);
+  // The env-scoped deployment parent (Cogni-DAO/cogni in prod; cogni-test-org/cogni-monorepo in test).
+  const parentOwner = env.NODE_SUBMODULE_PARENT_OWNER ?? "";
+  const parentRepo = env.NODE_SUBMODULE_PARENT_REPO ?? "";
+
+  cachedAttributionProfileResolver = createAttributionProfileResolver({
+    listRoutingNodes: async () =>
+      selectLocalAttributionNodes(
+        await plane.listCatalogNodes({
+          parentOwner,
+          parentRepo,
+          sourceRef: "main",
+        }),
+        env.DEPLOY_ENVIRONMENT ?? ""
+      ),
+    // In-repo node → `nodes/<slug>/.cogni/repo-spec.yaml` under the parent monorepo;
+    // fork → `.cogni/repo-spec.yaml` at the fork root. Mirrors prepareNodeRefCandidateFlight.
+    fetchRepoSpecText: ({ owner, repo, isInRepo, slug }) =>
+      plane.fetchFileText({
+        owner,
+        repo,
+        path: isInRepo
+          ? `nodes/${slug}/.cogni/repo-spec.yaml`
+          : ".cogni/repo-spec.yaml",
+        ref: "main",
+      }),
+    parentOwner,
+    parentRepo,
+  });
+  return cachedAttributionProfileResolver;
+}
+
+/**
+ * Module-singleton per-node distribution-config resolver (R3 finalize-fold seam, bug.5020).
+ * Same deploy-plane fetch deps as the attribution-profile resolver — App-read of
+ * `infra/catalog/<slug>.yaml` + the node's own repo-spec at git HEAD — but extracting the
+ * DISTRIBUTION config (token / emissions holder / distributor / chain) instead of source-refs.
+ * Consumed by /api/internal/attribution/distribution-config (worker-facing gateway).
+ */
+let cachedNodeDistributionConfigResolver:
+  | NodeDistributionConfigResolver
+  | undefined;
+
+export function resolveNodeDistributionConfigResolver(): NodeDistributionConfigResolver {
+  if (cachedNodeDistributionConfigResolver)
+    return cachedNodeDistributionConfigResolver;
+  const env = serverEnv();
+  const plane = createOperatorDeployPlane(env);
+  const parentOwner = env.NODE_SUBMODULE_PARENT_OWNER ?? "";
+  const parentRepo = env.NODE_SUBMODULE_PARENT_REPO ?? "";
+
+  cachedNodeDistributionConfigResolver = createNodeDistributionConfigResolver({
+    listRoutableNodes,
+    resolveNodeRepo: (slug) =>
+      plane.resolveNodeRepo({ parentOwner, parentRepo, slug }),
+    fetchRepoSpecText: ({ owner, repo, isInRepo, slug }) =>
+      plane.fetchFileText({
+        owner,
+        repo,
+        path: isInRepo
+          ? `nodes/${slug}/.cogni/repo-spec.yaml`
+          : ".cogni/repo-spec.yaml",
+        ref: "main",
+      }),
+    parentOwner,
+    parentRepo,
+  });
+  return cachedNodeDistributionConfigResolver;
+}
+
+/**
+ * Assemble deps for IN-PROCESS epoch finalization (story.5007 — finalize-in-process).
+ * The operator app runs `runFinalizeEpoch` synchronously in its own finalize route on its
+ * OWN service DB + repo-spec, retiring the Temporal FinalizeEpochWorkflow round-trip (no
+ * ledger-tasks queue, no cross-scope theft). All adapter/registry wiring lives here — the
+ * route boundary forbids adapter imports.
+ *
+ * - `attributionStore` = service DB (BYPASSRLS) scoped adapter, identical to the container's.
+ * - `walletResolver` built only when a token is configured; else the R3 fold no-ops.
+ * - `distributionConfigClient` = the in-process per-node resolver (bug.5020). For the
+ *   operator's OWN node it reads the operator's own repo-spec — authoritative, so the fold
+ *   never bakes a foreign governance identity. A transient read → runFinalizeEpoch falls
+ *   back to the baked tokenomics below (own node only).
+ */
+function buildFinalizeEpochDeps(logger: FinalizeLogger): RunFinalizeEpochDeps {
+  const serviceDb = getServiceDb();
+  const tokenomics = getNodeTokenomicsConfig();
+  const { excludedLogins, sourceRefs } = getLedgerSelectionConfig();
+  return {
+    attributionStore: new DrizzleAttributionAdapter(serviceDb, getScopeId()),
+    registries: createDefaultRegistries({ excludedLogins, sourceRefs }),
+    nodeId: getNodeId(),
+    scopeId: getScopeId(),
+    chainId: tokenomics.chainId,
+    tokenAddress: tokenomics.tokenAddress,
+    distributorAddress: tokenomics.distributorAddress,
+    emissionsHolderAddress: getEmissionsHolderAddress(),
+    walletResolver: tokenomics.tokenAddress
+      ? new DrizzleClaimantWalletResolver(serviceDb)
+      : null,
+    distributionConfigClient: resolveNodeDistributionConfigResolver(),
+    deploymentEnvironment: serverEnv().DEPLOY_ENVIRONMENT,
+    logger,
+  };
+}
+
+/**
+ * Run epoch finalization IN-PROCESS (story.5007). Thin composition-root wrapper the
+ * finalize route calls instead of dispatching a Temporal FinalizeEpochWorkflow — keeps
+ * the route free of adapter/package wiring (route boundary). Idempotent: a re-POST
+ * repairs; the fold FREEZE (bug.5022) preserves a published manifest.
+ */
+export async function finalizeEpochInProcess(
+  input: FinalizeEpochInput,
+  logger: FinalizeLogger
+): Promise<FinalizeEpochOutput> {
+  return runFinalizeEpoch(buildFinalizeEpochDeps(logger), input);
 }

@@ -19,17 +19,27 @@ You are the expert on Cogni's GitHub App integration, VCS tool layer, and candid
 flight pipeline. Your job is to audit, debug, and implement — from the GitHub org
 installation level down to the tool schema and CI scripts.
 
+> **Boundary first.** Read [CI/CD Platform Boundary & Freeze Policy](../../../docs/spec/cicd-platform-boundary.md) before adding deploy/flight behavior. The operator deploy brain in `scripts/ci/*.sh` + `.github/workflows/*.yml` is **frozen** — new control logic routes to the substrate (catalog/overlay/Argo/ESO) or into the typed `.ts` operator control plane. `DeployCapability` (`packages/ai-tools/src/capabilities/deploy.ts`) is the **sibling of `VcsCapability`** — same `CAPABILITY_INJECTION`/`ADAPTER_SWAPPABLE` shape, adapter in `nodes/operator/app/src/adapters/server/`. v0 is read-only over live Argo state and reuses `dispatchCandidateFlight` for promotion (no second dispatch path; Argo stays the reconciler). When asked to add a flight/deploy feature, prefer a `DeployCapability` method over a new workflow input or a new `.sh`.
+
 ## GitHub Apps on Cogni-DAO Org
 
 **One App per environment** — each App has exactly one webhook URL, so prod/preview/candidate-a
 cannot share one. Create + wire per the canonical guide:
 [`docs/guides/github-app-webhook-setup.md`](../../../docs/guides/github-app-webhook-setup.md).
 
-| App                   | ID        | Install ID | env          | webhooks → / installed on                                      |
-| --------------------- | --------- | ---------- | ------------ | -------------------------------------------------------------- |
-| `cogni-node-template` | 3062001   | 115515535  | (vcs/flight) | org-wide; `actions:write` for `workflow_dispatch`              |
-| `cogni-git-review`    | 1761205   | 80293097   | production   | `cognidao.org/...webhooks/github` · `Cogni-DAO/cogni`          |
-| `cogni-operator-test` | (per-env) | —          | candidate-a  | `test.cognidao.org/...webhooks/github` · `Cogni-DAO/test-repo` |
+| App                        | ID      | Install ID | env              | webhooks → / installed on                                              |
+| -------------------------- | ------- | ---------- | ---------------- | ---------------------------------------------------------------------- |
+| `cogni-operator-test`      | 3956976 | 138046799  | candidate-a/test | `test.cognidao.org/...webhooks/github` · all repos on `cogni-test-org` |
+| `cogni-operator`           | 2994706 | 113665458  | production ops   | `cognidao.org/...webhooks/github` · all repos on `Cogni-DAO`           |
+| `cogni-node-template`      | 3062001 | 115515535  | legacy/vcs       | selected repos; use only if the env's `GH_REVIEW_APP_ID` is `3062001`  |
+| `cogni-git-review`         | 1761205 | 80293097   | production       | `cognidao.org/...webhooks/github` · `Cogni-DAO/cogni`                  |
+| `cogni-git-review-preview` | 2011345 | 87655574   | preview          | `preview.cognidao.org/...webhooks/github` · selected preview repos     |
+
+`Cogni-DAO/test-repo` is only a legacy review-webhook fixture. It is not
+sufficient for node publish/flight testing: the candidate/test App must see the
+template repo, parent pin repo, and freshly minted node repos in the disposable
+GitHub org (`cogni-test-org`) without gaining access to production `Cogni-DAO`
+repos. Pair this with `DOLTHUB_OWNER=cogni-test-nodes` for node knowledge repos.
 
 **Where the App creds live (post-ESO migration, #1460/#1476):** the running operator pod reads
 `GH_REVIEW_APP_ID` / `GH_REVIEW_APP_PRIVATE_KEY_BASE64` / `GH_WEBHOOK_SECRET` from **OpenBao**
@@ -52,12 +62,30 @@ env means setting all three planes' creds + matching the webhook secret on both 
 
 ```bash
 gh api "orgs/Cogni-DAO/installations?per_page=20" | \
-  jq '.installations[] | select(.app_id == 3062001) | {app_slug, permissions}'
+  jq '.installations[] | select(.app_id == 2994706) | {app_slug, id, repository_selection, permissions}'
+
+gh api "orgs/cogni-test-org/installations?per_page=20" | \
+  jq '.installations[] | select(.app_id == 3956976) | {app_slug, id, repository_selection, permissions}'
 ```
 
-`actions:write` is required for `workflow_dispatch`. If the installation shows `actions:read`,
-the org admin must approve the pending permission upgrade at:
-`github.com/organizations/Cogni-DAO/settings/installations/115515535`
+Operator mint/flight Apps require `actions:write`, `administration:write`, `contents:write`,
+`workflows:write`, and `packages:write`. Package write reserves operator authority for future
+package policy/visibility management; node-ref flight must not treat GitHub Packages metadata reads
+as the deploy gate because private package metadata can false-negative even when the child image
+exists. Do not add a PAT to child node repos for publishing: child workflows publish with their
+repo-local `GITHUB_TOKEN` and `permissions.packages: write`. Parent candidate-flight and k3s image
+pulls are separate cross-repo read paths and still need either public packages, package Actions
+access grants, or the existing `GHCR_DEPLOY_TOKEN`/registry credential path with `read:packages`.
+If the installation lacks a newly requested permission, the org admin must approve the pending
+permission upgrade at the installation URL:
+
+```text
+https://github.com/organizations/cogni-test-org/settings/installations/138046799
+https://github.com/organizations/Cogni-DAO/settings/installations/113665458
+```
+
+The legacy `cogni-node-template` installation approval URL is
+`https://github.com/organizations/Cogni-DAO/settings/installations/115515535`.
 
 **Common gotcha**: the GitHub App _definition_ can request `actions:write` while the org
 _installation_ still shows `read` — they diverge when the org hasn't accepted the expanded
@@ -78,7 +106,7 @@ nodes/operator/app/src/bootstrap/ai/
   tool-bindings.ts                                 ← wires VcsCapability into tool implementations
 ```
 
-**Only the operator node has a real VcsCapability.** All other nodes (`poly`, `resy`,
+**Only the operator node has a real VcsCapability.** All other nodes (
 `node-template`) export `stubVcsCapability` — it satisfies the binding requirement but throws
 on use: `"VcsCapability not configured on this node."` This is intentional — VCS operations
 live on the operator node.
@@ -224,16 +252,16 @@ gh api "repos/Cogni-DAO/standalone-node/contents/infra/control/candidate-lease.j
 
 ## Per-App Slot Isolation (Planned)
 
-**Current**: one global `candidate-lease.json` — all apps share a single slot. A poly-only
+**Current**: one global `candidate-lease.json` — all apps share a single slot. A single-node
 PR blocks operator and vice versa.
 
-**Goal**: per-app leases so `poly` and `operator` can fly concurrently.
+**Goal**: per-app leases so any two nodes can fly concurrently.
 
 Design:
 
 - Replace single `infra/control/candidate-lease.json` with per-app files:
   `infra/control/candidate-lease-{app}.json`
-- `promote-build-payload.sh` already emits `promoted_apps` (e.g., `"poly"` for poly-only PRs)
+- `promote-build-payload.sh` already emits `promoted_apps` (the affected node subset for that PR)
 - `acquire-candidate-slot.sh` takes `APP_NAMES` env, acquires lock per promoted app
 - A PR is blocked only if any of _its_ promoted apps are currently leased by another flight
 - `release-candidate-slot.sh` releases only the apps that were acquired
@@ -268,8 +296,8 @@ When a flight fails or dispatch errors, work through this in order:
    a pod health or ingress routing issue on the candidate-a VM, not a code problem.
    Check: `curl -s https://test.cognidao.org/version`
 
-6. **`verify-buildsha` fails for resy** → resy SHA mismatch — resy images weren't promoted
-   in this flight (poly-only PR) but the verify script is checking resy anyway. This means
+6. **`verify-buildsha` fails for a node the PR never touched** → that node's images weren't
+   promoted in this flight, but the verify script is checking it anyway. This means
    `promoted_apps` output is wrong or the verify script isn't scoped correctly.
 
 7. **`wait-for-argocd` times out** → wrong `EXPECTED_SHA` passed (source SHA instead of

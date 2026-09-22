@@ -21,7 +21,7 @@
  */
 
 import type { SourceSystem, ToolSourcePort } from "@cogni/ai-core";
-import { CORE_TOOL_BUNDLE } from "@cogni/ai-tools";
+import { CORE_TOOL_BUNDLE, VCS_TOOL_BUNDLE } from "@cogni/ai-tools";
 import type {
   ExecutionContext,
   GraphFinal,
@@ -38,11 +38,11 @@ import {
 } from "@cogni/graph-execution-host";
 import type { UserId } from "@cogni/ids";
 import {
-  LANGGRAPH_CATALOG,
   loadMcpTools,
   McpToolSource,
   parseMcpConfigFromEnv,
 } from "@cogni/langgraph-graphs";
+import { LANGGRAPH_CATALOG } from "@cogni/operator-graphs";
 import { trace } from "@opentelemetry/api";
 import {
   type CompletionStreamFn,
@@ -168,6 +168,8 @@ export function createScopedGraphExecutor(params: {
       getTraceId: () =>
         trace.getActiveSpan()?.spanContext().traceId ??
         "00000000000000000000000000000000",
+      // Per LANGFUSE_NODE_ATTRIBUTION: stamp this node's identity on every trace.
+      nodeId: container.nodeId,
     },
     container.log,
     params.billing.billingAccountId
@@ -532,7 +534,8 @@ function createInProcProvider(
     inprocAdapter,
     container.toolSource,
     () => cache.getSource(),
-    [...CORE_TOOL_BUNDLE]
+    [...CORE_TOOL_BUNDLE, ...VCS_TOOL_BUNDLE],
+    container.authorization
   );
 }
 

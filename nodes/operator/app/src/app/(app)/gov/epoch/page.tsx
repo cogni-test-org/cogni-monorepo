@@ -4,10 +4,10 @@
 /**
  * Module: `@app/(app)/gov/epoch/page`
  * Purpose: Server entrypoint for the current epoch governance page.
- * Scope: Server component only; delegates all client behavior to CurrentEpochView. Does not perform data fetching.
- * Invariants: Auth enforced by (app) layout guard.
- * Side-effects: none (server render only)
- * Links: src/features/governance/types.ts
+ * Scope: Read-only server entrypoint; delegates lifecycle rendering to CurrentEpochView.
+ * Invariants: Auth enforced by (app) layout guard. All epoch mutations live in /gov/review.
+ * Side-effects: none
+ * Links: src/features/governance/types.ts, docs/spec/tokenomics-distribution.md
  * @public
  */
 

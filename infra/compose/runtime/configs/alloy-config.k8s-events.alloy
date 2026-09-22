@@ -12,6 +12,15 @@ loki.source.kubernetes_events "events" {
   namespaces = [
     "argocd",
     "kube-system",
+    // bug.5011: the secret plane (OpenBao + ESO) was invisible to Loki, so the
+    // prod OpenBao OOMKill→reseal outage was silent. Watch these so an OpenBao
+    // OOMKilled/restart event reaches Loki and a sealed-state alert can fire.
+    "openbao",
+    "external-secrets",
+    // bug.5219: the Crossplane runtime (provider-http, functions) is the actuator's
+    // wire path; its events were invisible while a lease-create POST silently
+    // never arrived.
+    "crossplane-system",
     "cogni-candidate-a",
     "cogni-preview",
     "cogni-production",

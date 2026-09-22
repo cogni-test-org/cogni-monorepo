@@ -47,12 +47,15 @@ k8s/
 │   ├── kustomization.yaml   # Non-HA Argo CD v2.13.4 install
 │   ├── ksops-cmp.yaml       # SOPS CMP plugin for secret decryption
 │   ├── repo-server-patch.yaml # ksops sidecar
-│   └── <env>-<node>-applicationset.yaml # one AppSet per (env,node) → cogni-<env>-<node>
-│                              # rendered by scripts/ci/render-node-appset.sh (LANE_ISOLATION)
+│   ├── argocd-cm-runtime-patch.yaml # Cogni's argocd-cm keys as a MERGE-PATCH body (never a manifest)
+│   ├── appsets/<env>/       # generated one-AppSet-per-(env,node) desired state
+│   └── control-plane/<env>/ # env-scoped app-of-apps continuously reconciled by Argo
 ├── base/                    # Kustomize bases
+│   ├── akash-tx-actuator/   # Private ClusterIP Akash transaction actuator (Crossplane calls it)
+│   ├── akash-tx-actuator-service-name/ # Post-namePrefix transformer pinning that Service's name
 │   ├── node-app/            # Shared base for operator, poly, resy
-│   ├── scheduler-worker/    # Temporal worker service
-│   └── sandbox-openclaw/    # OpenClaw gateway service
+│   ├── openfga-external/    # Operator opt-in bridge to Compose OpenFGA
+│   └── scheduler-worker/    # Temporal worker service
 ├── overlays/                # Environment-specific patches
 │   ├── staging/{app}/       # Per-app staging overlays (image digests, NodePorts)
 │   └── production/{app}/    # Per-app production overlays
@@ -80,6 +83,8 @@ k8s/
 
 - Renamed from `infra/cd/` during CD pipeline restructure (see `docs/spec/cd-pipeline-e2e.md`)
 - Node overlays use `namePrefix: {name}-` — configmap DNS values must match prefixed service names
+- `akash-tx-actuator` has its OWN OpenBao bucket + ExternalSecret (`cogni/<env>/akash-tx-actuator` → `akash-tx-actuator-env-secrets`), NOT the operator's. The operator ExternalSecret extracts the whole operator bucket into the Secret the public app takes via `envFrom`, so an Akash wallet credential there is readable by the internet-facing process. Add actuator keys to the dedicated ExternalSecret, never to `overlays/<env>/operator/external-secret.yaml`
+- ONE documented exception to that prefix: `akash-tx-actuator`. The Crossplane Composition derives its URL from the namespace alone and cannot know a prefix, so each operator overlay lists `base/akash-tx-actuator-service-name` under `transformers:` (which run AFTER namePrefix) to restore the bare name
 - SOPS secrets use age encryption; private key injected at cluster bootstrap, not stored in repo
 - Argo CD install is pinned to v2.13.4 (non-HA) — update version deliberately
 - Update this file when **directory structure changes**

@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read # Signed env-manager classifier reads PR identity + exact file list
   actions: read # Required for CI telemetry to fetch job logs
   packages: read # Required for pulling migrator images from GHCR
 
@@ -28,8 +29,71 @@ env:
   TEMPORAL_TASK_QUEUE: scheduler-tasks
 
 jobs:
+  env_manager_fast_path:
+    name: env-manager-fast-path
+    runs-on: ubuntu-latest
+    outputs:
+      eligible: ${{ steps.classify.outputs.eligible }}
+      claimed: ${{ steps.classify.outputs.claimed }}
+      reason: ${{ steps.classify.outputs.reason }}
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          fetch-depth: 0
+
+      - id: classify
+        name: Verify signed env-manager change type
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER_PR: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA_PR: ${{ github.event.pull_request.head.sha }}
+          MQ_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          MQ_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MQ_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          classifier='scripts/ci/classify-env-manager-fast-path.sh'
+          if git cat-file -e "origin/main:$classifier" 2>/dev/null; then
+            # TRUSTED_CLASSIFIER: never let the PR execute the code that decides
+            # whether that same PR may skip heavy checks.
+            git show "origin/main:$classifier" | bash
+          elif [ "$(git diff --name-status origin/main...HEAD -- "$classifier")" = "$(printf 'A\t%s' "$classifier")" ]; then
+            # One-time bootstrap: this PR adds the classifier, so it MUST take
+            # full CI. Deletion/drift is not a bootstrap and fails above.
+            echo 'eligible=false' >> "$GITHUB_OUTPUT"
+            echo 'claimed=false' >> "$GITHUB_OUTPUT"
+            echo 'reason=classifier-bootstrap' >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::trusted env-manager classifier is missing from main"
+            exit 1
+          fi
+
+      # Tiny, deterministic proof for the one reserved generator type. These
+      # are the checks that can actually invalidate an env-manager tree; app
+      # typechecks, unit tests, component containers, and image builds cannot.
+      - name: Validate changed catalog
+        if: steps.classify.outputs.eligible == 'true'
+        run: |
+          pipx install 'check-jsonschema==0.37.1'
+          check-jsonschema --schemafile infra/catalog/_schema.json infra/catalog/*.yaml
+          bash scripts/ci/next-free-node-port.sh --check
+
+      - name: Verify generated deployment tree
+        if: steps.classify.outputs.eligible == 'true'
+        run: |
+          bash scripts/ci/render-scheduler-worker-endpoints.sh --check
+          bash scripts/ci/render-node-appset.sh --check
+          bash scripts/ci/render-node-overlays.sh --check
+
   # Fast gate: install → typecheck → lint
   static:
+    needs: env_manager_fast_path
+    # A skipped required job is satisfied by GitHub and by the operator's
+    # getCiStatus contract. Invalid/unavailable classifier results still run
+    # this job so the enforcement step fails closed.
+    if: always() && (needs.env_manager_fast_path.result != 'success' || needs.env_manager_fast_path.outputs.eligible != 'true')
     runs-on: ubuntu-latest
     env:
       NODE_ENV: test
@@ -45,23 +109,42 @@ jobs:
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
 
+      - name: Enforce env-manager classifier result
+        env:
+          CLASSIFIER_RESULT: ${{ needs.env_manager_fast_path.result }}
+          FAST_PATH_ELIGIBLE: ${{ needs.env_manager_fast_path.outputs.eligible }}
+          FAST_PATH_CLAIMED: ${{ needs.env_manager_fast_path.outputs.claimed }}
+          FAST_PATH_REASON: ${{ needs.env_manager_fast_path.outputs.reason }}
+        run: |
+          [ "$CLASSIFIER_RESULT" = success ] || { echo "::error::env-manager classifier failed"; exit 1; }
+          if [ "$FAST_PATH_CLAIMED" = true ] && [ "$FAST_PATH_ELIGIBLE" != true ]; then
+            echo "::error::invalid signed env-manager claim: $FAST_PATH_REASON"; exit 1
+          fi
+          [ "$FAST_PATH_ELIGIBLE" != true ] || echo "Signed env-manager fast path accepted"
+
       - uses: pnpm/action-setup@c5ba7f7862a0f64c1b1a05fbac13e0b8e86ba08c # v4
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
       - name: Install dependencies
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Build workspace packages
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm packages:build
 
       - name: Type check
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm typecheck
 
       - name: Lint
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm lint
 
       - name: CI Telemetry
@@ -100,8 +183,8 @@ jobs:
           list-files: json # exposes <filter>_files so we can inspect which paths matched
           # Required so the operator filter's `**` + `!nodes/<X>/**` negations
           # actually subtract. Default `some` quantifier OR's the rules, so
-          # `**` matches everything and the negations are dead — a resy-only PR
-          # would (incorrectly) classify as resy + operator. Per-node filters
+          # `**` matches everything and the negations are dead — a node-only PR
+          # would (incorrectly) classify as node + operator. Per-node filters
           # have a single rule each, so the quantifier is a no-op for them.
           predicate-quantifier: "every"
           # Filter block is CATALOG_IS_SSOT — generated from the nodes/* listing
@@ -110,24 +193,63 @@ jobs:
           # run `pnpm gen:scope-filters`. CI (`--check`, unit job) fails on drift.
           filters: |
             # >>> GENERATED scope-filters (scripts/ci/render-scope-filters.sh) — DO NOT EDIT BY HAND
+            anotha:
+              - 'nodes/anotha/**'
+            brother:
+              - 'nodes/brother/**'
             canary:
               - 'nodes/canary/**'
+            ghcr:
+              - 'nodes/ghcr/**'
+            node-template:
+              - 'nodes/node-template/**'
             resy:
               - 'nodes/resy/**'
+            scheduler-worker:
+              - 'nodes/scheduler-worker/**'
+            spawny-boi:
+              - 'nodes/spawny-boi/**'
+            test-cog:
+              - 'nodes/test-cog/**'
+            toks2:
+              - 'nodes/toks2/**'
+            yo:
+              - 'nodes/yo/**'
             operator:
               - '**'
+              - '!nodes/anotha/**'
+              - '!nodes/brother/**'
               - '!nodes/canary/**'
+              - '!nodes/ghcr/**'
+              - '!nodes/node-template/**'
               - '!nodes/resy/**'
+              - '!nodes/scheduler-worker/**'
+              - '!nodes/spawny-boi/**'
+              - '!nodes/test-cog/**'
+              - '!nodes/toks2/**'
+              - '!nodes/yo/**'
             # <<< GENERATED scope-filters
 
       # Intentionally inline — single-workflow gate, no logic duplicated across
       # workflows. SCRIPTS_ARE_THE_API targets cross-workflow drift, not unique
       # gate policy. See docs/spec/node-ci-cd-contract.md.
+      #
+      # ARG_MAX: dorny's matched-file JSON is spliced into a quoted heredoc at
+      # YAML-render time, NOT passed via `env:`. A whole-node-retirement diff
+      # (purge #1631, ~2200 deleted paths) overflows the execve arg+env limit
+      # when `operator_files` rides in `env:`, crashing the step with
+      # "Argument list too long" before bash even starts. Heredoc bodies are
+      # written to the script file on disk, so they don't count against ARG_MAX.
       - name: Enforce single-domain scope
-        env:
-          MATCHED: ${{ steps.domains.outputs.changes }}
-          OPERATOR_FILES: ${{ steps.domains.outputs.operator_files }}
         run: |
+          # MATCHED is small (domain-name array); OPERATOR_FILES can be MB.
+          MATCHED='${{ steps.domains.outputs.changes }}'
+          opf="$(mktemp)"
+          cat > "$opf" <<'COGNI_OPERATOR_FILES_EOF'
+          ${{ steps.domains.outputs.operator_files }}
+          COGNI_OPERATOR_FILES_EOF
+          OPERATOR_FILES="$(cat "$opf")"
+
           count=$(jq 'length' <<<"$MATCHED")
           SCOPE=$(jq -r 'if length == 0 then "none" else join(" + ") end' <<<"$MATCHED")
 
@@ -140,13 +262,39 @@ jobs:
             exit 0
           fi
 
-          # The single non-operator node (if exactly one), for the NODE_BIRTH
+          # NODE_RETIREMENT exemption: a deletion-only sweep across one-or-more
+          # fully-removed nodes is a sanctioned operator-domain retirement, not a
+          # cross-node feature change. A fully-deleted node drops out of the
+          # generated dorny filter (render-scope-filters.sh keys on the surviving
+          # nodes/* listing), so a pure retirement usually collapses to count<=1
+          # above; this branch is the first-class guard for the residual case
+          # where a still-filtered node is wholly removed in the same diff. PASS
+          # iff EVERY non-operator domain in S is a nodes/<node>/ tree with NO
+          # tracked file left on HEAD (whole-tree removal). A PR that edits a
+          # surviving node still fails — git ls-files returns its files.
+          NON_OPERATOR_DOMAINS=$(jq -r 'map(select(. != "operator")) | .[]' <<<"$MATCHED")
+          if [ -n "$NON_OPERATOR_DOMAINS" ]; then
+            all_retired=true
+            while IFS= read -r dom; do
+              [ -z "$dom" ] && continue
+              if git ls-files -- "nodes/${dom}" | grep -q .; then
+                all_retired=false; break
+              fi
+            done <<<"$NON_OPERATOR_DOMAINS"
+            if [ "$all_retired" = true ]; then
+              retired_csv=$(tr '\n' ',' <<<"$NON_OPERATOR_DOMAINS" | sed 's/,$//; s/,/, /g')
+              report "✅ scope: node retirement (deletion-only across fully-removed nodes: ${retired_csv})"
+              exit 0
+            fi
+          fi
+
+          # The single non-operator node (if exactly one), for the NODE_FORMATION
           # wiring carve-out below.
           NODE=$(jq -r 'map(select(. != "operator")) | if length == 1 then .[0] else "" end' <<<"$MATCHED")
 
           # Ride-along exception: |S|=2, operator ∈ S, and every operator-matched
           # path is in the whitelist OR is the node's OWN deploy wiring (bug.5086
-          # NODE_BIRTH — catalog/overlays/AppSet for the one node in S). Whitelist
+          # NODE_FORMATION — catalog/overlays/AppSet for the one node in S). Whitelist
           # + isNodeWiring must mirror classify.ts (parity by convention; the
           # parity spec covers the TS side only).
           if [ "$count" -eq 2 ] \
@@ -168,10 +316,43 @@ jobs:
                     or . == "infra/k8s/base/scheduler-worker/configmap.yaml"
                     or . == "infra/compose/edge/configs/Caddyfile.tmpl"
                     or test("^infra/k8s/overlays/[^/]+/" + $node + "/")
-                    or test("^infra/k8s/argocd/[^/]*applicationset[^/]*\\.ya?ml$")
+                    or test("^infra/k8s/argocd/appsets/[^/]+/[^/]*applicationset[^/]*\\.ya?ml$")
                   ))
              )' <<<"$OPERATOR_FILES" >/dev/null; then
             report "✅ scope: ${NODE} (+ operator ride-along)"
+            exit 0
+          fi
+
+          # Devtools exception: root app Vitest config is duplicated per node
+          # today, but changing that entrypoint for shared fast-check behavior
+          # is operator-owned tooling. Keep this bounded to exact root app
+          # config files plus the fast-check/Vitest policy surface.
+          # Non-operator files = full changed-files − operator-matched files
+          # (CATALOG_IS_SSOT — no hand-listed per-node `<slug>_files` env, which
+          # rotted to canary/resy refs after the purge).
+          chf="$(mktemp)"
+          git diff --name-only "$(git merge-base origin/main HEAD)" | jq -R . | jq -s . > "$chf"
+          NON_OPERATOR_FILES=$(jq -nc --slurpfile changed "$chf" --argjson op "$OPERATOR_FILES" '$changed[0] - $op')
+          if jq -e 'index("operator") != null' <<<"$MATCHED" >/dev/null \
+             && jq -e 'length > 0 and all(test("^nodes/[^/]+/app/vitest\\.config\\.mts$"))' <<<"$NON_OPERATOR_FILES" >/dev/null \
+             && jq -e 'all(
+               . == ".github/workflows/ci.yaml"
+               or . == "docs/guides/new-worktree-setup.md"
+               or . == "nodes/operator/app/vitest.config.mts"
+               or . == "packages/langgraph-graphs/vitest.config.ts"
+               or . == "packages/repo-spec/AGENTS.md"
+               or . == "packages/repo-spec/src/accessors.ts"
+               or . == "scripts/AGENTS.md"
+               or . == "scripts/check-fast.sh"
+               or . == "scripts/run-scoped-package-build.mjs"
+               or startswith("scripts/vitest/")
+               or . == "scripts/worktree-check.sh"
+               or . == "tests/ci-invariants/classify.ts"
+               or startswith("tests/ci-invariants/fixtures/single-node-scope/")
+               or . == "tests/ci-invariants/single-node-scope-meta.spec.ts"
+               or . == "vitest.config.mts"
+             )' <<<"$OPERATOR_FILES" >/dev/null; then
+            report "✅ scope: operator devtools (+ root app Vitest configs)"
             exit 0
           fi
 
@@ -179,9 +360,22 @@ jobs:
           echo "::error::PR spans $count node domains: ${SCOPE}. Each node owns its directory; operator owns nodes/operator + repo infra. Split into $count PRs, one per domain."
           exit 1
 
+  # bug.5150 — the live-fleet DEPLOY_REF_SOURCE_IS_REACHABLE_FROM_MAIN check moved OUT of
+  # per-PR CI to its own scheduled workflow (.github/workflows/deploy-ref-ancestry.yml).
+  # It is a fleet-state invariant, not a property of any PR's diff: running it per-PR bought
+  # zero incremental protection (drift comes from ref/main movement, not the diff) while
+  # painting a permanent unrelated red on every open PR — the exact "trained blindness" it
+  # exists to prevent. The hermetic UNIT proof stays here on PR CI (see the shell-tests job).
+
   unit:
+    needs: env_manager_fast_path
+    if: always() && (needs.env_manager_fast_path.result != 'success' || needs.env_manager_fast_path.outputs.eligible != 'true')
     runs-on: ubuntu-latest
-    needs: static
+    # No `needs: static` (task.5140): unit does its own install + packages:build
+    # and consumes NO artifact from static, so gating on it only serialized
+    # static's ~1m38s onto the critical path for a fail-fast the merge queue
+    # re-checks anyway. Running unit in parallel with static drops the ci.yaml
+    # critical path to max(job) instead of static+unit.
     env:
       NODE_ENV: test
       LITELLM_MASTER_KEY: build-key
@@ -201,43 +395,68 @@ jobs:
           # leaves origin/main unreachable and forces a runtime fetch.
           fetch-depth: 0
 
+      - name: Enforce env-manager classifier result
+        env:
+          CLASSIFIER_RESULT: ${{ needs.env_manager_fast_path.result }}
+          FAST_PATH_ELIGIBLE: ${{ needs.env_manager_fast_path.outputs.eligible }}
+          FAST_PATH_CLAIMED: ${{ needs.env_manager_fast_path.outputs.claimed }}
+          FAST_PATH_REASON: ${{ needs.env_manager_fast_path.outputs.reason }}
+        run: |
+          [ "$CLASSIFIER_RESULT" = success ] || { echo "::error::env-manager classifier failed"; exit 1; }
+          if [ "$FAST_PATH_CLAIMED" = true ] && [ "$FAST_PATH_ELIGIBLE" != true ]; then
+            echo "::error::invalid signed env-manager claim: $FAST_PATH_REASON"; exit 1
+          fi
+          [ "$FAST_PATH_ELIGIBLE" != true ] || echo "Signed env-manager fast path accepted"
+
       - uses: pnpm/action-setup@c5ba7f7862a0f64c1b1a05fbac13e0b8e86ba08c # v4
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
       - name: Install dependencies
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Build workspace packages
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm packages:build
 
       - name: Repository policy check
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm check:root-layout
 
       - name: REUSE SPDX compliance
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         uses: fsfe/reuse-action@772649cfa03a64a08c458c7cca9a6a473d74e7f9 # v6
 
       - name: Validate chain configuration
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm validate:chain
 
       - name: Format check
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm format:check
 
       - name: UI tokens check
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: bash scripts/check-ui-tokens.sh
 
       - name: Documentation check
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm check:docs
 
       - name: Sync-manifest schema check (CATALOG_IS_SSOT pattern)
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: |
           pipx install 'check-jsonschema==0.37.1'
           check-jsonschema --schemafile .cogni/sync-manifest.schema.json .cogni/sync-manifest.yaml
 
       - name: Architecture check
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm arch:check
 
       # Schema-migration guards (task: doltgres-migration-safety):
@@ -247,6 +466,7 @@ jobs:
       #   2. strict-monotonic `when` in _journal.json (silent-skip variant)
       #   3. drizzle-kit's own snapshot-chain check
       - name: Database migration guards
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm db:check
 
       # bug.0344 — structural guardrail on image-updater scope. Positive
@@ -257,48 +477,39 @@ jobs:
       # closed. Current allowlist is preview-only (see script header for
       # why candidate-a + production are intentionally excluded).
       - name: Image Updater scope (bug.0344)
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: bash scripts/ci/check-image-updater-scope.sh
 
-      # task.0284 — fixture-driven regression tests for the secrets:set CLI
-      # (scripts/secrets/set-secret.sh). Uses a stdin-recording bao shim; no
-      # real OpenBao, no network. Ported from node-template with the substrate.
-      - name: secrets:set CLI tests (task.0284)
-        run: bash scripts/ci/tests/set-secret.test.sh
+      # task.5140 — the hermetic scripts/ci/tests/*.test.sh suite (23 pure-bash
+      # deploy/secrets/substrate regression tests) runs in ONE parallel primitive
+      # instead of ~22 serial steps (was ~3-4 min serial → ~40-60s). The
+      # authoritative test list, the mutator-vs-parallel concurrency tiers (a few
+      # tests `cd $REPO_ROOT` and mutate tracked files, so they run serially-first,
+      # alone), and exit-code aggregation all live in the script — SCRIPTS_ARE_THE_API.
+      # Add a new tests/*.test.sh there, not as a new workflow step.
+      - name: CI shell tests (parallel)
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
+        run: bash scripts/ci/run-shell-tests.sh
 
-      # task.5094 — per-node secret fan-out (seed_node_app_secrets). Drives the
-      # catalog-gated fan-out against the real infra/secrets-catalog.yaml with
-      # stubbed runtime deps; proves distinct-value-per-node + custody gating.
-      - name: secrets fan-out tests (task.5094)
-        run: bash scripts/ci/tests/secrets-fanout.test.sh
-
-      # task.5078 — catalog-driven edge routing. Asserts the committed Caddyfile
-      # is in sync with the catalog (drift gate that makes "add a node = 1
-      # catalog PR" enforceable), every type:node has an edge block (canary
-      # included), and catalog node_port == per-env overlay Service nodePort.
-      - name: edge routing tests (task.5078)
-        run: bash scripts/ci/tests/render-caddyfile.test.sh
-
-      # Catalog-driven node DNS: idempotent Cloudflare A-record upsert +
-      # reconcile fans one record per non-primary type:node. Stateful CF shim,
-      # no network. Closes the node-formation DNS gap (catalog → overlays →
-      # flight → secrets all auto-fan, but the public host never resolved).
-      - name: node DNS reconcile tests
-        run: bash scripts/ci/tests/reconcile-node-dns.test.sh
-
-      - name: scheduler node routing tests
-        run: bash scripts/ci/render-scheduler-worker-endpoints.sh --check
-
-      # single-node-scope filters are CATALOG_IS_SSOT: generated from the
-      # nodes/* listing. Fails if a node was added/removed under nodes/ without
-      # regenerating the dorny filter block (run `pnpm gen:scope-filters`).
+      # Catalog-driven drift gates — NOT part of the shell-test suite above: each
+      # asserts a committed artifact still matches the catalog (CATALOG_IS_SSOT),
+      # kept as named steps so a specific drift failure is legible. Fast (--check).
       - name: single-node-scope filter drift (CATALOG_IS_SSOT)
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: bash scripts/ci/render-scope-filters.sh --check
+
+      # scheduler-worker endpoint map is catalog-derived; fails if a node-add
+      # didn't regenerate it (run `pnpm gen:scheduler-worker-endpoints`).
+      - name: scheduler node routing drift
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
+        run: bash scripts/ci/render-scheduler-worker-endpoints.sh --check
 
       # Per-node ApplicationSet drift (CATALOG_IS_SSOT + LANE_ISOLATION, axiom
       # 18). One AppSet object per (env, node) is derived from the catalog rows
       # that declare a candidate_a_branch. Fails if a node was added/removed or
       # an AppSet/kustomization was hand-edited without `pnpm gen:node-appset`.
       - name: per-node ApplicationSet drift (CATALOG_IS_SSOT)
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: bash scripts/ci/render-node-appset.sh --check
 
       # Per-node overlay drift (CATALOG_IS_SSOT + NODE_AT_ROOT_MIGRATE_PATH,
@@ -308,19 +519,36 @@ jobs:
       # Regenerate from the node-template overlay + catalog and fail on drift
       # before flight (run `pnpm gen:node-overlays`).
       - name: per-node overlay drift (NODE_AT_ROOT_MIGRATE_PATH)
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: bash scripts/ci/render-node-overlays.sh --check
 
-      - name: node overlay renderer tests
-        run: bash scripts/ci/tests/render-node-overlays.test.sh
+      # task.5140 Stage B — affected-only unit tests. The suite is two disjoint
+      # vitest universes: the ROOT config (tests/** + packages + services) always
+      # runs full (turbo does not model it — dropping it would be a false green),
+      # while the OPERATOR app config (~60% of CI test time) is skipped on a PR
+      # when neither the operator app nor a package it depends on changed, and
+      # runs FULL on merge_group/push (the required-check backstop that catches
+      # any PR-time affected miss before merge). Logic + fail-safe live in
+      # scripts/ci/run-unit-tests.sh (SCRIPTS_ARE_THE_API). Coverage stays a
+      # single-flip: ENABLE_SONAR=true runs the full instrumented path so the
+      # sonar job below has an artifact.
+      - name: Unit + contract tests
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          TURBO_SCM_BASE: origin/main
+        run: |
+          if [ "${{ vars.ENABLE_SONAR }}" = "true" ]; then
+            pnpm test:ci:coverage
+          else
+            bash scripts/ci/run-unit-tests.sh
+          fi
 
-      - name: scheduler runtime routing tests
-        run: bash scripts/ci/tests/scheduler-runtime-routing.test.sh
-
-      - name: Unit + contract coverage tests
-        run: pnpm test:ci
-
+      # Only produced (and consumed by the sonar job) when Sonar is enabled;
+      # skipped otherwise, so the coverage-free run above can't false-fail on
+      # if-no-files-found.
       - name: Upload coverage reports
-        if: always()
+        if: vars.ENABLE_SONAR == 'true' && needs.env_manager_fast_path.outputs.eligible != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-${{ github.sha }}
@@ -343,9 +571,12 @@ jobs:
     # Skip on merge_group: not in required-status-checks (see infra/github/branch-protection.json),
     # so the queue doesn't gate on it. Re-running on the rebased candidate burns ~3 min for marginal
     # incremental signal vs PR-time. Spec: docs/spec/merge-queue-config.md § Excluded from required.
-    if: github.event_name != 'merge_group'
+    needs: env_manager_fast_path
+    if: always() && github.event_name != 'merge_group' && (needs.env_manager_fast_path.result != 'success' || needs.env_manager_fast_path.outputs.eligible != 'true')
     runs-on: ubuntu-latest
-    needs: static
+    # No `needs: static` (task.5140) — component does its own install + build and
+    # shares no artifact with static; running in parallel keeps it off the
+    # critical path. See the unit job note.
     env:
       NODE_ENV: test
       LITELLM_MASTER_KEY: build-key
@@ -360,31 +591,52 @@ jobs:
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
 
+      - name: Enforce env-manager classifier result
+        env:
+          CLASSIFIER_RESULT: ${{ needs.env_manager_fast_path.result }}
+          FAST_PATH_ELIGIBLE: ${{ needs.env_manager_fast_path.outputs.eligible }}
+          FAST_PATH_CLAIMED: ${{ needs.env_manager_fast_path.outputs.claimed }}
+          FAST_PATH_REASON: ${{ needs.env_manager_fast_path.outputs.reason }}
+        run: |
+          [ "$CLASSIFIER_RESULT" = success ] || { echo "::error::env-manager classifier failed"; exit 1; }
+          if [ "$FAST_PATH_CLAIMED" = true ] && [ "$FAST_PATH_ELIGIBLE" != true ]; then
+            echo "::error::invalid signed env-manager claim: $FAST_PATH_REASON"; exit 1
+          fi
+          [ "$FAST_PATH_ELIGIBLE" != true ] || echo "Signed env-manager fast path accepted"
+
       - uses: pnpm/action-setup@c5ba7f7862a0f64c1b1a05fbac13e0b8e86ba08c # v4
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
       - name: Install dependencies
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Build workspace packages
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm packages:build
 
       - name: Install ripgrep
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1 # v2
         with:
           tool: ripgrep
 
       - name: Verify ripgrep
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: rg --version
 
       - name: Build sandbox runtime image
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm sandbox:docker:build
 
       - name: Component tests (testcontainers)
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm test:component
 
       # Doltgres-migrator regression: boots dolthub/doltgresql:latest in its
@@ -393,6 +645,7 @@ jobs:
       # end-to-end. Proves the silent-skip drift gap is caught at runtime,
       # complementing the static CI guard in `db:check:immutable`.
       - name: Doltgres migrator regression (testcontainers)
+        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm test:doltgres-migrate
 
       - name: CI Telemetry
@@ -406,10 +659,9 @@ jobs:
 
   sonar:
     runs-on: ubuntu-latest
-    needs: unit
-    # Sonar is PR-time signal only (decorates the PR with a comment + Sonar dashboard link).
-    # Has no meaning on the merge_group ref; skip to save runtime.
-    if: needs.unit.result == 'success' && github.event_name != 'merge_group' && github.repository == 'cogni-dao/cogni-template'
+    needs: [unit, env_manager_fast_path]
+    # Sonar has no meaning on the merge_group ref; skip to save runtime.
+    if: vars.ENABLE_SONAR == 'true' && needs.unit.result == 'success' && needs.env_manager_fast_path.outputs.eligible != 'true' && github.event_name != 'merge_group'
     permissions:
       contents: read
       pull-requests: write # Required for PR decoration
@@ -445,3 +697,17 @@ jobs:
           loki_user: ${{ secrets.GRAFANA_CLOUD_LOKI_USER }}
           loki_token: ${{ secrets.GRAFANA_CLOUD_LOKI_API_KEY }}
           job_status: ${{ job.status }}
+
+  sonar-disabled:
+    runs-on: ubuntu-latest
+    needs: [unit, env_manager_fast_path]
+    if: vars.ENABLE_SONAR != 'true' && needs.unit.result == 'success' && needs.env_manager_fast_path.outputs.eligible != 'true' && github.event_name != 'merge_group'
+    steps:
+      - name: SonarCloud disabled
+        run: |
+          echo "::notice title=SonarCloud disabled::Set repository variable ENABLE_SONAR=true to restore the PR-time scan."
+          {
+            echo "### SonarCloud disabled"
+            echo ""
+            echo "Set repository variable \`ENABLE_SONAR=true\` to restore the PR-time scan."
+          } >> "$GITHUB_STEP_SUMMARY"

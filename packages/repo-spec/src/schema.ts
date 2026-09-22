@@ -34,9 +34,28 @@ export const creditsTopupSpecSchema = z.object({
 
   /** Optional: Informational list of token names (not enforced by schema) */
   allowed_tokens: z.array(z.string()).optional(),
+
+  /**
+   * Purchase-side price markup multiplier (governance config; was env USER_PRICE_MARKUP_FACTOR).
+   * Drives the OpenRouter top-up amount and the 0xSplits allocation (DAO margin).
+   * Default is tuned for a 95% provider top-up / 5% DAO Split margin with a 5% provider fee:
+   * 1 / (0.95 top-up share × 0.95 fee complement). Distinct from spend-side LLM markup.
+   */
+  markup_factor: z.number().min(1.0).default(1.10803324099723),
+
+  /**
+   * Fraction of purchased credits minted as a system-tenant (DAO) bonus (0–1).
+   * Default 0 = no system-account credit increase (the DAO earns USDC margin via the
+   * Split, not free minted AI credits). New nodes inherit 0; a node opts back in explicitly.
+   */
+  revenue_share: z.number().min(0).max(1).default(0),
 });
 
 export type CreditsTopupSpec = z.infer<typeof creditsTopupSpecSchema>;
+
+const evmAddressSchema = z
+  .string()
+  .regex(/^0x[0-9a-fA-F]{40}$/, "Invalid EVM address");
 
 /**
  * Schema for a single governance schedule entry.
@@ -64,10 +83,37 @@ export const governanceScheduleSchema = z.object({
 export type GovernanceScheduleSpec = z.infer<typeof governanceScheduleSchema>;
 
 /**
- * Schema for the governance section of repo-spec.
- * Optional — existing deployments without this section continue to work.
+ * Schema for the unified `governance` section of repo-spec — the node/scope's
+ * on-chain DAO identity (contracts + chain) AND its governance schedules.
+ * (identity-model.md `scope_id (1)──(1) dao_address`: each scope has one DAO; this
+ * is its governance binding.) All fields optional — a node without on-chain
+ * governance still validates; the DAO accessors return null when identity is incomplete.
  */
 export const governanceSpecSchema = z.object({
+  /** Chain ID as string or number (YAML flexibility); normalized to string. */
+  chain_id: z
+    .union([z.string(), z.number()])
+    .transform((v) => String(v))
+    .optional(),
+  /** DAO contract address (EVM 0x-prefixed, 40 hex chars) */
+  dao_contract: z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{40}$/, "Invalid EVM address")
+    .optional(),
+  /** Aragon voting plugin contract address */
+  plugin_contract: z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{40}$/, "Invalid EVM address")
+    .optional(),
+  /** CogniSignal contract address */
+  signal_contract: evmAddressSchema.optional(),
+  /** Aragon GovernanceERC20 token address used for contributor distributions */
+  token_contract: evmAddressSchema.optional(),
+  /** DAO-controlled holder/vault containing minted token inventory for emissions */
+  emissions_holder: evmAddressSchema.optional(),
+  /** Proposal launcher base URL (for deep links) */
+  base_url: z.string().url().optional(),
+  /** Governance council schedules (cron-triggered charters) */
   schedules: z
     .array(governanceScheduleSchema)
     .default([])
@@ -79,6 +125,327 @@ export const governanceSpecSchema = z.object({
 });
 
 export type GovernanceSpec = z.infer<typeof governanceSpecSchema>;
+
+// ---------------------------------------------------------------------------
+// Node-facing recurring-work schedules (story.5008 / task.5030)
+// ---------------------------------------------------------------------------
+
+/**
+ * Schema for a single node-facing schedule entry.
+ *
+ * This is the left edge a node owns (CATALOG_IS_SSOT / node-baas "node declares
+ * shape, operator wires env"): a node declares a recurring job in its own
+ * repo-spec; the operator runs it on schedule under that node's tenant identity.
+ *
+ * Invariants (review G3 — node↔Temporal tenant interface):
+ *   - WORKFLOWTYPE_FROM_ROUTE_XOR_GRAPH: exactly one of `route` (http-dispatch →
+ *     NodeTaskWorkflow) or `graph` (graph run → GraphRunWorkflow) is set. There is
+ *     NO node-facing `target` enum — that is operator vocabulary; the workflowType
+ *     is *inferred* from which field is present (route XOR graph).
+ *   - PLATFORM_OVERLAP_AND_CATCHUP: `overlap`/`catchupWindow` are NOT node-facing.
+ *     They are platform invariants the operator fixes (OVERLAP_SKIP_DEFAULT /
+ *     CATCHUP_WINDOW_ZERO). The schema does not accept them — a node cannot tune them.
+ *   - ROUTE_IS_RELATIVE: `route` is a relative path on the node's own resolved host
+ *     (operator allow-lists it to the node's nodeUrl — never an absolute/foreign URL).
+ *   - PAYLOAD_OPAQUE: `payload` is opaque to the operator; the node's route owns its
+ *     meaning. The operator forwards it verbatim inside the NodeTaskInput envelope.
+ *   - `id` is stable → it derives both the scheduleId and the Temporal workflowId
+ *     (`node-task:{node}:{id}` — WORKFLOW_ID_STABILITY).
+ */
+export const nodeScheduleSchema = z
+  .object({
+    /** Stable schedule id — derives scheduleId + workflowId. Lowercase kebab token. */
+    id: z
+      .string()
+      .regex(
+        /^[a-z][a-z0-9-]{0,63}$/,
+        "id must be a lowercase kebab token (max 64 chars)"
+      ),
+    /** 5-field cron expression (minute hour day month weekday) */
+    cron: z
+      .string()
+      .regex(
+        /^(\S+\s+){4}\S+$/,
+        "Cron must be a 5-field expression (minute hour day month weekday)"
+      ),
+    /** IANA timezone (defaults to UTC) */
+    timezone: z.string().default("UTC"),
+    /**
+     * Relative HTTP route on the node's OWN host (http-dispatch). The operator
+     * dispatches POST {nodeUrl}{route} under the node's tenant principal. Mutually
+     * exclusive with `graph`. Must be a leading-slash relative path (no host, no scheme).
+     */
+    route: z
+      .string()
+      .regex(
+        /^\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$/,
+        "route must be a relative path beginning with '/' on the node's own host (no scheme/host)"
+      )
+      .optional(),
+    /** Graph id to execute (graph run → GraphRunWorkflow). Mutually exclusive with `route`. */
+    graph: z.string().min(1).optional(),
+    /**
+     * Opaque job payload forwarded verbatim to the node's route / graph input.
+     * The operator never interprets it; the node's handler owns its meaning.
+     */
+    payload: z.record(z.string(), z.unknown()).default({}),
+  })
+  .strict()
+  .superRefine((entry, ctx) => {
+    const hasRoute = entry.route !== undefined;
+    const hasGraph = entry.graph !== undefined;
+    // WORKFLOWTYPE_FROM_ROUTE_XOR_GRAPH — exactly one
+    if (hasRoute === hasGraph) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "Exactly one of `route` (http-dispatch) or `graph` (graph run) must be set per schedule",
+      });
+    }
+    // ROUTE_IS_RELATIVE — reject anything that smells like an absolute/foreign URL
+    if (
+      hasRoute &&
+      entry.route &&
+      /^[a-z][a-z0-9+.-]*:\/\//i.test(entry.route)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["route"],
+        message:
+          "route must not be an absolute URL — relative path on the node's own host only",
+      });
+    }
+  });
+
+export type NodeScheduleSpec = z.infer<typeof nodeScheduleSchema>;
+
+/**
+ * Node-facing `schedules` block.
+ * Optional — existing deployments without recurring work continue to work.
+ * Duplicate ids are rejected (each id maps to one stable schedule/workflow).
+ */
+export const nodeSchedulesSchema = z
+  .array(nodeScheduleSchema)
+  .default([])
+  .refine((arr) => new Set(arr.map((s) => s.id)).size === arr.length, {
+    message: "Duplicate schedule ids in schedules[]",
+  });
+
+export type NodeSchedules = z.infer<typeof nodeSchedulesSchema>;
+
+// ---------------------------------------------------------------------------
+// Provider-neutral node service deployment (story.5016 / task.5065)
+// ---------------------------------------------------------------------------
+
+const serviceNameSchema = z
+  .string()
+  .regex(
+    /^[a-z][a-z0-9-]{0,62}$/,
+    "service and artifact names must be DNS-safe lowercase tokens (max 63 chars)"
+  );
+
+const serviceEnvKeySchema = z
+  .string()
+  .regex(
+    /^[A-Z][A-Z0-9_]{0,63}$/,
+    "service environment keys must be uppercase names"
+  );
+
+export const nodeServiceSecretRefSchema = z
+  .object({ key: serviceEnvKeySchema })
+  .strict();
+
+export type NodeServiceSecretRefSpec = z.infer<
+  typeof nodeServiceSecretRefSchema
+>;
+
+const relativeBuildPathSchema = z
+  .string()
+  .min(1)
+  .max(256)
+  .refine(
+    (value) =>
+      !value.startsWith("/") &&
+      !value.includes("\\") &&
+      !value.split("/").includes(".."),
+    "build paths must be repo-relative and must not traverse parents"
+  );
+
+/** Stable, source-repo-owned instructions for building one service artifact. */
+export const nodeServiceArtifactSchema = z
+  .object({
+    /** Stable logical artifact identity; becomes the bundle lookup key. */
+    name: serviceNameSchema,
+    /** Docker build context, relative to the source repository root. */
+    context: relativeBuildPathSchema.default("."),
+    /** Dockerfile path, relative to the source repository root. */
+    dockerfile: relativeBuildPathSchema.default("Dockerfile"),
+    /** Optional multi-stage Docker target. */
+    target: z.string().min(1).max(128).optional(),
+  })
+  .strict();
+
+export type NodeServiceArtifactSpec = z.infer<typeof nodeServiceArtifactSchema>;
+
+/**
+ * Bounded v0 resource request for one app-tier service.
+ * `storage_mi` is ephemeral workload storage. Persistent volumes, replication,
+ * backups, and stateful lifecycle are intentionally absent from this contract.
+ */
+export const nodeServiceResourcesSchema = z
+  .object({
+    // Broad sanity bounds prevent malformed requests; environment/provider
+    // admission policy owns practical quotas and may be much smaller.
+    cpu_units: z.number().min(0.1).max(64),
+    memory_mi: z.number().int().min(128).max(262144),
+    storage_mi: z.number().int().min(128).max(1048576),
+  })
+  .strict();
+
+export type NodeServiceResourcesSpec = z.infer<
+  typeof nodeServiceResourcesSchema
+>;
+
+/** Named app compatibility contracts; absent means generic runtime behavior. */
+export const nodeServiceRuntimeProfileSchema = z.literal("cogni-node-app-v1");
+
+export type NodeServiceRuntimeProfileSpec = z.infer<
+  typeof nodeServiceRuntimeProfileSchema
+>;
+
+/**
+ * One app-tier service declared by a sovereign node.
+ *
+ * `bind_host` is intentionally a fixed literal, not a placement knob: sibling
+ * containers can reach the process only when it listens beyond loopback.
+ * Runtime assembly also exports HOST/HOSTNAME/PORT, while the image remains
+ * responsible for honoring that process contract.
+ */
+export const nodeServiceSpecSchema = z
+  .object({
+    name: serviceNameSchema,
+    artifact: nodeServiceArtifactSchema,
+    command: z.array(z.string().min(1).max(1024)).min(1).max(32).optional(),
+    args: z.array(z.string().max(1024)).max(32).optional(),
+    port: z.number().int().min(1).max(65535),
+    visibility: z.enum(["public", "private"]),
+    /** Explicit non-provider compatibility selector; absent stays generic. */
+    runtime_profile: nodeServiceRuntimeProfileSchema.optional(),
+    /**
+     * Service topology owned in Git: environment variable → sibling service.
+     * Assembly resolves each target to http://<service>:<declared-port>; values
+     * cannot carry arbitrary URLs or secrets.
+     */
+    bindings: z
+      .record(serviceEnvKeySchema, serviceNameSchema)
+      .refine((bindings) => Object.keys(bindings).length <= 16, {
+        message: "A service may declare at most 16 sibling bindings",
+      })
+      .default({}),
+    /** Value-free logical secret needs; scope is derived outside Git. */
+    secret_refs: z
+      .array(nodeServiceSecretRefSchema)
+      .max(32)
+      .refine(
+        (refs) => new Set(refs.map((ref) => ref.key)).size === refs.length,
+        "secret_refs keys must be unique"
+      )
+      .default([]),
+    bind_host: z.literal("0.0.0.0").default("0.0.0.0"),
+    /** Explicit for every declared service; environment policy owns recommended sizes. */
+    resources: nodeServiceResourcesSchema,
+  })
+  .strict();
+
+export type NodeServiceSpec = z.infer<typeof nodeServiceSpecSchema>;
+
+/**
+ * App-tier workload declaration. Exactly one service owns public ingress; all
+ * other services share the workload network privately by service-name DNS.
+ */
+export const nodeDeploymentSchema = z
+  .object({
+    services: z.array(nodeServiceSpecSchema).min(1).max(8),
+  })
+  .strict()
+  .superRefine((deployment, ctx) => {
+    const serviceNames = deployment.services.map((service) => service.name);
+    if (new Set(serviceNames).size !== serviceNames.length) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Duplicate deployment service names",
+      });
+    }
+    const artifactsByName = new Map<
+      string,
+      (typeof deployment.services)[number]["artifact"]
+    >();
+    deployment.services.forEach((service, index) => {
+      const prior = artifactsByName.get(service.artifact.name);
+      if (
+        prior &&
+        (prior.context !== service.artifact.context ||
+          prior.dockerfile !== service.artifact.dockerfile ||
+          prior.target !== service.artifact.target)
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["services", index, "artifact"],
+          message:
+            "Services reusing an artifact name must use identical build instructions",
+        });
+      } else {
+        artifactsByName.set(service.artifact.name, service.artifact);
+      }
+      const bindingKeys = new Set(Object.keys(service.bindings));
+      const conflictingSecret = service.secret_refs.find((ref) =>
+        bindingKeys.has(ref.key)
+      );
+      if (conflictingSecret) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["services", index, "secret_refs"],
+          message: `${conflictingSecret.key} cannot be both a sibling binding and a secret ref`,
+        });
+      }
+    });
+    if (
+      deployment.services.filter((service) => service.visibility === "public")
+        .length !== 1
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "deployment.services must contain exactly one public service",
+      });
+    }
+    deployment.services.forEach((service, index) => {
+      if (service.visibility === "private" && service.runtime_profile) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["services", index, "runtime_profile"],
+          message:
+            "cogni-node-app-v1 runtime_profile requires the public service",
+        });
+      }
+      Object.entries(service.bindings).forEach(([envName, target]) => {
+        if (target === service.name) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["services", index, "bindings", envName],
+            message: "A service binding cannot target itself",
+          });
+        } else if (!serviceNames.includes(target)) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["services", index, "bindings", envName],
+            message: `Service binding target is not declared: ${target}`,
+          });
+        }
+      });
+    });
+  });
+
+export type NodeDeploymentSpec = z.infer<typeof nodeDeploymentSchema>;
 
 /**
  * Schema for activity_ledger section — epoch and ingestion configuration.
@@ -145,6 +512,100 @@ export const operatorWalletSpecSchema = z.object({
 });
 
 export type OperatorWalletSpec = z.infer<typeof operatorWalletSpecSchema>;
+
+/**
+ * Schema for payments_out.steward_wallet configuration.
+ *
+ * The steward wallet is a HUMAN-CUSTODIED wallet (EOA / hardware wallet) that
+ * settles vendor invoices the operator wallet cannot pay programmatically —
+ * vendors whose crypto checkout is a per-session / per-invoice hosted flow
+ * (OpenRouter Coinbase Business Checkout; Cherry → Coingate). The operator
+ * Privy wallet funds this one pinned address via a single constrained transfer
+ * (OperatorWalletPort.withdrawToSteward); a human then completes each vendor
+ * checkout in USDC. Deliberately node-generic and NOT named "operator" to avoid
+ * overloading the operator node / operator wallet. See docs/design/node-steward-wallet.md.
+ */
+export const stewardWalletSpecSchema = z.object({
+  /** Checksummed EVM address of the human-custodied steward wallet (USDC on Base). */
+  address: z
+    .string()
+    .regex(
+      /^0x[a-fA-F0-9]{40}$/,
+      "Steward wallet address must be a valid EVM address (0x + 40 hex chars)"
+    ),
+});
+
+export type StewardWalletSpec = z.infer<typeof stewardWalletSpecSchema>;
+
+function isDoltHubRemoteUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.hostname === "doltremoteapi.dolthub.com" &&
+      url.username === "" &&
+      url.password === "" &&
+      url.search === "" &&
+      url.hash === "" &&
+      /^\/[^/]+\/[^/]+$/.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Schema for the node-local knowledge plane declaration.
+ * Credentials are never stored here; the repo-spec only pins the Cogni-owned
+ * DoltHub repository identity that this node mirrors to.
+ */
+export const knowledgeRemoteSpecSchema = z
+  .object({
+    provider: z.literal("dolthub"),
+    owner: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/),
+    repo: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
+    url: z.string().refine(isDoltHubRemoteUrl, {
+      message:
+        "DoltHub remote URL must be https://doltremoteapi.dolthub.com/<owner>/<repo> with no credentials",
+    }),
+    custody: z.literal("cogni-owned"),
+  })
+  .superRefine((remote, ctx) => {
+    // Fail closed against the retired `knowledge-<slug>` naming. The DoltHub repo
+    // now mirrors the node slug 1:1 (dolt name == git name); the legacy prefix is
+    // gone, not merely tolerated, so a `knowledge-` repo can never be reintroduced.
+    if (remote.repo.startsWith("knowledge-")) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["repo"],
+        message:
+          "knowledge.remote.repo must be the bare node slug — the legacy `knowledge-` prefix is retired",
+      });
+    }
+    let url: URL;
+    try {
+      url = new URL(remote.url);
+    } catch {
+      return;
+    }
+    const expected = `/${remote.owner}/${remote.repo}`;
+    if (url.pathname !== expected) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["url"],
+        message:
+          "DoltHub remote URL path must match knowledge.remote owner/repo",
+      });
+    }
+  });
+
+export const knowledgeSpecSchema = z.object({
+  database: z.string().regex(/^knowledge_[a-z][a-z0-9_]{0,63}$/),
+  remote: knowledgeRemoteSpecSchema,
+});
+
+export type KnowledgeRemoteSpec = z.infer<typeof knowledgeRemoteSpecSchema>;
+export type KnowledgeSpec = z.infer<typeof knowledgeSpecSchema>;
 
 // ---------------------------------------------------------------------------
 // Gate + rule schemas (PR review)
@@ -239,6 +700,23 @@ export type GateConfig = z.infer<typeof gateConfigSchema>;
 /** Gates array schema. */
 export const gatesArraySchema = z.array(gateConfigSchema);
 
+/**
+ * PR review configuration — the node-author-facing on/off + model toggle.
+ *
+ * The operator reviews a PR by reading the TARGET repo's own repo-spec, so this
+ * block makes git PR review 100% node-controlled (no operator-side hardcode):
+ *   - `enabled` — when `false`, the operator skips review entirely (no Check Run,
+ *     no comment). Defaults to `true` for backward-compat (review was always-on).
+ *   - `model` — platform model id (LiteLLM-resolvable, e.g. `gpt-4o-mini`) the
+ *     `pr-review` graph runs with. Omitted → operator default.
+ */
+export const reviewConfigSchema = z.object({
+  enabled: z.boolean().optional().default(true),
+  model: z.string().min(1).optional(),
+});
+
+export type ReviewConfig = z.infer<typeof reviewConfigSchema>;
+
 // ---------------------------------------------------------------------------
 // Scope identity primitives
 // ---------------------------------------------------------------------------
@@ -263,7 +741,7 @@ export const nodeRegistryEntrySchema = z.object({
   node_id: z.string().uuid(),
   /** Human-friendly display name (for logging, UI, dashboards) */
   node_name: z.string().min(1),
-  /** Path relative to repo root (e.g., "." for operator, "nodes/poly" for poly) */
+  /** Path relative to repo root (e.g., "nodes/operator" for operator, "nodes/<slug>" for a child) */
   path: z.string().min(1),
   /** Docker-internal endpoint for billing callback routing (optional — runtime config) */
   endpoint: z.string().optional(),
@@ -280,6 +758,38 @@ export const repoSpecSchema = z
     /** Unique node identity — scopes all ledger tables. Generated once at init, never changes. */
     node_id: z.string().uuid("node_id must be a valid UUID"),
 
+    /**
+     * Human-facing node identity (display, not a key) — the SSOT a node self-describes from. `name` is
+     * the node slug (e.g. `operator`, `beacon`). The display layers, all projected to the node's public
+     * `/.well-known/agent.json` so the operator reads them rather than hardcoding (IDENTITY_IS_REPO_SPEC_PROJECTION):
+     *   - `hook`    — punchy ~5-word tagline shown on gallery cards / node-page headings.
+     *   - `mission` — the 1–3 sentence north-star the cognition substrate surfaces at session start.
+     *   - `brand`   — visual identity: `thumbnail` is a URL the NODE hosts (e.g. its OG image) so brand
+     *     stays sovereign + current with no operator asset-hosting; `color` tints the monogram fallback.
+     * All optional for back-compat (a node with only `name` falls back to title-cased slug + monogram).
+     */
+    intent: z
+      .object({
+        name: z.string().min(1),
+        hook: z.string().min(1).max(80).optional(),
+        mission: z.string().min(1).optional(),
+        brand: z
+          .object({
+            // SSOT for the node's visual mark: a Lucide icon NAME (PascalCase, e.g. `Gamepad2`).
+            // ONE field, every surface reads it — app header, gallery card, og:image, favicon — so
+            // the icon is never hand-coded per-fork in AppHeader JSX again (that was the split-brain).
+            icon: z.string().optional(),
+            // `color` tints the brand mark (icon + monogram fallback).
+            color: z.string().optional(),
+            // Deprecated: a node-hosted image URL/path. Superseded by `icon` (which the node's
+            // /opengraph-image route renders to a PNG). Kept optional for back-compat during migration.
+            thumbnail: z.string().optional(),
+          })
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
+
     /** Stable opaque scope UUID — DB FK, never changes. Optional for backward compat. */
     scope_id: scopeIdSchema.optional(),
 
@@ -292,36 +802,39 @@ export const repoSpecSchema = z
     /** Operator wallet configuration (optional — needed only when operator wallet is enabled) */
     operator_wallet: operatorWalletSpecSchema.optional(),
 
-    /** DAO governance configuration */
-    cogni_dao: z.object({
-      /**
-       * Chain ID as string or number (YAML flexibility).
-       * Normalized to string at extraction time.
-       */
-      chain_id: z.union([z.string(), z.number()]).transform((v) => String(v)),
-      /** DAO contract address (EVM 0x-prefixed, 40 hex chars) */
-      dao_contract: z
-        .string()
-        .regex(/^0x[0-9a-fA-F]{40}$/, "Invalid EVM address")
-        .optional(),
-      /** Aragon voting plugin contract address */
-      plugin_contract: z
-        .string()
-        .regex(/^0x[0-9a-fA-F]{40}$/, "Invalid EVM address")
-        .optional(),
-      /** CogniSignal contract address */
-      signal_contract: z
-        .string()
-        .regex(/^0x[0-9a-fA-F]{40}$/, "Invalid EVM address")
-        .optional(),
-      /** Proposal launcher base URL (for deep links) */
-      base_url: z.string().url().optional(),
-    }),
+    /** Node-local knowledge plane declaration (optional for pre-knowledge nodes) */
+    knowledge: knowledgeSpecSchema.optional(),
 
     /** Payment activation status — pending_activation until node:activate-payments completes */
     payments: z
       .object({
         status: z.enum(["pending_activation", "active"]),
+      })
+      .optional(),
+
+    /** Token distribution activation status — active only after DAO-controlled minted inventory is verified */
+    distributions: z
+      .object({
+        status: z.enum(["pending_activation", "active"]),
+        claim_contract_pattern: z
+          .enum([
+            "uniswap.merkle-distributor.v1",
+            "1inch.cumulative-merkle-drop.v1",
+          ])
+          .optional(),
+        /**
+         * The ONE cumulative Merkle distributor deployed for this node at
+         * distributions activation (R2). DAO-owned (ownership transferred to
+         * `governance.dao_contract` post-deploy). Epoch finalization (R3) resolves
+         * this address, calls `setMerkleRoot` per epoch, and mints only the delta —
+         * there is no per-epoch redeploy. Recorded once and treated as immutable.
+         */
+        distributor_address: evmAddressSchema.optional(),
+        /** Deploy transaction hash for the distributor (audit/provenance). */
+        distributor_deploy_tx: z
+          .string()
+          .regex(/^0x[0-9a-fA-F]{64}$/, "Invalid tx hash")
+          .optional(),
       })
       .optional(),
 
@@ -333,8 +846,46 @@ export const repoSpecSchema = z
       })
       .optional(),
 
+    /**
+     * Outbound payment configuration (optional). Declares the human-custodied
+     * steward wallet that settles vendor invoices via manual crypto checkout.
+     * Besides the 0xSplits distribute, this is the operator wallet's only
+     * outbound destination (a single pinned address, funded by withdrawToSteward).
+     */
+    payments_out: z
+      .object({
+        /** Human-custodied wallet that settles vendor invoices (OpenRouter, Cherry). */
+        steward_wallet: stewardWalletSpecSchema,
+      })
+      .optional(),
+
     /** Governance schedule configuration (optional — defaults to empty schedules) */
-    governance: governanceSpecSchema.optional().default({ schedules: [] }),
+    /**
+     * Unified governance section — DAO identity (contracts + chain) + council
+     * schedules. Required (every node declares its governance binding); inner
+     * fields optional so DAO identity can be incomplete pre-activation, and
+     * `schedules` defaults to [].
+     */
+    governance: governanceSpecSchema,
+
+    /**
+     * Node-facing recurring-work schedules (story.5008). The node declares
+     * recurring jobs; the operator reconciles them into Temporal Schedules under
+     * the node's tenant identity (see syncNodeSchedules). Optional — defaults to
+     * empty. Distinct from `governance.schedules` (operator charters): this is the
+     * node-author-facing contract (route XOR graph; no operator vocab leak).
+     */
+    schedules: nodeSchedulesSchema.optional().default([]),
+
+    /**
+     * Provider-neutral app-tier services. Omitted by existing nodes; the
+     * accessor supplies the legacy one-public-app default without requiring an
+     * author migration.
+     */
+    deployment: nodeDeploymentSchema.optional(),
+
+    /** PR review on/off + model selection (optional — defaults to enabled). */
+    review: reviewConfigSchema.optional(),
 
     /** PR review gate configuration (optional — gates run in declared order). */
     gates: gatesArraySchema.optional(),

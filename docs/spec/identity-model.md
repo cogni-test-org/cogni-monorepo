@@ -9,7 +9,7 @@ summary: "Single source of truth for all identity primitives in the Cogni system
 read_when: Working on identity, scoping, multi-project, ledger attribution, node-operator boundaries, or any code that references node_id, scope_id, user_id, or billing_account_id.
 owner: derekg1729
 created: 2026-02-22
-verified: 2026-02-22
+verified: 2026-06-07
 tags: [identity, architecture, governance]
 ---
 
@@ -19,13 +19,14 @@ tags: [identity, architecture, governance]
 
 ## Key References
 
-|          |                                                                      |                                          |
-| -------- | -------------------------------------------------------------------- | ---------------------------------------- |
-| **Spec** | [Node vs Operator Contract](./node-operator-contract.md)             | Node/Operator boundaries, scope_id intro |
-| **Spec** | [Attribution Ledger](./attribution-ledger.md)                        | Ledger scoping by (node_id, scope_id)    |
-| **Spec** | [User Identity + Account Bindings](./decentralized-user-identity.md) | user_id, user_bindings, identity_events  |
-| **Spec** | [Accounts Design](./accounts-design.md)                              | billing_account_id, credit ledger        |
-| **Spec** | [DAO Enforcement](./dao-enforcement.md)                              | dao_address, payment rails               |
+|          |                                                                      |                                                                   |
+| -------- | -------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| **Spec** | [Node vs Operator Contract](./node-operator-contract.md)             | Node/Operator boundaries, scope_id intro                          |
+| **Spec** | [Attribution Ledger](./attribution-ledger.md)                        | Ledger scoping by (node_id, scope_id)                             |
+| **Spec** | [User Identity + Account Bindings](./decentralized-user-identity.md) | user_id, user_bindings, identity_events                           |
+| **Spec** | [Accounts Design](./accounts-design.md)                              | billing_account_id, credit ledger                                 |
+| **Spec** | [DAO Enforcement](./dao-enforcement.md)                              | dao_address, payment rails                                        |
+| **Spec** | [Tokenomics: Distribution Lifecycle](./tokenomics-distribution.md)   | distribution executor authority + recipient (actor_id) resolution |
 
 ## Design
 
@@ -131,6 +132,137 @@ actor_id (N) ──── (1) billing_account_id Multiple actors per tenant
 
 **Orthogonality:** `scope_id` and `billing_account_id` are independent dimensions. A user's billing account is for paying for AI service consumption. A scope's DAO is for paying contributors. These never intersect — contributing to a project does not require a billing account, and using the AI service does not require contributing to a project.
 
+## Runtime Authorization Principals
+
+Runtime RBAC uses string principal identifiers. These are not database primary
+keys, and `actorId` is not the same thing as the `actor_id` economic-subject
+column.
+
+| Runtime Field | Format                    | Source of Truth                                               | Purpose                                     |
+| ------------- | ------------------------- | ------------------------------------------------------------- | ------------------------------------------- |
+| `actorId`     | `user:{user_id}`          | Browser session or HMAC machine bearer token `sub`            | Direct human/user-bound machine execution   |
+| `actorId`     | `agent:{agent_id}`        | Server-issued execution grant                                 | Autonomous agent execution                  |
+| `actorId`     | `service:{service_name}`  | Internal service bootstrap                                    | Internal service execution                  |
+| `subjectId`   | `user:{user_id}`          | Server-issued delegation/grant/session context only           | On-behalf-of authority for delegated runs   |
+| `tenantId`    | `{billing_account_id}`    | Billing resolver / execution grant / API-originated run input | Authorization tenant boundary and audit key |
+| `graphId`     | `{provider}:{graph_name}` | Graph catalog / execution request                             | Graph-scoped authorization context          |
+
+Current operator chat and API-originated graph runs bind direct users as
+`actorId = user:{user_id}` and `tenantId = billing_account_id` before
+`toolRunner.exec()` can call `AuthorizationPort.check()`. Machine bearer tokens
+are user-bound keys; they resolve to the same `SessionUser.id` shape as browser
+sessions. They are not standalone `agent:{id}` principals until an execution
+grant issues that identity server-side.
+
+**Subject binding:** `subjectId` never comes from a request body, tool args, or
+`RunnableConfig.configurable`. It is attached only by trusted server launchers
+after validating a session or execution grant.
+
+## Distribution Authority + Recipient
+
+Token distribution adds two identity concerns beyond the six primitives — one on the
+**authority** side (who may publish on-chain), one on the **recipient** side (who receives
+the tokens). Neither is a new identity KEY; both compose existing primitives. Mechanism +
+lifecycle: [tokenomics-distribution.md](./tokenomics-distribution.md).
+
+**Authority — three distinct roles, do NOT conflate:**
+
+| Role                      | Identity                                                                                                                                           | Authorizes                                                                       | Plane                      |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | -------------------------- |
+| **Approver**              | wallet(s) in `activity_ledger.approvers` (bound to `scope_id`)                                                                                     | WHAT is owed — signs the per-epoch EIP-712 statement (`SIGNATURE_BINDS_SOURCES`) | off-chain governance truth |
+| **Distribution executor** | a wallet / Safe / `EmissionsExecutor` granted a SCOPED authority on `dao_address` — EXECUTE-via-`IPermissionCondition`, granted ONCE at activation | the on-chain PUBLISH (`mint` + `setMerkleRoot`) and nothing else                 | on-chain                   |
+| **RBAC node-admin**       | OpenFGA principal (`user:`/`agent:`) with `node.flight` etc.                                                                                       | operational (flight / secrets / promote)                                         | off-chain operational      |
+
+The DAO (`dao_address`) is the on-chain root; the executor is a scoped, revocable DAO
+delegation, NOT the DAO. An `agent` actor CAN hold the executor role (e.g. a Privy agent
+wallet) precisely because the on-chain condition caps it to publishing — the scope is what
+makes agent custody safe.
+
+**Recipient — the claimant is an `actor_id` (economic subject), not `user_id` directly.**
+Agents are first-class DAO participants: an `agent` actor earns, is attributed, and can hold
+tokens, resolved to a wallet via `actor_bindings`. When an agent works **on-behalf-of** a
+user (the `subjectId = user:{user_id}` delegation), **who owns the earned tokens is a
+delegation policy that must be explicit** — the agent's own `actor_bindings` wallet, or the
+delegating user's — never an implicit default. This is exactly why the claimant model is
+`actor_id`-keyed (economic subject), not `user_id`-keyed: it must be able to express
+_agent-earns / user-owns_.
+
+> **OPEN (design point, raised 2026-08-15):** the on-behalf-of earnings-ownership policy —
+> agent-wallet vs delegating-user-wallet, and whether it is scoped per-agent, per-grant, or
+> per-node — is not yet settled. Today the claimant→wallet resolver is user-centric
+> (`user:{user_id}` / `identity:{provider}:{externalId}`); extending it to `agent:{actor_id}`
+> with `subjectId`-delegated routing is forward work. Track in
+> [tokenomics-distribution.md](./tokenomics-distribution.md) + the story.5005 lineage.
+
+## AI Agent Node Developer Identity
+
+V0 external AI agents enter through `POST /api/v1/agent/register`. Registration
+mints a canonical `user_id`, a billing account, and an HMAC bearer token. That
+credential authenticates the request; it does not by itself grant authority over
+any node.
+
+Node-scoped developer control is a separate OpenFGA relationship:
+
+| Step           | Actor                        | System Fact                                                                                                                                                                                |
+| -------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Register       | External AI agent            | `users.id = agent_user_id`; bearer token resolves to `SessionUser.id`                                                                                                                      |
+| Request        | `user:{agent_user_id}`       | Agent files an access request (`role=developer`) on one `node:{node_id}`, **declaring its own `githubLogin`** → durable `node_access_requests` row (tracking only; not authority)          |
+| Approve/reject | Node creator/admin           | `POST /api/v1/nodes/{node_id}/developers` writes/removes the OpenFGA tuple AND provisions/de-provisions **GitHub branch-push** for the declared login on the node's own repo (rbac.md §6a) |
+| Flight         | `user:{agent_user_id}` in V0 | `POST /api/v1/vcs/flight` checks `node.flight` on `node:{node_id}`                                                                                                                         |
+
+**Two planes from one grant (`TWO_PLANE_DEVELOPER_GRANT`, rbac.md §6a).** A `developer`
+approval grants the agent TWO things, keyed by TWO identities of the SAME agent: (1) the
+OpenFGA `developer` relation on `node:{node_id}` keyed by `user:{agent_user_id}` (→
+`can_flight`), and (2) GitHub `push` on the node's OWN repo keyed by the agent's **GitHub
+login**. The agent binds its GitHub identity by declaring `githubLogin` on its OWN access
+request (`SELF_REQUEST_ONLY`); the human approving supplies nothing
+(`PUSH_LOGIN_FROM_REQUEST`). The operator App is the privilege bridge — the agent never
+holds standing GitHub admin — and resolves the node's own repo from the catalog
+`source_repo` (NOT `nodes.repoOwner`/`repoName`, which is the submodule-parent monorepo;
+see bug.5054), then adds/removes the collaborator. The OpenFGA tuple is the SOLE authority
+for flight; branch-push is a best-effort side-effect that never reverses it. VNext:
+cryptographically prove the declared login (agent-native GitHub-identity proof →
+`user_bindings`) rather than trusting the owner's attestation at approve-time.
+
+The node creator/admin is the human RLS owner for the node registry row in V0.
+That RLS ownership authorizes the approval act; it must not be confused with
+ongoing flight authority. After approval, the flight route uses RBAC, not
+`nodes.owner_user_id = caller`, so an external agent can flight exactly the node
+it was approved for.
+
+**Principal-agnostic by design (not a migration debt):** the `node` model accepts
+both principal types — `node.developer: [user, agent]` — so V0's user-backed
+machine principals (`actorId = user:{agent_user_id}`) and a later
+`actorId = agent:{actor_id}` form coexist **additively**: introducing
+agent-actor principals writes new `@agent:` tuples without a model change or
+tuple rewrite. V0 registers agents as users (user-bound bearer), which is a
+legitimate principal representation, not a stopgap. Agent-actor principals — with
+`subjectId = user:{approver_user_id}` for explicit on-behalf-of delegation —
+become meaningful once the actors table + execution grants are the registration
+authority; that is a forward capability, not a correction of V0.
+
+### Operator node-registry projection (OPERATOR_NODE_ROW_ID_IS_NODE_ID)
+
+The repo-spec `.cogni/repo-spec.yaml::node_id` is authoritative. The operator's `nodes`
+table is a **projection** of it (same relationship as `SPECS_GIT_AUTHORITATIVE` → derived
+index): the projection is rebuildable, never a second authority.
+
+That projection is keyed under the **same** identity — `nodes.id` **is** the node's
+repo-spec `node_id`, not a private surrogate. So the OpenFGA resource `node:<nodes.id>`,
+the Loki `node` label, the flight `nodeRef.nodeId`, and `NodeSummary.nodeId` are all the
+one repo-spec `node_id`. There is no separate "registry row id."
+
+- **Wizard-born nodes:** `nodes.id`'s `defaultRandom()` UUID _is_ the act of minting the
+  `node_id`; `publish` writes that same value into the node's minted repo-spec. Authority
+  flows row → repo-spec, then the repo-spec is authoritative forever after.
+- **Externally-formed nodes:** the operator inserts the row with `id = <child repo-spec
+node_id>` (read from the child repo), never a fresh UUID — so identity cannot fork.
+- **Addressing vs authority:** `nodes.slug` is the human/agent-friendly handle used to
+  _address_ a node in API paths and UIs; the UUID `node_id` is the immutable _authority_
+  that reaches OpenFGA tuples and Loki labels. A slug is unique but not guaranteed
+  immutable, so it must never be an OpenFGA resource or a ledger key. Resolve `{id}` path
+  segments by `node_id` **or** `slug`, then use the UUID downstream.
+
 ## Scoping Rules
 
 ### Where Each Key Appears
@@ -179,6 +311,22 @@ These are hard constraints. Violating any of them is a design error.
 
 **Synonym prohibition:** Do not introduce `org_id`, `account_id`, `tenant_id` (DB column), `project_id` (DB column), or `contributor_id` as new terms. The six keys above are the complete set. External provider IDs (e.g., WalletConnect project ID, Terraform workspace ID) must be namespaced (e.g., `walletconnect_project_id`) to avoid collision with `scope_id`.
 
+### BINDING_IS_THE_MULTI_ENV_KEY (resolve through the binding, never author a surrogate)
+
+`user_id` / `actor_id` are **env-local surrogates** — a fresh UUID is minted per env at first contact
+(SIWE, OAuth). The **binding** (`wallet_address`, Discord snowflake, GitHub id, DID) is the **stable,
+env-independent identity** — the same value in candidate-a, preview, and production. Therefore:
+
+- **Any cross-env artifact** (seed migration, config, ownership grant, RLS row) that needs "who" MUST
+  **resolve through the binding** (`… WHERE wallet_address = <stable>`), never hardcode a per-env `user_id`.
+  A "different migration per env" or a committed surrogate UUID is the anti-pattern — one binding-resolved
+  artifact is correct on every env at once, and SIWE reuses the binding's row on next login so the surrogate
+  lines up automatically.
+- This is the top-0.1% multi-env pattern (Stripe/Auth0/Clerk): one external identity, per-env internal ids,
+  joined by the external ref. Applied to node ownership in
+  [`docs/design/node-wizard-formation-wiring.md`](../design/node-wizard-formation-wiring.md) § Owner binding
+  and proven in `pm.prod-reprovision-nodes-registry-reseed.2026-08-05`.
+
 ## V0 Defaults
 
 In V0 (single-project nodes), most keys resolve to a single value:
@@ -191,7 +339,7 @@ In V0 (single-project nodes), most keys resolve to a single value:
 
 `scope_id` is a deterministic UUID derived from `uuidv5(node_id, scope_key)`. The UUID is declared in `repo-spec.yaml` (V0) or `.cogni/projects/*.yaml` (multi-scope). `scope_key` is the human-readable slug used for display, logging, and as the derivation input.
 
-**Inline-until-second-scope:** V0 inlines the default scope's governance fields (`cogni_dao`, `operator_wallet`, `payments`, `activity_ledger.approvers`, weight policy) directly in the node-spec. A `.cogni/projects/<scope_key>.yaml` file materializes only when a second scope is declared — until then it would merely duplicate the inline default. Adding the first non-default scope moves **all** scopes, including `default`, into per-scope manifests.
+**Inline-until-second-scope:** V0 inlines the default scope's governance fields (`governance`, `operator_wallet`, `payments`, `activity_ledger.approvers`, weight policy) directly in the node-spec. A `.cogni/projects/<scope_key>.yaml` file materializes only when a second scope is declared — until then it would merely duplicate the inline default. Adding the first non-default scope moves **all** scopes, including `default`, into per-scope manifests.
 
 ## Spec File Layering
 
@@ -201,7 +349,7 @@ Three altitudes, one file per altitude. Closest file wins; a higher tier never r
 | ----------------- | ----------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Repo manifest** | `.cogni/repo-spec.yaml` (repo root)             | 1 per repo   | Monorepo-wide concerns only: review `gates`, `fail_on_error`. Node registry SSOT is `infra/catalog/*.yaml` (`CATALOG_IS_SSOT`); any `nodes:[]` here is a derived convenience carrying runtime endpoints, never a second authority. |
 | **Node-spec**     | `nodes/<node>/.cogni/repo-spec.yaml`            | 1 per node   | Deployment identity: `node_id`, `providers`, `llm_proxy`, `secrets`. Loaded at runtime via `COGNI_REPO_PATH`.                                                                                                                      |
-| **Scope-spec**    | `nodes/<node>/.cogni/projects/<scope_key>.yaml` | 1:N per node | Governance + money + permissions: `scope_id`, `cogni_dao`, `operator_wallet`, `payments`, `activity_ledger.approvers`, weight policy. Inlined into the node-spec while a node has only the `default` scope.                        |
+| **Scope-spec**    | `nodes/<node>/.cogni/projects/<scope_key>.yaml` | 1:N per node | Governance + money + permissions: `scope_id`, `governance`, `operator_wallet`, `payments`, `activity_ledger.approvers`, weight policy. Inlined into the node-spec while a node has only the `default` scope.                       |
 
 **SINGLE_HOME:** a node's identity and governance fields live in exactly one tier. The operator is both the hub (repo manifest) and a node (node-spec); its `node_id` and governance fields belong to its node-spec — never duplicated at the repo root.
 

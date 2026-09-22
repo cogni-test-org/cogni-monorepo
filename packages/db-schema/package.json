@@ -31,6 +31,11 @@
       "import": "./dist/billing.js",
       "default": "./dist/billing.js"
     },
+    "./compute": {
+      "types": "./dist/compute.d.ts",
+      "import": "./dist/compute.js",
+      "default": "./dist/compute.js"
+    },
     "./ai": {
       "types": "./dist/ai.d.ts",
       "import": "./dist/ai.js",
@@ -62,7 +67,7 @@
   ],
   "scripts": {
     "build": "tsup",
-    "postbuild": "node -e \"const fs=require('fs'); for(const f of ['dist/index.js','dist/refs.js']){if(!fs.existsSync(f)){console.error('ERROR: '+f+' missing'); process.exit(1)}}\"",
+    "postbuild": "node -e \"const fs=require('fs'); for(const f of ['dist/index.js','dist/refs.js','dist/compute.js']){if(!fs.existsSync(f)){console.error('ERROR: '+f+' missing'); process.exit(1)}}\"",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

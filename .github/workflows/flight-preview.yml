@@ -1,25 +1,21 @@
 name: Flight Preview
 
 # Triggered on every push to main (PR merged) or via workflow_dispatch(sha).
-# Re-tags mq-{N}-{queueSHA} → preview-{mainSHA} in GHCR (no rebuild) and then
-# calls scripts/ci/flight-preview.sh which handles the three-value lease gate:
-# unlocked → dispatching → reviewing. See task.0293 for the lease model.
+# Resolves the merge's `sha-<mainSHA>` images (published by pr-build.yml on
+# merge_group AND push:main) and calls scripts/ci/flight-preview.sh, which
+# dispatches promote-and-deploy env=preview for the merged SHA. There is NO
+# re-tag step — promote-and-deploy resolves the same sha-<mainSHA> digest
+# directly (BUILD_ONCE_PROMOTE_DIGEST). Preview is latest-wins; no review lease.
 #
 # SHA resolution: HEAD_SHA is the commit on main (github.sha for push events,
-# inputs.sha for dispatch). With merge queue enabled, the squash-merged commit
-# on main equals the queue commit Y that pr-build (merge_group) built, so
-# HEAD_SHA = Y and the merge_group's rebuilt image is at mq-{N}-{HEAD_SHA}.
-# We use that tag for source lookup and HEAD_SHA as the destination preview-{}
-# tag, the source_sha to promote-and-deploy, and the BUILD_SHA assertion.
+# inputs.sha for dispatch). pr-build publishes `<image>:sha-<HEAD_SHA>` on both
+# the merge_group build (queue commit == merged main SHA) and the push:main build
+# — so flight-preview source-addresses by `sha-<HEAD_SHA>`, passes HEAD_SHA as
+# both source_sha and the BUILD_SHA assertion.
 #
-# bug.0412 changed this from pr-{N}-{prHeadSHA} to mq-{N}-{HEAD_SHA}: the old
-# pattern collided with candidate-flight, which also consumes pr-{N}-{X}.
-# pr-build now keeps pull_request tags immutable; flight-preview owns the
-# mq-{N}-{Y} namespace exclusively.
-#
-# Direct pushes to main (no associated PR) are NOT a supported flight trigger:
-# the re-tag source images are pr-build outputs, and a direct push has no PR
-# number. Such pushes exit 0 with a message and do nothing.
+# Direct pushes to main with no associated PR resolve no PR number; such pushes
+# exit 0 with a message and do nothing (the push:main pr-build still publishes
+# the image, so a later workflow_dispatch can flight it).
 
 on:
   push:
@@ -37,10 +33,10 @@ permissions:
   pull-requests: read
   actions: write
 
-# Serialize entry to the unlocked → dispatching transition. Two merges landing
-# within seconds will run back-to-back, not in parallel. The three-value lease
-# in flight-preview.sh is the correctness guarantee; this concurrency group
-# just reduces push-retry churn under bursty merges.
+# Serialize flight dispatch: two merges landing within seconds run back-to-back,
+# not in parallel, so they dispatch promote-and-deploy in merge order.
+# promote-and-deploy.yml's own per-env concurrency group then serializes the
+# deploys themselves (latest-wins) — there is no review lease.
 concurrency:
   group: flight-preview
   cancel-in-progress: false
@@ -61,13 +57,15 @@ jobs:
        !startsWith(github.event.head_commit.message, 'chore(preview):'))
     outputs:
       # Emitted by scripts/ci/flight-preview.sh into $GITHUB_OUTPUT.
-      # Values: dispatched | queued | (empty when the flight step was
-      # gated off, e.g. workflow_dispatch with a non-PR SHA).
-      # Consumed by the deploy-preview job so a queued run surfaces as a
-      # visibly-skipped entry in the checks list instead of a green one.
+      # Values: dispatched | (empty when the flight step was gated off,
+      # e.g. workflow_dispatch with a non-PR SHA).
+      # Consumed by the deploy-preview job to confirm a dispatch occurred.
       status: ${{ steps.flight.outputs.status }}
       pr_number: ${{ steps.pr.outputs.pr_number }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
+      # Clickable URL of the promote-and-deploy run this flight spawned, resolved
+      # by flight-preview.sh (best-effort; may be empty if resolution timed out).
+      spawned_run_url: ${{ steps.flight.outputs.spawned_run_url }}
     steps:
       - name: Checkout app source
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
@@ -124,23 +122,31 @@ jobs:
               echo "::error::flight-preview triggered by push to main but no PR resolvable for ${HEAD_SHA:0:8} after primary (commit subject) + fallback (API 5×3s) lookups. Direct pushes to main are incident-only per docs/spec/ci-cd.md. If this push is intentional, dispatch flight-preview.yml manually with an explicit sha input after the commit you want flighted is on main."
               exit 1
             fi
-            # workflow_dispatch with a non-PR SHA (incident recovery path) — skip cleanly.
-            echo "ℹ️  Dispatched with SHA ${HEAD_SHA:0:8} that has no PR — skipping."
+            # workflow_dispatch with a non-PR SHA. Skip cleanly either way, but a
+            # HUMAN-typed dispatch that resolves no PR is operator error — make it
+            # LOUD (bug.5050) so a green-no-op run can't be mistaken for a deploy.
+            # (A push-triggered skip is a legitimate quiet incident-path and is
+            # handled above; this branch only fires for workflow_dispatch.)
+            echo "::warning::flight-preview dispatched with SHA ${HEAD_SHA:0:8} that resolves to NO PR — promote-and-deploy was NOT dispatched. This run did nothing. Re-dispatch with a PR-merge SHA."
+            {
+              echo "## ⚠️ Flight Preview — no-op (nothing deployed)"
+              echo ""
+              echo "Dispatched with SHA \`${HEAD_SHA}\` that resolves to **NO PR** — \`promote-and-deploy\` was **NOT** dispatched."
+              echo ""
+              echo "This is almost certainly operator error: a manual \`workflow_dispatch\` must target a PR-merge SHA on main. Re-dispatch with a PR-merge SHA."
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # bug.0412 — pr-build.yml emits two distinct GHCR tag namespaces:
-          # `pr-{N}-{X}` for pull_request builds (immutable, candidate-flight
-          # consumes), and `mq-{N}-{Y}` for merge_group rebuilds where Y is
-          # the queue/rebased commit. With merge queue enabled, the squash-
-          # merged commit on main equals the queue commit — i.e. HEAD_SHA = Y —
-          # so the merge_group's rebuilt image is at `mq-{N}-{HEAD_SHA}`.
-          # That image carries the rebased tree's BUILD_SHA, which is what
-          # preview should reflect.
+          # ONE identity (SOURCE_SHA_IS_DEPLOY_IDENTITY): pr-build publishes
+          # `<image>:sha-<sourceSha>` on BOTH merge_group (sourceSha = queue commit
+          # = this merged main SHA) AND push:main (sourceSha = this merged main SHA).
+          # Either way the deployable for this merge is at `sha-${HEAD_SHA}` — no
+          # pr-/mq-/preview- namespaces, no re-tag. promote-and-deploy resolves the
+          # same `sha-${HEAD_SHA}` directly, so preview carries that exact digest.
           #
-          # PR_HEAD_SHA (the original PR branch head) is still recorded for
-          # logging / artifact provenance only; it is NOT the image lookup key.
+          # PR_HEAD_SHA (the original PR branch head) is recorded for logging only.
           PR_HEAD_SHA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq '.head.sha')
           if [ -z "$PR_HEAD_SHA" ]; then
             echo "❌ Failed to resolve head SHA for PR #${PR_NUMBER}"
@@ -150,9 +156,30 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           echo "pr_head_sha=$PR_HEAD_SHA" >> "$GITHUB_OUTPUT"
-          echo "image_tag=mq-${PR_NUMBER}-${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=sha-${HEAD_SHA}" >> "$GITHUB_OUTPUT"
           echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "Merged PR #${PR_NUMBER}: main SHA ${HEAD_SHA:0:8} (= queue commit), PR head SHA ${PR_HEAD_SHA:0:8}"
+          echo "Merged PR #${PR_NUMBER}: main SHA ${HEAD_SHA:0:8} → image sha-${HEAD_SHA:0:8}; PR head ${PR_HEAD_SHA:0:8}"
+
+      - name: Fetch merged PR changed-paths
+        id: pr-files
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          OUT: ${{ runner.temp }}/preview-pr-changed-paths.txt
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${{ github.repository }}/pulls/${PR_NUMBER}/files" \
+            --jq '.[] | (.filename, .previous_filename) | select(. != null)' > "$OUT"
+          echo "changed_paths_file=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Detect remote-source artifact targets
+        id: remote-source-artifact-targets
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          CHANGED_PATHS_FILE: ${{ steps.pr-files.outputs.changed_paths_file }}
+          OUTPUT_FILE: ${{ runner.temp }}/remote-source-artifact-targets.json
+        run: bash scripts/ci/detect-remote-source-artifact-targets.sh
 
       - name: Set up Docker Buildx
         if: steps.pr.outputs.skip != 'true'
@@ -166,13 +193,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Resolve PR image digests
+      # Resolve the merge's `sha-<mainSha>` images directly (no re-tag). On a
+      # queue merge the merge_group build already published them (instant hit).
+      # On a non-queue/admin/direct merge there is no merge_group build, so wait
+      # (bounded) for the push:main build of pr-build.yml to publish them. This is
+      # the only added cost of self-building on push:main; the queue path is
+      # unaffected. promote-and-deploy resolves the same sha-<mainSha> directly.
+      - name: Resolve preview image digests (bounded wait for push:main build)
         id: images
         if: steps.pr.outputs.skip != 'true'
         env:
           IMAGE_TAG: ${{ steps.pr.outputs.image_tag }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          REMOTE_SOURCE_ARTIFACT_TARGETS_FILE: ${{ steps.remote-source-artifact-targets.outputs.targets_file }}
           OUTPUT_FILE: ${{ runner.temp }}/resolved-pr-images.json
-        run: bash scripts/ci/resolve-pr-build-images.sh
+        run: |
+          set -euo pipefail
+          deadline=$(( SECONDS + 900 ))   # 15 min — covers a cold push:main build
+          while :; do
+            GITHUB_OUTPUT=/dev/null bash scripts/ci/resolve-pr-build-images.sh || true
+            if [ -s "$OUTPUT_FILE" ] && [ "$(jq '.targets | length' "$OUTPUT_FILE")" -gt 0 ]; then
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::warning::No sha-${HEAD_SHA:0:8} images after wait — emitting empty (hard-fail follows)"
+              break
+            fi
+            echo "Waiting for sha-${HEAD_SHA:0:8} build to publish… ($((deadline - SECONDS))s left)"
+            sleep 20
+          done
+          # Final authoritative resolve writes has_images/resolved_targets to step outputs.
+          bash scripts/ci/resolve-pr-build-images.sh
 
       - name: Hard-fail when no images found for resolved PR
         if: steps.pr.outputs.skip != 'true' && steps.images.outputs.has_images != 'true'
@@ -180,61 +231,13 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
-          echo "::error::flight-preview resolved PR #${PR_NUMBER} (sha ${HEAD_SHA:0:8}) but no \`mq-${PR_NUMBER}-${HEAD_SHA}\` images exist in GHCR. Most likely cause: the PR was admin-merged (bypassed merge_group), so pr-build never rebuilt against the queue commit. Recovery: open a follow-up PR that touches the affected node's paths (e.g. nodes/<node>/app/) and merge via the GH merge queue — NOT admin-merge. The merge_group rebuild produces the mq-{N}-{queue-sha} images, and the auto-flight on the resulting push:main heals preview."
+          echo "::error::flight-preview resolved PR #${PR_NUMBER} (sha ${HEAD_SHA:0:8}) but no deployable artifact images exist in GHCR. In-repo + remote-source artifacts alike must publish image_repository:sha-<sourceSha> — ensure pr-build.yml (merge_group or push:main) built sha-${HEAD_SHA}."
           exit 1
 
-      # Re-tag only the images that were actually built (affected-only CI may skip services).
-      # promote-and-deploy resolves preview-{sha} tags — this creates them without rebuilding.
-      # Source tag is mq-{N}-{HEAD_SHA} (pr-build merge_group output, bug.0412);
-      # destination is preview-{HEAD_SHA} so promote-and-deploy can look it up.
-      - name: Re-tag merge_group images as preview-{sha} in GHCR
-        if: steps.pr.outputs.skip != 'true' && steps.images.outputs.has_images == 'true'
-        env:
-          PR_IMAGE_TAG: ${{ steps.pr.outputs.image_tag }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          RESOLVED_TARGETS: ${{ steps.images.outputs.resolved_targets }}
-        run: |
-          # Canonical target catalog + tag-suffix + GHCR-package mapping
-          # (bug.0328 + bug.0344). Iterating ALL_TARGETS means adding a new
-          # node is a one-line edit in scripts/ci/lib/image-tags.sh — no
-          # inline list to drift here (root cause of PR #923). image_name_for_target
-          # picks the APP vs MIGRATOR GHCR package per target (bug.0344
-          # GHCR split — gives the image updater's app/migrator aliases
-          # independent Status.Summary.Images entries).
-          # shellcheck source=../../scripts/ci/lib/image-tags.sh
-          . scripts/ci/lib/image-tags.sh
-
-          PREVIEW_TAG="preview-${HEAD_SHA}"
-
-          for target in "${ALL_TARGETS[@]}"; do
-            # type:infra (e.g. litellm) deploys via Compose-on-VM, not k8s/Argo,
-            # so there is no preview-{sha} tag to mint — deploy-infra resolves the
-            # content-hash tag directly. resolve-pr-build-images.sh DOES resolve
-            # infra (via infra_image_tag), so it lands in RESOLVED_TARGETS; the
-            # naive mq-{N}-{sha}{suffix} src below never exists for it. Skip here,
-            # mirroring promote-build-payload.sh's is_infra_target guard.
-            if is_infra_target "$target"; then
-              echo "Skipping ${target} — infra image (Compose-deployed, no k8s preview tag)"
-              continue
-            fi
-            if ! echo "$RESOLVED_TARGETS" | grep -qw "$target"; then
-              echo "Skipping ${target} — not in PR build (not affected or not built)"
-              continue
-            fi
-            suffix=$(tag_suffix_for_target "$target")
-            image_name=$(image_name_for_target "$target")
-            src="${image_name}:${PR_IMAGE_TAG}${suffix}"
-            dst="${image_name}:${PREVIEW_TAG}${suffix}"
-            echo "Re-tagging ${target}: ${image_name##*/}:${PR_IMAGE_TAG}${suffix} → ${PREVIEW_TAG}${suffix}"
-            docker buildx imagetools create --tag "$dst" "$src"
-          done
-
-          echo "✅ Re-tag complete for preview-${HEAD_SHA:0:8}"
-
-      # The script writes `status=dispatched|queued` to $GITHUB_OUTPUT and a
-      # markdown banner to $GITHUB_STEP_SUMMARY — no decision logic lives in
-      # this workflow. Exit 0 = dispatched, 1 = error, 2 = queued.
-      - name: Flight to preview (lock-gate aware)
+      # The script writes `status=dispatched` to $GITHUB_OUTPUT and a markdown
+      # banner to $GITHUB_STEP_SUMMARY — no decision logic lives in this
+      # workflow. Exit 0 = dispatched, 1 = error.
+      - name: Flight to preview
         id: flight
         if: steps.pr.outputs.skip != 'true'
         env:
@@ -267,8 +270,7 @@ jobs:
           exit 1
 
       # Consumed by promote-preview-digest-seed.yml (workflow_run). Only
-      # `dispatched` may trigger a chore(preview): commit on main — queued
-      # merges must not (task.0349 follow-up).
+      # `dispatched` may trigger a chore(preview): commit on main.
       - name: Record preview flight outcome artifact
         if: always() && steps.pr.outputs.skip != 'true'
         run: |
@@ -280,9 +282,8 @@ jobs:
           name: preview-flight-outcome
           path: preview-flight-outcome.txt
 
-  # Visible check: green only when promote-and-deploy was actually dispatched
-  # (lease unlocked). Skipped (grey) when preview was queue-only — distinct
-  # from a green "Flight Preview" job alone.
+  # Visible check: green when promote-and-deploy was dispatched for this merge.
+  # Skipped (grey) only when the flight was gated off (a non-PR dispatch SHA).
   preview-dispatched-marker:
     needs: flight
     if: success() && needs.flight.outputs.status == 'dispatched'
@@ -293,9 +294,8 @@ jobs:
           echo "✅ Preview lease was unlocked; promote-and-deploy was dispatched for this merge."
 
   # Deploy-preview is gated on the flight script's `status` output, not on
-  # step conclusions. A queued run emits `status=queued`, leaving this job
-  # visibly skipped in the checks list; a dispatched run emits
-  # `status=dispatched` and this job runs to confirm.
+  # step conclusions. A dispatched run emits `status=dispatched` and this job
+  # runs to confirm; a gated-off run (non-PR dispatch SHA) leaves it skipped.
   deploy-preview:
     needs: flight
     if: needs.flight.outputs.status == 'dispatched'
@@ -305,6 +305,11 @@ jobs:
         env:
           PR_NUMBER: ${{ needs.flight.outputs.pr_number }}
           HEAD_SHA: ${{ needs.flight.outputs.head_sha }}
+          SPAWNED_RUN_URL: ${{ needs.flight.outputs.spawned_run_url }}
         run: |
           echo "✅ promote-and-deploy dispatched for PR #${PR_NUMBER} (${HEAD_SHA:0:8})."
-          echo "Watch: gh run list --workflow=promote-and-deploy.yml --limit 1"
+          if [ -n "${SPAWNED_RUN_URL}" ]; then
+            echo "🔗 Spawned run: ${SPAWNED_RUN_URL}"
+          else
+            echo "Watch: gh run list --workflow=promote-and-deploy.yml --limit 1"
+          fi

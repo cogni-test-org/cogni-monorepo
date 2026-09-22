@@ -34,10 +34,10 @@ inbox with N single-commit branches for one unit of work (the noob failure).
 Walk top-to-bottom. **Most agent work stops at step 1.**
 
 1. **STAY SILENT.** Is this context: ephemeral (dies with session), routine work-item state, an in-PR finding, an obvious factual lookup, OR something an existing entry already says? → **write nothing.** Knowledge entries are precious; sprawl is the failure mode. **≥80% of contributable-feeling moments belong here.**
-2. **RECALL.** Use `/knowledge?mode=browse` filtered by domain, or `core__knowledge_search`. Is there an existing entry that already covers your claim? If yes → step 3. Also recall **your own** open contribution (`GET /contributions?state=open`) so you append rather than fork.
+2. **RECALL — both planes.** (a) The **merged** plane: `/knowledge?mode=browse` filtered by domain, or `core__knowledge_search`. (b) **Your own open contribution _branch_**: `GET /contributions?state=open` for the id, then **`GET /contributions/{id}/diff` to read the entries already on it.** Branch-local entries do **not** appear in `/knowledge?domain=` (it returns merged-`main` only) — so an agent who recalls the merged plane alone will re-discover, re-author, or outright deny knowledge it wrote minutes ago on its own branch. Read the branch before you write or before you answer "does X exist / is it linked." Cite the siblings you find; append rather than fork.
 3. **REFINE.** Found a related entry that's slightly off, stale, or bloated? **Sharpen it in place** via an `op: update` edit. Shorter + sharper + raises confidence. **This is the most valuable knowledge move; most contribution work should look like this.**
-4. **CITE.** Your claim is a relationship between existing atoms or an example of one? Add a `citation` edge — `supports`, `contradicts`, `extends`, `supersedes`. Or write a sibling atom that cites the parent. Never inline "companion to X" prose.
-5. **WRITE ATOMIC.** No existing atom fits AND the claim earns its keep → file new entry. See routing below for which entry type / sub-skill.
+4. **CITE.** Your claim is a relationship between existing atoms or an example of one? Add a `citation` edge — `supports`, `contradicts`, `extends`, `supersedes`. Or write a sibling atom that cites the parent. Never inline "companion to X" prose. **Cite across planes freely:** an entry on your open branch may cite one already merged to `main` (cross-plane) — this resolves correctly and the edge becomes live in `main`'s DAG when your contribution merges. (Before bug.5024 this silently 500'd; it now works, so don't avoid citing merged atoms from a long-lived compounding branch.) **Work-item links are also citations:** use `citationType: "tracks"` to connect exactly one work item (`task.*`, `bug.*`, `spike.*`, `story.*`, or `subtask.*`) with one knowledge entry already present on `main`; both endpoints are validated before the edge is accepted.
+5. **WRITE ATOMIC.** No existing atom fits AND the claim earns its keep → file new entry. See routing below for which entry type / sub-skill. **Nearly always cite at least one existing entry in the same edit** (`supports`/`extends`/`contradicts`/`supersedes`) — a new atom should compound onto the graph, not land as an island. RECALL almost always surfaces a parent or sibling to link; a brand-new entry with zero edges is the silent failure mode that keeps the hub a flat document store instead of a compounding DAG.
 6. **EXTEND.** Anti-pattern. Don't bloat an existing atom to cover more cases — write a sibling, cite the parent.
 
 ## Routing by content shape
@@ -81,8 +81,7 @@ Text entry types render their `content` as **GFM markdown** in the human UI (str
 Cogni nodes own niche hubs. Pick by primary subject:
 
 - **operator** (`https://cognidao.org` / `https://test.cognidao.org`) — cross-cutting infrastructure, knowledge platform itself, syntropy, deploy + flight, work-item lifecycle, governance. **Default when in doubt.**
-- **poly** (`poly.cognidao.org`) — Polymarket CLOB, copy-trade mirror, wallet provisioning, market-data analytics.
-- **resy** (`resy.cognidao.org`) — reservation knowledge.
+- Each node owns its own domain. derive the node set — `for f in infra/catalog/*.yaml; do grep -q '^type: node' $f && basename $f .yaml; done` — never a hand-typed list (Dolt `operator-node-catalog`: "the roster is LIVE STATE"); a node's hub lives at its own host. (A hand-typed list here previously named `resy`, a node that never existed.)
 - Other nodes — see each node's charter.
 
 If a claim is genuinely cross-node (e.g. "Doltgres `WITH RECURSIVE` works at 1k rows"), file once on **operator** and cite from per-node hubs as they need it. Don't duplicate.
@@ -104,11 +103,17 @@ KEY=$(grep -E "^COGNI_API_KEY_TEST=" .env.cogni | cut -d= -f2- | tr -d "\"")   #
 BASE=https://test.cognidao.org   # or production cognidao.org
 ```
 
-**Step 1 — recall your open contribution (so you append, not fork):**
+**Step 1 — recall your open contribution AND read what's already on its branch:**
 
 ```bash
 CID=$(curl -sS "$BASE/api/v1/knowledge/contributions?state=open&limit=20" \
   -H "Authorization: Bearer $KEY" | jq -r '.contributions[0].contributionId // empty')
+
+# MANDATORY when CID exists: read the entries already on YOUR branch. These are
+# NOT in /knowledge?domain= (merged-main only) — skip this and you'll re-author
+# or deny knowledge you wrote this session. Cite/refine these siblings.
+[ -n "$CID" ] && curl -sS "$BASE/api/v1/knowledge/contributions/$CID/diff" \
+  -H "Authorization: Bearer $KEY" | jq -r '.entries[] | "\(.rowId): \((.after // .before).title)"'
 ```
 
 **Step 2 — only if you have none open, create ONCE and capture the id:**
@@ -135,7 +140,7 @@ CID=$(curl -sS -X POST "$BASE/api/v1/knowledge/contributions" \
 **Step 3 — every further edit appends to that SAME branch via `/commits`:**
 
 ```bash
-# Add another atom, refine a row you created earlier on this branch, or deprecate —
+# Add another atom, refine a row you created earlier on this branch, or delete —
 # all on the open contribution. NEVER POST /contributions again for this work.
 curl -sS -X POST "$BASE/api/v1/knowledge/contributions/$CID/commits" \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
@@ -145,7 +150,33 @@ curl -sS -X POST "$BASE/api/v1/knowledge/contributions/$CID/commits" \
   }'
 ```
 
-One POST can carry a **mixed-op batch** (`insert` + `update` + `deprecate`, up to 50) in a single commit when the changes belong together — that's one review for one coherent unit, not N branches.
+One POST can carry a **mixed-op batch** (`insert` + `update` + `delete`, up to 50) in a single commit when the changes belong together — that's one review for one coherent unit, not N branches.
+
+**Work-item↔knowledge tracking links.** Use a `cite` edit with
+`citationType: "tracks"` when a work item is the operational owner of a
+knowledge entry, or when a knowledge entry explains/proves a work item. The edge
+must connect exactly one work-item id and one merged knowledge id; branch-local
+knowledge rows are not accepted for `tracks` because work-item detail pages read
+the merged DAG.
+
+```bash
+curl -sS -X POST "$BASE/api/v1/knowledge/contributions/$CID/commits" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{
+    "message": "link story.5017 to knowledge invariant",
+    "edits": [{
+      "op": "cite",
+      "citingId": "story.5017",
+      "citedId": "<merged-knowledge-id>",
+      "citationType": "tracks",
+      "context": "story.5017 implements and validates this knowledge invariant"
+    }]
+  }'
+```
+
+Do **not** add work-item link columns or duplicate the relationship in work
+metadata. The `citations` row is the source of truth and renders from both the
+knowledge and work-item detail surfaces after merge.
 
 **Two distinct "refine" cases — don't conflate them:**
 
@@ -153,6 +184,20 @@ One POST can carry a **mixed-op batch** (`insert` + `update` + `deprecate`, up t
 | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | a row you wrote earlier **on your open branch** | `POST /contributions/{id}/commits` with `{op:"update", targetRowId, entry}` — `targetRowId` resolves on the branch |
 | an entry **already merged to `main`**           | `POST /contributions` once with `{op:"update", targetRowId:<main id>}`, then keep refining **that** via `/commits` |
+
+### Edit ops + the three constraints that bite
+
+`KnowledgeContributionEditSchema` is a discriminated union of **exactly four** ops
+(`packages/knowledge-store/src/domain/contribution-schemas.ts`) — anything else is
+HTTP 400 `invalid_union` / "No matching discriminator":
+
+- `{op:"insert", entry}` · `{op:"update", targetRowId, entry}` · `{op:"delete", targetRowId, reason}` (**`reason` is required**, 1–512 chars) · `{op:"cite", citingId, citedId, citationType, context?}` (self-citation — `citingId === citedId` — is rejected at the wire). The API verb is literally `delete`; the syntropy bar for _when_ to remove an entry is a separate judgement call (see `knowledge-syntropy-expert`).
+- **Referential integrity on delete.** Deleting a row that anything cites fails **409**: `cannot delete '<id>': cited by <list>. Remove or repoint those edges first, or refine the entry in place.` The dead row's own _outbound_ edges cascade; inbound edges never dangle.
+- **`tracks` endpoints must already be on `main`.** A `tracks` edge pointing at a **branch-local** knowledge row fails **404** `{"code":"cited_not_found"}` — work-item detail pages read the merged DAG. Cross-plane the other way works: a branch entry citing a merged entry resolves fine and goes live in `main`'s DAG on merge.
+- **`op:update` cannot rename a row id.** `targetRowId` is the `WHERE` key and `entry.id` is ignored, so a slug can never change in place. Renaming a **cited** entry therefore needs multiple sequential merges (insert new → merge → repoint edges → delete old) — prefer refining in place.
+- **Consequence, stated plainly: supersede+repoint of a cited entry is impossible inside one contribution.** Don't plan a batch around it; refine the entry in place instead.
+
+Verified empirically against `https://cognidao.org` on 2026-09-16.
 
 ## Format the `content` field as Markdown
 
@@ -204,8 +249,11 @@ Don't set `confidencePct` on the request unless you have a defensible reason. In
 ## Anti-patterns
 
 - **Re-POSTing `/contributions` for related work instead of appending via `/commits`** — the fracturing failure: N single-commit branches for one unit of work (and an inbox no human wants to triage).
+- **Recalling the merged plane only — never reading your own open branch.** `/knowledge?domain=` returns merged-`main`; your `contrib/*` branch entries are invisible to it. Answering "does X exist / is it linked" or deciding to write _without_ `GET /contributions/{id}/diff` is how an agent denies or duplicates knowledge it authored minutes ago (the exact failure that prompted this rule).
 - **Registering a fresh agent key per contribution** — multiplies principals; reuse your one saved key.
 - Filing a new entry when RECALL would surface an existing match
+- **Filing a new atom with zero citation edges — the island failure.** A new entry should nearly always `cite` a parent/sibling RECALL surfaced (cross-plane to merged atoms works); islands don't compound and leave the hub a flat document store
+- **Linking work items outside `citations`** — work↔knowledge relationships use one `tracks` edge, not duplicated columns, tags, or prose.
 - Writing a `content` prose blob instead of structured markdown (headings / bold lead / table / list) — renders as an unscannable wall; see "Format the `content` field"
 - Reaching for `html` for ordinary human-facing content that a markdown table or list expresses fine — `html` is the rare visual escape hatch (SVG / chart), not the default for "a human reads it"
 - Filing a falsifiable prediction as `finding` to avoid EDO overhead — use `edo-loop` or stay silent

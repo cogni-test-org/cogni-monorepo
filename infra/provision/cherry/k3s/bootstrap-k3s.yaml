@@ -118,28 +118,29 @@ write_files:
       echo "Waiting for Argo CD to be ready..."
       kubectl -n argocd wait --for=condition=Available deployment/argocd-server --timeout=300s
 
-      # Apply ApplicationSets (canary/preview/production) from repo
+      # Apply ApplicationSets (preview/production) from repo
       echo "Cloning repo for Argo ApplicationSets..."
       REPO_DIR="/tmp/cogni-bootstrap-repo"
       rm -rf "$REPO_DIR"
-      git clone --depth=1 --branch "${git_branch:-canary}" \
+      git clone --depth=1 --branch "${git_branch:-main}" \
         "https://github.com/cogni-dao/cogni.git" "$REPO_DIR"
 
-      # Per-node AppSets: one `<env>-<node>-applicationset.yaml` object per node
-      # (LANE_ISOLATION, axiom 18). Apply every per-node file for the envs this
-      # VM hosts (preview + production); candidate slots live on separate VMs.
-      echo "Applying per-node ApplicationSets..."
-      shopt -s nullglob
-      for appset in "$REPO_DIR"/infra/k8s/argocd/preview-*-applicationset.yaml \
-                    "$REPO_DIR"/infra/k8s/argocd/production-*-applicationset.yaml; do
-        kubectl apply -f "$appset" -n argocd
-        echo "  Applied $(basename "$appset")"
+      # Per-env ROOT app-of-apps (story.5020): apply the `cogni-<env>-control-plane`
+      # SEED for the envs this VM hosts (preview + production). The seed is the ONLY
+      # apply-once surface; from it Argo continuously reconciles control-plane/<env>/
+      # (the cogni-<env>-appsets app-of-apps) which in turn reconciles appsets/<env>/
+      # with prune. So a merged change to the app-of-apps layer reaches the cluster
+      # without a re-provision, and a catalog-removed node's AppSet auto-prunes.
+      # candidate slots live on separate VMs and apply their own seed.
+      echo "Applying per-env control-plane root app-of-apps..."
+      for env in preview production; do
+        kubectl apply -f "$REPO_DIR/infra/k8s/argocd/control-plane/roots/${env}-control-plane-application.yaml" -n argocd
+        echo "  Applied cogni-${env}-control-plane seed"
       done
-      shopt -u nullglob
       rm -rf "$REPO_DIR"
 
       # Create app namespaces (Argo CreateNamespace=true handles this too, belt+suspenders)
-      for ns in cogni-canary cogni-preview cogni-production; do
+      for ns in cogni-preview cogni-production; do
         kubectl create namespace "$ns" 2>/dev/null || true
       done
 

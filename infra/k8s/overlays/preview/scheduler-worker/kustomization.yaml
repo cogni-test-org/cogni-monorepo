@@ -16,6 +16,12 @@ images:
     digest: "sha256:7c4170927e7916262a6e0a9fa7fdb8946da48184e2d7353e13d2494c45d79072"
 
 patches:
+  # PROVIDER-RESOLVED COGNI_NODE_ENDPOINTS. bug.5094 — a node placed on akash has
+  # no in-cluster Service, so its address is env-variant and belongs here, not in
+  # the shared base. Listed first so the base default is replaced before the
+  # env-specific ops below apply.
+  - path: node-endpoints.patch.yaml
+
   # Patch ConfigMap with staging-specific values
   - target:
       kind: ConfigMap

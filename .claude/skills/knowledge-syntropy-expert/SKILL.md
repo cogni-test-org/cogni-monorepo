@@ -13,6 +13,22 @@ Each Cogni node grows into the subject-matter expert for a specific niche commun
 
 End state: open-core today, optionally privileged/paywalled tomorrow. Agents are first-class consumers. Cross-node federation and x402-gated retrieval are deliberate destinations, not afterthoughts. Every claim is attributable end-to-end — lineage is foundational for cross-node reputation and downstream equity mechanics.
 
+## The baseline — where it lives (pointers, not copies)
+
+Every node's hub ships a generic schema + a small set of domains + an anchor orientation seed; content boots empty and compounds via the EDO loop. To avoid drift, each fact has ONE home — recall from it, don't restate it here:
+
+| Fact                                                                   | Canonical home                                                                              |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| The universal domain **values**                                        | `BASE_DOMAIN_SEEDS` (`packages/knowledge-base/src/seeds/domains.ts`)                        |
+| Domain **model** (universal vs per-node niche) + v0 **manual** seeding | [`knowledge-domain-registry.md`](../../../docs/spec/knowledge-domain-registry.md) § Seeding |
+| The 6 tables + `entry_type` list + the **EDO loop**                    | [`knowledge-syntropy.md`](../../../docs/spec/knowledge-syntropy.md)                         |
+| What the session bundle assembles                                      | `api/v1/cognition/{route,_bundle}.ts`                                                       |
+
+Two invariants agents get wrong (the reason this section exists — stable, won't drift):
+
+- **`skills` is an `entry_type` (skill = executed, guide = read, playbook), NOT a domain.**
+- **There is no `strategy` entry_type** — a strategy is a `hypothesis → decision → outcome` chain, promoted to `rule`/`conclusion` once validated. A hub that doesn't predict → decide → resolve is a filing cabinet.
+
 ## What makes knowledge valuable
 
 - **Discoverable.** Every entry has a "use when X" framing — same shape as a skill description. If an agent can't decide whether to load it from title + first line, it might as well not exist.
@@ -67,6 +83,7 @@ If you reach step 8, you're sprawling in git, where humans can't recall it. Know
 - **DOLT_IS_SOURCE_OF_TRUTH** — Postgres search index is derived and rebuildable.
 - **AUTO_COMMIT_ON_WRITE** — every write commits via the capability layer.
 - **EXTERNAL_WRITES_TO_BRANCH** — bearer agents → `contrib/*`; only session users merge to `main`.
+- **CROSS_LINKS_ARE_EDGES_NOT_COLUMNS** — a relationship between any two entities (knowledge↔knowledge **and** work-item↔knowledge) is a single `citations` row, never a ref-column duplicated on each endpoint (that fractures — the two copies drift). The work-item↔knowledge link generalizes `citations` to allow a work-item endpoint (id-shape `task./bug./…\d+`); it is authored via the contribution `cite` op (so links are curated, validated both-endpoints-exist-on-`main`) and read both directions via the indexed `citing_id`/`cited_id`. Work-item **lifecycle** (claim/status/PR) stays direct-write (autonomy); cross-**links** are curated knowledge. `work_items` holds no link data. Full rationale + roadmap: hub entry `work-knowledge-write-planes` (meta) + work item `story.5017`.
 
 ## Anti-sprawl rules
 

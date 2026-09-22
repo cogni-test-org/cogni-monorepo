@@ -40,23 +40,60 @@ server:
         path    = "/openbao/data"
         node_id = "openbao-0"
       }
-      service_registration "kubernetes" {}
+      # bug.5051: NO service_registration. The chart does NOT grant the openbao
+      # ServiceAccount a Role/RoleBinding to get/patch its own pod, so each
+      # `service_registration "kubernetes"` attempt is 403 Forbidden, retried
+      # every 5s forever (~17k/day) — a slow memory leak that climbs from ~132Mi
+      # idle to the 1Gi limit over ~9 days and OOMKills the pod → Shamir reseal
+      # → silent multi-day secret-plane outage on EVERY env (preview/prod/cand-a
+      # all exit-137 ~2026-06-20). The registration is also UNUSED: ESO's
+      # ClusterSecretStore targets the plain `openbao` Service; there is no
+      # `openbao-active`/`openbao-standby` Service, so the vault-active/
+      # vault-sealed pod labels this would set route nothing. Verified against
+      # openbao-helm 0.28.2: removing this line is the only render delta (the SA,
+      # the kubernetes AUTH method, and raft storage are all unaffected).
 
   dataStorage:
     enabled: true
     size: 10Gi
     # storageClass: omitted — defaults to cluster default (local-path on k3s).
 
+  # bug.5011: the 512Mi limit OOMKilled prod OpenBao (2026-06-11 02:25) on the
+  # memory-tight 6GB box → Shamir reseal → ESO/secrets outage until manual
+  # unseal. Raised headroom so a Raft vault under load isn't container-OOMKilled;
+  # the larger request also reserves it honestly so node pressure can't squeeze
+  # it. NOTE: this mitigates the OOM *trigger* only — the durable fix for the
+  # reseal-on-restart SPOF (any reboot/update reseals a Shamir 1-of-1 vault) is
+  # auto-unseal, tracked in bug.5011.
   resources:
     requests:
       cpu: 250m
-      memory: 256Mi
+      memory: 384Mi
     limits:
-      memory: 512Mi
+      memory: 1Gi
 
   # Readiness/liveness use OpenBao's /v1/sys/health endpoint. Sealed pods
   # return 503 by default; the chart's standby/sealed code mappings already
   # treat sealed-but-running as "alive" so it doesn't crash-loop pre-unseal.
+  #
+  # ...which was ASPIRATIONAL until 2026-09-09: the chart's default readiness
+  # probe is not an httpGet at all, it is an exec of
+  # `bao status -tls-skip-verify`. Forking a shell and a CLI binary on every
+  # probe is orders of magnitude more sensitive to node I/O than one HTTP GET,
+  # and on an iowait-saturated node it routinely blew the 3s exec timeout — so a
+  # perfectly healthy vault was marked NotReady 20,920 times on production.
+  # Each of those emits a Kubernetes Event, and every Event is a write into
+  # k3s's kine datastore, so the probe became a leading cause of the node
+  # pressure that tripped it.
+  #
+  # Setting `path` makes the chart render an httpGet instead of the exec, which
+  # is what the comment above always claimed. This is deliberately NOT a timeout
+  # bump: a bigger timeout would hide the cost, where this removes it.
+  # `standbyok=true` keeps a standby replica Ready; a SEALED vault still returns
+  # 503 and still goes NotReady, exactly as `bao status` behaved.
+  readinessProbe:
+    enabled: true
+    path: /v1/sys/health?standbyok=true
 
   # Kubernetes auth method config is applied by `provision-env-vm.sh`
   # Phase 5b.3 (auto-init + auto-bind eso-reader) after init/unseal. It is

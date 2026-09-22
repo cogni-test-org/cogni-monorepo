@@ -23,9 +23,10 @@ tags:
 
 Cogni's deployment artifacts span three git repos today:
 
-- `Cogni-DAO/cogni` — the **monorepo hub**. Holds `nodes/operator/`, `nodes/node-template/`, `nodes/resy/`, plus the canonical `scripts/ci/`, `infra/k8s/base/`, `.github/workflows/`, `infra/compose/`, `infra/catalog/`.
-- `Cogni-DAO/standalone-node` — the **OSS template artifact**. Public surface for forks. Mirrors the hub's `nodes/node-template/` 1:1 and inherits operator-scope infrastructure.
+- `Cogni-DAO/cogni` — the **operator control-plane hub**. Holds `nodes/operator/`, submodule pins for hosted node repos, any remaining legacy in-tree node directories while they are being migrated, plus the canonical `scripts/ci/`, `infra/k8s/base/`, `.github/workflows/`, `infra/compose/`, `infra/catalog/`.
+- `Cogni-DAO/node-template` — the **canonical node-at-root template**. Public source for named node forks. The hub may pin it as a submodule/deployment row, but does not mirror its source under `nodes/node-template/**`.
 - `Cogni-DAO/cogni-poly` — a **per-node fork artifact**. Polymarket-specific node that historically branched off node-template; continues to land operator-scope CI/infra fixes that the hub needs.
+- `cogni-test-org/cogni-monorepo` — the **test parent**. Not a downstream node: a near-1:1 mirror of the hub that candidate-a deploys FROM (the operator's `NODE_SUBMODULE_PARENT_{OWNER,REPO}` on candidate-a). See § Test-Parent Mirror.
 
 Operator-scope fixes have been diverging across these three repos with no shared lineage. Empirical evidence and the backlog of unsynced PRs are tracked in [proj.repo-sync](../../work/projects/proj.repo-sync.md). The canonical example: `scripts/ci/wait-for-in-cluster-services.sh` is byte-identical-stale between hub and node-template, while cogni-poly already eliminated the divergence in [#127](https://github.com/Cogni-DAO/cogni-poly/pull/127). bug.5001 is the same anti-pattern repeated.
 
@@ -60,11 +61,25 @@ Define the contract that:
 
 4. **DECLARED_DIVERGENCE**: Any intentional divergence between a hub path and its artifact counterpart MUST appear in the manifest's `divergences:` block with a `reason:` field. Undeclared divergence is a contract violation surfaced by the drift detector.
 
-5. **MULTI_NODE_OUT_OF_BOX**: The hub MUST ship multi-node fundamentals (catalog-driven Caddyfile, catalog-driven `deploy-infra.sh` per-node env vars, catalog-driven CI gating). node-template inherits these and ships them in fork-quickstart even though it ships with one node today. Single-node hardcoding in operator-scope paths is a contract violation regardless of which repo it lives in.
+5. **MULTI_NODE_OUT_OF_BOX**: The hub MUST ship multi-node fundamentals (catalog-driven Caddyfile, catalog-driven `deploy-infra.sh` per-node env vars, catalog-driven CI gating). node-template ports the relevant operator-hosted node contract without becoming an in-tree hub source directory. Single-node hardcoding in operator-scope paths is a contract violation regardless of which repo it lives in.
 
 6. **ONE_FIX_ONE_LINEAGE**: A fix that addresses the same root cause as an existing upstream PR MUST cite the upstream PR in its description and be cherry-picked or rebased onto upstream's commit, not re-implemented. Reviewers reject parallel fixes with no shared lineage.
 
-7. **CATALOG_BOUNDARY**: `infra/catalog/*.yaml` is the API between operator-scope and per-node scope. Operator-scope code reads from the catalog and never special-cases node names. Per-node bits (a node's own `nodes/<name>/`) are downstream-only and do not propagate up — with the sole exception of `nodes/node-template/`, which IS the canonical template node and propagates hub → node-template-artifact 1:1.
+7. **CATALOG_BOUNDARY**: `infra/catalog/*.yaml` is the API between operator-scope and per-node scope. Operator-scope code reads from the catalog and never special-cases node names. Per-node source bits live in their source repo. A hub `nodes/<name>` gitlink is an operator pin, not source content.
+
+8. **TEST_PARENT_IS_NEAR_IDENTICAL**: an artifact declaring `role: test-parent` mirrors hub main 1:1 for ALL CI/CD infrastructure. Exactly three kinds of difference may be declared — **test identity**, **fixture roster + source pins**, and **environment-specific desired state**. A test-specific reimplementation of a workflow, generator, script, Crossplane/Argo manifest or substrate module is a contract violation, not a divergence: the mirror's value is that it executes the SAME lane production does, and a reimplemented lane proves nothing about the real one.
+
+9. **PRESENCE_IS_NOT_CONTENT**: roster-generated CONTENT is per-deployment; roster-generated PRESENCE is not. `content_may_differ:` suppresses the content check only, so a canonical path the hub generates can never be silently absent on an artifact. Content correctness stays with the canonical generators' own `--check` gates running in the artifact's own CI against the artifact's own catalog — one derivation per fact, never two readers.
+
+10. **MISSING_MAY_BE_FATAL**: an artifact declaring `on_missing: fail` turns an undeclared missing-on-artifact path into a non-zero detector exit. Evidence for the rule: the mirror's absent `infra/k8s/overlays/<env>/scheduler-worker/node-endpoints.patch.yaml` surfaced only as a 422 (`cannot plan scheduler routing for '<env>'/'<slug>': missing the current node-endpoints patch`) at env-activation time, on the mirror, hours into a node launch — not as a red build on the hub that generated the path.
+
+11. **REFRESH_IS_NOT_A_ROSTER_CHANGE**: a content refresh converges code, never membership. Retiring a node from the mirror (catalog row + ApplicationSet + body together) is its own reviewed change; the refresh declares such legacy bodies retained rather than deleting them as a side effect.
+
+12. **SYNC_IS_A_REVIEWED_PR**: the refresh opens ONE pull request as the operator GitHub App, parented on the mirror's own `main` so it is conflict-free by construction. It never pushes or force-pushes `main`, and hub `production`/`staging` secret material is declared hub-only so it cannot enter the mirror's tree by construction rather than by convention.
+
+13. **THREE_TIER_FORK_SYNC**: The `node-template → fork` propagation (a different axis from hub↔artifact drift above) is **three** tiers, by content kind: **Tier 1 — flight contract** (force-overwritten), **Tier 2 — foundational substrate** (node-template-authoritative overlay → always auto-mergeable), **Tier 3 — node identity/presentation** (NEVER synced — `node-template` is a starter). For Tier 2, **node-template wins** every shared (non-`node_local`) path; the upstream branch is parented on the fork tip so the PR is conflict-free by construction (`TIER2_NODE_TEMPLATE_AUTHORITATIVE` + `TIER2_IS_ALWAYS_MERGEABLE`). The Tier-3 set is **declared as data** in `.cogni/sync-manifest.yaml`'s `node_local:` block (read at runtime from the template's own copy, `TIER3_IS_DATA`), and is left as the fork's own version (never overlaid). Operator mission: _build their mission (Tier 3, node-owned), not their plumbing (Tier 1+2, synced)_. See § Three-Tier Fork Sync.
+
+14. **OWNER_APP_BOUNDARY_FAILS_CLOSED**: every `role: test-parent` artifact declares the non-secret GitHub App ID + slug allowed to write its owner. The workflow mints with that manifest ID, masks decoded key material before workflow output, and verifies the returned App slug before any repository write. It never selects an App ID from a generic environment secret. A stale cross-environment keypair therefore fails authentication instead of widening authority or writing to the wrong org.
 
 ---
 
@@ -73,8 +88,8 @@ Define the contract that:
 ```
                               Cogni-DAO/cogni  (HUB)
                               ├── nodes/operator/         (operator app, hub-only)
-                              ├── nodes/node-template/    (template node — exported to node-template-artifact)
-                              ├── nodes/resy/             (per-node, hub-only)
+                              ├── nodes/node-template     (gitlink pin to Cogni-DAO/node-template)
+                              ├── nodes/<legacy>/         (transitional in-tree node source, if any)
                               ├── scripts/ci/             (operator-scope)
                               ├── scripts/setup/          (operator-scope)
                               ├── infra/k8s/base/         (operator-scope)
@@ -87,12 +102,12 @@ Define the contract that:
                                        │
                           ┌────────────┴────────────┐
                           ▼                          ▼
-                Cogni-DAO/standalone-node       Cogni-DAO/cogni-poly
-                (OSS template artifact)       (per-node fork artifact)
-                ├── nodes/node-template/      ├── nodes/poly/         (fork-owned, not hub-mirrored)
-                │   (mirrors hub 1:1)         └── operator-scope paths (hub-mirrored)
-                └── operator-scope paths
-                    (hub-mirrored)
+                Cogni-DAO/node-template          Cogni-DAO/cogni-poly
+                (node-at-root template)        (per-node fork artifact)
+                ├── app/                       ├── nodes/poly/         (fork-owned, not hub-mirrored)
+                ├── graphs/                    └── operator-scope paths (hub-mirrored)
+                ├── packages/
+                └── operator-hosted node contract files
 ```
 
 **Primary flow:** hub → artifacts (forward sync).
@@ -121,7 +136,66 @@ This is the inverse of the v1 (schema=1) form, which enumerated `scope[]` of inc
 
 See the live file for current content. The schema is the durable contract; if doc and live drift, the schema wins.
 
+The manifest also carries a top-level **`node_local:`** glob block — the Tier-3 declaration consumed by § Three-Tier Fork Sync below. It is a **different axis** from `divergences[]`: `divergences` is the hub↔artifact drift model (consumed by the drift-detector); `node_local` is the node-template→fork carve-out (consumed by the operator's fork-sync at runtime). A path may legitimately appear in neither, one, or both.
+
 ---
+
+## Three-Tier Fork Sync
+
+The hub↔artifact drift model above is the **detector** axis (surfacing). The **`node-template → spawned fork`** propagation is a separate, actively-pushing axis: on a push to `node-template`'s default branch the operator GitHub App opens sync PRs on every child fork (`dispatchCanonicalForkSync` → `fanOutForkSync`). It is **three tiers, by content kind:**
+
+| Tier                                 | Content                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Mechanism                                                                                                                                          | Mergeability                                                                      |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| **1 — Flight contract**              | **Roots:** `.github/workflows/{ci.yaml,pr-build.yml,pr-lint.yaml}`, `scripts/check-node-ci-workflow.mjs` (`CI_CONTRACT_PATHS`) + the identity substrate (`IDENTITY_SUBSTRATE_PATHS`). **Delivered:** their transitive closure at the source SHA — every `scripts/**` a canonical workflow invokes and every module a canonical contract barrel re-exports (`TIER1_IS_CLOSED`)                                                                                                                                                                           | Surgical force-overwrite (`syncCanonicalFilesToFork`)                                                                                              | byte-safe, lands even when Tier 2 conflicts                                       |
+| **2 — Foundational substrate**       | the rest of the node's plumbing: `app/src/app/api/**`, `app/src/shared/**`, `app/src/bootstrap/**`, `graphs/**`, `packages/**`, base `k8s/`, etc. — everything **not** Tier 1 or Tier 3                                                                                                                                                                                                                                                                                                                                                                 | node-template-authoritative overlay onto the fork tip (`syncTemplateUpstreamToFork`): node-template wins shared files; fork-unique files preserved | **conflict-free → always auto-mergeable** (branch is a descendant of fork `main`) |
+| **3 — Node identity / presentation** | the node's _face_: homepage (`app/src/app/(public)/page.tsx`), home feature surface (`app/src/features/home/**`), branding/theme/assets, `.cogni/repo-spec.yaml`, persona — declared in `.cogni/sync-manifest.yaml#node_local`. **Scope is the face, NOT the shell**: generic `(public)/` chrome (`layout.tsx`, `error.tsx`, `loading.tsx`) and platform routes (`propose/merge/**`) are Tier 2 — carving the whole `(public)/**` out strands forks at stale shells that break against changed shared components (e.g. `AppHeader`'s `brandMark` prop). | **NEVER synced.** Left as the fork's own version (never overlaid)                                                                                  | n/a — opens no PR                                                                 |
+
+### Invariants
+
+- **`TIER1_IS_CLOSED`**: the Tier-1 lists in the operator are **roots**, not the delivered set. `syncCanonicalFilesToFork` walks them to a fixpoint at the source SHA (`nodes/operator/app/src/shared/node-app-scaffold/canonical-path-closure.ts`) so a canonical workflow ships with the `scripts/**` it invokes, and a canonical contract barrel ships with the modules it re-exports plus the package build manifest that compiles them. A node-template PR that adds a CI script or a `packages/repo-spec` module needs **no operator change**. Derivation is deliberately **bounded** (`CLOSURE_IS_BOUNDED`): only canonical workflows, `scripts/**`, and `packages/<pkg>/**` expand — the app's `@/…` graph is never followed, because the app is Tier-2 substrate and following it would drag the whole tree into the force-overwrite tier. A path reached by a real module edge is **required** (absent at source ⇒ the sync fails closed); a path reached by a textual workflow reference is best-effort. _Why this invariant exists:_ the list used to be hand-maintained, and the PR that added `oras push`-of-an-OCI-bundle to `pr-build.yml` shipped every fork a workflow calling four `scripts/ci/*.mjs` it never delivered and an `index.ts` re-exporting an `artifact-bundle.ts` it never delivered — every fork's build broke and none could publish an Akash-consumable bundle (task.5078). Same failure class as a second reader of a catalog SSOT.
+- **`TIER3_IS_DATA`**: the Tier-3 set is **declared**, not hardcoded in the operator. It lives in `node-template`'s `.cogni/sync-manifest.yaml#node_local` and is read at runtime from the template at the pushed SHA (`OperatorDeployPlanePort.resolveNodeLocalPaths`). A node-template PR that adds a new presentation directory declares it node-local **in the same PR**. A hardcoded floor (`nodes/operator/app/src/shared/node-app-scaffold/node-local-paths.ts`, `DEFAULT_NODE_LOCAL_PATHS`) is used only when the template manifest omits the block, so the carve-out is never empty.
+- **`TIER2_NODE_TEMPLATE_AUTHORITATIVE`**: for shared substrate (everything not Tier 1 or Tier 3), **node-template wins**. The Tier-2 commit overlays node-template's blob (mode preserved) onto the fork tip for every non-`node_local` path that differs. This is what dissolves the recurring conflict class: a fork that drifted in a shared path — e.g. a fix hand-ported to the fork _and_ to node-template independently (`ONE_FIX_ONE_LINEAGE`), re-authored with a different comment → cosmetic conflict — is simply overwritten with node-template's version. Fork-_unique_ shared files (present on the fork, absent upstream) are preserved; node-template's _deletions_ of shared files do not propagate (a fork keeps what node-template removed). A fork that must own a shared path declares it `node_local` (Tier 3).
+- **`TIER3_NEVER_SYNCED`**: `node-template` is a **starter**, not a parent — its identity/presentation must never overwrite a fork's. `node_local` paths are left as the fork's `main` version (never overlaid); an upstream-introduced `node_local` file the fork lacks is simply not added.
+- **`TIER2_IS_ALWAYS_MERGEABLE`**: the upstream branch is built as a merge commit parented on **both** the fork tip and `templateSha`, so it is a **descendant of fork `main`**. The same-repo PR (head=branch → base=`main`) is therefore conflict-free **by construction** — no fork-owner conflict resolution, even when the fork drifted in shared paths. (The prior design carved only Tier 3 and relied on forks never editing Tier 2; hand-ported fixes broke that assumption — see § Why this shape.)
+- **`TIERS_DECOUPLED`**: per-tier, per-fork error isolation — a Tier-1 failure never blocks Tier 2 and vice versa.
+
+### Why this shape (the #30 symptom)
+
+Before this, Tier 2 merged the _whole repo_, so a node-template homepage PR ([node-template#30](https://github.com/Cogni-DAO/node-template/pull/30)) swept node-local presentation into every fork. The resulting fork PRs (oss/beacon) came up **DIRTY** — conflicted on the forks' own homepages — _and_ carried real cognition-substrate edits (`app/src/app/api/v1/cognition/_bundle.ts`, `packages/knowledge-base/src/seeds/base.ts`) in the same PR. You could neither merge (forces unwanted homepage) nor close (drops substrate). Splitting substrate (Tier 2, synced) from identity (Tier 3, node-owned) dissolves the bind: the substrate flows automatically; the homepage stays the fork's.
+
+### Mechanism
+
+Approach: **node-template-authoritative overlay, parented on the fork tip** (`buildUpstreamMergeCommit`). The living branch `cogni-operator/node-template-upstream` is materialized as a merge commit whose:
+
+- **base tree** is the fork's `main` tree (so fork-unique files + Tier-3 ride along untouched);
+- **overlay** replaces every non-`node_local` blob that differs with node-template's version, mode preserved (node-template wins Tier-2 — `TIER2_NODE_TEMPLATE_AUTHORITATIVE`);
+- **parents** are `[forkMain, templateSha]` — making the branch a descendant of fork `main`, so the PR is conflict-free by construction (`TIER2_IS_ALWAYS_MERGEABLE`).
+
+When nothing in Tier-2 differs the branch points at the fork tip and the PR no-ops to `up_to_date`. This replaces the earlier "restore-Tier-3-inside-a-three-way-merge" approach, which preserved fork Tier-2 edits and therefore **conflicted** whenever a fork drifted in a shared path (the `ONE_FIX_ONE_LINEAGE` hand-port case).
+
+---
+
+## Test-Parent Mirror
+
+`cogni-test-org/cogni-monorepo` is where operator CI/CD is exercised before it reaches production: candidate-a's operator reads ITS catalog, opens node-formation PRs against IT, and renders env state from IT. That makes its staleness indistinguishable from a product bug — a node launch fails against a control plane that has not existed on main for months, and the failure is attributed to the launch.
+
+**Two axes, one policy.** The declared divergence in `.cogni/sync-manifest.yaml` is read by exactly one compiled module (`scripts/ci/lib/sync-policy.mjs`) and consumed by both:
+
+| Axis          | Mechanism                          | Output                                                                                              |
+| ------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------- |
+| **Surfacing** | `scripts/ci/detect-sync-drift.mjs` | ancestry + path drift → ONE upserted `sync-drift` hub issue; non-zero exit per MISSING_MAY_BE_FATAL |
+| **Repair**    | `scripts/ci/sync-test-parent.mjs`  | ONE reviewed PR on the mirror, as the operator GitHub App                                           |
+
+Both run on every push to hub `main` and on a daily schedule. "What drift reports" and "what sync does" cannot disagree, because neither owns a matching rule.
+
+**Authority boundary.** The test-parent artifact binds `cogni-test-org` to the
+`cogni-operator-test` App in the manifest. The GitHub Environment provides only the corresponding
+private key; it cannot choose the App identity. The workflow masks the decoded PEM before it becomes
+a step output and requires the minted App slug to match the manifest before running the repair.
+
+**What the refresh computes.** The target tree STARTS as hub main's tree, then re-applies exactly the declared divergences. Preserve-by-default is the failure mode being corrected: it is what let 2,273 retired paths accumulate on a mirror that had fallen 667 commits behind. Deletions therefore propagate — except where REFRESH_IS_NOT_A_ROSTER_CHANGE declares otherwise.
+
+**Why not an allowlist.** The prior attempt ([cogni-test-org/cogni-monorepo#60](https://github.com/cogni-test-org/cogni-monorepo/pull/60), closed unmerged) pinned "exactly 34 candidate-local paths may differ" and enforced it with a bespoke parity script committed to the mirror. Both halves are the anti-pattern: an allowlist puts every newly added canonical path OUT of scope until a human remembers to add it, and a mirror-local enforcement script is precisely the test-specific reimplementation TEST_PARENT_IS_NEAR_IDENTICAL forbids. Default-deny inverts the first; hub-owned mechanism inverts the second.
 
 ## Sync Mechanism
 

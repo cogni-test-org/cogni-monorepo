@@ -3,8 +3,9 @@
 
 /**
  * Module: `@shared/db/schema`
- * Purpose: Barrel re-export of all database schema from @cogni/db-schema package.
- * Scope: Re-exports only. Does not define any tables - all schema definitions live in packages/db-schema.
+ * Purpose: Barrel re-export of all database schema — the shared @cogni/db-schema package plus the operator-local tables.
+ * Scope: Re-exports only. Does not define any tables - shared definitions live in packages/db-schema,
+ *   operator-local ones in sibling files here.
  * Invariants: This file must not define any tables - only re-export from the package.
  * Side-effects: none
  * Links: docs/spec/packages-architecture.md
@@ -17,10 +18,13 @@ export * from "@cogni/db-schema/attribution";
 // Domain slices
 export * from "@cogni/db-schema/auth";
 export * from "@cogni/db-schema/billing";
+export * from "@cogni/db-schema/compute";
 export * from "@cogni/db-schema/identity";
 export * from "@cogni/db-schema/profile";
 // Core FK targets (users, billingAccounts)
 export * from "@cogni/db-schema/refs";
 export * from "@cogni/db-schema/scheduling";
+export * from "./akash-tx-allocations";
+export * from "./compute-cost-intervals";
 export * from "./nodes";
 export * from "./work-item-sessions";

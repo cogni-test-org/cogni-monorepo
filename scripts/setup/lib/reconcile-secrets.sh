@@ -42,6 +42,7 @@ declare -ga NODE_BASELINE_KEYS=(
   AUTH_SECRET LITELLM_MASTER_KEY
   SCHEDULER_API_TOKEN BILLING_INGEST_TOKEN
   INTERNAL_OPS_TOKEN METRICS_TOKEN GH_WEBHOOK_SECRET
+  IDENTITY_ATTESTATION_PRIVATE_KEY
   CONNECTIONS_ENCRYPTION_KEY POLY_WALLET_AEAD_KEY_HEX
   POLY_WALLET_AEAD_KEY_ID
   APP_DB_PASSWORD APP_DB_SERVICE_PASSWORD
@@ -49,7 +50,7 @@ declare -ga NODE_BASELINE_KEYS=(
   DOLTGRES_PASSWORD DOLTGRES_URL
   POSTHOG_API_KEY POSTHOG_HOST OPENROUTER_API_KEY
   EVM_RPC_URL POLYGON_RPC_URL
-  APP_BASE_URL NEXTAUTH_URL
+  DOMAIN APP_BASE_URL NEXTAUTH_URL
   # External integrations (source: human, gate-by-presence). _node_gets_key
   # gates each against the catalog: _shared/llm/web reach every node; PRIVY_*
   # (appliesTo: payments) + PRIVY_USER_WALLETS_* (service: poly) drop from
@@ -78,6 +79,21 @@ declare -ga SCHEDULER_WORKER_KEYS=(
   DATABASE_SERVICE_URL SCHEDULER_API_TOKEN
   INTERNAL_OPS_TOKEN
 )
+# ── Non-node PLATFORM SERVICES (mirror of scripts/lib/secrets-catalog-loader.ts) ─
+# Services that own their OWN OpenBao bucket `cogni/<env>/<service>/*` + their own
+# ExternalSecret, because their blast radius must NOT be the owning node's. The
+# operator app consumes the WHOLE `cogni/<env>/operator` bucket via `dataFrom: extract`,
+# so a credential parked there is readable by the public app — Invariant 1 gives these
+# their own `<service>` instead. Membership is a SECURITY BOUNDARY: a new name here
+# needs a dedicated ExternalSecret and a least-privilege pod projection.
+#
+# These are NOT nodes: no node DNS, no node DB, no NODE_BASELINE_KEYS fan-out.
+# Drift against the TS constant is asserted by tests/ci-invariants/akash-tx-actuator-runtime.spec.ts.
+# shellcheck disable=SC2034  # consumed by the sourcing script (scripts/ci/secret-materialize.sh)
+declare -ga PLATFORM_SERVICES=(
+  akash-tx-actuator   # private Akash transaction actuator wallet + bearer token (task.5102)
+)
+
 # Compose-tier secrets — bootstrap postgres/temporal directly via runtime/.env,
 # never seeded to OpenBao. Truth lives on the VM after first provision.
 declare -ga COMPOSE_ONLY_KEYS=(
@@ -177,19 +193,48 @@ _resolve_node_value() {
 # value (0 churn on re-runs); secret-materialize uses THIS to overwrite a DRIFTED
 # composed DSN — e.g. a pre-#1584 DATABASE_URL still naming the legacy app_user
 # instead of the per-node app_<node> role (#1584 half-rollout self-heal).
+# THE SUBSTRATE IDENTIFIER SUFFIX FOR A FOREIGN-CUSTODIED LANE (bug.5207).
+#
+# The database and role names were derived from the NODE ALONE. The env was never IN the
+# name — it was implicit in the HOST, because one env meant one VM meant one Postgres. That
+# held for every row ever created, so `cogni_poly` was unambiguous.
+#
+# task.5132 breaks the premise: an akash node's non-production lane is reconciled, PAID FOR
+# and (bug.5206) secret-custodied by the PRODUCTION cluster, so its DSN is composed against
+# production's VM. Two lanes of one node then resolve to the SAME database and the SAME role
+# on one Postgres — and because each lane generates its own password, a lane reconcile would
+# `ALTER USER app_poly PASSWORD` and break LIVE PRODUCTION.
+#
+# The suffix is added ONLY when this lane's substrate is someone else's — i.e. the control
+# env differs from the lane. Every row that exists today (every k3s lane, every production
+# row) has control_env == env, gets the empty suffix, and keeps its exact current name.
+# NOTHING MIGRATES. A foreign-custodied lane is new by construction, so it is born correct.
+# Delegates to the ONE definition (scripts/ci/lib/appset-paths.sh) so the name this composes
+# and the name the provisioner creates cannot drift — that drift IS bug.5207. The fallback
+# keeps this file usable where the lib is not on the path (local/test callers).
+_lane_db_suffix() {
+  local lane="${DEPLOY_ENV:-}" control="${SECRETS_CONTROL_ENV:-${DEPLOY_ENV:-}}"
+  if command -v lane_db_suffix >/dev/null 2>&1; then
+    lane_db_suffix "$lane" "$control"; return 0
+  fi
+  [ -n "$lane" ] && [ "$control" != "$lane" ] || return 0
+  printf '_%s' "${lane//-/_}"
+}
+
 _compose_node_value() {
-  local node="$1" k="$2" kind source shared service db
-  db="cogni_${node//-/_}"
+  local node="$1" k="$2" kind source shared service db sfx
+  sfx="$(_lane_db_suffix)"
+  db="cogni_${node//-/_}${sfx}"
   case "$k" in
     DATABASE_URL)
       # Per-node: app_<node> role + the node's own source:agent password (OpenBao).
       # Role name is computed from the node; the password is read from
       # cogni/<env>/<node> (materialize generated it before this composition).
-      printf 'postgresql://app_%s:%s@%s:5432/%s?sslmode=disable' \
-        "${node//-/_}" "$(bao_get_field "$node" APP_DB_PASSWORD)" "${VM_IP}" "${db}"; return 0 ;;
+      printf 'postgresql://app_%s%s:%s@%s:5432/%s?sslmode=disable' \
+        "${node//-/_}" "${sfx}" "$(bao_get_field "$node" APP_DB_PASSWORD)" "${VM_IP}" "${db}"; return 0 ;;
     DATABASE_SERVICE_URL)
-      printf 'postgresql://service_%s:%s@%s:5432/%s?sslmode=disable' \
-        "${node//-/_}" "$(bao_get_field "$node" APP_DB_SERVICE_PASSWORD)" "${VM_IP}" "${db}"; return 0 ;;
+      printf 'postgresql://service_%s%s:%s@%s:5432/%s?sslmode=disable' \
+        "${node//-/_}" "${sfx}" "$(bao_get_field "$node" APP_DB_SERVICE_PASSWORD)" "${VM_IP}" "${db}"; return 0 ;;
     DOLTGRES_PASSWORD)
       # Env-wide Doltgres superuser (one server, every node's knowledge_<node> DB).
       # Operator holds the single canonical SSOT (cogni/<env>/operator/DOLTGRES_PASSWORD)
@@ -211,8 +256,8 @@ _compose_node_value() {
       # operator is seeded. Composed, never derived inline, never from .env.
       local _dgu; _dgu="$(bao_get_field operator DOLTGRES_PASSWORD)"
       [[ -n "$_dgu" ]] || _dgu="$(derive_secret doltgres-root)"
-      printf 'postgresql://postgres:%s@%s:5435/knowledge_%s?sslmode=disable' \
-        "$_dgu" "${VM_IP}" "${node//-/_}"; return 0 ;;
+      printf 'postgresql://postgres:%s@%s:5435/knowledge_%s%s?sslmode=disable' \
+        "$_dgu" "${VM_IP}" "${node//-/_}" "${sfx}"; return 0 ;;
   esac
   kind=$(_cat_field "$k" '.generate.kind')
   source=$(_cat_field "$k" '.source')
