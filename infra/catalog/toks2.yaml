@@ -16,6 +16,10 @@ production_branch: deploy/production-toks2
 # renders exactly the births appset.ts generates. Trimming a node's reach is a
 # later catalog edit (drop an env here) once its envs are provisioned.
 envs: [candidate-a, preview, production]
+deployment_provider:
+  candidate-a: k3s
+  preview: k3s
+  production: k3s
 activity_env: candidate-a
 owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
 path_prefix: nodes/toks2/
