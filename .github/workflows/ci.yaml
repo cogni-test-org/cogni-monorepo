@@ -27,6 +27,10 @@ env:
   TEMPORAL_ADDRESS: localhost:7233
   TEMPORAL_NAMESPACE: cogni-test
   TEMPORAL_TASK_QUEUE: scheduler-tasks
+  # FLEET_CONTROL_ENV (subtask.5007): the appset drift gate renders per the fleet's control
+  # env. Default 'production' (cogni-dao); an isolated fleet (cogni-test-org) sets the repo
+  # var to 'candidate-a' so its committed appsets tree matches. Read by control_env_for.
+  FLEET_CONTROL_ENV: ${{ vars.FLEET_CONTROL_ENV || 'production' }}
 
 jobs:
   env_manager_fast_path:
@@ -193,41 +197,11 @@ jobs:
           # run `pnpm gen:scope-filters`. CI (`--check`, unit job) fails on drift.
           filters: |
             # >>> GENERATED scope-filters (scripts/ci/render-scope-filters.sh) — DO NOT EDIT BY HAND
-            anotha:
-              - 'nodes/anotha/**'
-            brother:
-              - 'nodes/brother/**'
-            canary:
-              - 'nodes/canary/**'
-            ghcr:
-              - 'nodes/ghcr/**'
-            node-template:
-              - 'nodes/node-template/**'
-            resy:
-              - 'nodes/resy/**'
             scheduler-worker:
               - 'nodes/scheduler-worker/**'
-            spawny-boi:
-              - 'nodes/spawny-boi/**'
-            test-cog:
-              - 'nodes/test-cog/**'
-            toks2:
-              - 'nodes/toks2/**'
-            yo:
-              - 'nodes/yo/**'
             operator:
               - '**'
-              - '!nodes/anotha/**'
-              - '!nodes/brother/**'
-              - '!nodes/canary/**'
-              - '!nodes/ghcr/**'
-              - '!nodes/node-template/**'
-              - '!nodes/resy/**'
               - '!nodes/scheduler-worker/**'
-              - '!nodes/spawny-boi/**'
-              - '!nodes/test-cog/**'
-              - '!nodes/toks2/**'
-              - '!nodes/yo/**'
             # <<< GENERATED scope-filters
 
       # Intentionally inline — single-workflow gate, no logic duplicated across
