@@ -201,14 +201,10 @@ jobs:
               - 'nodes/anotha/**'
             brother:
               - 'nodes/brother/**'
-            canary:
-              - 'nodes/canary/**'
             ghcr:
               - 'nodes/ghcr/**'
             node-template:
               - 'nodes/node-template/**'
-            resy:
-              - 'nodes/resy/**'
             scheduler-worker:
               - 'nodes/scheduler-worker/**'
             spawny-boi:
@@ -223,10 +219,8 @@ jobs:
               - '**'
               - '!nodes/anotha/**'
               - '!nodes/brother/**'
-              - '!nodes/canary/**'
               - '!nodes/ghcr/**'
               - '!nodes/node-template/**'
-              - '!nodes/resy/**'
               - '!nodes/scheduler-worker/**'
               - '!nodes/spawny-boi/**'
               - '!nodes/test-cog/**'
