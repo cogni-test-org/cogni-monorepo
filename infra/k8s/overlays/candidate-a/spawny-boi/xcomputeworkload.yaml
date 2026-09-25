@@ -45,7 +45,7 @@ spec:
   bootPolicy:
     onDeadline: Close
   leaseGeneration: 0
-  actuatorNamespace: cogni-production
+  actuatorNamespace: cogni-candidate-a
   dns:
     provider: cloudflare
     zoneId: 3ec6c3aa10fb3488ce3bf86db469d29a
