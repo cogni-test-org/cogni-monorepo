@@ -191,6 +191,37 @@ describe("XComputeWorkload composite API (task.5096)", () => {
     );
   });
 
+  it("anchors the boot deadline to the current attempt, not the XR's age (bug.5244)", () => {
+    // Anchored to creationTimestamp, a never-served XR older than the deadline was a
+    // roach motel: $closeForBudget latched true, the lease Request stopped rendering, so
+    // no OBSERVE could ever set $prevSha and no spec change could revive the workload.
+    // The anchor must be the (bundle sha, leaseGeneration) attempt, latched via status.
+    expect(template).toContain(
+      '$bootKey := printf "%s:%d" $desiredSha $leaseGeneration'
+    );
+    expect(template).toContain('dig "status" "bootEpoch" "key" "" $xr');
+    // The window resets ONLY when the attempt key changes — a mere re-render of the same
+    // attempt must keep the recorded start, or the deadline could never fire at all.
+    expect(template).toContain(
+      'and (eq $prevBootKey $bootKey) (ne $prevBootAt "")'
+    );
+    // The latch is persisted where the next render reads it.
+    const bootEpoch = (statusSchema.bootEpoch as YamlObject)
+      .properties as YamlObject;
+    expect(Object.keys(bootEpoch)).toEqual(["key", "at"]);
+  });
+
+  it("stages the host-routed serving proof as an explicit two-phase rollout (bug.5237)", () => {
+    // A stale deployment still owning the public hostname made the bare-ingress serving
+    // probe a lie. The fix is OBSERVE handing the actuator the public hostname — but the
+    // actuator's observe schema is a strictObject, so emitting the key before every
+    // environment's actuator image accepts it would 400 every observe and freeze
+    // reconciliation fleet-wide. Phase 1 (this tree): the actuator accepts + probes
+    // `publicHost`; the composition documents the pending emission and must NOT send it.
+    expect(template).toContain("bug.5237 PHASE 2");
+    expect(templateCode).not.toContain("publicHost: {{ $publicHost | quote }}");
+  });
+
   it("declares the empty-birth schema policy WITHOUT claiming it gates payment", () => {
     const migration = specSchema.migration as YamlObject;
     const policy = (migration.properties as YamlObject).policy as YamlObject;
@@ -890,6 +921,56 @@ describe("XComputeWorkload public reachability (bug.5152)", () => {
     expect(templateCode).toContain("published: {{ $dnsPublished }}");
     expect(templateCode).not.toContain("published: {{ if $dns }}");
     expect(templateCode).toContain('index $observedResources "dns-record"');
+  });
+});
+
+describe("XComputeWorkload DNS survives a promotion transition (bug.5188)", () => {
+  // Everything from the Cloudflare Request to the end of the template, prose-stripped: the
+  // assertions here pin the last-known-good DNS latch that keeps a promotion from withdrawing
+  // the live public record when the current observe carries an ERROR body with no endpoints.
+  const dnsBlock = templateCode.slice(
+    templateCode.indexOf("composition-resource-name: dns-record")
+  );
+
+  it("latches the last-known-good target from status, exactly like $prevSha/$prevResource", () => {
+    // provider-http overwrites status.response.body with the ERROR body of a failed mutation
+    // (see the lease-handle latch), which has no endpoints, so $dnsTarget collapses to "" while
+    // a promotion's migration runs. The last-served target is read back from status.dns.target
+    // and carried forward — the same posture the observed-bundle and lease-handle latches take.
+    expect(templateCode).toContain(
+      '$prevDnsTarget := dig "status" "dns" "target" ""'
+    );
+    expect(templateCode).toContain("$effectiveDnsTarget");
+  });
+
+  it("gates the composed dns-record child on the LATCHED target, never the collapsing one", () => {
+    // The render gate is what a transient endpoint-less observe used to fail: an omitted child
+    // is garbage-collected, which fires a real Cloudflare DELETE and takes the live proxied
+    // CNAME to NXDOMAIN. The gate must read the latched value so the child keeps rendering.
+    expect(templateCode).toContain(
+      'if and $dns (ne $effectiveDnsTarget "") $renderLease'
+    );
+    expect(templateCode).not.toContain(
+      'if and $dns (ne $dnsTarget "") $renderLease'
+    );
+  });
+
+  it("adopts a genuinely-new target only once the new revision actually serves", () => {
+    // PROVE_BEFORE_TRAFFIC: a different, non-empty $dnsTarget is only trusted while the workload
+    // is active AND serving. Until then the record keeps pointing at the last-known-good target,
+    // so a mid-flight endpoint change can never repoint the live name at a not-yet-serving lease.
+    expect(templateCode).toContain(
+      '{{- else if and (ne $prevDnsTarget "") (ne $dnsTarget $prevDnsTarget) (not (and $active $serving)) }}'
+    );
+  });
+
+  it("writes the latched target onto the Cloudflare record content", () => {
+    // The record the composite intends to hold must be the latched target, not the collapsed
+    // one — otherwise the CREATE/UPDATE body would publish "" the instant the observe errored.
+    expect(dnsBlock.length).toBeGreaterThan(0);
+    expect(templateCode).toContain(
+      '$cfPayload := dict "name" $publicHost "content" $effectiveDnsTarget'
+    );
   });
 });
 

@@ -141,8 +141,9 @@ describe("buildComputeWorkloadManifest", () => {
     ).toThrow("digest-pinned OCI reference");
   });
 
-  it("rejects an incomplete runtime profile before rendering desired state", () => {
-    const incompleteBundle: ResolvedNodeArtifactBundle = {
+  it("supplies the profile's secret_refs so a spec that predates a key still renders (bug.5175)", () => {
+    // A stale spec that declares only AUTH_SECRET — the shape that blocked toks5 PR#2.
+    const staleBundle: ResolvedNodeArtifactBundle = {
       ...bundle,
       services: bundle.services.map(({ service, ...resolved }, index) => ({
         ...resolved,
@@ -153,17 +154,20 @@ describe("buildComputeWorkloadManifest", () => {
       })),
     };
 
-    expect(() =>
-      buildComputeWorkloadManifest({
-        slug: "toks4",
-        environment: "candidate-a",
-        bundleRef: `ghcr.io/cogni-dao/toks4@sha256:${BUNDLE_DIGEST}`,
-        bundle: incompleteBundle,
-        publicHost: "toks4-test.cognidao.org",
-        computeApi: "legacy",
-        leaseGeneration: 0,
-      })
-    ).toThrow(/cogni-node-app-v1 is missing secret_refs/);
+    const manifest = buildComputeWorkloadManifest({
+      slug: "toks4",
+      environment: "candidate-a",
+      bundleRef: `ghcr.io/cogni-dao/toks4@sha256:${BUNDLE_DIGEST}`,
+      bundle: staleBundle,
+      publicHost: "toks4-test.cognidao.org",
+      computeApi: "legacy",
+      leaseGeneration: 0,
+    });
+
+    // No throw — the desired state carries the FULL profile contract, deduped.
+    expect(manifest.spec.workload.services[0]?.secretRefs).toEqual(
+      REQUIRED_SECRET_REFS
+    );
   });
 
   it("emits the legacy kind with no Crossplane-only policy fields", () => {
@@ -357,6 +361,112 @@ describe("buildComputeWorkloadManifest", () => {
     expect(migration).toBeDefined();
     expect(bootPolicy).toBeDefined();
     expect(leaseGeneration).toBe(0);
+  });
+
+  /**
+   * PER_SERVICE_ENV_GATE (story.5043). A private sidecar may declare `envs:` to opt into a
+   * subset of deployment environments; a service whose `envs` excludes THIS environment is
+   * dropped from the workload entirely. This is what lets the poly node keep its paper-trader
+   * sidecar in candidate-a/preview while production stays a 1-service lease it can ship in place.
+   */
+  describe("per-service envs gate (story.5043)", () => {
+    const gatedBundle: ResolvedNodeArtifactBundle = {
+      ...bundle,
+      services: bundle.services.map((resolved) =>
+        resolved.service.name === "worker"
+          ? {
+              ...resolved,
+              service: {
+                ...resolved.service,
+                envs: ["candidate-a", "preview"] as const,
+              },
+            }
+          : resolved
+      ),
+    };
+
+    it.each([
+      "candidate-a",
+      "preview",
+    ] as const)("keeps a gated sidecar in an environment it lists (%s)", (environment) => {
+      const manifest = buildComputeWorkloadManifest({
+        slug: "toks4",
+        environment,
+        bundleRef: `ghcr.io/cogni-dao/toks4@sha256:${BUNDLE_DIGEST}`,
+        bundle: gatedBundle,
+        publicHost: `toks4-${environment}.cognidao.org`,
+        computeApi: "crossplane",
+        leaseGeneration: 0,
+      });
+
+      expect(
+        manifest.spec.workload.services.map((service) => service.name)
+      ).toEqual(["web", "worker"]);
+      // Where the sidecar IS included, its artifact and the inbound binding are preserved.
+      expect(manifest.spec.bundle.artifacts.map((a) => a.name)).toEqual([
+        "web",
+        "worker",
+      ]);
+      const web = manifest.spec.workload.services.find((s) => s.name === "web");
+      expect(web?.bindings).toEqual({ WORKER_URL: "worker" });
+    });
+
+    it("drops a gated sidecar from an environment it does not list (production)", () => {
+      const manifest = buildComputeWorkloadManifest({
+        slug: "toks4",
+        environment: "production",
+        bundleRef: `ghcr.io/cogni-dao/toks4@sha256:${BUNDLE_DIGEST}`,
+        bundle: gatedBundle,
+        publicHost: "toks4.cognidao.org",
+        computeApi: "crossplane",
+        leaseGeneration: 0,
+      });
+
+      // Only the public app remains — a 1-service lease, and the one public service survives.
+      const names = manifest.spec.workload.services.map(
+        (service) => service.name
+      );
+      expect(names).toEqual(["web"]);
+      expect(
+        manifest.spec.workload.services.filter(
+          (service) => service.visibility === "public"
+        )
+      ).toHaveLength(1);
+
+      // bug.5262 — the exclusion CASCADES: dropping `worker` also prunes the orphaned `worker`
+      // artifact and the `web` service's now-dangling `WORKER_URL: worker` binding, so the
+      // rendered XR satisfies the XRD's two cross-reference invariants (no artifact used by zero
+      // services; no binding targeting a non-declared sibling) and Argo can sync it.
+      expect(manifest.spec.bundle.artifacts.map((a) => a.name)).toEqual([
+        "web",
+      ]);
+      const web = manifest.spec.workload.services.find((s) => s.name === "web");
+      expect(web?.bindings).toEqual({});
+    });
+
+    it("keeps every service that declares no envs in every environment", () => {
+      for (const environment of [
+        "candidate-a",
+        "preview",
+        "production",
+      ] as const) {
+        const manifest = buildComputeWorkloadManifest({
+          slug: "toks4",
+          environment,
+          bundleRef: `ghcr.io/cogni-dao/toks4@sha256:${BUNDLE_DIGEST}`,
+          bundle,
+          publicHost:
+            environment === "production"
+              ? "toks4.cognidao.org"
+              : `toks4-${environment}.cognidao.org`,
+          computeApi: "crossplane",
+          leaseGeneration: 0,
+        });
+        expect(
+          manifest.spec.workload.services.map((service) => service.name)
+        ).toEqual(["web", "worker"]);
+      }
+    });
   });
 
   it("refuses DNS intent on the legacy authority, which resolves its own zone", () => {
