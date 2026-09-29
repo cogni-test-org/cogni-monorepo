@@ -9,6 +9,8 @@ source_repo: https://github.com/cogni-test-org/spawny-boi.git
 image_repository: ghcr.io/cogni-test-org/spawny-boi
 source_sha: bef8ba3f93efdd106da8d102a1cdf4f889c338df
 candidate_a_branch: deploy/candidate-a-spawny-boi
+preview_branch: deploy/preview-spawny-boi
+production_branch: deploy/production-spawny-boi
 # story.5025 — per-env node-set (deploy ⊆ provisioned). A wizard birth renders the transient
 # candidate-a proof slot and canonical production; PREVIEW_IS_ABSENT_AT_BIRTH. Closing the
 # candidate after the proof is the ordinary env verb ({env:candidate-a, present:false}).
