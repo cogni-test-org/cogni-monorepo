@@ -20,5 +20,4 @@ resources:
   - candidate-a-test-cog-applicationset.yaml
   - candidate-a-toks2-applicationset.yaml
   - candidate-a-yo-applicationset.yaml
-  - preview-spawny-boi-applicationset.yaml
   - production-spawny-boi-applicationset.yaml
