@@ -20,7 +20,7 @@ spec:
         image: ghcr.io/cogni-test-org/spawny-boi@sha256:aef638d87df753c3c4186ae85547fba85ae779503452ede4ed2f723bf367c608
   workload:
     name: spawny-boi
-    publicHost: spawny-boi.cogni-testing.org
+    publicHost: spawny-boi-preview.cognidao.org
     services:
       - name: app
         artifact: app
