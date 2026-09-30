@@ -7,21 +7,67 @@ namespace: cogni-candidate-a
 
 resources:
   - ../../../base/node-app
+  - ../../../base/openfga-external
+  # story.5016 step 9 — the legacy ComputeWorkload controller is REMOVED from
+  # candidate-a so exactly ONE writer reaches the Akash wallet here: the private
+  # transaction actuator below, driven by Crossplane. ONE_WALLET_ONE_ACTIVE_WRITER.
+  # Preview installs the same control plane but pins NO wallet (dormant/unfunded),
+  # so candidate-a is the sole active writer on the shared test wallet; production
+  # already carries the rail on its own dedicated wallet. Per-row catalog selection
+  # remains the atomic authority cutover, with no compatibility layer or
+  # dual-writer period.
+  # task.5102 — the private Akash transaction actuator Crossplane calls. Each environment
+  # that HOSTS A WRITER has its own actuator and credential-delivery path; candidate-a holds
+  # the managed test account, preview hosts no writer, and production is isolated on a
+  # dedicated account. The reviewed map is CROSSPLANE_ACTUATOR_WRITERS in
+  # nodes/operator/app/src/shared/node-registry/crossplane-control-plane.ts — `account ->
+  # writer` is injective, `writer -> envs` deliberately is not (bug.5187).
   - ../../../base/akash-tx-actuator
+  - external-secret.yaml
+  # story.5016 secret-boundary amendment 2 — the actuator's OWN secret plane
+  # (cogni/candidate-a/akash-tx-actuator -> akash-tx-actuator-env-secrets). Deliberately a
+  # SECOND ExternalSecret rather than more keys in external-secret.yaml above: that one is
+  # extracted wholesale into the public operator app's envFrom.
   - ./akash-tx-actuator-external-secret.yaml
   - ./akash-tx-actuator-auth-external-secret.yaml
+  # bug.5240 — the keyless lease-log pump rides wherever an actuator runs: it enumerates the
+  # actuator's ledger (read-only op) and ships every live lease's logs to Loki.
+  - ../../../base/lease-log-pump
+  - ./secrets-writer-sa.yaml
+  - ./compute-workload-platform-application.yaml
 
 namePrefix: operator-
 
+# Runs AFTER the built-in namePrefix transformer and restores the actuator Service's
+# name to the bare `akash-tx-actuator` the Crossplane Composition dials. See
+# ../../../base/akash-tx-actuator-service-name for why the prefix is what gives.
 transformers:
   - ../../../base/akash-tx-actuator-service-name
 
 images:
   - name: ghcr.io/cogni-dao/cogni-template
-    newName: ghcr.io/cogni-test-org/cogni-template
+    newName: ghcr.io/cogni-dao/cogni-template
     digest: "sha256:d40062282189a3741dfdbca992fa778551d5d95e5c3a02f03986d73305a3f306"
 
+replacements:
+  - source:
+      kind: Application
+      name: compute-workload-platform
+      fieldPath: spec.destination.namespace
+    targets:
+      - select: { kind: Application, name: compute-workload-platform }
+        fieldPaths: [metadata.namespace]
+
 patches:
+  # story.5016 Gate 0b: actuator env values are set BY NAME via strategic
+  # merge (env lists merge on `name`), never by positional JSON-pointer index.
+  # A positional `/env/N/value` patch silently repoints when the base list
+  # shifts — that exact failure (d69e5c29) blanked AKASH_ALLOWED_PROVIDERS
+  # fleet-wide, and an empty allowlist rejects every Akash provider bid.
+  # DEPLOY_ENVIRONMENT must equal the `environment` the Composition sends — the Composition
+  # pins that to `cogni-<env>` == the namespace, so these two values are one invariant expressed
+  # in two places. It is NOT the ledger scope: bug.5187 keys `wallet_scope` on
+  # AKASH_ACTUATOR_ACCOUNT_ID below, so that one account is one single-writer slot.
   - target:
       kind: Deployment
       name: akash-tx-actuator
@@ -43,8 +89,44 @@ patches:
                     value: candidate-a
                   - name: AKASH_ALLOWED_PROVIDERS
                     value: akash16yr3wxt97ae045a06kr3ycde9srcgpg8syjxxm
+                  # HUMAN GATE (story.5016 secret-boundary amendment 3). The PUBLIC Akash
+                  # account/wallet address the actuator is authorized to spend from — pinned
+                  # here as plain config because it is not a secret and must be reviewable in
+                  # git. The actuator asserts the live Console account matches it at boot and
+                  # refuses otherwise, which is what replaced holding the legacy wallet key
+                  # just to byte-compare it.
+                  #
+                  # EMPTY until the cutover: disable every legacy controller writer, revoke the
+                  # legacy Console key, mint a fresh key on the SAME account, then land that
+                  # account's address here in the same change that seeds
+                  # cogni/candidate-a/akash-tx-actuator/AKASH_ACTUATOR_CONSOLE_API_KEY.
+                  # Until then the actuator CrashLoops with `actuator_account_id_missing`,
+                  # which is the correct state for a wallet writer with no proven wallet.
                   - name: AKASH_ACTUATOR_ACCOUNT_ID
+                    # PUBLIC, non-secret Akash account address of the operator sponsor wallet.
+                    # Asserted at boot by assertActuatorWalletAccount() against Console
+                    # /v1/wallets, so the actuator refuses to start if its credential resolves
+                    # to any other account. This is the same account the legacy controller used:
+                    # story.5016's cutover is one wallet with ONE ACTIVE WRITER, achieved by
+                    # revoking the legacy key and minting a fresh one, not by a second account.
                     value: "akash12eh8xgpeyumar3sk6wp94y0tq9uh62mkezxjmt"
+  # bug.5240 — same BY-NAME env rule as the actuator patch above.
+  - target:
+      kind: Deployment
+      name: lease-log-pump
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: lease-log-pump
+      spec:
+        template:
+          spec:
+            containers:
+              - name: pump
+                env:
+                  - name: DEPLOY_ENVIRONMENT
+                    value: candidate-a
   - target:
       kind: ConfigMap
       name: node-app-config
@@ -52,6 +134,35 @@ patches:
       - op: replace
         path: /data/NODE_NAME
         value: "operator"
+      # Deploy-env name the secrets route stamps onto the OpenBao path
+      # (cogni/<env>/<node>/<KEY>). Distinct from APP_ENV (a build flag).
+      - op: add
+        path: /data/DEPLOY_ENVIRONMENT
+        value: "candidate-a"
+      # FLEET CONTROL ENV (bug.5204/bug.5235) — the env whose cluster reconciles akash lanes, the
+      # TS twin of scripts/ci/lib/appset-paths.sh `control_env_for` (FLEET_CONTROL_ENV). This is the
+      # ISOLATED cogni-test-org fleet with NO production cluster, so its OWN control plane
+      # (candidate-a) reconciles + pays for akash lanes and the env-membership verb authors its
+      # AppSets under appsets/candidate-a/, not the nonexistent appsets/production/. Unset on the
+      # cogni-dao fleet => production (byte-identical).
+      - op: add
+        path: /data/FLEET_CONTROL_ENV
+        value: "candidate-a"
+      # Public Akash workload zone for the disposable test fleet. This is deliberately separate
+      # from NEXTAUTH_URL/test.cognidao.org, which is the shared k3s operator control endpoint.
+      - op: add
+        path: /data/FORK_DOMAIN_ROOT
+        value: "cogni-testing.org"
+      # PUBLIC, non-secret Akash account the actuator spends from (same value pinned on the
+      # akash-tx-actuator container above). The OPERATOR APP needs it too: the env-membership
+      # verb (`POST /api/v1/nodes/{id}/envs`) derives lease_generation by reading the allocation
+      # ledger through createLeaseReadCapability (compute-leases.ts), which returns undefined —
+      # and the ADD verb 503s `generation_evidence_unavailable` (EVIDENCE_OR_REFUSE, task.5132) —
+      # unless AKASH_ACTUATOR_ACCOUNT_ID is on the app runtime. Without this the whole
+      # env-manager test-org deploy e2e (task.5141/story.5039) is blocked at the verb layer.
+      - op: add
+        path: /data/AKASH_ACTUATOR_ACCOUNT_ID
+        value: "akash12eh8xgpeyumar3sk6wp94y0tq9uh62mkezxjmt"
       - op: replace
         path: /data/TEMPORAL_NAMESPACE
         value: "cogni-candidate-a"
@@ -76,15 +187,44 @@ patches:
       - op: add
         path: /data/NODE_TEMPLATE_OWNER
         value: "cogni-test-org"
-      # Submodule pin-PR target — a cogni-shaped mirror in the throwaway org so the test app
-      # (cogni-operator-test, zero Cogni-DAO access) can open the pin-PR. Wizard-scoped override;
-      # prod leaves these unset → pin-PR falls back to Cogni-DAO/cogni.
+      # DoltHub node knowledge repo owner — non-secret environment config.
+      # PAT stays in operator-env-secrets via OpenBao/ESO.
+      - op: add
+        path: /data/DOLTHUB_OWNER
+        value: "cogni-test-nodes"
+      # Per-env override for the operator's OWN knowledge mirror: candidate-a
+      # syncs to a throwaway repo so validation here never touches prod knowledge.
+      # A doltgres push only lands cleanly on a repo with no prior (divergent)
+      # history, so this is a dedicated fresh repo — NOT the reused probe. Prod
+      # instead targets its canonical <owner>/<slug> repo.
+      - op: add
+        path: /data/KNOWLEDGE_DOLTHUB_REMOTE_URL
+        value: "https://doltremoteapi.dolthub.com/cogni-dao/knowledge-operator-candidate-a"
+      # Submodule pin-PR target: candidate-a uses the throwaway org mirror.
       - op: add
         path: /data/NODE_SUBMODULE_PARENT_OWNER
         value: "cogni-test-org"
       - op: add
         path: /data/NODE_SUBMODULE_PARENT_REPO
         value: "cogni-monorepo"
+      # Runtime catalog/deploy-state source. This is intentionally distinct from
+      # the disposable submodule PR target above: candidate serves the fleet
+      # declared by the canonical operator repo.
+      - op: add
+        path: /data/NODE_REGISTRY_CATALOG_OWNER
+        value: "cogni-dao"
+      - op: add
+        path: /data/NODE_REGISTRY_CATALOG_REPO
+        value: "cogni"
+      - op: add
+        path: /data/OPENFGA_API_URL
+        value: "http://operator-openfga-external:8080"
+      # Node self-serve secret writes — the operator's OpenBao writer role (the
+      # SA + projected token are wired on the Deployment below). OPENBAO_ADDR
+      # defaults to the in-cluster ClusterIP, so only the role name is set here.
+      - op: add
+        path: /data/OPENBAO_NODE_SECRETS_WRITER_ROLE
+        value: "candidate-a-node-secrets-writer"
   - target:
       kind: Service
       name: node-app
@@ -111,6 +251,34 @@ patches:
       - op: add
         path: /spec/template/metadata/labels/app.kubernetes.io~1instance
         value: "operator"
+
+  # design.node-self-serve-secrets §1.B: the operator pod's OWN OpenBao identity.
+  # serviceAccountName resolves to operator-secrets-writer (namePrefix), bound by
+  # the <env>-node-secrets-writer k8s-auth role. The projected token carries the
+  # cogni-openbao audience (the default audience is bound to no role — silent-auth trap).
+  - target:
+      kind: Deployment
+      name: node-app
+    patch: |
+      - op: add
+        path: /spec/template/spec/serviceAccountName
+        value: secrets-writer
+      - op: add
+        path: /spec/template/spec/volumes
+        value:
+          - name: openbao-token
+            projected:
+              sources:
+                - serviceAccountToken:
+                    path: token
+                    audience: cogni-openbao
+                    expirationSeconds: 3600
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts
+        value:
+          - name: openbao-token
+            mountPath: /var/run/secrets/openbao
+            readOnly: true
 
   # task.0423: Doltgres knowledge-plane migrator runs as a second initContainer
   # on the operator Deployment. DATABASE_URL maps to DOLTGRES_URL (separate from
@@ -172,6 +340,16 @@ patches:
       kind: Service
       metadata:
         name: litellm-external
+      spec:
+        type: ExternalName
+        externalName: cogni-candidate-a.vm.cognidao.org
+        clusterIP: null
+  - target: { kind: Service, name: openfga-external }
+    patch: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: openfga-external
       spec:
         type: ExternalName
         externalName: cogni-candidate-a.vm.cognidao.org
