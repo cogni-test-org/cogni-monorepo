@@ -36,7 +36,7 @@ compute_api:
   production: crossplane
 lease_generation:
   candidate-a: 1
-  preview: 1
+  preview: 2
   production: 0
 # story.5025 — birth authority is PRODUCTION, the only environment that receives Git
 # webhooks (ACTIVITY_FOLLOWS_INGEST, bug.5079). Born here it is immutable for life: a
