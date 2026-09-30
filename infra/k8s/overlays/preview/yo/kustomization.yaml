@@ -42,7 +42,7 @@ patches:
         value: "redis://yo-redis-external:6379"
       - op: add
         path: /data/NEXTAUTH_URL
-        value: "https://yo-preview.cognidao.org"
+        value: "https://yo-preview.cogni-testing.org"
   - target:
       kind: Service
       name: node-app

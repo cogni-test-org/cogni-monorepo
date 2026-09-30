@@ -42,7 +42,7 @@ patches:
         value: "redis://brother-redis-external:6379"
       - op: add
         path: /data/NEXTAUTH_URL
-        value: "https://brother-test.cognidao.org"
+        value: "https://brother-test.cogni-testing.org"
   - target:
       kind: Service
       name: node-app

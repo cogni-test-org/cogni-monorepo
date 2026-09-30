@@ -42,7 +42,7 @@ patches:
         value: "redis://anotha-redis-external:6379"
       - op: add
         path: /data/NEXTAUTH_URL
-        value: "https://anotha.cognidao.org"
+        value: "https://anotha.cogni-testing.org"
   - target:
       kind: Service
       name: node-app
