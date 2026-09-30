@@ -36,6 +36,8 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/cogni-template
   SLOT: candidate-a
   OVERLAY_ENV: candidate-a
+  # Public workload zone for fork-aware generated scheduler routes.
+  FORK_DOMAIN_ROOT: ${{ vars.FORK_DOMAIN_ROOT || 'cognidao.org' }}
   # FLEET_CONTROL_ENV (subtask.5007): the env whose cluster reconciles + pays for akash
   # lanes. Default 'production' (cogni-dao fleet); an isolated fleet (cogni-test-org) sets
   # the repo var to 'candidate-a' so its own control plane owns akash lanes and no test
@@ -986,6 +988,12 @@ jobs:
           SSH_OPTS: "-i /home/runner/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o ServerAliveInterval=10 -o ServerAliveCountMax=6"
           DEPLOY_ENVIRONMENT: candidate-a
           DOMAIN: ${{ fromJSON(needs.decide.outputs.deployment_provider_by_target_json)[matrix.node] == 'k3s' && format('test.{0}', vars.FORK_DOMAIN_ROOT || 'cognidao.org') || vars.DOMAIN }}
+          # bug.5240 — secret-materialize's CI-derived bootstrap for the lease-log pump's
+          # push credential (LOKI_LEASE_PUSH_* fallback; promote-and-deploy already exposes
+          # these at job level). Create-if-absent: a later dedicated token wins.
+          GRAFANA_CLOUD_LOKI_URL: ${{ secrets.GRAFANA_CLOUD_LOKI_URL }}
+          GRAFANA_CLOUD_LOKI_USER: ${{ secrets.GRAFANA_CLOUD_LOKI_USER }}
+          GRAFANA_CLOUD_LOKI_API_KEY: ${{ secrets.GRAFANA_CLOUD_LOKI_API_KEY }}
           APP_SOURCE_DIR: app-src
           COGNI_CATALOG_ROOT: infra/catalog
           HEAD_SHA: ${{ needs.decide.outputs.head_sha }}
@@ -1576,7 +1584,7 @@ jobs:
 
       # A foreign-custodied lane's XCW lives on the CONTROL cluster (its AppSet is
       # rendered under appsets/<control-env>/), not on this candidate VM. Polling the
-      # candidate VM for it is a structurally guaranteed not_observed timeout
+      # candidate VM for it is a structurally guaranteed resource_absent timeout
       # (bug.5216, run 35281632015). Mirror the custody skip the AppSet-apply step
       # already does; for those lanes the external /version probe below is the gate.
       - name: Resolve lane custody
@@ -1628,6 +1636,12 @@ jobs:
           NODES: ${{ matrix.node }}
           COGNI_CATALOG_ROOT: app-src/infra/catalog
           CUTOVER_TIMEOUT: ${{ env.DEPLOYMENT_PROVIDER == 'akash' && '420' || '90' }}
+          # bug.5183: candidate-flight always flights a fresh single-SHA build of
+          # this image, so every probed app carries the SHA-addressed static
+          # marker. Assert the served bundle — not just the dynamic /version
+          # route — came from the flighted image, closing the split-brain /
+          # stale-bundle hole that let two agents "test" pre-fix code.
+          VERIFY_BUNDLE_MARKER: "1"
         run: bash ci-src/scripts/ci/verify-buildsha.sh
 
       - name: Run candidate smoke checks (per-node)
