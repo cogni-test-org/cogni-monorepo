@@ -7,8 +7,14 @@ namespace: cogni-candidate-a
 
 resources:
   - ../../../base/node-app
+  - ../../../base/akash-tx-actuator
+  - ./akash-tx-actuator-external-secret.yaml
+  - ./akash-tx-actuator-auth-external-secret.yaml
 
 namePrefix: operator-
+
+transformers:
+  - ../../../base/akash-tx-actuator-service-name
 
 images:
   - name: ghcr.io/cogni-dao/cogni-template
@@ -16,6 +22,29 @@ images:
     digest: "sha256:0250cc2e6c01a80172d19b00583b65c50990b27849ca16815e75d2d899511b53"
 
 patches:
+  - target:
+      kind: Deployment
+      name: akash-tx-actuator
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: akash-tx-actuator
+      spec:
+        template:
+          spec:
+            containers:
+              - name: actuator
+                env:
+                  - name: POD_NAMESPACE
+                    valueFrom:
+                      fieldRef: { fieldPath: metadata.namespace }
+                  - name: DEPLOY_ENVIRONMENT
+                    value: candidate-a
+                  - name: AKASH_ALLOWED_PROVIDERS
+                    value: akash16yr3wxt97ae045a06kr3ycde9srcgpg8syjxxm
+                  - name: AKASH_ACTUATOR_ACCOUNT_ID
+                    value: "akash12eh8xgpeyumar3sk6wp94y0tq9uh62mkezxjmt"
   - target:
       kind: ConfigMap
       name: node-app-config
