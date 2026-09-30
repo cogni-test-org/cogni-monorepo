@@ -11,13 +11,13 @@ spec:
   nodeId: d520f82e-486a-40f1-9e4f-c8ef7a016e9a
   environment: preview
   bundle:
-    ref: ghcr.io/cogni-test-org/spawny-boi@sha256:87bd92e6f6ff31c7307d7e6edc9b08add6e4269cdd8f46e6002a14f28bb214de
+    ref: ghcr.io/cogni-test-org/spawny-boi@sha256:7f8f5f86d4b74cf2edb5a5efe0f1f032cc3aeb73ab24339e6a3c0db9e42f4687
     source:
       repository: cogni-test-org/spawny-boi
-      sha: bef8ba3f93efdd106da8d102a1cdf4f889c338df
+      sha: 662d748423b9698ed77adb41f93103a2c79b2fa6
     artifacts:
       - name: app
-        image: ghcr.io/cogni-test-org/spawny-boi@sha256:43cff2d0e29e048952b8d2b02d0443ca07236f64e21781bbbfed3801658b2816
+        image: ghcr.io/cogni-test-org/spawny-boi@sha256:aef638d87df753c3c4186ae85547fba85ae779503452ede4ed2f723bf367c608
   workload:
     name: spawny-boi
     publicHost: spawny-boi-preview.cogni-testing.org
