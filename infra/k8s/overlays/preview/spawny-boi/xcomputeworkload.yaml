@@ -1,0 +1,53 @@
+apiVersion: compute.cogni.io/v1alpha1
+kind: XComputeWorkload
+metadata:
+  name: d520f82e-486a-40f1-9e4f-c8ef7a016e9a
+  namespace: cogni-preview
+  labels:
+    cogni.io/node-id: d520f82e-486a-40f1-9e4f-c8ef7a016e9a
+    cogni.io/environment: preview
+    cogni.io/node: spawny-boi
+spec:
+  nodeId: d520f82e-486a-40f1-9e4f-c8ef7a016e9a
+  environment: preview
+  bundle:
+    ref: ghcr.io/cogni-test-org/spawny-boi@sha256:7f8f5f86d4b74cf2edb5a5efe0f1f032cc3aeb73ab24339e6a3c0db9e42f4687
+    source:
+      repository: cogni-test-org/spawny-boi
+      sha: 662d748423b9698ed77adb41f93103a2c79b2fa6
+    artifacts:
+      - name: app
+        image: ghcr.io/cogni-test-org/spawny-boi@sha256:aef638d87df753c3c4186ae85547fba85ae779503452ede4ed2f723bf367c608
+  workload:
+    name: spawny-boi
+    publicHost: spawny-boi.cogni-testing.org
+    services:
+      - name: app
+        artifact: app
+        runtimeProfile: cogni-node-app-v1
+        secretRefs:
+          - key: AUTH_SECRET
+          - key: DATABASE_URL
+          - key: DATABASE_SERVICE_URL
+          - key: EVM_RPC_URL
+          - key: LITELLM_VIRTUAL_KEY
+          - key: SCHEDULER_API_TOKEN
+          - key: BILLING_INGEST_TOKEN
+        port: 3200
+        visibility: public
+        bindings: {}
+        bindHost: 0.0.0.0
+        cpuUnits: 2
+        memoryMi: 2048
+        storageMi: 4096
+  migration:
+    policy: RequireBeforeServing
+  bootPolicy:
+    onDeadline: Close
+  leaseGeneration: 0
+  actuatorNamespace: cogni-candidate-a
+  dns:
+    provider: cloudflare
+    zoneId: 3ec6c3aa10fb3488ce3bf86db469d29a
+  runtime:
+    substrateHost: cogni-candidate-a.vm.cognidao.org
