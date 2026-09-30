@@ -20,7 +20,7 @@ spec:
         image: ghcr.io/cogni-test-org/spawny-boi@sha256:aef638d87df753c3c4186ae85547fba85ae779503452ede4ed2f723bf367c608
   workload:
     name: spawny-boi
-    publicHost: spawny-boi-preview.cognidao.org
+    publicHost: spawny-boi-preview.cogni-testing.org
     services:
       - name: app
         artifact: app
@@ -44,7 +44,7 @@ spec:
     policy: RequireBeforeServing
   bootPolicy:
     onDeadline: Close
-  leaseGeneration: 0
+  leaseGeneration: 1
   actuatorNamespace: cogni-candidate-a
   dns:
     provider: cloudflare
