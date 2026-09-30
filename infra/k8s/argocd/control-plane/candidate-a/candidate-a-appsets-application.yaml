@@ -30,8 +30,8 @@
 #   It NEVER manages Argo's own install (install.yaml / ksops / substrate apps) —
 #   those stay in the bootstrap kustomization, applied out-of-band.
 #
-# repoURL is the LITERAL upstream — the bootstrap apply path does NO envsubst,
-# so (unlike the substrate Applications) this cannot use ${FORK_REPO}.
+# Test-fleet override: repoURL is the isolated test repository. Production remains
+# pointed at the canonical repository.
 #
 # targetRevision: main — the AppSets are shared SOURCE with zero per-env
 # templating, mirroring the substrate Applications' main-tracking rationale.
@@ -45,7 +45,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/cogni-dao/cogni.git
+    repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
     targetRevision: main
     path: infra/k8s/argocd/appsets/candidate-a
   destination:
