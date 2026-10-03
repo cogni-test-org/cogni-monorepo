@@ -8,8 +8,9 @@
  *   that frames hub-delivered skills + domain pointers for a SessionStart hook.
  * Scope: Pure functions + the invariants constant. No I/O, no env, no container.
  * Invariants:
- *   - IRREDUCIBLE_INVARIANTS_ALWAYS_PRESENT: the constant is the one piece of
- *     cognition that must render even when the hub is empty/unreachable.
+ *   - ONE_VOICE: a served orientation entry IS the constitution — the
+ *     code-owned invariants + watch-gate render ONLY when no orientation
+ *     exists (empty/unseeded hub fallback), never alongside it (task.5155).
  *   - ORIENTATION_LOADED_IN_FULL: renders pointers (id + title + recall path)
  *     for skills/domains, but the current-node `<slug>-agent-orientation` entry
  *     is rendered IN FULL — the bootstrap IS the agent's operating map, so the
@@ -23,6 +24,30 @@ import type {
   CognitionDomainPointer,
   CognitionSkillPointer,
 } from "@cogni/node-contracts";
+
+/**
+ * Hard ceiling for model-visible SessionStart context.
+ *
+ * Codex's repo hook opts out of its approximate token spill so the middle of
+ * the orientation can never disappear. That is safe only while the producer
+ * enforces a strict bound. Keep the shell loader's value identical: the API
+ * rejects growth at the source, and the loader independently protects stale
+ * or foreign caches.
+ */
+export const SESSION_COGNITION_MAX_BYTES = 16 * 1024;
+
+/** Reject an oversized bundle rather than silently removing arbitrary text. */
+export function assertBundleWithinBudget(markdown: string): void {
+  // Shell command substitution strips trailing newlines; the presenter then
+  // restores exactly one. Count that exact model-visible stdout shape here.
+  const presented = `${markdown.replace(/\n+$/, "")}\n`;
+  const bytes = new TextEncoder().encode(presented).byteLength;
+  if (bytes > SESSION_COGNITION_MAX_BYTES) {
+    throw new Error(
+      `Session cognition bundle is ${bytes} bytes; maximum is ${SESSION_COGNITION_MAX_BYTES}`
+    );
+  }
+}
 
 /**
  * The irreducible session contract. This is the ONLY cognition that is
@@ -75,6 +100,43 @@ export function escapeCell(value: string | null | undefined): string {
 export interface OrientationEntry {
   id: string;
   content: string;
+}
+
+/** Minimal read surface `resolveOrientation` needs from the knowledge store. */
+export interface OrientationLookupPort {
+  getKnowledge(
+    id: string
+  ): Promise<{ id: string; content: string } | null | undefined>;
+}
+
+/**
+ * Resolve the current-node orientation entry by direct id lookup.
+ *
+ * The domain scan that feeds the skills index only reads the newest
+ * PER_DOMAIN_LIMIT rows per domain, so once a domain outgrows the limit an
+ * older `<slug>-agent-orientation` entry silently drops out of the scan and
+ * the bundle reports it as unseeded (bug.5280). Direct lookup by exact id is
+ * the ground truth; the scan result is only a fallback for suffix-named
+ * entries, and the generic starter seed every node inherits comes last.
+ */
+export async function resolveOrientation(
+  port: OrientationLookupPort,
+  exactOrientationId: string,
+  scannedOrientationId: string | null
+): Promise<OrientationEntry | null> {
+  const candidates = [
+    exactOrientationId,
+    scannedOrientationId,
+    "cogni-agent-orientation",
+  ];
+  for (const id of candidates) {
+    if (!id) continue;
+    const entry = await port.getKnowledge(id);
+    if (entry) {
+      return { id: entry.id, content: entry.content };
+    }
+  }
+  return null;
 }
 
 export interface RenderBundleInput {
@@ -160,6 +222,25 @@ export function renderBundleMarkdown(input: RenderBundleInput): string {
         `_No \`${name}-agent-orientation\` entry yet. Recall the hub, then seed one — the current-node operating map for agents (what this node is, where authority lives, what's safe, what to recall next) — and refine it as the repo changes._`,
       ];
 
+  // ONE VOICE: when the hub serves an orientation, it IS the constitution —
+  // the code-owned invariants + watch-gate would restate it in different words
+  // (the two-constitution bundle agents flailed past, task.5155). They render
+  // ONLY as the empty-hub fallback, their original design intent.
+  const fallbackConstitution = orientation
+    ? []
+    : [
+        "",
+        "## Tooling invariants",
+        "",
+        invariants,
+        "",
+        `_Your candidate (flight + validate target): \`https://${candidateHost}\` · Loki namespace \`cogni-candidate-a\`._`,
+        "",
+        "## Watch an async gate — CI · flight · deploy",
+        "",
+        SESSION_WATCH_GATE,
+      ];
+
   return [
     `# ${name} — Cogni Session Cognition`,
     "",
@@ -168,16 +249,7 @@ export function renderBundleMarkdown(input: RenderBundleInput): string {
     `> Delivered at session start from ${origin}/api/v1/cognition — replaces git-synced AGENTS.md sprawl. (node \`${node}\` · build \`${buildSha}\`)`,
     "",
     ...orientationLines,
-    "",
-    "## Tooling invariants",
-    "",
-    invariants,
-    "",
-    `_Your candidate (flight + validate target): \`https://${candidateHost}\` · Loki namespace \`cogni-candidate-a\`._`,
-    "",
-    "## Watch an async gate — CI · flight · deploy",
-    "",
-    SESSION_WATCH_GATE,
+    ...fallbackConstitution,
     "",
     "## Skills index (recall full content from the hub before acting)",
     "",
@@ -190,6 +262,23 @@ export function renderBundleMarkdown(input: RenderBundleInput): string {
     "| domain | entries | about |",
     "| --- | --- | --- |",
     domainRows,
+    "",
+    // Deliberately OUTSIDE `fallbackConstitution`: this must render even when the
+    // hub serves an orientation. It does not restate the constitution (the
+    // ONE_VOICE concern of task.5155) — it is the node-relative endpoint contract,
+    // which a hub entry structurally cannot carry because `origin` is only known
+    // per-request. Without it agents fall back to harness-local slash commands
+    // that hardcode the operator apex and file every node's work onto operator.
+    "## Work items — this node's own ledger",
+    "",
+    `Your items live in THIS node's store (\`${origin}\`) — each node owns its own \`knowledge_<slug>\` database, so there is no central ledger to fall back to. ONE work item + ONE node per session.`,
+    "",
+    `- Find work: \`GET ${origin}/api/v1/work/items?statuses=needs_implement,needs_design\` — adopt over create.`,
+    `- File one: \`POST ${origin}/api/v1/work/items\` \`{type,title,summary,outcome}\` — \`type\` ∈ task|bug|story|spike|subtask; the server allocates the id, never send one.`,
+    `- Progress: \`PATCH ${origin}/api/v1/work/items/{id}\` \`{"set":{...}}\` — the wrapper is \`set\`, NOT \`patch\`.`,
+    "- `status` ∈ needs_triage|needs_research|needs_design|needs_implement|needs_closeout|needs_merge|done|blocked|cancelled. There is no `in_progress`.",
+    '- Close with `{"set":{"status":"done"}}` only after the PR merges.',
+    `- Machine schemas for the two writes: \`GET ${origin}/.well-known/agent.json\` → \`actions.createWorkItem\` / \`actions.updateWorkItem\`.`,
     "",
     "## Recall + contribute",
     "",

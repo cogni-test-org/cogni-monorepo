@@ -26,6 +26,10 @@
  */
 
 import type { ResolvedNodeArtifactBundle } from "@cogni/repo-spec";
+import {
+  resolveNodeArtifactBundleForEnvironment,
+  resolveRuntimeProfileSecretRefs,
+} from "@cogni/repo-spec";
 
 import type {
   ComputeWorkloadSpec,
@@ -36,7 +40,6 @@ import { writerFor } from "@/shared/node-registry/crossplane-control-plane";
 
 import type { NodeComputeApi } from "./node-compute-api";
 import type { DeploymentEnvironment } from "./node-deployment-provider";
-import { assertRuntimeProfileSecretRefs } from "./node-services-workload-spec";
 
 const DIGEST_PINNED_OCI_REF =
   /^[a-z0-9][a-z0-9._:-]*(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[0-9a-f]{64}$/;
@@ -122,9 +125,21 @@ function actuatorNamespaceForLane(
  * split, so a new non-production lane cannot arrive holding only half the policy.
  */
 export function bootPolicyForEnvironment(
-  environment: DeploymentEnvironment
+  environment: DeploymentEnvironment,
+  recovery: BootRecovery = "hold"
 ): XComputeWorkloadBootPolicy {
-  return { onDeadline: environment === "production" ? "Hold" : "Close" };
+  // ONE CELL OPENS BOTH GATES (story.5050). Recovery needs the lease CLOSED (`onDeadline`) before
+  // the Composition's `:recover:<n>` path is even reachable (`onGiveUp`). Deriving both from a
+  // single declaration is the point: half the policy is exactly the hazard the note above warns
+  // about — `Replace` with `onDeadline: Hold` is a workload that holds a dead lease forever while
+  // claiming it will self-heal, which is strictly worse than honest `Hold`.
+  if (recovery === "auto") {
+    return { onDeadline: "Close", onGiveUp: "Replace" };
+  }
+  return {
+    onDeadline: environment === "production" ? "Hold" : "Close",
+    onGiveUp: "Hold",
+  };
 }
 
 /**
@@ -150,7 +165,20 @@ export interface XComputeWorkloadDns {
 
 export interface XComputeWorkloadBootPolicy {
   readonly onDeadline: "Hold" | "Close";
+  readonly onGiveUp: "Hold" | "Replace";
 }
+
+/**
+ * Per-(node, environment) boot-recovery posture, declared in the catalog (story.5050).
+ *
+ * `hold` (the default, and today's behaviour everywhere) — a production lease that never serves
+ * is KEPT as evidence and a human bumps `lease_generation` to try again.
+ *
+ * `auto` — a lease that never serves is CLOSED at the boot deadline, which is what lets the
+ * Composition's bounded `:recover:<1..3>` re-mint fire, landing on a DIFFERENT provider because
+ * the ledger-derived excluded set skips the one that just failed.
+ */
+export type BootRecovery = "hold" | "auto";
 
 /**
  * Value-free runtime topology for the `cogni-node-app-v1` profile. The legacy controller
@@ -192,12 +220,21 @@ const SUBSTRATE_HOSTNAME =
  * additions are policies the bespoke controller held as compiled-in behaviour and a declarative
  * API has to state (see infra/crossplane/xcomputeworkload/xrd.yaml).
  */
+/**
+ * story.5050 — HARD placement requirement. Absent = unconstrained, which is what every
+ * existing lease runs under, so this field stays inert for every row without the catalog cell.
+ */
+export interface XComputeWorkloadPlacement {
+  readonly requiredCountries: readonly string[];
+}
+
 export interface XComputeWorkloadSpec extends ComputeWorkloadSpec {
   readonly migration: { readonly policy: typeof MIGRATION_POLICY };
   readonly bootPolicy: XComputeWorkloadBootPolicy;
   readonly leaseGeneration: number;
   readonly dns?: XComputeWorkloadDns;
   readonly runtime?: XComputeWorkloadRuntime;
+  readonly placement?: XComputeWorkloadPlacement;
 }
 
 export interface ComputeWorkloadManifest {
@@ -232,6 +269,22 @@ export interface BuildComputeWorkloadManifestInput {
    */
   readonly leaseGeneration: number;
   /**
+   * story.5050 — ISO 3166-1 alpha-2 countries this workload's lease MAY be minted in, read
+   * from the node's own catalog row (`required_placement_countries.<env>`). Absent/empty =
+   * unconstrained, which is what every existing lease runs under.
+   *
+   * It is a REQUIREMENT, not the fleet-wide latency preference: the actuator FILTERS bids on
+   * it and fails closed on an unknown provider country. It binds only on a fresh mint, because
+   * Akash refuses in-place placement change — so changing it needs a `leaseGeneration` bump,
+   * and the XRD marks the field immutable to make that explicit rather than silently inert.
+   */
+  readonly requiredPlacementCountries?: readonly string[];
+  /**
+   * story.5050 — boot-recovery posture from the node's catalog row (`boot_recovery.<env>`).
+   * Absent = `hold`, which is byte-identical to every row's behaviour before this existed.
+   */
+  readonly bootRecovery?: BootRecovery;
+  /**
    * DNS intent for the Crossplane authority only — the legacy controller resolves its own zone
    * from an in-cluster secret, so passing it there would be desired state nothing reads.
    * Absent is a supported state: the composite still publishes the CNAME target it WOULD write
@@ -259,10 +312,36 @@ export function buildComputeWorkloadManifest(
     );
   }
 
-  const services: DeclaredProvisionServiceSpec[] = input.bundle.services.map(
+  // PER_SERVICE_ENV_GATE (story.5043 + bug.5262). A service may declare `envs:` to opt into a
+  // subset of deployment environments; absent = every environment (backward-compatible — this is a
+  // no-op for every service that omits it). `resolveNodeArtifactBundleForEnvironment` (pure, in
+  // @cogni/repo-spec) drops a gated-out service AND cascades the drop so the rendered manifest
+  // still satisfies the XRD's cross-reference invariants: it prunes any artifact the dropped
+  // service alone referenced and any surviving service's binding that targeted it. Without the
+  // cascade, excluding e.g. poly's private paper-trader sidecar from `production` left an orphaned
+  // `paper-trader` artifact + the app's `PAPER_SIDECAR_URL: paper-trader` binding, producing an
+  // INVALID XR that Argo's server-side-diff refused to sync (bug.5262). The repo-spec schema
+  // forbids `envs` on the public service, so this can never gate out the sole public service —
+  // ONE_PUBLIC_SERVICE holds by construction.
+  const envBundle = resolveNodeArtifactBundleForEnvironment(
+    input.bundle,
+    input.environment
+  );
+  if (envBundle.services.length === 0) {
+    // Unreachable while the schema keeps the public service ungated (it always survives); a
+    // defensive guard so a future schema change that broke that invariant fails loudly here
+    // rather than materializing an empty, serviceless workload.
+    throw new Error(
+      `[compute-workload-manifest] no service is deployable to ${input.environment}; every declared service is gated out by its envs allow-list`
+    );
+  }
+
+  const services: DeclaredProvisionServiceSpec[] = envBundle.services.map(
     ({ artifact, service }) => {
-      assertRuntimeProfileSecretRefs({
-        serviceName: service.name,
+      // PROFILE_SUPPLIES_ITS_SECRET_REFS: the runtime profile's required keys are unioned in here,
+      // so a node's repo-spec never re-lists them and a spec that predates a newly-added profile
+      // key still materializes a complete workload (bug.5175).
+      const secretRefs = resolveRuntimeProfileSecretRefs({
         ...(service.runtimeProfile
           ? { runtimeProfile: service.runtimeProfile }
           : {}),
@@ -274,9 +353,7 @@ export function buildComputeWorkloadManifest(
         ...(service.runtimeProfile
           ? { runtimeProfile: service.runtimeProfile }
           : {}),
-        ...(service.secretRefs.length > 0
-          ? { secretRefs: service.secretRefs }
-          : {}),
+        ...(secretRefs.length > 0 ? { secretRefs } : {}),
         ...(service.command ? { command: service.command } : {}),
         ...(service.args ? { args: service.args } : {}),
         port: service.port,
@@ -301,6 +378,18 @@ export function buildComputeWorkloadManifest(
   if (input.computeApi !== "crossplane" && input.leaseGeneration !== 0) {
     throw new Error(
       "[compute-workload-manifest] leaseGeneration is carried only by the crossplane authority; the legacy controller keys its lease per k8s metadata.generation and reads no replacement counter"
+    );
+  }
+
+  // A placement requirement the legacy controller cannot read would be desired state nothing
+  // enforces — the node would place anywhere while the catalog claims it is constrained, which
+  // is the exact silent-unconstrained failure this feature exists to prevent. Refuse instead.
+  if (
+    input.computeApi !== "crossplane" &&
+    (input.requiredPlacementCountries?.length ?? 0) > 0
+  ) {
+    throw new Error(
+      "[compute-workload-manifest] required_placement_countries is enforced only by the crossplane authority; the legacy controller screens no bids and would place the workload anywhere"
     );
   }
 
@@ -343,7 +432,9 @@ export function buildComputeWorkloadManifest(
     bundle: {
       ref: input.bundleRef,
       source: input.bundle.source,
-      artifacts: input.bundle.artifacts,
+      // Env-resolved artifact set (bug.5262): an artifact only a gated-out service referenced is
+      // pruned here so "every bundle artifact must be used by at least one service" holds.
+      artifacts: envBundle.artifacts,
     },
     workload: { name: input.slug, publicHost: input.publicHost, services },
   };
@@ -370,7 +461,10 @@ export function buildComputeWorkloadManifest(
         ? {
             ...spec,
             migration: { policy: MIGRATION_POLICY },
-            bootPolicy: bootPolicyForEnvironment(input.environment),
+            bootPolicy: bootPolicyForEnvironment(
+              input.environment,
+              input.bootRecovery ?? "hold"
+            ),
             // Emitted even at 0, like migration.policy (bug.5116): the committed desired
             // state states its own idempotence-key generation rather than inheriting a
             // default, so a catalog bump is a visible one-line git diff on the deploy branch.
@@ -383,6 +477,16 @@ export function buildComputeWorkloadManifest(
             // alias. Dual-writing would pin `leaseEpoch` into every ref forever and make the
             // alias unremovable.
             leaseGeneration: input.leaseGeneration,
+            // Absent stays ABSENT, unlike leaseGeneration above: the actuator fails closed on
+            // this field, so emitting an empty list would refuse every bid and read as "no
+            // provider bid for this workload" rather than as a placement policy.
+            ...((input.requiredPlacementCountries?.length ?? 0) > 0
+              ? {
+                  placement: {
+                    requiredCountries: input.requiredPlacementCountries,
+                  },
+                }
+              : {}),
             // WHICH writer mints this lease (task.5132, refined for owner routing in bug.5263).
             // A node app runs on AKASH, so its XR is pure desired state reconciled on a writer
             // cluster whose own `cogni-<env>` namespace may run no actuator — the Composition

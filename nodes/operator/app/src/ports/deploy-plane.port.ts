@@ -28,6 +28,14 @@ export interface CandidateFlightDispatchResult {
   readonly message: string;
 }
 
+/** A workflow dispatch GitHub has acknowledged with a concrete Actions run. */
+export interface ObservedWorkflowDispatchResult
+  extends CandidateFlightDispatchResult {
+  readonly runId: number;
+  readonly runUrl: string;
+  readonly runApiUrl: string;
+}
+
 export interface PrepareNodeRefCandidateFlightInput {
   readonly parentOwner: string;
   readonly parentRepo: string;
@@ -51,11 +59,30 @@ export interface PromoteNodeInput {
   readonly parentRepo: string;
   readonly slug: string;
   /**
-   * Node-repo commit SHA to promote — the build the node's PR CI published as `sha-<sourceSha>`.
-   * For a REMOTE-SOURCE (fork) node this source-addresses the image (`node_source_sha`). For an
-   * IN-REPO node it is the operator checkout ref (`source_sha`); never crossed between the two.
+   * Canonical commit SHA on the source repository's main branch. For a REMOTE-SOURCE (fork) node
+   * this source-addresses the image (`node_source_sha`). For an IN-REPO node it is the operator
+   * checkout ref (`source_sha`); never crossed between the two.
    */
   readonly sourceSha: string;
+  /** Explicit authorized escape hatch for a deliberate rollback to an older commit on main. */
+  readonly allowRollback?: boolean;
+}
+
+export interface PromoteNodeFromPreviewInput {
+  readonly parentOwner: string;
+  readonly parentRepo: string;
+  readonly slug: string;
+  /** Explicit authorized escape hatch for a deliberate rollback to an older commit on main. */
+  readonly allowRollback?: boolean;
+}
+
+export interface PruneNodeEnvironmentInput {
+  readonly parentOwner: string;
+  readonly parentRepo: string;
+  readonly slug: string;
+  readonly env: "candidate-a" | "preview" | "production";
+  /** GitHub environment whose VM owns this lane's Argo/Crossplane control plane. */
+  readonly controlEnv: "candidate-a" | "preview" | "production";
 }
 
 export interface NodePromoteResult {
@@ -72,6 +99,10 @@ export interface NodePromoteResult {
   /** `remote_source` when source-addressed by node sha; `in_repo` when passing the checkout ref. */
   readonly sourceAddressing: "remote_source" | "in_repo";
   readonly workflowUrl: string;
+  /** Native run identity proves GitHub created the workflow run; a bare 204 is not success. */
+  readonly runId: number;
+  readonly runUrl: string;
+  readonly runApiUrl: string;
 }
 
 export type ReconcileNodeInfraInput =
@@ -129,83 +160,6 @@ export type NodeInfraReconcileResult =
       readonly prUrl: string;
     };
 
-export interface MirrorCanonicalFilesInput {
-  /** Canonical source repo owner (the template), e.g. `Cogni-DAO`. */
-  readonly sourceOwner: string;
-  /** Canonical source repo, e.g. `node-template`. */
-  readonly sourceRepo: string;
-  /** Source ref to read canonical content at — a 40-char SHA or a branch name (e.g. `main`). */
-  readonly sourceRef: string;
-  /** Target fork repo owner (a catalog `source_repo` row owner). */
-  readonly targetOwner: string;
-  /** Target fork repo (a catalog `source_repo` row repo). */
-  readonly targetRepo: string;
-  /** Target node slug — used only for the mirror PR title/labelling. */
-  readonly slug: string;
-  /**
-   * Canonical ROOTS to mirror byte-for-byte. Any operator-scope node-template content the caller
-   * declares — CI workflows, scripts, package manifests, configs. The DELIVERED set is these roots
-   * plus their transitive closure at `sourceRef` (TIER1_IS_CLOSED): the scripts a canonical workflow
-   * invokes and the modules a canonical contract barrel re-exports ship in the same commit, so a
-   * caller never has to hand-track them.
-   */
-  readonly canonicalPaths: readonly string[];
-}
-
-export type MirrorCanonicalFilesResult =
-  | {
-      readonly status: "no_changes";
-      readonly branch: string;
-      readonly changedPaths: readonly string[];
-    }
-  | {
-      readonly status: "pr_opened";
-      readonly branch: string;
-      readonly prNumber: number;
-      readonly prUrl: string;
-      readonly changedPaths: readonly string[];
-    };
-
-export interface SyncTemplateUpstreamInput {
-  /** Template (upstream/parent) repo owner, e.g. `Cogni-DAO` — for PR copy only. */
-  readonly templateOwner: string;
-  /** Template repo, e.g. `node-template` — for PR copy only. */
-  readonly templateRepo: string;
-  /** The upstream commit SHA to merge (node-template's pushed main tip). Reachable in the fork network. */
-  readonly templateSha: string;
-  /** Fork (child node) repo owner. */
-  readonly forkOwner: string;
-  /** Fork repo = node slug. */
-  readonly forkRepo: string;
-  /** Fork base branch the upstream merges into, e.g. `main`. */
-  readonly forkBranch: string;
-  /**
-   * Tier-3 (node identity / presentation) globs to carve OUT of the upstream merge — the fork's own
-   * version of these paths is restored before the PR opens, so node-template's starter
-   * presentation/branding/identity never overwrites a fork's. Declared in node-template's
-   * `.cogni/sync-manifest.yaml#node_local` (TIER3_IS_DATA); the caller resolves it and passes it here.
-   * Empty/omitted ⇒ no carve-out (legacy whole-repo merge behavior).
-   */
-  readonly nodeLocalPaths?: readonly string[];
-}
-
-export type SyncTemplateUpstreamResult =
-  | { readonly status: "up_to_date" }
-  | {
-      readonly status: "pr_opened";
-      readonly prNumber: number;
-      readonly prUrl: string;
-    };
-
-export interface CatalogForkTarget {
-  /** Fork repo owner, parsed from the catalog row's `source_repo`. */
-  readonly owner: string;
-  /** Fork repo name. */
-  readonly name: string;
-  /** Catalog slug (the `<slug>.yaml` filename). */
-  readonly slug: string;
-}
-
 /**
  * Merged catalog intent needed to project one node into every environment's local registry.
  * The stable values come from git; `ownerWallet` is resolved to a different users.id per DB.
@@ -252,28 +206,33 @@ export interface ResolvedNodeRepo {
   readonly repo: string;
 }
 
+/** Input to `classifyEnvManagerPr` — a PR addressed in the parent monorepo. */
+export interface ClassifyEnvManagerPrInput {
+  readonly owner: string;
+  readonly repo: string;
+  readonly prNumber: number;
+}
+
+/**
+ * Whether a monorepo PR is an App-signed `cogni.env-manager.v1` env-membership PR (structurally
+ * identical to `@/shared/vcs/env-manager-pr` `EnvManagerPrClassification` — declared here because
+ * the ports layer may not import shared).
+ */
+export interface EnvManagerPrClassificationResult {
+  readonly isEnvManagerPr: boolean;
+  /** The `Cogni-Node` trailer value — the node whose env membership the PR changes. */
+  readonly targetNodeRef?: string;
+}
+
 export interface DeployPlanePort {
   prepareNodeRefCandidateFlight(
     input: PrepareNodeRefCandidateFlightInput
   ): Promise<PreparedNodeRefCandidateFlight>;
 
   /**
-   * Enumerate the child node FORKS from the parent monorepo's `infra/catalog/*.yaml` `source_repo` rows
-   * (read via the App — the catalog is absent on the operator's runtime disk). This is the env-aligned
-   * SSOT: the parent is `NODE_SUBMODULE_PARENT_{OWNER,REPO}` (cogni-test-org/cogni-monorepo on candidate-a,
-   * Cogni-DAO/cogni on prod), so the forks are exactly the repos the env's App can write. Excludes
-   * `node-template` (the mirror source) and `operator` (the hub). Used to target the fork sync — NOT the
-   * `nodes` table (wizard-spawn state, may not contain catalog-declared forks) and NOT the node registry.
-   */
-  listCatalogForkTargets(input: {
-    readonly parentOwner: string;
-    readonly parentRepo: string;
-  }): Promise<readonly CatalogForkTarget[]>;
-
-  /**
-   * App-read every merged `type:node` catalog row for registry projection. Unlike the
-   * fork-sync target list this includes operator + node-template and fails loud on a
-   * malformed node row: one bad file must never be mistaken for an empty catalog.
+   * App-read every merged `type:node` catalog row for registry projection. Includes operator +
+   * node-template and fails loud on a malformed node row: one bad file must never be mistaken for
+   * an empty catalog.
    */
   listCatalogNodes(input: {
     readonly parentOwner: string;
@@ -283,60 +242,6 @@ export interface DeployPlanePort {
   }): Promise<readonly CatalogNodeDefinition[]>;
 
   /**
-   * Tier 2 (optional, customization-preserving): open a cross-fork PR `templateOwner:templateBranch`
-   * → the fork's base branch, so node-template's app/graphs/runtime improvements reach the fork as a
-   * **merge** the fork reviews — never an overwrite. Relies on the shared merge-base a node fork keeps
-   * with node-template (node-ci-cd-contract §Forward path), so the PR carries only upstream deltas and
-   * preserves fork customizations (`FORK_FREEDOM`, `POLICY_STAYS_LOCAL`). `up_to_date` when no commits
-   * separate the fork from upstream. Distinct from `syncCanonicalFilesToFork` (Tier 1): that surgically
-   * overwrites the flight-contract files so a CI fix lands cleanly even when this merge conflicts.
-   *
-   * THREE_TIER_CARVE_OUT (spec.repo-sync-contract): `nodeLocalPaths` (Tier 3 — node identity /
-   * presentation) are restored to the FORK's version before the PR opens, so the upstream PR carries
-   * only Tier-2 substrate (`build their mission, not their plumbing`). With Tier 3 out of the diff the
-   * merge stops conflicting on node-local UI/branding/identity, so Tier 1 + Tier 2 are always
-   * auto-mergeable. node-template is a starter only — its presentation never overwrites a fork's.
-   */
-  syncTemplateUpstreamToFork(
-    input: SyncTemplateUpstreamInput
-  ): Promise<SyncTemplateUpstreamResult>;
-
-  /**
-   * Forward-mirror a declared canonical file set from the template repo to one fork repo,
-   * opening (or updating) exactly one PR. The set is whatever `canonicalPaths` the caller
-   * declares — any operator-scope node-template content (CI workflows, scripts, package
-   * manifests, configs), not CI alone. Reads each `canonicalPaths` entry at `sourceRef`,
-   * diffs against the fork's `main`, and commits only the changed files as a single tree.
-   *
-   * Invariants:
-   *   - FORWARD_MIRROR_INDEPENDENT_OF_DETECTOR: this is the node-template→forks axis. It does NOT
-   *     consume the hub↔artifact `sync-drift-detector` signal; `node-template` is the mirror SOURCE,
-   *     never a detector artifact. Keep the two propagation directions decoupled.
-   *   - BRANCH_IS_IDEMPOTENCY_KEY: the head branch is derived from the resolved source SHA, so a
-   *     re-run on the same canonical version updates the same PR instead of opening a second one.
-   *   - CHANGED_ONLY: byte-identical files produce no tree entry; an all-identical fork is `no_changes`.
-   *   - TIER1_IS_CLOSED: `canonicalPaths` are ROOTS. The implementation expands them to a fixpoint at
-   *     `sourceRef` so the mirrored set is self-consistent — a delivered workflow's scripts and a
-   *     delivered barrel's re-exports are delivered too (task.5078).
-   */
-  syncCanonicalFilesToFork(
-    input: MirrorCanonicalFilesInput
-  ): Promise<MirrorCanonicalFilesResult>;
-
-  /**
-   * Resolve the Tier-3 (node identity / presentation) globs from the template repo's
-   * `.cogni/sync-manifest.yaml#node_local` at `sourceRef` (TIER3_IS_DATA — declared in node-template,
-   * read at runtime). Falls back to the hardcoded default floor when the manifest is missing or carries
-   * no `node_local:` block, so the carve-out is always at least the obvious presentation surface.
-   * The facade resolves this once per sync and threads it into every fork's Tier-2 merge.
-   */
-  resolveNodeLocalPaths(input: {
-    readonly sourceOwner: string;
-    readonly sourceRepo: string;
-    readonly sourceRef: string;
-  }): Promise<readonly string[]>;
-
-  /**
    * Resolve a node's OWN source repo (`{owner, repo}`) from the parent monorepo's
    * `infra/catalog/<slug>.yaml` `source_repo` (read via the App — the catalog is absent on the
    * operator's runtime disk). The node-scoped VCS routes (`approve-checks`, `merge`) target the
@@ -344,6 +249,22 @@ export interface DeployPlanePort {
    * the merge route catches it to fall back to the monorepo (legacy lane); approve-checks surfaces it.
    */
   resolveNodeRepo(input: ResolveNodeRepoInput): Promise<ResolvedNodeRepo>;
+
+  /**
+   * Classify a monorepo PR as an App-signed env-membership PR (`cogni.env-manager.v1`) or not.
+   * Fetches the PR + its HEAD commit via the App and applies the pure classifier
+   * (`@/shared/vcs/env-manager-pr`): reserved branch family, single `Cogni-Change-Type` +
+   * `Cogni-Node` trailers, and an App signature (`verified && reason==="valid"`, one parent).
+   * The env-membership verb authors these signed PRs into the parent monorepo, so the merge
+   * route resolves the repo from `nodeId:operator` as usual and uses this ONLY to decide WHO may
+   * authorize: an env-manager PR is authorized by `node.manage_envs` on its `targetNodeRef`
+   * instead of `node.flight` on the operator. NEVER throws for a non-env PR — a look-alike that
+   * fails any gate returns `{ isEnvManagerPr: false }`, and the route additionally fail-closes on
+   * any thrown error (treats it as not-env-manager).
+   */
+  classifyEnvManagerPr(
+    input: ClassifyEnvManagerPrInput
+  ): Promise<EnvManagerPrClassificationResult>;
 
   /**
    * Read a text file from a repo via the operator App (contents:read). Returns null when the file is
@@ -425,6 +346,42 @@ export interface DeployPlanePort {
   promoteNode(input: PromoteNodeInput): Promise<NodePromoteResult>;
 
   /**
+   * Promote preview's exact digest to production after validating its recorded source SHA against
+   * the node repository and current production pin. The workflow remains preview-forward so the
+   * accepted digest is copied rather than rebuilt or re-resolved from a mutable tag.
+   */
+  promoteNodeFromPreview(
+    input: PromoteNodeFromPreviewInput
+  ): Promise<CandidateFlightDispatchResult>;
+
+  /**
+   * Remove one retired lane from its control cluster. Env-membership REMOVE deletes the generated
+   * AppSet from git; this workflow bridge deletes the live per-node AppSet/Application so Argo
+   * prunes the workload and Crossplane closes any paid lease. It never changes another lane.
+   */
+  pruneNodeEnvironment(
+    input: PruneNodeEnvironmentInput
+  ): Promise<ObservedWorkflowDispatchResult>;
+
+  /**
+   * The sha an environment is ACTUALLY running for one node: `<slug>` in
+   * `.promote-state/source-sha-by-app.json` on `deploy/<env>-<slug>` — the pin every promote and
+   * every candidate flight writes (`scripts/ci/update-source-sha-map.sh`). This is the ONLY
+   * runtime-readable statement of deployed truth: promotion writes ZERO commits to `main`, so
+   * `main` cannot carry it (task.5022 retired that firehose).
+   *
+   * Returns `null` when the node has never deployed to that env — a BIRTH lane, the one case where
+   * the catalog row's `source_sha` is a legitimate stand-in. Anywhere else, reading the catalog for
+   * a deploy sha reverts a live env to its birth pin (bug.5043, re-observed as bug.5237).
+   */
+  readNodeDeployPin(input: {
+    parentOwner: string;
+    parentRepo: string;
+    env: string;
+    slug: string;
+  }): Promise<string | null>;
+
+  /**
    * Existing deploy authority for shared infrastructure. Production replays the current app pin
    * through the full-infra workflow. Candidate-a classifies a reviewed PR into exactly one lane:
    * Compose/edge dispatches the existing candidate infra workflow, while control-plane changes
@@ -451,5 +408,5 @@ export interface DeployPlanePort {
     slug: string;
     sourceSha?: string;
     nodeSourceSha?: string;
-  }): Promise<CandidateFlightDispatchResult>;
+  }): Promise<ObservedWorkflowDispatchResult>;
 }

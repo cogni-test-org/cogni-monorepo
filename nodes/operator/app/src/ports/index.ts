@@ -59,6 +59,7 @@ export type {
 } from "./ai-telemetry.port";
 export {
   type AkashAllocationProbe,
+  type AkashLeaseLogDescriptor,
   type AkashTxActuatorPort,
   type AkashTxAllocationLedgerPort,
   type AkashTxAllocationRecord,
@@ -67,10 +68,13 @@ export {
   type AkashTxCreateResult,
   AkashTxError,
   type AkashTxErrorCode,
+  type AkashTxLeaseLogSource,
+  type AkashTxLeaseLogSources,
   type AkashTxMigrationPhase,
   type AkashTxMigrationPort,
   type AkashTxMigrationStep,
   type AkashTxObservation,
+  type AkashTxProviderOutcomesPort,
   type AkashTxResource,
   type AkashTxStaleAllocation,
   type AkashTxSweepReport,
@@ -109,40 +113,25 @@ export type {
   ComputeResourceCostIdentity,
 } from "./compute-cost.port";
 export { ComputeCostInvariantError } from "./compute-cost.port";
-export {
-  COMPUTE_WORKLOAD_ATTEMPT_ANNOTATION,
-  COMPUTE_WORKLOAD_FINALIZER,
-  type ComputeWorkload,
-  type ComputeWorkloadArtifact,
-  type ComputeWorkloadAttempt,
-  type ComputeWorkloadAttemptReceipt,
-  type ComputeWorkloadBundle,
-  type ComputeWorkloadCondition,
-  type ComputeWorkloadPhase,
-  type ComputeWorkloadSecretRef,
-  type ComputeWorkloadSource,
-  type ComputeWorkloadSpec,
-  type ComputeWorkloadStatus,
-  computeWorkloadIdempotencyKey,
-  type DeclaredProvisionServiceSpec,
-  type DeclaredProvisionSpec,
-  decodeAttemptReceipt,
-  encodeAttemptReceipt,
+export type {
+  ComputeWorkloadArtifact,
+  ComputeWorkloadBundle,
+  ComputeWorkloadSecretRef,
+  ComputeWorkloadSource,
+  ComputeWorkloadSpec,
+  DeclaredProvisionServiceSpec,
+  DeclaredProvisionSpec,
 } from "./compute-workload.types";
-export type { ComputeWorkloadDnsPort } from "./compute-workload-dns.port";
 export {
   ComputeLifecycleError,
   type ComputeLifecycleFailureKind,
   type ComputeLifecycleFailureReason,
-  type ComputeWorkloadLifecyclePort,
 } from "./compute-workload-lifecycle.port";
 export type {
   ComputeWorkloadMigrationInput,
   ComputeWorkloadMigrationPhase,
   ComputeWorkloadMigrationPort,
 } from "./compute-workload-migration.port";
-export type { ComputeWorkloadSecretResolverPort } from "./compute-workload-secret-resolver.port";
-export type { ComputeWorkloadStatePort } from "./compute-workload-state.port";
 export type {
   ConnectionBrokerPort,
   ConnectionScope,
@@ -150,21 +139,21 @@ export type {
 } from "./connection-broker.port";
 export type {
   CandidateFlightDispatchResult,
-  CatalogForkTarget,
   CatalogNodeDefinition,
+  ClassifyEnvManagerPrInput,
   DeployPlanePort,
-  MirrorCanonicalFilesInput,
-  MirrorCanonicalFilesResult,
+  EnvManagerPrClassificationResult,
   NodeInfraReconcileResult,
   NodePromoteResult,
+  ObservedWorkflowDispatchResult,
   PreparedNodeRefCandidateFlight,
   PrepareNodeRefCandidateFlightInput,
+  PromoteNodeFromPreviewInput,
   PromoteNodeInput,
+  PruneNodeEnvironmentInput,
   ReconcileNodeInfraInput,
   ResolvedNodeRepo,
   ResolveNodeRepoInput,
-  SyncTemplateUpstreamInput,
-  SyncTemplateUpstreamResult,
 } from "./deploy-plane.port";
 export type { EpochsRead } from "./epochs-read.port";
 export { EpochsReadError } from "./epochs-read.port";
@@ -185,6 +174,12 @@ export type {
   LangfuseTraceQuery,
   LangfuseTraceSummary,
 } from "./langfuse-reader.port";
+export type {
+  LeaseLogPushPort,
+  LeaseLogStream,
+  ProviderLeaseLogLine,
+  ProviderLeaseLogReaderPort,
+} from "./lease-log.port";
 // LlmError types re-exported for adapters (adapters can only import from ports)
 // Features should import directly from @/core
 export {
@@ -238,6 +233,10 @@ export type {
 export type { ModelProviderResolverPort } from "./model-provider-resolver.port";
 export type { NodeAddressPort } from "./node-address.port";
 export { NodeAddressError } from "./node-address.port";
+export type {
+  NodeDeployedService,
+  NodeDeploymentTopologyPort,
+} from "./node-deployment-topology.port";
 export type {
   AssertLiveResult,
   EnvFlightStatus,
