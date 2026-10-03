@@ -41,6 +41,7 @@ import {
   type AkashTxCreateInput,
   AkashTxCreateInputSchema,
   AkashTxDeleteInputSchema,
+  AkashTxLeaseLogSourcesInputSchema,
   type AkashTxObserveInput,
   AkashTxObserveInputSchema,
   AkashTxUpdateInputSchema,
@@ -69,6 +70,10 @@ const STATUS_BY_CODE: Readonly<Record<AkashTxErrorCode, number>> = {
   // The Composition treats 409 as retryable (`Progressing`), which is exactly right here.
   allocation_rolled_back: 409,
   provider_rejected: 422,
+  // 409: the desired placement and the live lease disagree. Retrying this UPDATE can never
+  // succeed — Akash will not move a lease in place — so the caller must CREATE at a bumped
+  // generation instead (story.5050).
+  placement_violated_by_incumbent: 409,
   // Terminal, NOT a conflict to retry: no number of retries changes who consumed the resource.
   identity_conflict: 422,
   provider_unavailable: 502,
@@ -124,6 +129,15 @@ function toSpec(parsed: AkashTxCreateInput["spec"]): ProvisionSpec {
           }
         : {}),
     })),
+    // Absent stays absent: an empty requirement would fail closed and refuse every bid,
+    // so "no cell in the catalog" must not become "requiredCountryCodes: []" here.
+    ...(parsed.placement
+      ? {
+          placement: {
+            requiredCountryCodes: parsed.placement.requiredCountryCodes,
+          },
+        }
+      : {}),
   };
 }
 
@@ -140,6 +154,7 @@ function toObserveInput(parsed: AkashTxObserveInput) {
     ...(parsed.expectedSourceSha
       ? { expectedSourceSha: parsed.expectedSourceSha }
       : {}),
+    ...(parsed.publicHost ? { publicHost: parsed.publicHost } : {}),
     ...(parsed.migration
       ? {
           migration: {
@@ -217,9 +232,29 @@ export function createAkashTxDispatcher(
       switch (request.path) {
         case "/v1/akash/observe": {
           const input = AkashTxObserveInputSchema.parse(payload);
+          const observation = await deps.actuator.observe(
+            toObserveInput(input)
+          );
+          if (input.publicHost) {
+            // One structured, non-secret receipt per host-routed observation. `null` is
+            // deliberate: it distinguishes "probe could not run" (no endpoints) from a
+            // real negative result, which matters when this signal gates recovery.
+            deps.log?.info(
+              {
+                cogniKey: input.cogniKey,
+                publicHost: input.publicHost,
+                expectedSourceSha: input.expectedSourceSha ?? null,
+                found: observation.found,
+                resourceState: observation.resource?.state ?? null,
+                endpointCount: observation.resource?.endpoints.length ?? 0,
+                serving: observation.serving ?? null,
+              },
+              "akash_tx_host_routed_probe_result"
+            );
+          }
           return {
             status: 200,
-            body: await deps.actuator.observe(toObserveInput(input)),
+            body: observation,
           };
         }
         case "/v1/akash/create": {
@@ -254,6 +289,18 @@ export function createAkashTxDispatcher(
           const input = AkashTxDeleteInputSchema.parse(payload);
           await deps.actuator.delete(input);
           return { status: 200, body: { deleted: true } };
+        }
+        case "/v1/akash/lease-log-sources": {
+          // Read-only (bug.5240): enumerates live-lease log coordinates and mints a
+          // logs-scoped ephemeral JWT. No wallet slot, no ledger write, no Console mutation.
+          const input = AkashTxLeaseLogSourcesInputSchema.parse(payload);
+          return {
+            status: 200,
+            body: await deps.actuator.leaseLogSources({
+              ...(input.environment ? { environment: input.environment } : {}),
+              ...(input.limit ? { limit: input.limit } : {}),
+            }),
+          };
         }
         default:
           return errorResponse(

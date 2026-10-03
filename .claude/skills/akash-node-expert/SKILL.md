@@ -35,6 +35,97 @@ substrate, read
 When as-built code differs, name the gap and fix toward this target. Never
 reinterpret the target around a temporary implementation constraint.
 
+## READ GROUND TRUTH FIRST — Loki cannot tell you WHERE a node runs or WHAT it reaches
+
+A 2026-10-01 session produced **five successive wrong root causes** for one node (firewall, provider
+NAT pool, node-specific, Postgres exhaustion, "it never left Belgium") by inferring topology from
+logs. All five died to a read available the whole time. Take these before hypothesising.
+
+**1. The XR names the provider.** CRs are keyed by node UUID and are NAMESPACED.
+
+```bash
+export KUBECONFIG=<repo-parent>/.local/production-kubeconfig.yaml   # candidate-a/-b exist too
+kubectl -n cogni-<env> get xcomputeworkload <nodeId-uuid> -o json
+```
+
+`status.resource.endpoints[0]` is the provider's own ingress host (`…ingress.akash.rhite.co.uk` =
+RHITE FI). `status.dns.target` proves which lease the public host resolves to.
+**`Ready:False` + `reason:Creating` + `Unready resources: akash-lease-g<N>` is the boot SLO not
+latching — NOT an outage**, especially with `Synced:True` and `resource.state: active`.
+
+**2. `scripts/grafana-postgres-query.sh` — read-only SQL into any env, no SSH.** Rules out the
+whole "substrate saturated/restarting?" family in one call (measured: `max_connections=100`, 35
+backends, 7d uptime, not in recovery). Two traps, each of which produced a wrong root cause:
+
+- **`pg_stat_activity` is SERVER-WIDE** — running it "through node X's datasource" does NOT scope to
+  node X. Mis-attributed `client_addr` is how "poly egresses from Belgium" was manufactured; the
+  address was the OPERATOR's pods. **Always `group by datname`.**
+- **A node's datasource may not authenticate** — `database=cogni_poly` fails SQLSTATE 28P01
+  (bug.5117), silently answering about a different DB. `app_readonly` is GRAFANA's user, not the
+  app's: its `FATAL: password authentication failed` spam is not an app fault but does disable this
+  instrument per node. Use `--node operator` + a `datname` filter.
+
+**3. Money truth:** `scripts/ops/recover-orphaned-akash-lease.sh --audit` (needs `KUBECONFIG`) execs
+the actuator and reads Console with its own credential; `DRY_RUN=1 --dseq <dseq>` per lease. The
+`--audit` summary under-reports — the per-DSEQ read is the truth (bug.5262).
+
+**4. Provider cross-check:** `{service="actuator"} |= "<nodeId>:<gen>" |= "cost"` → `rateAmount`
+equals the winning bid price. Never a substitute for the XR read.
+
+## Placement narrows a POOL; it is not egress, and it binds only on CREATE
+
+- **`required_placement_countries` filters bids on the provider's DECLARED/ingress country. That is
+  not egress.** Measured three times: dfrontier FI ingress `95.217.58.106` → egress
+  `95.216.46.103`; RHITE ingress `95.217.139.177` → egress `157.180.59.24`; pronto-ai UA → egress
+  `194.44.52.157`. **Never derive `compute_egress_cidrs` from the registry — measure from inside a
+  lease.** Polymarket returns 200 from FI and UA egress (measured).
+- **Placement lives in the CR's `spec.placement`, NOT the SDL.** Change the country set and the
+  rendered SDL is byte-identical, so the update path rebinds the incumbent lease and
+  `IDENTICAL_SDL_IS_A_NO_OP` returns success — a verb that succeeds and changes nothing. #2542 adds
+  `placement_violated_by_incumbent` (409) so it fails loudly instead.
+- **`featEndpointCustomDomain` is OPTIONAL** and audited, online, quality-passing providers publish
+  `false`; they win a lease and never serve the `accept:` host. **Both Swiss providers declare
+  false, so CH is inert for any node with a `publicHost`** — and CH was the CHEAPEST in-set bid
+  (6.00 vs 7.00) with price as the final tiebreak, so naming CH made the incapable provider win.
+  Screened since #2532.
+- **`activeLeases > 0` is NOT a quality signal (bug.5334).** A popularity proxy no provider without
+  an existing tenant can satisfy, so a provider's FIRST lease was unwinnable — it refused RHITE FI
+  (bid 9.14, audited, validVersion, online, uptime 0.967, customDomain=true, in-set) across
+  thirteen dry auctions. Removing it is what landed the lease in Finland. Boot failures are already
+  covered by the strike blacklist: OUR history, not someone else's tenancy count.
+- **`ipCountryCode` is GeoIP and it LIES.** `akash15pkdke…96hr` declares `country=NL, city=AMS` and
+  geolocates to `GB` at 51.5072/-0.1276 — central London, a registrant default. Screen on the
+  DECLARED field, fall back to GeoIP, log disagreement. Never hand-maintain a correction table.
+- **Read the ROSTER before widening any gate.** `NO_ELIGIBLE_BIDS` carries `[refused: <reason>=N]`
+  AND `[bids: <address> <country> <price> <verdict>]`. Attribution is first-match-wins, so a bid
+  killed by an earlier gate never reveals whether it would pass the later ones — widening on
+  aggregate counts is a guess. Four days were spent tuning country sets while the refusals came
+  from `activeLeases`.
+- **Market scale:** ~1850 registered, **~60 online**, ~33 audited, **~28 custom-domain-capable
+  across 9 countries**. Always pass a country SET, never one country.
+
+## Probe the market with the DEV key before spending a production auction
+
+`.env.cogni` carries `AKASH_PROBE_CONSOLE_API_KEY` + `AKASH_PROBE_ACCOUNT_ID` — a dedicated wallet
+(`akash1umgm…ncn47`). Turns "would X bid / what's its egress / does Polymarket accept it" into a
+2-minute question instead of a 40-minute production auction. Plain HTTP on
+`https://console-api.akash.network` with `x-api-key`:
+
+- `POST /v1/deployments {data:{sdl, deposit:0.5}}` → `{dseq, manifest}`
+- `GET /v1/bids?dseq=<dseq>` → `bid.id.provider`, `bid.price.amount`
+- `POST /v1/leases {manifest, leases:[{dseq,gseq,oseq,provider}]}` → take the lease
+- `GET /v1/deployments/<dseq>` → `leases[].status.services.<svc>.uris` once serving
+- `GET /v1/providers` → whole registry · `DELETE /v1/deployments/<dseq>` → close
+
+**NEVER the production actuator account** (`akash10auj6u…`) or candidate-a's: a manual mint has no
+`akash_tx_allocations` receipt, so it is unclosable through the actuator (422 identity_conflict) and
+bills invisibly (bug.5189/5262). Assert the key opens ONLY the pinned address before spending, and
+**always `DELETE`, re-reading state until `closed`** — a 200 from DELETE is not proof.
+
+Measured: a bare SDL at poly's profile draws **9–11 bids in 10–20s**, cheapest ~6–9 uact/block
+against our 10000 uakt ceiling — **price is never the blocker.** Serving a `publicHost` and reading
+`EGRESS_IP`/`CLOB_STATUS` from inside the lease is a ~4-minute loop and the only egress proof.
+
 ## The lane (how a node reaches Akash)
 
 1. Catalog row `infra/catalog/<slug>.yaml`: `deployment_provider: {candidate-a|preview|production: akash}` (requires `type: node` + `source_repo`; schema `infra/catalog/_schema.json`) + `compute_egress_cidrs` (provider NAT, e.g. 80.200.246.35/32 = zencloud+digitalfrontier shared). `compute_egress_cidrs` is REQUIRED on akash rows (#2175) — currently hand-edited; there is NO TS writer for it yet.
@@ -53,7 +144,7 @@ Node-birth adjacents on main (2026-09-11): `POST /api/v1/nodes/{id}/reconcile-pr
 
 ## Traps that already burned us (do not repeat)
 
-- **A lease outlives every Kubernetes object that names it. NEVER strip a `compute.cogni.io/external-resource` finalizer to "unwedge" a namespace, and never let an Argo cascade delete an `XComputeWorkload` you have not confirmed released its lease** (bug.5189). Two orphan shapes, same fix in the same fixed order — CLOSE → VERIFY BY RE-READING CONSOLE → only then clear the finalizer: (1) a legacy `ComputeWorkload` stuck on that finalizer whose owning controller was retired (#2212/#2276), so nothing alive can clear it and its Argo Application + ApplicationSet wedge behind it; (2) a lease whose tracking object is already gone and which therefore bills invisibly — recoverable by **dseq alone**. Run `scripts/ops/recover-orphaned-akash-lease.sh` (`--workload <name>` or `--dseq <dseq>`; `--audit` lists every active deployment on the wallet). It tries the actuator first, falls back to Console with the actuator's own projected credential from inside the pod, and REFUSES to clear a finalizer it cannot prove closed. **The cluster is not the source of truth for spend** — a CR's `status.resource.state: active` freezes the moment its controller dies, so audit the WALLET (`--audit`), not k8s; and `{env="<env>"} |= "compute_cost_observed"` in Loki is the real proof the money stopped, not the k8s object being gone.
+- **A lease outlives every Kubernetes object that names it. NEVER strip a `compute.cogni.io/external-resource` finalizer to "unwedge" a namespace, and never let an Argo cascade delete an `XComputeWorkload` you have not confirmed released its lease** (bug.5189). Two orphan shapes, same fix in the same fixed order — CLOSE → VERIFY BY RE-READING CONSOLE → only then clear the finalizer: (1) a legacy `ComputeWorkload` stuck on that finalizer whose owning controller was retired (#2212/#2276), so nothing alive can clear it and its Argo Application + ApplicationSet wedge behind it; (2) a lease whose tracking object is already gone and which therefore bills invisibly — recoverable by **dseq alone**. Run `scripts/ops/recover-orphaned-akash-lease.sh` (`--workload <name>` or `--dseq <dseq>`; `--audit` lists every active deployment on the wallet). It tries the actuator first, falls back to Console with the actuator's own projected credential from inside the pod, and REFUSES to clear a finalizer it cannot prove closed. **The cluster is not the source of truth for spend** — a CR's `status.resource.state: active` freezes the moment its controller dies, so audit the WALLET, not k8s. **But the `--audit` SUMMARY line itself under-reports** (poly bug.5262: it printed `active deployments: 0` while THREE prod leases were live + billing, escrow open) — the money-truth is the **per-DSEQ Console read**: `--dseq <dseq>` with `DRY_RUN=1` prints each lease's real `deployment/leases/escrow` state. `deploy-state.leases[].state` (ledger) and the XR status lie the same way. `{env="<env>"} |= "compute_cost_observed"` in Loki is the real proof the money stopped, not the k8s object being gone.
 - Overlays patched controller env BY INDEX; an insertion blanked AKASH_ALLOWED_PROVIDERS fleet-wide (empty allowlist = reject every bid, silently). Now name-keyed (PR #2143); never add positional env patches.
 - `strategy: Recreate` + live `rollingUpdate` residue = ArgoCD server-side-apply dry-run Forbidden => whole app un-syncable (ComparisonError, sync status Unknown). Use RollingUpdate maxSurge:0/maxUnavailable:1. PR #2138.
 - Deploy branches historically rendered infra manifests from MAIN, making manifest changes unvalidatable pre-merge; fixed for candidate by PR #2152 (flight renders from source sha). Pre-merge flights also exercise new-image-vs-old-manifest skew — the state prod passes through mid-rollout.
@@ -61,11 +152,12 @@ Node-birth adjacents on main (2026-09-11): `POST /api/v1/nodes/{id}/reconcile-pr
 - An empty node DB surfaces as generic INTERNAL_ERROR on `/readyz` → controller reads failed boot SLO → closes lease → escrow refund makes the wallet balance go UP. When one env works and another doesn't: DIFF THE ENVS FIRST (preview 37 tables vs prod 0 found it in one query).
 - The controller Role must cover every adapter call; missing verbs surface as `compute_workload_migration_hold causeMessage:ProviderTransient` loops. Full call→grant matrix in PR #2148 body.
 - Re-promoting the SAME sha into a wedged CR is a silent no-op (idempotency key includes generation) — promote a moving sha.
+- A **terminally closed lease's idempotency key is spent forever**: the actuator refuses to recreate `xcw:<ns>:<node>:<gen>` (`akash_tx_create_refused_settled_key`), so every promote at that generation "sticks" (poly bug.5262 — three closed prod leases, four dead promotes). Recovery from a down/multi-lease prod node: close every stale lease (Console-verified) → bump `infra/catalog/<node>.yaml` `lease_generation.<env>` past every spent gen (= `requiredLeaseGeneration` over the ledger) via a **reviewed catalog PR** (CATALOG_IS_SSOT) → promote the fix build → one clean gen-N CREATE. Do NOT hand-edit the deploy-branch XR `leaseGeneration`: the promote reads the CATALOG cell, so a deploy-branch-only bump diverges and the next promote renders the WRONG (spent) gen. The **activity-env (prod) has NO reproducible re-mint verb** — `/nodes/{id}/envs` refuses to remove/re-add it — so this bump is a manual catalog PR. Full runbook: hub [`akash-prod-lease-recovery`](https://cognidao.org/knowledge/akash-prod-lease-recovery).
 - Promote silently no-ops when NO IMAGE exists at the sha: the run goes green with only a "skipping" warning (bug.5121 / story.5023). Probe `bundle-sha-<sha>` on ghcr BEFORE dispatching. Dispatches return no run id — select the run by exact headSha/inputs, never "latest run".
 - Fork CI checks out the PR HEAD, not a merge commit: files that landed on main mid-PR (e.g. `.cogni/repo-policy.json`) must be byte-copied onto the PR branch or its CI fails (bug.5124).
 - Tier-2 machine merges clobber fork-local schema/migrations (poly#5 / beacon#58 precedent) — redo as a feature-aware TRUE merge, never re-fire the machine merge.
 - Flip PRs collide on shared catalog/configmap files — serialize them and re-fire the verb on DIRTY; the merge queue drops PRs silently (check the PR actually reached MERGED).
-- Akash app logs do NOT ship to Loki — only controller/litellm/scheduler-worker do. An Akash node's app logs are reachable only via the provider lease; don't "prove" app behavior from Loki silence (observability gap, open).
+- Akash lease logs ship to Loki via the operator-side **lease-log pump** (bug.5240): `infra/k8s/base/lease-log-pump` rides beside each akash-tx-actuator, enumerates live leases from the allocation ledger (`POST /v1/akash/lease-log-sources`), reads provider logs through the Console provider-proxy (logs-scoped ephemeral JWT), and pushes streams `{env, node=<uuid>, service=<sdl-service>, source="lease"}` — node devs read them via `GET /api/v1/nodes/{id}/observability/logs?service=<name>`. Enabled per env ONLY after `LOKI_LEASE_PUSH_*` exist in `cogni/<env>/operator` (bug.5142 projected-mount ordering). On any env without a seeded pump, Loki silence still proves nothing about app behavior.
 
 ## Placement lever (Gate 2, PRs #2150 #2151, nt#117)
 
@@ -83,4 +175,4 @@ control anchor throughout.
 
 ## Open edges (check work items before assuming)
 
-Second audited provider needed (single-provider risk, task.5075). beacon placement blocked on its Tier-2 true merge (beacon#58, task.5088). Agent chat on Akash nodes hangs — the raised health bar (agent-api-validation) fails fleet-wide, under investigation (likely stale scheduler-worker `COGNI_NODE_ENDPOINTS` + bug.5121). `compute_egress_cidrs` has no TS writer (#2175, hand-edited). One-deploy-verb fix for the silent no-op promote = story.5023. Akash app logs absent from Loki. Remote metrics for controller not scraped (Axiom 26 scope). Preview/prod promote lane has no off-cluster preflight job (candidate-only). Vocabulary migrating external→off-cluster (task.5081). bug.5117 app_readonly auth failures unowned.
+Second audited provider needed (single-provider risk, task.5075). beacon placement blocked on its Tier-2 true merge (beacon#58, task.5088). Agent chat on Akash nodes hangs — the raised health bar (agent-api-validation) fails fleet-wide, under investigation (likely stale scheduler-worker `COGNI_NODE_ENDPOINTS` + bug.5121). `compute_egress_cidrs` has no TS writer (#2175, hand-edited). One-deploy-verb fix for the silent no-op promote = story.5023. Lease-log pump live on candidate-a (bug.5240); production enable pending `LOKI_LEASE_PUSH_*` seeding. Remote metrics for controller not scraped (Axiom 26 scope). Preview/prod promote lane has no off-cluster preflight job (candidate-only). Vocabulary migrating external→off-cluster (task.5081). bug.5117 `app_readonly` password auth fails continuously in production — it is GRAFANA's datasource user, so the failures are not an app problem, BUT they break `grafana-postgres-query.sh` for any node whose datasource uses it (`database=cogni_poly` returns SQLSTATE 28P01). That is the box-free SQL instrument above, so this bug costs you your best diagnostic — fix it early, not never.

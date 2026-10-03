@@ -36,6 +36,7 @@ import {
   NODE_BUNDLE_PAYLOAD_FILE,
   verifyNodeBundleManifest,
 } from "@/features/compute/node-artifact-bundle-oci";
+import { resolveNodeBootRecovery } from "@/features/compute/node-boot-recovery";
 import { resolveNodeComputeApi } from "@/features/compute/node-compute-api";
 import {
   deploymentEnvironmentSchema,
@@ -46,6 +47,7 @@ import {
   resolvePromoteDeploymentTargets,
 } from "@/features/compute/node-deployment-targets";
 import { resolveNodeLeaseGeneration } from "@/features/compute/node-lease-generation";
+import { resolveNodeRequiredPlacement } from "@/features/compute/node-required-placement";
 import { assertDeclaredNodeDeployment } from "@/features/compute/node-services-workload-spec";
 import { hostForNode } from "@/shared/node-registry/resolve";
 
@@ -181,6 +183,15 @@ async function main(): Promise<void> {
   // never a CLI flag: a generation a caller could pass would be a generation automation could
   // bump, and NOTHING may bump it implicitly. Absent cell resolves to 0.
   const leaseGeneration = resolveNodeLeaseGeneration({ catalog, environment });
+  // Node-owned HARD placement requirement, same operator-reviewed row and never a CLI flag: a
+  // requirement a caller could pass would be a requirement a flight could relax. Absent = [].
+  const requiredPlacementCountries = resolveNodeRequiredPlacement({
+    catalog,
+    environment,
+  });
+  // story.5050 — whether a never-serving lease is held for a human or closed so the bounded
+  // re-mint can try the NEXT provider. Same operator-reviewed row, never a CLI flag.
+  const bootRecovery = resolveNodeBootRecovery({ catalog, environment });
   const dnsZoneId = values["dns-zone-id"]?.trim();
   if (dnsZoneId && !CLOUDFLARE_ZONE_ID.test(dnsZoneId)) {
     throw new Error(
@@ -199,6 +210,10 @@ async function main(): Promise<void> {
     ),
     computeApi,
     leaseGeneration,
+    ...(requiredPlacementCountries.length > 0
+      ? { requiredPlacementCountries }
+      : {}),
+    bootRecovery,
     // DNS intent is Crossplane-only: the legacy controller resolves its own zone in-cluster.
     ...(computeApi === "crossplane" && dnsZoneId
       ? { dns: { provider: "cloudflare" as const, zoneId: dnsZoneId } }
@@ -207,12 +222,33 @@ async function main(): Promise<void> {
       ? { runtime: { substrateHost: values["substrate-host"].trim() } }
       : {}),
   });
+  // Read the resolved secret refs straight off the workload the manifest builder just emitted,
+  // so the projected secrets MATCH the workload exactly. The builder already unions each service's
+  // runtime-profile keys (PROFILE_SUPPLIES_ITS_SECRET_REFS) AND applies the per-service `envs`
+  // gate (story.5043), so a sidecar dropped from this environment contributes no service here and
+  // therefore no secret keys either — the projection can never re-introduce a gated-out service's
+  // secrets. This keeps the "projected secrets match the workload" invariant true by construction.
+  const resolvedSecretRefs = manifest.spec.workload.services.flatMap(
+    (service) => service.secretRefs ?? []
+  );
+  // Observability (stderr — stdout is the machine contract): make the EXACT set of secret keys
+  // this flight will project into the workload visible in the flight log. Key NAMES are public
+  // (they live in the git repo-spec); values never touch logs. This is the signal that turns a
+  // missing node-specific secret_ref (e.g. PAPER_ENFORCE_MODE) from a silent runtime no-op into
+  // a one-glance diff — "the flight materialized these keys, and yours isn't among them."
+  process.stderr.write(
+    `${JSON.stringify({
+      event: "compute.workload.secret_refs_resolved",
+      nodeSlug: catalogIdentity.slug,
+      environment,
+      keyCount: resolvedSecretRefs.length,
+      keys: resolvedSecretRefs.map((ref) => ref.key),
+    })}\n`
+  );
   const secretResources = buildComputeSecretResources({
     slug: catalogIdentity.slug,
     environment,
-    secretRefs: bundle.services.flatMap(
-      (service) => service.service.secretRefs
-    ),
+    secretRefs: resolvedSecretRefs,
   });
   // ONE_AUTHORITY_PER_WORKLOAD (task.5097). The kustomization lists exactly one compute
   // resource, and the deploy-branch writer rsyncs this directory with `--delete`, so the
