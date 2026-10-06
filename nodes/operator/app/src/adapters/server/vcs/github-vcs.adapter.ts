@@ -313,13 +313,16 @@ export class GitHubVcsAdapter implements VcsCapability {
    * we never have to disambiguate a `405`.
    *
    * MERGED_XOR_ENQUEUED: the merge gate (caller) has already asserted the PR is
-   * green; this method only chooses the execution path by queue requirement.
+   * green; this method only chooses the execution path by queue requirement. Every direct merge
+   * also sends `expectedHeadSha`; GitHub rejects the request if the PR head moved after the
+   * caller's CI read.
    */
   async mergePr(params: {
     owner: string;
     repo: string;
     prNumber: number;
     method: "squash" | "merge" | "rebase";
+    expectedHeadSha: string;
   }): Promise<MergeResult> {
     const octokit = await this.getOctokit(params.owner, params.repo);
 
@@ -366,6 +369,7 @@ export class GitHubVcsAdapter implements VcsCapability {
           repo: params.repo,
           pull_number: params.prNumber,
           merge_method: params.method,
+          sha: params.expectedHeadSha,
         }
       );
 

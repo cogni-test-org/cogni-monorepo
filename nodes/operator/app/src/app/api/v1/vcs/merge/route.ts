@@ -30,6 +30,8 @@
  *   - MERGED_XOR_ENQUEUED: `mergePr` is queue-tolerant — when the base requires a merge queue it
  *     enqueues (returns `enqueued`, no `sha`; merge completes async on the rebased candidate),
  *     else it direct-merges (`merged` + `sha`). Both are 200; only neither is a failure.
+ *   - HEAD_SHA_PINNED: every merge attempt carries the exact head SHA inspected by the CI gate;
+ *     GitHub rejects a changed head instead of merging unverified code.
  *   - NO_SEPARATION_OF_DUTIES (V0): autonomous self-merge on green is intended ("no human required
  *     for routine merges"); a second-reviewer policy is vNext. The operator-App execution boundary
  *     is the structural control today.
@@ -189,7 +191,13 @@ export const POST = wrapRouteHandlerWithLogging(
     //    (async). Classify failure on the surfaced GitHub HTTP status.
     let result: Awaited<ReturnType<typeof vcs.mergePr>>;
     try {
-      result = await vcs.mergePr({ owner, repo, prNumber, method });
+      result = await vcs.mergePr({
+        owner,
+        repo,
+        prNumber,
+        method,
+        expectedHeadSha: ci.headSha,
+      });
     } catch (error) {
       const g = classifyGithubOpError(error);
       return fail(g.status, g.errorCode, g.error, prCtx);
