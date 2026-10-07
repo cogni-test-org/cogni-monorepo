@@ -34,8 +34,22 @@ env:
   # The repo that owns this fleet's deploy/* branches. Canonical keeps the same URL;
   # the isolated test fleet renders its own repo instead of cogni-dao/cogni.
   REPO_URL: https://github.com/${{ github.repository }}.git
-  # Public workload zone used by catalog-derived scheduler endpoints. Canonical keeps the
-  # cognidao.org default; isolated fleets set the repo variable to their own Cloudflare zone.
+  # bug.5379 — DOMAIN and FORK_DOMAIN_ROOT are TWO ROLES, and one variable cannot serve both.
+  # render-scheduler-worker-endpoints.sh resolves the PUBLIC workload zone as
+  # FORK_ROOT="${DOMAIN:-${FORK_DOMAIN_ROOT:-cognidao.org}}", while
+  # .github/actions/materialize-compute-workload uses FORK_DOMAIN_ROOT as the SUBSTRATE/VM DNS
+  # root and states it "may intentionally remain canonical in a test parent". In the isolated
+  # fleet those diverge: the public zone is cogni-testing.org, the substrate VM alias is
+  # cogni-candidate-a.vm.cognidao.org. With FORK_DOMAIN_ROOT=cognidao.org (correct for the
+  # substrate -- the cogni-testing.org VM alias is NXDOMAIN) and DOMAIN absent here, the public
+  # zone silently fell back to the substrate root, so `--check` demanded
+  # spawny-boi-test.cognidao.org while the committed, reachable value is
+  # spawny-boi-test.cogni-testing.org -- turning test-parent main RED and blocking the merge
+  # queue. Flipping FORK_DOMAIN_ROOT to cogni-testing.org would fix the check and re-break the
+  # substrate (that NXDOMAIN substrateHost is bug.5377). So pass BOTH, each in its own role.
+  DOMAIN: ${{ vars.DOMAIN }}
+  # SUBSTRATE/VM DNS root only. Deliberately canonical in a test parent; the public workload
+  # zone is DOMAIN above, never this.
   FORK_DOMAIN_ROOT: ${{ vars.FORK_DOMAIN_ROOT || 'cognidao.org' }}
 
 jobs:
