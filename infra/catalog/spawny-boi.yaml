@@ -35,7 +35,7 @@ compute_api:
   preview: crossplane
   production: crossplane
 lease_generation:
-  candidate-a: 1
+  candidate-a: 2
   preview: 3
   production: 0
 # story.5025 — birth authority is PRODUCTION, the only environment that receives Git
