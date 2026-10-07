@@ -50,7 +50,14 @@ done
 
 # bug.5094 — the value that actually reaches a cluster is the per-env overlay map,
 # and each node's address must follow its OWN catalog placement for THAT env.
-FORK_ROOT="${FORK_DOMAIN_ROOT:-cognidao.org}"
+# bug.5379 — MIRROR THE RENDERER'S PRECEDENCE EXACTLY. render-scheduler-worker-endpoints.sh
+# resolves the PUBLIC workload zone as "${DOMAIN:-${FORK_DOMAIN_ROOT:-cognidao.org}}", because
+# DOMAIN is the fleet's public apex while FORK_DOMAIN_ROOT is the SUBSTRATE/VM root and stays
+# canonical in a test parent (see .github/actions/materialize-compute-workload). Computing the
+# expectation from FORK_DOMAIN_ROOT alone made this test demand cognidao.org endpoints in the
+# isolated fleet, so it failed against the committed, reachable cogni-testing.org ones and held
+# test-parent main RED -- which blocks the merge queue for every PR.
+FORK_ROOT="${DOMAIN:-${FORK_DOMAIN_ROOT:-cognidao.org}}"
 # shellcheck source=scripts/setup/lib/fork-identity.sh
 source "$REPO_ROOT/scripts/setup/lib/fork-identity.sh"
 # shellcheck source=scripts/setup/lib/cogni-deployment-identity.sh
