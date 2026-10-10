@@ -107,9 +107,18 @@ describe("test-parent divergence policy", () => {
     "infra/k8s/base/scheduler-worker/configmap.yaml",
     "infra/compose/edge/configs/Caddyfile.tmpl",
     "infra/catalog/operator.yaml",
+    "nodes/operator/app/src/adapters/server/node-registry/network-nodes.data.ts",
     ".cogni/repo-spec.yaml",
   ])("requires the generated control-plane path, frees only its content — %s", (p) => {
     expect(policy.hubDisposition(p)).toBe("content_free");
+  });
+
+  it("regenerates the mirror runtime roster from the restored catalog", () => {
+    const sync = fs.readFileSync(
+      path.join(REPO_ROOT, "scripts/ci/sync-test-parent.mjs"),
+      "utf8"
+    );
+    expect(sync).toContain('render-network-nodes.sh", "--write"');
   });
 
   // CONTENT_MAY_DIFFER_WINS — the control-plane cases above are nested inside these omissions.
@@ -136,7 +145,7 @@ describe("test-parent divergence policy", () => {
     "nodes/spawny-boi",
     "infra/catalog/spawny-boi.yaml",
     "infra/k8s/argocd/candidate-a-operator-applicationset.yaml",
-    "nodes/canary/app/package.json",
+    "infra/k8s/overlays/candidate-a/yo/kustomization.yaml",
   ])("leaves the mirror's declared fixtures alone — %s", (p) => {
     expect(policy.isArtifactOnlyDeclared(p)).toBe(true);
   });
@@ -147,5 +156,15 @@ describe("test-parent divergence policy", () => {
         "nodes/operator/app/src/features/home/showcase/nodes.data.ts"
       )
     ).toBe(false);
+  });
+
+  // canary + resy were legacy in-repo node bodies, retired from the mirror
+  // (cogni-test-org/cogni-monorepo#72). Their retention is gone, so the detector
+  // now treats any reappearance as drift rather than a preserved fixture.
+  it.each([
+    "nodes/canary/app/package.json",
+    "nodes/resy/app/package.json",
+  ])("treats retired canary/resy as drift, not a fixture — %s", (p) => {
+    expect(policy.isArtifactOnlyDeclared(p)).toBe(false);
   });
 });

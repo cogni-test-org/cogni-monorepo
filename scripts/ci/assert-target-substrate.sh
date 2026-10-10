@@ -54,6 +54,9 @@ service_count="$(yq -N '.deployment.services | length' "$repo_spec")"
   || fail "external-compute target '$node' must declare deployment.services"
 required_keys="$(yq -r '(.deployment.services[]?.secret_refs[]?.key // "") | select(. != "")' "$repo_spec" | sort -u)"
 required_keys_csv="$(paste -sd, - <<<"$required_keys")"
+# OpenSSH serializes the remote command as shell text, so an empty argv entry is
+# not preserved. Keep this slot non-empty or every later remote positional shifts.
+required_keys_arg="${required_keys_csv:-__none__}"
 
 egress_cidrs="$(yq -r '.compute_egress_cidrs[]?.cidr' "$catalog_file" | sort -u)"
 [ -n "$egress_cidrs" ] \
@@ -81,15 +84,21 @@ read -r -a ssh_opts <<< "$ssh_opts_raw"
 # The shared helper buffers this heredoc and retries only the OpenBao Kubernetes
 # login transient; stable 403 authz drift still fails after one fresh-JWT check.
 cogni_openbao_kubernetes_login_retry "$ssh_bin" "${ssh_opts[@]}" "root@${vm_host}" bash -s -- \
-  "$DEPLOY_ENVIRONMENT" "$node" "$required_keys_csv" "$egress_cidrs_csv" \
-  "$egress_allowlist" "$compute_api" <<'REMOTE'
+  "$DEPLOY_ENVIRONMENT" "$node" "$required_keys_arg" "$egress_cidrs_csv" \
+  "$egress_allowlist" "$compute_api" "$vm_host" <<'REMOTE'
 set -euo pipefail
 env_name="$1"
 node="$2"
 required_keys_csv="$3"
+[ "$required_keys_csv" = "__none__" ] && required_keys_csv=""
 egress_cidrs_csv="$4"
 egress_allowlist="$5"
 authority="$6"
+# bug.5394 — the cluster this assertion actually reached. DEPLOY_ENVIRONMENT names the
+# lane being asserted; this names the VM whose kubeconfig answered. They are two
+# different things, and when they disagree every namespaced lookup below returns
+# "absent" for resources that are perfectly healthy in the lane's own cluster.
+vm_host="${7:-unknown}"
 namespace="cogni-${env_name}"
 actuator="operator-akash-tx-actuator"
 xcw_crd="xcomputeworkloads.compute.cogni.io"
@@ -102,6 +111,20 @@ fail() { echo "::error::assert-target-substrate: $*" >&2; exit 1; }
 mark_ok() { echo "[OK] $*"; }
 
 echo "[INFO] compute authority for ${node} in ${env_name}: compute_api=${authority}"
+echo "[INFO] asserting lane ${env_name} (namespace ${namespace}) against the cluster reachable from ${vm_host}"
+
+# ── LANE_AND_CLUSTER_MUST_AGREE (bug.5394) ──────────────────────────────────────
+# Every assertion below is namespaced to the lane. If this VM's cluster does not host
+# the lane at all, those lookups come back empty and the first one to notice blames the
+# resource instead of the address — #2602 pointed this job's SSH at the production VM
+# while still asserting candidate-a, and the resulting "actuator is not available
+# (availableReplicas='0')" sent four sessions after a phantom actuator outage while the
+# real one was healthy. Check the address before trusting any answer about the lane.
+if ! kubectl get namespace "$namespace" >/dev/null 2>&1; then
+  present="$(kubectl get namespace -o name 2>/dev/null | sed 's#^namespace/##' | grep '^cogni-' | paste -sd, - || true)"
+  fail "lane ${env_name} is not hosted by the cluster reachable from ${vm_host}: namespace ${namespace} does not exist there (cogni-* namespaces present: ${present:-none}). This is an ADDRESSING failure, not a substrate failure — the lane's own resources are untouched and unasserted. Point this job at the environment that owns ${namespace} (its own VM_HOST / SSH_DEPLOY_KEY) and re-run; do NOT read the per-resource assertions below as evidence about ${env_name}."
+fi
+mark_ok "lane ${env_name}: namespace ${namespace} exists on the cluster reached from ${vm_host}"
 
 if [ "$authority" = "crossplane" ]; then
   # Crossplane owns the workload here. Assert the control plane (XRD + Composition +
@@ -138,13 +161,30 @@ if [ "$authority" = "crossplane" ]; then
   # AKASH_ALLOWED_PROVIDERS is NOT a secret and NOT reachable by exec-ing the deleted
   # controller. The actuator receives it as a plain, by-name env var on its own
   # Deployment (infra/k8s/base/akash-tx-actuator/deployment.yaml, pinned per overlay),
-  # and nodes/operator/app/src/bootstrap/akash-tx-actuator.ts splits that value into the
-  # provider allowlist — empty rejects EVERY bid. So read it off the pod spec, which is
-  # exactly the value the process will see, and needs no exec at all.
+  # and nodes/operator/app/src/bootstrap/akash-tx-actuator.ts splits that value into an
+  # OPTIONAL provider pin. So read it off the pod spec, which is exactly what the process
+  # will see, and needs no exec at all.
+  #
+  # WHAT THIS ASSERTS CHANGED (story.5050). It used to assert the value was NON-EMPTY,
+  # because an empty pin refused every bid and a blanked overlay (d69e5c29) was therefore a
+  # fleet-wide outage. Empty is now a legitimate, documented configuration — "no pin, screen
+  # on policy alone" — so asserting non-empty would forbid the supported default and would
+  # keep a rotting 11-address enumeration mandatory. What is STILL load-bearing is the
+  # DECLARATION: the env var must exist by name on the rendered pod spec, which is what
+  # proves the overlay merged the base env contract on `name` rather than by positional
+  # index. So the check inverts from "has a value" to "is declared", and the value is
+  # REPORTED (pin size) instead of demanded — a preflight should surface the placement
+  # policy in the log, not legislate it.
+  allowed_providers_declared="$(kubectl -n "$namespace" get deployment "$actuator" -o jsonpath='{.spec.template.spec.containers[?(@.name=="actuator")].env[?(@.name=="AKASH_ALLOWED_PROVIDERS")].name}' 2>/dev/null || true)"
+  [ "$allowed_providers_declared" = "AKASH_ALLOWED_PROVIDERS" ] \
+    || fail "compute_api=crossplane for ${node} in ${env_name}: AKASH_ALLOWED_PROVIDERS is not declared on ${namespace}/${actuator}; the overlay did not merge the base actuator env contract by name, so no placement policy can be read off the pod spec"
   allowed_providers="$(kubectl -n "$namespace" get deployment "$actuator" -o jsonpath='{.spec.template.spec.containers[?(@.name=="actuator")].env[?(@.name=="AKASH_ALLOWED_PROVIDERS")].value}' 2>/dev/null || true)"
-  [ -n "$allowed_providers" ] \
-    || fail "compute_api=crossplane for ${node} in ${env_name}: AKASH_ALLOWED_PROVIDERS is empty or unset on ${namespace}/${actuator}; an empty allowlist rejects every Akash provider bid"
-  mark_ok "crossplane authority: AKASH_ALLOWED_PROVIDERS is non-empty on ${namespace}/${actuator}"
+  if [ -n "$allowed_providers" ]; then
+    allowed_providers_count="$(printf '%s' "$allowed_providers" | tr ',' '\n' | grep -c '[^[:space:]]' || true)"
+    mark_ok "crossplane authority: AKASH_ALLOWED_PROVIDERS is declared on ${namespace}/${actuator} (pinned to ${allowed_providers_count} provider(s))"
+  else
+    mark_ok "crossplane authority: AKASH_ALLOWED_PROVIDERS is declared on ${namespace}/${actuator} (no provider pin; bids screened on audit + required country + quality + price + strikes)"
+  fi
 else
   # RETIRED AUTHORITY (task.5138 purge; deletion tracked by task.5098). The bespoke
   # compute-workload-controller is deleted from every environment, so a row still

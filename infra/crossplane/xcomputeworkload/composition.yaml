@@ -21,7 +21,7 @@
 # THE WIRE IS THE 5095 CONTRACT, NOT THIS API. @contracts/compute.akash-tx.v1 is a zod
 # strictObject: an unknown key is a 400, never a silently ignored field. So the pipeline LOWERS
 # the full-fidelity XR (bundle artifacts, bindings, secret refs, runtime profile, visibility)
-# onto exactly `{cogniKey, environment, spec:{name, services[]}}`. Every lowering rule below is
+# onto exactly `{cogniKey, environment, spec:{name, services[], placement?}}`. Every lowering rule below is
 # a port of `toProvisionSpec` + `legacyCogniAppEnv` in the bespoke controller, and the two must
 # stay byte-comparable — that equality is what makes this a migration rather than a rewrite.
 #
@@ -115,8 +115,10 @@ spec:
               that controller decided observe-then-create itself. Under Crossplane, provider-http
               asks "does the resource for this key exist?" - a key that changed per reconcile
               would answer "no" after every promote and mint a SECOND PAID LEASE. namespace and
-              name are both immutable (name == nodeId), so the only varying component is
-              spec.leaseGeneration, which NOTHING bumps implicitly.
+              name are both immutable (name == nodeId), so spec.leaseGeneration is the only
+              operator-controlled varying component. bug.5287 adds only the bounded
+              `:recover:<1..3>` child namespace after actor read-back proves the current key is
+              closed; transport retries and reconcile ticks never vary either identity.
 
               leaseEpoch is the PRE-task.5122 name, and is READ HERE ONLY - no caller writes it
               any more (the materializer emits leaseGeneration exclusively). It stays served
@@ -153,14 +155,16 @@ spec:
               Default is $ns, so every existing production XR renders byte-identically. */}}
             {{- $writerNs := $ns }}
             {{- if (dig "actuatorNamespace" "" $spec) }}{{ $writerNs = get $spec "actuatorNamespace" }}{{ end }}
-            {{- $cogniKey := printf "xcw:%s:%s:%d" $ns $name $leaseGeneration }}
+            {{- $baseCogniKey := printf "xcw:%s:%s:%d" $ns $name $leaseGeneration }}
+            {{- $cogniKey := $baseCogniKey }}
             {{- $baseUrl := printf "http://akash-tx-actuator.%s.svc.cluster.local:8080" $writerNs }}
             {{- $authHeader := printf "Bearer {{ akash-tx-actuator-auth:%s:token }}" $writerNs }}
 
             {{- /* ------------------------------------------------------------------
               LOWERING: full-fidelity XR -> the actuator's ProvisionSpec.
               Port of toProvisionSpec() + legacyCogniAppEnv() in
-              features/compute/compute-workload-reconciler.ts.
+              the retired features/compute/compute-workload-reconciler.ts (deleted in
+              task.5098; read it at commit 4d6fb62d if you need the original).
             ------------------------------------------------------------------ */ -}}
             {{- $images := dict }}
             {{- range $spec.bundle.artifacts }}{{ $_ := set $images .name .image }}{{ end }}
@@ -314,13 +318,155 @@ spec:
             {{- end }}
             {{- $hasLegacyMigration := gt (len $legacyMigration) 0 }}
 
-            {{- $payload := dict "cogniKey" $cogniKey "environment" $env "identity" $identity "spec" (dict "name" $slug "services" $services) }}
+            {{- /*
+              story.5050 — lower the XR's HARD placement requirement onto the wire. The wire
+              renames `requiredCountries` to `requiredCountryCodes` because the zod contract
+              speaks ISO codes explicitly; both are strictObjects, so a typo here is a 400 and
+              never a silently unconstrained lease. Absent stays ABSENT: sending an empty list
+              would fail closed in the actuator and refuse every bid.
+            */ -}}
+            {{- $specDict := dict "name" $slug "services" $services }}
+            {{- $requiredCountries := dig "placement" "requiredCountries" (list) $spec }}
+            {{- if gt (len $requiredCountries) 0 }}
+            {{- $_ := set $specDict "placement" (dict "requiredCountryCodes" $requiredCountries) }}
+            {{- end }}
+            {{- $payload := dict "cogniKey" $cogniKey "environment" $env "identity" $identity "spec" $specDict }}
             {{- if $hasMigrationStep }}{{ $_ := set $payload "migrationStep" $migrationStep }}{{ end }}
             {{- if $hasLegacyMigration }}{{ $_ := set $payload "migration" $legacyMigration }}{{ end }}
 
             {{- /* ---------- observed state ---------- */ -}}
             {{- $observedResources := default (dict) .observed.resources }}
-            {{- $leaseObs := index $observedResources "akash-lease" }}
+            {{- /*
+              GENERATION_BUMP_REPLACES_THE_REQUEST (story.5050). provider-http chooses CREATE
+              only for a NEW managed Request; changing the payload of the existing Request chooses
+              UPDATE, which cannot mint a replacement lease. Keep the historical static child name
+              for every XR that has not crossed this seam (zero fleet churn), then latch a
+              generation-qualified name the first time an observed response belongs to an older
+              base generation. Later explicit bumps advance that name directly. The old child is
+              garbage-collected through its normal REMOVE path while the new child enters through
+              CREATE with the fresh wallet-wide key.
+
+              This block alone only ADVANCES the name. Holding the outgoing child open until the
+              incoming one has proved itself is the OVERLAP_BEFORE_CLOSE block immediately below
+              (bug.5322); without it, advancing the name is also what closes a live lease.
+            */ -}}
+            {{- $leaseRequestGeneration := int (dig "status" "leaseRequestGeneration" -1 $xr) }}
+            {{- $leaseResourceName := "akash-lease" }}
+            {{- if ge $leaseRequestGeneration 0 }}
+            {{- $leaseResourceName = printf "akash-lease-g%d" $leaseRequestGeneration }}
+            {{- end }}
+            {{- $initialLeaseObs := index $observedResources $leaseResourceName }}
+            {{- $initialResponseKey := "" }}
+            {{- if $initialLeaseObs }}
+            {{- $initialRequestBodyRaw := dig "status" "requestDetails" "body" "" $initialLeaseObs.resource }}
+            {{- if ne $initialRequestBodyRaw "" }}
+            {{- $initialRequestBody := fromJson $initialRequestBodyRaw }}
+            {{- $initialResponseKey = dig "cogniKey" "" $initialRequestBody }}
+            {{- end }}
+            {{- end }}
+            {{- $desiredRecoveryPrefix := printf "%s:recover:" $baseCogniKey }}
+            {{- $initialResponseMatchesDesiredGeneration := or (eq $initialResponseKey $baseCogniKey) (hasPrefix $desiredRecoveryPrefix $initialResponseKey) }}
+            {{- if or (and (ge $leaseRequestGeneration 0) (ne $leaseRequestGeneration $leaseGeneration)) (and (lt $leaseRequestGeneration 0) (ne $initialResponseKey "") (not $initialResponseMatchesDesiredGeneration)) }}
+            {{- $leaseRequestGeneration = $leaseGeneration }}
+            {{- $leaseResourceName = printf "akash-lease-g%d" $leaseGeneration }}
+            {{- end }}
+            {{- /*
+              OVERLAP_BEFORE_CLOSE (bug.5322). Crossplane garbage-collects whatever this function
+              stops rendering, and for a LIVE, SERVING lease that GC is a REMOVE ->
+              /v1/akash/delete. So the block above — which advances the child name the instant
+              spec.leaseGeneration is bumped — ALSO closes the incumbent lease before its
+              replacement has served a single request (toks4, 2026-09-30: /readyz 503, stale sha,
+              no lease). A lease close is IRREVERSIBLE and its idempotence key is refused forever
+              once settled, so the only correct ordering is: mint the replacement -> prove it
+              serving -> flip DNS -> THEN close the outgoing one.
+
+              status.activeLeaseGeneration is the generation this XR has actually PROVEN serving
+              (written only on `active && serving`, the same signals the Ready phase uses). While
+              it names a generation OTHER than the desired one, the child holding that
+              generation's key keeps being rendered ALONGSIDE the candidate, so nothing GCs it and
+              nothing closes its lease. The candidate still enters through CREATE under its own
+              fresh key exactly as before, and the last-known-good DNS latch below — which keys on
+              the CANDIDATE's $active/$serving — keeps the public name on the incumbent until the
+              candidate genuinely serves. Once it does, status.activeLeaseGeneration advances, this
+              block stops matching on the NEXT reconcile, and the incumbent GCs through the
+              ORDINARY REMOVE path: exactly once, after the cutover. No new close call exists.
+
+              THE RETAINED CHILD IS FOUND BY ITS KEY, NEVER REBUILT FROM ONE. A lease minted under
+              a bounded `:recover:<n>` child key must be CLOSED under that same key, and the only
+              trustworthy record of which key minted it is the child's own requestDetails body —
+              the same source $responseKey reads below. Deriving the key from
+              $activeLeaseGeneration alone would hand REMOVE a key the actuator never allocated
+              and leave a live lease billing forever. Searching the observed children by key also
+              survives the double-bump case: a second bump during an overlap still finds the
+              PROVEN-SERVING child rather than the never-served candidate of the first bump.
+
+              RETENTION ENDS ONLY ON A POSITIVE OBSERVATION. provider-http overwrites
+              status.response.body with the ERROR body of a failed mutation (the fact bug.5188's
+              DNS latch already defends against), and that body has no `found` at all — so
+              treating "not observed found" as "nothing to protect" would close the live lease on
+              a transient refusal. The presence of the `found` KEY is what distinguishes an
+              OBSERVE answer from a refusal body or a create/update echo, so $retainedGone
+              requires one: observed, and either gone or closed. An observed `closed` is what
+              keeps today's ordinary replace-a-terminally-spent-lease flow (PR #2582, toks5
+              preview) byte-identical — a closed outgoing lease is not retained at all, so only
+              the candidate renders. An observed `found: false` ends retention for the OTHER
+              reason: isRemovedCheck would read it as "does not exist" and CREATE under a settled
+              key every reconcile forever, which is the Axiom 26 churn $renderLease fences below.
+
+              BOOTSTRAP IS ZERO-CHURN. Every XR in the fleet omits status.activeLeaseGeneration
+              today, which digs to -1 and disables this block entirely — such an XR renders
+              exactly as it does on main. The field is adopted the first time that workload is
+              observed `active && serving`, after which its next bump is protected.
+            */ -}}
+            {{- $activeLeaseGeneration := int (dig "status" "activeLeaseGeneration" -1 $xr) }}
+            {{- $retainedResourceName := "" }}
+            {{- $retainedKey := "" }}
+            {{- $retainedResp := dict }}
+            {{- if and (ge $activeLeaseGeneration 0) (ne $activeLeaseGeneration $leaseGeneration) }}
+            {{- $activeBaseKey := printf "xcw:%s:%s:%d" $ns $name $activeLeaseGeneration }}
+            {{- $activeRecoveryPrefix := printf "%s:recover:" $activeBaseKey }}
+            {{- range $childName, $child := $observedResources }}
+            {{- if and (eq $retainedResourceName "") (hasPrefix "akash-lease" $childName) (ne $childName $leaseResourceName) }}
+            {{- $childKey := "" }}
+            {{- $childBodyRaw := dig "status" "requestDetails" "body" "" $child.resource }}
+            {{- if ne $childBodyRaw "" }}{{ $childKey = dig "cogniKey" "" (fromJson $childBodyRaw) }}{{ end }}
+            {{- if or (eq $childKey $activeBaseKey) (and (ne $childKey "") (hasPrefix $activeRecoveryPrefix $childKey)) }}
+            {{- $retainedResourceName = $childName }}
+            {{- $retainedKey = $childKey }}
+            {{- $childRaw := dig "status" "response" "body" "" $child.resource }}
+            {{- if ne $childRaw "" }}{{ $retainedResp = fromJson $childRaw }}{{ end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- $retainedRes := dig "resource" $retainedResp $retainedResp }}
+            {{- $retainedState := dig "state" "unknown" $retainedRes }}
+            {{- $retainedFound := dig "found" (ne (dig "externalName" "" $retainedRes) "") $retainedResp }}
+            {{- $retainedObserved := hasKey $retainedResp "found" }}
+            {{- $retainedGone := and $retainedObserved (or (not $retainedFound) (eq $retainedState "closed")) }}
+            {{- $holdOutgoingLease := and (ne $retainedResourceName "") (not $retainedGone) }}
+            {{- /* The retained child carries the CURRENT lowering under the INCUMBENT's key. Only
+              the key is load-bearing: it is what REMOVE closes, and it is read back from the
+              child's own request body, never reconstructed. */ -}}
+            {{- $retainedPayload := dict }}
+            {{- if $holdOutgoingLease }}
+            {{- $retainedPayload = fromJson (toJson $payload) }}
+            {{- $_ := set $retainedPayload "cogniKey" $retainedKey }}
+            {{- end }}
+            {{- /*
+              OBSERVE-ONLY BY CONSTRUCTION. expectedResponseCheck is the ONLY thing that triggers
+              UPDATE, and an UPDATE on the incumbent is an in-place SDL replacement — it would
+              restart the live workload on the CANDIDATE's image, which is the opposite of holding
+              it. This logic is satisfied by every response under which the child is retained
+              (`active`, or an error body whose `.resource.state` is null), and the one response
+              that falsifies it — a positive `closed` — is one of the two observations that stop
+              the child being rendered at all. So provider-http only ever OBSERVEs the incumbent.
+              CREATE is unreachable for the same reason: isRemovedCheck (unchanged below) fires
+              only on an observed `closed` or `found: false`, and $retainedGone has already
+              stopped rendering the child in both of those cases.
+            */ -}}
+            {{- $retainedUpToDateLogic := "(.response.body.resource.state != \"closed\")" }}
+            {{- $leaseObs := index $observedResources $leaseResourceName }}
             {{- $resp := dict }}
             {{- $respStatus := 0 }}
             {{- if $leaseObs }}
@@ -345,14 +491,70 @@ spec:
             {{- $refusalMessage := dig "message" "" $resp }}
             {{- $refusalRetryable := or (eq $respStatus 409) (ge $respStatus 500) }}
             {{- $prevResource := dig "status" "resource" (dict) $xr }}
-            {{- $found := dig "found" false $resp }}
-            {{- $res := dig "resource" (dict) $resp }}
+            {{- /* OBSERVE wraps the resource; CREATE/UPDATE return it directly. Normalize both
+              shapes so a replayed settled key cannot masquerade as an empty response and spin
+              forever. */ -}}
+            {{- $res := dig "resource" $resp $resp }}
             {{- $state := dig "state" "unknown" $res }}
             {{- $endpoints := dig "endpoints" (list) $res }}
             {{- $externalName := dig "externalName" "" $res }}
+            {{- $found := dig "found" (ne $externalName "") $resp }}
             {{- $serving := dig "serving" false $resp }}
             {{- $active := and $found (eq $state "active") }}
             {{- $closed := and $found (eq $state "closed") }}
+
+            {{- /*
+              BOUNDED RECOVERY (bug.5287). A settled key is deliberately never re-spent by the
+              actuator. The retired controller handled that fact with recoverBounded(3); dropping
+              the budget during the Crossplane port changed "one authority" into "zero automatic
+              recovery". Keep leaseGeneration as the operator-controlled base identity, then use
+              at most three deterministic recovery keys beneath that generation. A recovery is
+              opened ONLY after the actor read-back for the CURRENT key proves state=closed. The
+              provider's requestDetails body ties the response to its key, preventing a stale
+              closed response from consuming all three attempts while the managed Request update
+              is still propagating.
+
+              The count is generation-scoped. An explicit leaseGeneration bump resets it to zero;
+              no resourceVersion, wall clock, or reconcile tick can manufacture another paid key.
+            */ -}}
+            {{- $maxRecoveryAttempts := 3 }}
+            {{- $recoveryCount := 0 }}
+            {{- $recoveryLeaseGeneration := int (dig "status" "recovery" "leaseGeneration" -1 $xr) }}
+            {{- if eq $recoveryLeaseGeneration $leaseGeneration }}
+            {{- $recoveryCount = int (dig "status" "recovery" "count" 0 $xr) }}
+            {{- end }}
+            {{- $currentKey := $baseCogniKey }}
+            {{- if gt $recoveryCount 0 }}
+            {{- $currentKey = printf "%s:recover:%d" $baseCogniKey $recoveryCount }}
+            {{- end }}
+            {{- $responseKey := "" }}
+            {{- if $leaseObs }}
+            {{- $requestBodyRaw := dig "status" "requestDetails" "body" "" $leaseObs.resource }}
+            {{- if ne $requestBodyRaw "" }}
+            {{- $requestBody := fromJson $requestBodyRaw }}
+            {{- $responseKey = dig "cogniKey" "" $requestBody }}
+            {{- end }}
+            {{- end }}
+            {{- $closedForCurrentKey := and $closed (eq $responseKey $currentKey) }}
+            {{- $recoveryExhausted := and $closedForCurrentKey (ge $recoveryCount $maxRecoveryAttempts) }}
+            {{- /* PAID REPLACEMENT IS OPT-IN (bug.5287 review). bootPolicy.onGiveUp gates the
+              re-mint: Hold (the permanent default) NEVER spends on a replacement — a closed
+              lease parks as LeaseClosed until a human bumps spec.leaseGeneration. The XRD enum
+              is [Hold]-only until provider strikes are re-homed in the actuator (PR D), so
+              recovery is unreachable by TWO independent mechanisms: this gate, and the schema
+              rejecting a premature `Replace` catalog cell. */ -}}
+            {{- $onGiveUp := dig "bootPolicy" "onGiveUp" "Hold" $spec }}
+            {{- if and $closedForCurrentKey (not $recoveryExhausted) (eq $onGiveUp "Replace") }}
+            {{- $recoveryCount = add1 $recoveryCount }}
+            {{- $currentKey = printf "%s:recover:%d" $baseCogniKey $recoveryCount }}
+            {{- end }}
+            {{- /* A closed lease we are NOT actively replacing must park, not re-render:
+              re-rendering under a settled key is refused by the actuator every reconcile
+              forever (Axiom 26 churn). Held ⇒ the lease closed under the CURRENT key and
+              onGiveUp is not Replace. */ -}}
+            {{- $heldClosed := and $closedForCurrentKey (ne $onGiveUp "Replace") }}
+            {{- $cogniKey = $currentKey }}
+            {{- $_ := set $payload "cogniKey" $cogniKey }}
 
             {{- /*
               THE RELEASE STEP, READ BACK (task.5135). Only an OBSERVE answer carries a phase —
@@ -362,7 +564,22 @@ spec:
             */ -}}
             {{- $prevMigrationPhase := dig "status" "migration" "phase" "" $xr }}
             {{- $migrationPhase := dig "migration" "phase" $prevMigrationPhase $resp }}
-            {{- $migrationFailed := eq $migrationPhase "failed" }}
+            {{- /*
+              FAILURE IS NEVER LATCHED (bug.5309). $migrationPhase above deliberately falls
+              back to the PREVIOUS phase so status.migration does not blink out on the ticks
+              that carry no migration answer — that latch is for DISPLAY and is correct. But
+              deciding the XR is terminally Failed from a latched value makes one transient
+              `failed` permanent: the actuator then reports `succeeded` on every later tick and
+              the XR keeps re-emitting MigrationFailed forever, because a response WITHOUT a
+              migration phase re-reads the stale `failed` out of its own status.
+              Observed on toks4 candidate-a: Job succeeded=1/failed=0, pod logged
+              "migrate complete: 1 migration(s) applied + verified", database present, actuator
+              logged akash_tx_migration_succeeded x6 — and the XR sat Failed/MigrationFailed
+              with an empty observedBundle and a 404 edge, with no path forward.
+              So the TERMINAL decision reads the CURRENT response only. No fresh `failed`, no
+              failure. Same correction shape as bug.5301's DNS gate and #2464's None sentinel.
+            */ -}}
+            {{- $migrationFailed := eq (dig "migration" "phase" "" $resp) "failed" }}
 
             {{- /*
               LATCHED observed bundle. Only a workload that actually SERVED its exact source sha
@@ -377,21 +594,74 @@ spec:
             {{- $bootDeadlineSeconds := int (dig "bootPolicy" "bootDeadlineSeconds" 1800 $spec) }}
             {{- $onDeadline := dig "bootPolicy" "onDeadline" "Hold" $spec }}
             {{- $createdAt := $meta.creationTimestamp }}
-            {{- $createdTime := toDate "2006-01-02T15:04:05Z07:00" $createdAt }}
-            {{- $ageSeconds := int (sub (now | unixEpoch) ($createdTime | unixEpoch)) }}
-            {{- $bootDeadlineAt := dateInZone "2006-01-02T15:04:05Z07:00" ($createdTime | dateModify (printf "%ds" $bootDeadlineSeconds)) "UTC" }}
-            {{- $neverServed := and (not $serving) (eq $prevSha "") }}
-            {{- $deadlineExceeded := and $neverServed (gt $ageSeconds $bootDeadlineSeconds) }}
+            {{- /*
+              BOOT EPOCH (bug.5244). The deadline is anchored to the CURRENT boot attempt —
+              (bundle sha, leaseGeneration) — not the XR's creationTimestamp. Anchored to
+              creation, a never-served XR older than the deadline was a roach motel:
+              $closeForBudget latched true, the lease Request stopped rendering, so no
+              OBSERVE could ever set $prevSha and no spec change could un-close it. The
+              anchor is latched through status.bootEpoch: same key -> keep the recorded
+              start; key changed -> this render opens a fresh window. A first render (no
+              recorded epoch) keeps creationTimestamp, so every existing XR renders
+              byte-identically until its spec next changes.
+            */ -}}
+            {{- $bootKey := printf "%s:%d" $desiredSha $leaseGeneration }}
+            {{- if gt $recoveryCount 0 }}{{ $bootKey = printf "%s:recover:%d" $bootKey $recoveryCount }}{{ end }}
+            {{- $prevBootKey := dig "status" "bootEpoch" "key" "" $xr }}
+            {{- $prevBootAt := dig "status" "bootEpoch" "at" "" $xr }}
+            {{- $bootAnchorAt := $createdAt }}
+            {{- if and (eq $prevBootKey $bootKey) (ne $prevBootAt "") }}
+            {{- $bootAnchorAt = $prevBootAt }}
+            {{- else if ne $prevBootKey "" }}
+            {{- $bootAnchorAt = dateInZone "2006-01-02T15:04:05Z07:00" now "UTC" }}
+            {{- end }}
+            {{- $anchorTime := toDate "2006-01-02T15:04:05Z07:00" $bootAnchorAt }}
+            {{- $ageSeconds := int (sub (now | unixEpoch) ($anchorTime | unixEpoch)) }}
+            {{- $bootDeadlineAt := dateInZone "2006-01-02T15:04:05Z07:00" ($anchorTime | dateModify (printf "%ds" $bootDeadlineSeconds)) "UTC" }}
+            {{- /*
+              THE DEADLINE MUST BIND TO THE CURRENT ATTEMPT, NOT TO "EVER SERVED ANYTHING"
+              (bug.5287, the arc's original finding). `$prevSha` is the LATCHED
+              status.observedBundle.source.sha, so `eq $prevSha ""` could only ever be true on
+              a workload's very first boot. Once an XR had recorded ANY bundle the old
+              predicate was permanently false, the deadline could never fire again, and
+              BOOT_SLO_OR_CLOSE was structurally unreachable for the rest of that XR's life.
+
+              Observed on toks5 production: three generations, `bootDeadlineAt` hours past,
+              `failure.reason = None`, a lease billing with no workload and no terminal state —
+              because `observedBundle` still carried `cf5de44c…` from a generation that once
+              served. Combined with the actuator replaying a settled-but-never-served receipt
+              (task.5157), such a workload is unbounded in BOTH directions: nothing re-creates
+              it and nothing closes it.
+
+              `$hasServedDesired` (computed above) asks the right question: has THIS attempt's
+              sha actually served? A live serving workload is unaffected; a never-served XR
+              behaves exactly as before. What changes is that an XR which served an OLD sha and
+              never served the current one can now reach its deadline instead of hanging.
+
+              DELIBERATELY NOT WIDENED: an XR whose `observedBundle` EQUALS the desired sha —
+              served once, then stopped — still does not trip the deadline. Catching that needs
+              a trustworthy live-serving signal, and `serving` yields false negatives (toks4
+              production served HTTP 200 for 13 days while its XR read serving=false). Closing
+              a live node on a false negative is worse than leaving that case to a human; it
+              waits on bug.5237's host-routed probe.
+            */ -}}
+            {{- $deadlineExceeded := and (not $hasServedDesired) (gt $ageSeconds $bootDeadlineSeconds) }}
             {{- $closeForBudget := and $deadlineExceeded (eq $onDeadline "Close") }}
 
             {{- /*
-              A CLOSED lease is TERMINAL for this XR, and the composed Request stops being
-              rendered. Re-creating under the same key would ask the actuator to re-spend a
-              settled key (it refuses by design, FAIL_CLOSED), so hammering it would only burn
-              provider calls. Replacement is an explicit spec.leaseGeneration bump.
+              A CLOSED lease opens the next bounded recovery key. Only the third closed recovery
+              is terminal; at that point the composed Request stops rendering and the XR exposes
+              RecoveryLimitExceeded. This is the Crossplane-owned equivalent of the retired
+              controller's recoverBounded(3), without an unbounded retry loop or implicit base
+              generation bump.
             */ -}}
-            {{- $terminallyClosed := and $closed (not $closeForBudget) }}
-            {{- $renderLease := not (or $closeForBudget $terminallyClosed) }}
+            {{- /* Never render under a settled key (Axiom 26): a closed lease renders again
+              ONLY through a Replace-bumped fresh recovery key. $heldClosed parks Hold nodes;
+              the (closed && not-current-key) term fences the foreign/stale-key shape, where
+              $responseKey is absent or names another key and the guard would otherwise fail
+              open into refused-create churn every reconcile. An explicit BASE generation bump
+              selects a new generation-qualified child above before this fence is evaluated. */ -}}
+            {{- $renderLease := not (or $closeForBudget $recoveryExhausted $heldClosed (and $closed (not $closedForCurrentKey))) }}
 
             {{- /*
               BOOT GRACE. `serving` is the convergence signal, so a not-yet-serving workload
@@ -408,14 +678,42 @@ spec:
             {{- $upToDateLogic = "(.response.body.found == true) and (.response.body.resource.state != \"closed\") and (.response.body.serving == true)" }}
             {{- end }}
 
-            {{- /* ---------- DNS target (bug.5125: never CNAME a host to itself) ---------- */ -}}
+            {{- /* ---------- DNS target (bug.5125: never point a host to itself) ---------- */ -}}
             {{- $dns := dig "dns" (dict) $spec }}
-            {{- $dnsTarget := "" }}
+            {{- /* Prefer a provider hostname because it survives ingress-IP rotation. Some
+              providers expose ONLY an IPv4 ingress, though (bug.5340 / RHITE). Keep the first
+              IPv4 as a fallback instead of discarding the only routable target. */ -}}
+            {{- $dnsHostnameTarget := "" }}
+            {{- $dnsIpv4Target := "" }}
             {{- range $endpoints }}
             {{- $h := regexReplaceAll "^[A-Za-z][A-Za-z0-9+.-]*://" . "" | splitList "/" | first | splitList ":" | first | lower | trimSuffix "." }}
-            {{- if and (eq $dnsTarget "") (ne $h "") (ne $h $publicHost) (not (regexMatch "^[0-9]{1,3}([.][0-9]{1,3}){3}$" $h)) }}
-            {{- $dnsTarget = $h }}
+            {{- if and (ne $h "") (ne $h $publicHost) }}
+            {{- if regexMatch "^[0-9]{1,3}([.][0-9]{1,3}){3}$" $h }}
+            {{- if eq $dnsIpv4Target "" }}{{ $dnsIpv4Target = $h }}{{ end }}
+            {{- else if eq $dnsHostnameTarget "" }}
+            {{- $dnsHostnameTarget = $h }}
             {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- $dnsTarget := $dnsHostnameTarget }}
+            {{- if eq $dnsTarget "" }}{{ $dnsTarget = $dnsIpv4Target }}{{ end }}
+
+            {{- /* LAST-KNOWN-GOOD DNS LATCH (bug.5188). status.response.body is overwritten with the
+               ERROR body of a failed mutation (see the lease-handle latch below), which has no endpoints,
+               so $dnsTarget collapses to "" mid-promote. Omitting the dns-record child then GC-deletes the
+               live Cloudflare record -> NXDOMAIN. Latch the last-known-good target from status exactly like
+               $prevSha/$prevResource: never withdraw a live record for a transient endpoint-less observe, and
+               only FLIP to a genuinely-new target once the new revision actually serves (PROVE_BEFORE_TRAFFIC). */ -}}
+            {{- $prevDnsTarget := dig "status" "dns" "target" "" $xr }}
+            {{- $effectiveDnsTarget := $dnsTarget }}
+            {{- if eq $dnsTarget "" }}
+            {{- $effectiveDnsTarget = $prevDnsTarget }}
+            {{- else if and (ne $prevDnsTarget "") (ne $dnsTarget $prevDnsTarget) (not (and $active $serving)) }}
+            {{- $effectiveDnsTarget = $prevDnsTarget }}
+            {{- end }}
+            {{- $dnsRecordType := "CNAME" }}
+            {{- if regexMatch "^[0-9]{1,3}([.][0-9]{1,3}){3}$" $effectiveDnsTarget }}
+            {{- $dnsRecordType = "A" }}
             {{- end }}
 
             {{- /*
@@ -426,13 +724,34 @@ spec:
               no, and a live, healthy, 200-serving workload looked converged while its public
               name answered 502. It is now read back from the composed dns-record Request's last
               Cloudflare response: true only when a record that IS this composite's desired
-              proxied CNAME is actually live in the zone.
+              proxied record of the target-derived type is actually live in the zone.
             */ -}}
             {{- $dnsObs := index $observedResources "dns-record" }}
             {{- $dnsResp := dict }}
+            {{- $dnsCreatePending := "" }}
+            {{- $dnsCreateAmbiguous := false }}
             {{- if $dnsObs }}
             {{- $dnsRaw := dig "status" "response" "body" "" $dnsObs.resource }}
             {{- if ne $dnsRaw "" }}{{ $dnsResp = fromJson $dnsRaw }}{{ end }}
+            {{- /*
+              SAFE CREATE-AMBIGUITY RECOVERY (bug.5341). provider-http writes
+              external-create-pending before CREATE and normally follows with
+              external-create-succeeded. If the controller is interrupted between those writes,
+              Crossplane correctly refuses to guess whether CREATE happened. DNS is the narrow
+              case where we do not need to guess: OBSERVE is name-addressed, and the desired
+              writer adopts an existing A/AAAA/CNAME before deciding whether CREATE is needed.
+              Once the provider itself reports that exact ambiguity, mirror its pending timestamp
+              into succeeded so the next reconcile performs the authoritative name lookup. Never
+              do this merely because pending exists — the provider must already have latched the
+              leak-prevention refusal. Lease Requests are deliberately outside this recovery.
+            */ -}}
+            {{- $dnsAnnotations := dig "metadata" "annotations" (dict) $dnsObs.resource }}
+            {{- $dnsCreatePending = get $dnsAnnotations "crossplane.io/external-create-pending" | default "" }}
+            {{- range (dig "status" "conditions" (list) $dnsObs.resource) }}
+            {{- if contains "cannot determine creation result" (dig "message" "" .) }}
+            {{- $dnsCreateAmbiguous = true }}
+            {{- end }}
+            {{- end }}
             {{- end }}
             {{- /* Cloudflare answers a LIST with an array and a CREATE/UPDATE with one object. */ -}}
             {{- $dnsResult := dig "result" (list) $dnsResp }}
@@ -440,9 +759,90 @@ spec:
             {{- if kindIs "slice" $dnsResult }}{{ $dnsRecords = $dnsResult }}{{ else if kindIs "map" $dnsResult }}{{ $dnsRecords = list $dnsResult }}{{ end }}
             {{- $dnsPublished := false }}
             {{- range $dnsRecords }}
-            {{- if and (eq (dig "type" "" .) "CNAME") (eq (dig "content" "" . | lower | trimSuffix ".") $dnsTarget) (dig "proxied" false .) }}
+            {{- if and (eq (dig "type" "" .) $dnsRecordType) (eq (dig "content" "" . | lower | trimSuffix ".") $effectiveDnsTarget) (dig "proxied" false .) }}
             {{- $dnsPublished = true }}
             {{- end }}
+            {{- end }}
+
+            {{- /* ---------- composed: the OUTGOING Akash lease, held open ---------- */ -}}
+            {{- /* bug.5322. A DELIBERATE COPY of the lease Request below, differing in exactly
+              four places — the composition-resource-name, the absent `ready` annotation, the
+              payload (the incumbent's own key) and expectedResponseCheck (observe-only). The
+              mappings and isRemovedCheck are byte-identical on purpose: REMOVE is how this child
+              eventually closes its lease, so it must speak the same wire as the child that
+              minted it. They are pinned equal by
+              tests/ci-invariants/crossplane-xcomputeworkload.spec.ts so the copy cannot drift.
+              It is NOT folded into one `range` over two children because the candidate block's
+              exact bytes are the thing bug.5322's fix must not disturb. */ -}}
+            {{- if $holdOutgoingLease }}
+            ---
+            apiVersion: http.m.crossplane.io/v1alpha2
+            kind: Request
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ $retainedResourceName }}
+            spec:
+              providerConfigRef:
+                kind: ClusterProviderConfig
+                name: cogni-http
+              forProvider:
+                waitTimeout: 300s
+                headers:
+                  Content-Type: ["application/json"]
+                  Authorization: [{{ $authHeader | quote }}]
+                payload:
+                  baseUrl: {{ $baseUrl | quote }}
+                  body: {{ toJson $retainedPayload | quote }}
+                mappings:
+                  - action: OBSERVE
+                    method: POST
+                    url: (.payload.baseUrl + "/v1/akash/observe")
+                    body: |
+                      {
+                        cogniKey: .payload.body.cogniKey,
+                        publicHost: {{ $publicHost | quote }},
+                        expectedSourceSha: {{ $desiredSha | quote }}{{ if $hasMigrationStep }},
+                        workload: .payload.body.spec.name,
+                        environment: .payload.body.environment,
+                        migration: .payload.body.migrationStep{{ end }}
+                      }
+                  - action: CREATE
+                    method: POST
+                    url: (.payload.baseUrl + "/v1/akash/create")
+                    body: |
+                      {
+                        cogniKey: .payload.body.cogniKey,
+                        environment: .payload.body.environment,
+                        identity: .payload.body.identity,
+                        spec: .payload.body.spec{{ if $hasLegacyMigration }},
+                        migration: .payload.body.migration{{ end }}
+                      }
+                  - action: UPDATE
+                    method: POST
+                    url: (.payload.baseUrl + "/v1/akash/update")
+                    body: |
+                      {
+                        cogniKey: .payload.body.cogniKey,
+                        externalName: .response.body.resource.externalName,
+                        environment: .payload.body.environment,
+                        identity: .payload.body.identity,
+                        spec: .payload.body.spec{{ if $hasLegacyMigration }},
+                        migration: .payload.body.migration{{ end }}
+                      }
+                  - action: REMOVE
+                    method: POST
+                    url: (.payload.baseUrl + "/v1/akash/delete")
+                    body: |
+                      {
+                        cogniKey: .payload.body.cogniKey,
+                        externalName: .response.body.resource.externalName
+                      }
+                expectedResponseCheck:
+                  type: CUSTOM
+                  logic: {{ $retainedUpToDateLogic | quote }}
+                isRemovedCheck:
+                  type: CUSTOM
+                  logic: '(.response.body.found == false) or (.response.body.resource.state == "closed")'
             {{- end }}
 
             {{- /* ---------- composed: the paid Akash lease ---------- */ -}}
@@ -452,7 +852,7 @@ spec:
             kind: Request
             metadata:
               annotations:
-                gotemplating.fn.crossplane.io/composition-resource-name: akash-lease
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ $leaseResourceName }}
                 {{- if and $active $serving }}
                 gotemplating.fn.crossplane.io/ready: "True"
                 {{- end }}
@@ -484,6 +884,12 @@ spec:
                     body: |
                       {
                         cogniKey: .payload.body.cogniKey,
+                        {{- /* bug.5237 PHASE 2. Phase 1's strict-schema reader is deployed in
+                          every environment, so OBSERVE can now require the real host-routed
+                          path instead of mistaking a healthy bare ingress for the hostname
+                          that users reach. Keep this field on OBSERVE only: it is proof input,
+                          never paid-mutation input. */}}
+                        publicHost: {{ $publicHost | quote }},
                         expectedSourceSha: {{ $desiredSha | quote }}{{ if $hasMigrationStep }},
                         workload: .payload.body.spec.name,
                         environment: .payload.body.environment,
@@ -536,10 +942,18 @@ spec:
             {{- end }}
 
             {{- /* ---------- composed: DNS intent ---------- */ -}}
-            {{- if and $dns (ne $dnsTarget "") $renderLease }}
+            {{- /* LEASE LIVENESS AND DNS PUBLICATION ARE DIFFERENT CONCERNS (bug.5301). This
+              gate used to include $renderLease, so EVERY terminal lease condition (budget
+              close, recovery exhaustion, Hold-parked or foreign-key closure) also GC-deleted
+              the public hostname -> live Cloudflare DELETE -> NXDOMAIN (beacon/node-template,
+              2026-09-28). With Replace armed, closure becomes routine and every recovery cycle
+              would open an NXDOMAIN window. The record now withdraws only on genuine XR
+              deletion via normal finalization — the same class of hazard the last-known-good
+              latch above already defends for the mid-promote case. */ -}}
+            {{- if and $dns (ne $effectiveDnsTarget "") }}
             {{- $cfBase := printf "https://api.cloudflare.com/client/v4/zones/%s/dns_records" $dns.zoneId }}
             {{- $cfToken := printf "Bearer {{ operator-env-secrets:%s:CLOUDFLARE_API_TOKEN }}" $writerNs }}
-            {{- $cfPayload := dict "name" $publicHost "content" $dnsTarget }}
+            {{- $cfPayload := dict "name" $publicHost "content" $effectiveDnsTarget "type" $dnsRecordType }}
             {{- /*
               ADOPT BY NAME, NEVER BY TYPE (bug.5152). Cloudflare's list API FILTERS, it does not
               merge: `?type=CNAME&name=<host>` over a host already held by a legacy A record
@@ -551,8 +965,8 @@ spec:
               NAME across all types and adopt whatever occupies it, exactly as the bespoke
               reconciler this composition replaces does: CloudflareComputeWorkloadDnsAdapter
               .reconcile() calls findRecords(hostname) with NO type filter and then PUTs the
-              CNAME over the live record's id, which is how every other Akash node in the fleet
-              got converted from its k3s A record. ci-cd.md Axiom 21 already pinned the mirror
+              desired A or CNAME over the live record's id, which is how every other Akash node
+              in the fleet got converted from its k3s A record. ci-cd.md Axiom 21 already pinned the mirror
               image of this for the k3s writer ("never `?type=A`, which reads a live CNAME as
               absent"); it is restated here because this is a second, independent writer.
 
@@ -561,13 +975,11 @@ spec:
               set, so the request fails LOUDLY on CREATE rather than silently converting a record
               this composite never owned. That mirrors the bespoke adapter's DnsOwnershipChanged.
 
-              PROXIED IS LOAD-BEARING, not a preference. The Akash provider's ingress serves a
-              `*.ingress.zencloud.eu` certificate, so a grey-cloud CNAME from the cogni name to
-              it fails TLS on a subject-name mismatch before a single byte of HTTP is exchanged.
-              Cloudflare's orange cloud is what terminates TLS for the cogni name and
-              re-originates to the provider; every serving Akash node in the fleet is proxied,
-              and so is the bespoke adapter's desired record. `proxied: false` here would have
-              published a record that resolves and still cannot be reached.
+              PROXIED IS LOAD-BEARING, not a preference. Provider ingress certificates are not
+              issued for the Cogni hostname, whether the target is a provider hostname (CNAME)
+              or a bare IPv4 address (A). Cloudflare's orange cloud terminates TLS for the Cogni
+              name and re-originates to the provider; `proxied: false` would publish a record
+              that resolves and still cannot be reached safely.
             */ -}}
             {{- $cfAdoptable := `(.response.body.result // [] | if type == "array" then . else [.] end | map(select(.type == "A" or .type == "AAAA" or .type == "CNAME")))` }}
             ---
@@ -576,6 +988,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: dns-record
+                {{- if and $dnsCreateAmbiguous (ne $dnsCreatePending "") }}
+                crossplane.io/external-create-succeeded: {{ $dnsCreatePending | quote }}
+                {{- end }}
             spec:
               providerConfigRef:
                 kind: ClusterProviderConfig
@@ -597,7 +1012,7 @@ spec:
                     url: .payload.baseUrl
                     body: |
                       {
-                        type: "CNAME",
+                        type: .payload.body.type,
                         name: .payload.body.name,
                         content: .payload.body.content,
                         ttl: 1,
@@ -608,7 +1023,7 @@ spec:
                     url: (.payload.baseUrl + "/" + ({{ $cfAdoptable }} | .[0].id))
                     body: |
                       {
-                        type: "CNAME",
+                        type: .payload.body.type,
                         name: .payload.body.name,
                         content: .payload.body.content,
                         ttl: 1,
@@ -622,7 +1037,7 @@ spec:
                   logic: |
                     ({{ $cfAdoptable }} | length) == 1
                     and
-                    ({{ $cfAdoptable }} | .[0].type) == "CNAME"
+                    ({{ $cfAdoptable }} | .[0].type) == .payload.body.type
                     and
                     ({{ $cfAdoptable }} | .[0].content) == .payload.body.content
                     and
@@ -666,10 +1081,32 @@ spec:
             {{- $phase = "Progressing" }}
             {{- $failReason = $refusalCode }}
             {{- $failMessage = substr 0 256 $refusalMessage }}
-            {{- else if $terminallyClosed }}
+            {{- else if $heldClosed }}
+            {{- /* Ordered BEFORE recoveryExhausted: if someone flips Replace back to Hold
+              mid-recovery, the human choice (Hold) names the state. */ -}}
             {{- $phase = "Failed" }}
             {{- $failReason = "LeaseClosed" }}
-            {{- $failMessage = printf "lease %s is closed; bump spec.leaseGeneration to mint a replacement (the actuator refuses to re-spend a settled key)" $externalName }}
+            {{- $failMessage = printf "lease %s is closed and bootPolicy.onGiveUp is Hold; bump spec.leaseGeneration to mint a replacement (no paid recovery is attempted under Hold)" $externalName }}
+            {{- else if $recoveryExhausted }}
+            {{- $phase = "Failed" }}
+            {{- $failReason = "RecoveryLimitExceeded" }}
+            {{- $failMessage = printf "lease recovery exhausted after %d attempts for generation %d; no further paid mutation will be attempted" $recoveryCount $leaseGeneration }}
+            {{- else if gt $recoveryCount 0 }}
+            {{- $phase = "Progressing" }}
+            {{- $failReason = "LeaseRecoveryInProgress" }}
+            {{- $failMessage = printf "lease recovery attempt %d of %d for generation %d" $recoveryCount $maxRecoveryAttempts $leaseGeneration }}
+            {{- else if $closed }}
+            {{- /* A lease observed closed under a NON-current recovery key (settled/foreign key).
+              $heldClosed above only catches $closedForCurrentKey, and every recovery branch
+              above has already claimed the active-recovery cases ($recoveryCount > 0), so what
+              reaches here is a settled, parked closed lease with no recovery in flight. Without
+              this branch the chain fell through to the default Progressing/reason:"None" and lied
+              that a permanently-closed lease was still coming up. $renderLease already PARKS this
+              case (Axiom 26 fence: (and $closed (not $closedForCurrentKey))); status must tell the
+              same truth. Terminal until a human bumps spec.leaseGeneration. */ -}}
+            {{- $phase = "Failed" }}
+            {{- $failReason = "LeaseClosed" }}
+            {{- $failMessage = printf "lease %s is closed under a settled recovery key; bump spec.leaseGeneration to mint a replacement" $externalName }}
             {{- end }}
             ---
             apiVersion: {{ $xr.apiVersion }}
@@ -678,6 +1115,32 @@ spec:
               phase: {{ $phase | quote }}
               serving: {{ and $active $serving }}
               bootDeadlineAt: {{ $bootDeadlineAt | quote }}
+              bootEpoch:
+                key: {{ $bootKey | quote }}
+                at: {{ $bootAnchorAt | quote }}
+              {{- if gt $recoveryCount 0 }}
+              recovery:
+                leaseGeneration: {{ $leaseGeneration }}
+                count: {{ $recoveryCount }}
+                maxAttempts: {{ $maxRecoveryAttempts }}
+                key: {{ $cogniKey | quote }}
+              {{- end }}
+              {{- if ge $leaseRequestGeneration 0 }}
+              leaseRequestGeneration: {{ $leaseRequestGeneration }}
+              {{- end }}
+              {{- /* THE CUTOVER LATCH (bug.5322). The generation PROVEN serving — advanced only
+                on `active && serving` for the CANDIDATE child, which is the same pair
+                status.serving and the Ready phase are written from. Advancing it is what lets
+                the OVERLAP_BEFORE_CLOSE block above stop retaining the outgoing child on the
+                next reconcile, so the close happens AFTER the cutover rather than before it.
+                Carried forward verbatim on every tick that does not prove serving: this must
+                never silently regress to -1 and un-protect a live lease. Omitted entirely while
+                still -1 so a fleet that has never served renders byte-identically. */}}
+              {{- if and $active $serving }}
+              activeLeaseGeneration: {{ $leaseGeneration }}
+              {{- else if ge $activeLeaseGeneration 0 }}
+              activeLeaseGeneration: {{ $activeLeaseGeneration }}
+              {{- end }}
               {{- if ne $migrationPhase "" }}
               migration:
                 phase: {{ $migrationPhase | quote }}
@@ -710,16 +1173,26 @@ spec:
               */}}
               resource: {{ toJson $prevResource }}
               {{- end }}
-              {{- if ne $dnsTarget "" }}
+              {{- if ne $effectiveDnsTarget "" }}
               dns:
                 hostname: {{ $publicHost | quote }}
-                target: {{ $dnsTarget | quote }}
+                target: {{ $effectiveDnsTarget | quote }}
                 published: {{ $dnsPublished }}
               {{- end }}
               {{- if ne $failReason "" }}
               failure:
                 reason: {{ $failReason | quote }}
                 message: {{ $failMessage | quote }}
+              {{- else }}
+              {{- /* UNCONDITIONAL EMISSION (bug.5287). Omitting the key does not clear it:
+                    status merge preserves the previous value, so a recovered workload kept
+                    its stale failure.reason (ledger_unavailable under Progressing) latched
+                    for days. "None" is the cleared-failure sentinel — always written, never
+                    omitted; compute-workload-readiness treats it as absent. Matches the
+                    XRD reason pattern ^[A-Za-z_][A-Za-z0-9_]{0,127}$. */}}
+              failure:
+                reason: "None"
+                message: ""
               {{- end }}
     - step: ready
       functionRef:

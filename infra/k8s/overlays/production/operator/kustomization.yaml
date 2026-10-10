@@ -69,6 +69,12 @@ patches:
       - op: add
         path: /data/NEXTAUTH_URL
         value: "https://cognidao.org"
+      # Public, non-secret account identity. Keep the test-parent production overlay internally
+      # complete even though candidate-a is this PR's proof lane: the shared env-manager and
+      # invariant suite derive lease-generation evidence from each funded environment's own pin.
+      - op: add
+        path: /data/AKASH_ACTUATOR_ACCOUNT_ID
+        value: "akash10auj6u6wr7aqjawuxurgue9w7wfnca50t8cr4l"
   # NodePort assignment (operator = 30000) + instance label on selector.
   # Instance label prevents cross-node service routing: namePrefix only renames
   # resource names, not labels/selectors, so without this every Service

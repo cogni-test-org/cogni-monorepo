@@ -228,6 +228,9 @@ grep -qxF "$DEPLOY_ENVIRONMENT" <<<"$node_envs" \
   || fail "'$TARGET_NODE' is not in the '$DEPLOY_ENVIRONMENT' node-set (envs: $(yq -r '.envs | join(",")' "$node_catalog_file")) — add the env to infra/catalog/${TARGET_NODE}.yaml to deploy it here"
 
 node_db="$(node_database_for_target "$TARGET_NODE" "$DEPLOY_ENVIRONMENT")"
+node_id="$(node_id_for_target "$TARGET_NODE")" \
+  || fail "node_id missing for '$TARGET_NODE' (REPO_SPEC_IS_IDENTITY_SSOT)"
+node_temporal_namespace="cogni-${DEPLOY_ENVIRONMENT}-${node_id}"
 
 read -r -a SSH_OPTS_ARR <<< "$SSH_OPTS_RAW"
 # bug.5159 — multiplex every remote call over ONE ssh connection. Each remote() used to
@@ -549,13 +552,32 @@ copy_to_remote "$REPO_ROOT/scripts/ci/ensure-temporal-namespace.sh" "/tmp/ensure
 remote "TEMPORAL_NAMESPACE='cogni-${DEPLOY_ENVIRONMENT}' \
   TEMPORAL_CONTAINER=cogni-runtime-temporal-1 \
   TEMPORAL_TIMEOUT=60 \
-  bash /tmp/ensure-temporal-namespace.sh"
+  bash /tmp/ensure-temporal-namespace.sh" \
+  || fail "temporal namespace ensure failed (rc=$?) for cogni-${DEPLOY_ENVIRONMENT} on ${SUBSTRATE_CONTROL_ENV}'s Temporal"
 mark_row temporal_namespace ensured "cogni-${DEPLOY_ENVIRONMENT} registered on ${SUBSTRATE_CONTROL_ENV}'s Temporal (idempotent)"
 
+# NODE-SOVEREIGN WORKFLOW NAMESPACE. Provision it from the catalog lifecycle even before a node
+# opts into the private Worker profile, so enabling `cogni-workflow-worker-v1` is a pure app
+# release and never races a paid workload boot against namespace registration. The UUID comes
+# from node_id_for_target (repo-spec SSOT with the drift-gated catalog projection fallback), not
+# from the human slug. Existing centralized schedules remain in cogni-<lane>; creating this
+# namespace alone moves no traffic and starts no Worker.
+CURRENT_ROW="node_temporal_namespace"
+remote "TEMPORAL_NAMESPACE='${node_temporal_namespace}' \
+  TEMPORAL_CONTAINER=cogni-runtime-temporal-1 \
+  TEMPORAL_TIMEOUT=60 \
+  bash /tmp/ensure-temporal-namespace.sh" \
+  || fail "node Temporal namespace ensure failed (rc=$?) for ${node_temporal_namespace} on ${SUBSTRATE_CONTROL_ENV}'s Temporal"
+mark_row node_temporal_namespace ensured "${node_temporal_namespace} registered on ${SUBSTRATE_CONTROL_ENV}'s Temporal (idempotent)"
+
 CURRENT_ROW="remote_reconcile"
+# Breadcrumbs ([remote] … ok) after every sub-step, stdout so they stream live:
+# bug.5278's silent exit 1 was only locatable by mtime forensics on the VM. With
+# these, the last printed crumb names the step the next such death died in.
 remote "set -euo pipefail
   runtime_env=/opt/cogni-template-runtime/.env
   runtime_compose=(docker compose --project-name cogni-runtime --env-file \"\$runtime_env\" -f /opt/cogni-template-runtime/docker-compose.yml)
+  echo '[remote] reconcile begin (${DEPLOY_ENVIRONMENT}/${TARGET_NODE})'
 
 ${edge_reconcile_snippet}
 
@@ -583,13 +605,17 @@ ${edge_reconcile_snippet}
   dbs_n=\$(grep -cE '^COGNI_NODE_DBS=' \"\$env_tmp\" || true)
   new_n=\$(wc -l < \"\$env_tmp\")
   old_n=\$(wc -l < \"\$runtime_env\")
-  if [ ! -s \"\$env_tmp\" ] || [ \"\$dbs_n\" != 1 ] || [ \"\$new_n\" -lt \"\$old_n\" ]; then
+  env_guard_fail() {
     rm -f \"\$env_tmp\"
-    echo 'refusing to publish a malformed runtime env; original left intact' >&2
+    echo \"::error::reconcile-node-substrate[remote]: \$1 (dbs_n=\$dbs_n new_n=\$new_n old_n=\$old_n) — refusing to publish a malformed runtime env; original left intact\" >&2
     exit 1
-  fi
+  }
+  [ -s \"\$env_tmp\" ] || env_guard_fail 'rendered runtime env is EMPTY'
+  [ \"\$dbs_n\" = 1 ] || env_guard_fail \"rendered runtime env must hold exactly one COGNI_NODE_DBS line, found \$dbs_n\"
+  [ \"\$new_n\" -ge \"\$old_n\" ] || env_guard_fail 'rendered runtime env LOST lines vs the live file'
   mv -f \"\$env_tmp\" \"\$runtime_env\"
   rm -f \"\$runtime_env.bak\"
+  echo '[remote] runtime env published (COGNI_NODE_DBS reconciled) ok'
 
   # Alloy node-label reconcile — stage the fresh config (rsync's restart-on-change
   # half) then the SAME hash-gated restart deploy-infra runs. Born-observable on
@@ -600,8 +626,10 @@ ${edge_reconcile_snippet}
   ALLOY_CONFIG=/opt/cogni-template-runtime/configs/alloy-config.metrics.alloy \\
   HASH_DIR=/var/lib/cogni \\
     bash /tmp/reconcile-alloy-config.remote.sh >/dev/null
+  echo '[remote] alloy config reconciled ok'
 
   \"\${runtime_compose[@]}\" up -d postgres >/dev/null
+  echo '[remote] postgres up ok'
   # Single-node db-provision: override COGNI_NODE_DBS to THIS node and inject its
   # per-node OpenBao passwords (read above) via -e, so provision.sh reconciles the
   # per-node app/service roles to the OpenBao value. The passwords transit this SSH
@@ -612,8 +640,10 @@ ${edge_reconcile_snippet}
     -e APP_DB_PASSWORD='${app_db_password}' \
     -e APP_DB_SERVICE_PASSWORD='${app_db_service_password}' \
     db-provision >/dev/null
+  echo '[remote] db-provision ok'
   if \"\${runtime_compose[@]}\" config --services 2>/dev/null | grep -q '^doltgres$'; then
     \"\${runtime_compose[@]}\" up -d doltgres >/dev/null
+    echo '[remote] doltgres up ok'
     # bug.5033: node-scope doltgres-provision with -e COGNI_NODE_DBS='${node_db}',
     # symmetric with db-provision above. Otherwise doltgres-provision relied on the
     # env-file COGNI_NODE_DBS (whole fleet) and the surrounding grep gate silently
@@ -622,7 +652,9 @@ ${edge_reconcile_snippet}
     \"\${runtime_compose[@]}\" --profile bootstrap run --rm \
       -e COGNI_NODE_DBS='${node_db}' \
       ${dg_pw_env} doltgres-provision >/dev/null
-${dolt_mirror_reconcile_snippet}  fi"
+    echo '[remote] doltgres-provision ok'
+${dolt_mirror_reconcile_snippet}  fi" \
+  || fail "remote reconcile block failed (rc=$?) — the last '[remote] … ok' breadcrumb above names the last completed step"
 
 mark_row remote_reconcile updated "${DEPLOYMENT_PROVIDER} placement steps, DB inventory, and DB provisioners reconciled on VM"
 log "substrate ready inputs reconciled for ${TARGET_NODE} (${DEPLOY_ENVIRONMENT})"

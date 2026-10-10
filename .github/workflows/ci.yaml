@@ -34,9 +34,14 @@ env:
   # The repo that owns this fleet's deploy/* branches. Canonical keeps the same URL;
   # the isolated test fleet renders its own repo instead of cogni-dao/cogni.
   REPO_URL: https://github.com/${{ github.repository }}.git
-  # Public workload zone used by catalog-derived scheduler endpoints. Canonical keeps the
-  # cognidao.org default; isolated fleets set the repo variable to their own Cloudflare zone.
+  # SUBSTRATE root zone (state-service / VM-discovery externalName hosts). Canonical keeps the
+  # cognidao.org default; an isolated fleet that relocates its substrate sets the repo variable.
   FORK_DOMAIN_ROOT: ${{ vars.FORK_DOMAIN_ROOT || 'cognidao.org' }}
+  # Public WORKLOAD zone (browser-facing NEXTAUTH host + catalog-derived scheduler endpoints).
+  # On the test-parent mirror this DIVERGES from the substrate root: DOMAIN=cogni-testing.org
+  # while FORK_DOMAIN_ROOT stays cognidao.org. Empty default so a plain fork that sets only
+  # FORK_DOMAIN_ROOT still falls back via the renderer's ${DOMAIN:-${FORK_DOMAIN_ROOT:-cognidao.org}} (bug.5330).
+  DOMAIN: ${{ vars.DOMAIN }}
 
 jobs:
   env_manager_fast_path:
@@ -95,6 +100,7 @@ jobs:
         run: |
           bash scripts/ci/render-scheduler-worker-endpoints.sh --check
           bash scripts/ci/render-node-appset.sh --check
+          bash scripts/ci/render-network-nodes.sh --check
           bash scripts/ci/render-node-overlays.sh --check
 
   # Fast gate: install → typecheck → lint
@@ -133,28 +139,22 @@ jobs:
           [ "$FAST_PATH_ELIGIBLE" != true ] || echo "Signed env-manager fast path accepted"
 
       - uses: pnpm/action-setup@c5ba7f7862a0f64c1b1a05fbac13e0b8e86ba08c # v4
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
       - name: Install dependencies
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Build workspace packages
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm packages:build
 
       - name: Type check
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm typecheck
 
       - name: Lint
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm lint
 
       - name: CI Telemetry
@@ -187,6 +187,13 @@ jobs:
         with:
           fetch-depth: 0 # required so paths-filter can resolve base...HEAD on fork PRs
 
+      # Runtime-derived from this checkout's node roster. The same workflow is
+      # byte-identical in the canonical hub and test-parent mirror; only the
+      # generated action input differs with each fleet's own nodes/* tree.
+      - name: Render single-domain scope filters
+        id: scope_filters
+        run: bash scripts/ci/render-scope-filters.sh --github-output
+
       - id: domains
         uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
         with:
@@ -197,42 +204,9 @@ jobs:
           # would (incorrectly) classify as node + operator. Per-node filters
           # have a single rule each, so the quantifier is a no-op for them.
           predicate-quantifier: "every"
-          # Filter block is CATALOG_IS_SSOT — generated from the nodes/* listing
-          # by scripts/ci/render-scope-filters.sh. Adding nodes/<slug>/ no longer
-          # needs a hand-edited `<slug>:` filter + `!nodes/<slug>/**` negation;
-          # run `pnpm gen:scope-filters`. CI (`--check`, unit job) fails on drift.
-          filters: |
-            # >>> GENERATED scope-filters (scripts/ci/render-scope-filters.sh) — DO NOT EDIT BY HAND
-            anotha:
-              - 'nodes/anotha/**'
-            brother:
-              - 'nodes/brother/**'
-            ghcr:
-              - 'nodes/ghcr/**'
-            node-template:
-              - 'nodes/node-template/**'
-            scheduler-worker:
-              - 'nodes/scheduler-worker/**'
-            spawny-boi:
-              - 'nodes/spawny-boi/**'
-            test-cog:
-              - 'nodes/test-cog/**'
-            toks2:
-              - 'nodes/toks2/**'
-            yo:
-              - 'nodes/yo/**'
-            operator:
-              - '**'
-              - '!nodes/anotha/**'
-              - '!nodes/brother/**'
-              - '!nodes/ghcr/**'
-              - '!nodes/node-template/**'
-              - '!nodes/scheduler-worker/**'
-              - '!nodes/spawny-boi/**'
-              - '!nodes/test-cog/**'
-              - '!nodes/toks2/**'
-              - '!nodes/yo/**'
-            # <<< GENERATED scope-filters
+          # DIRECTORY_IS_SOURCE_OF_TRUTH: generated at runtime from nodes/* so a
+          # node add/remove cannot leave committed filter state stale.
+          filters: ${{ steps.scope_filters.outputs.filters }}
 
       # Intentionally inline — single-workflow gate, no logic duplicated across
       # workflows. SCRIPTS_ARE_THE_API targets cross-workflow drift, not unique
@@ -413,54 +387,42 @@ jobs:
           [ "$FAST_PATH_ELIGIBLE" != true ] || echo "Signed env-manager fast path accepted"
 
       - uses: pnpm/action-setup@c5ba7f7862a0f64c1b1a05fbac13e0b8e86ba08c # v4
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
       - name: Install dependencies
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Build workspace packages
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm packages:build
 
       - name: Repository policy check
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm check:root-layout
 
       - name: REUSE SPDX compliance
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         uses: fsfe/reuse-action@772649cfa03a64a08c458c7cca9a6a473d74e7f9 # v6
 
       - name: Validate chain configuration
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm validate:chain
 
       - name: Format check
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm format:check
 
       - name: UI tokens check
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: bash scripts/check-ui-tokens.sh
 
       - name: Documentation check
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm check:docs
 
       - name: Sync-manifest schema check (CATALOG_IS_SSOT pattern)
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: |
           pipx install 'check-jsonschema==0.37.1'
           check-jsonschema --schemafile .cogni/sync-manifest.schema.json .cogni/sync-manifest.yaml
 
       - name: Architecture check
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm arch:check
 
       # Schema-migration guards (task: doltgres-migration-safety):
@@ -470,7 +432,6 @@ jobs:
       #   2. strict-monotonic `when` in _journal.json (silent-skip variant)
       #   3. drizzle-kit's own snapshot-chain check
       - name: Database migration guards
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm db:check
 
       # bug.0344 — structural guardrail on image-updater scope. Positive
@@ -481,10 +442,9 @@ jobs:
       # closed. Current allowlist is preview-only (see script header for
       # why candidate-a + production are intentionally excluded).
       - name: Image Updater scope (bug.0344)
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: bash scripts/ci/check-image-updater-scope.sh
 
-      # task.5140 — the hermetic scripts/ci/tests/*.test.sh suite (23 pure-bash
+      # task.5140 — the hermetic scripts/ci/tests/*.test.sh suite (25 pure-bash
       # deploy/secrets/substrate regression tests) runs in ONE parallel primitive
       # instead of ~22 serial steps (was ~3-4 min serial → ~40-60s). The
       # authoritative test list, the mutator-vs-parallel concurrency tiers (a few
@@ -492,28 +452,31 @@ jobs:
       # alone), and exit-code aggregation all live in the script — SCRIPTS_ARE_THE_API.
       # Add a new tests/*.test.sh there, not as a new workflow step.
       - name: CI shell tests (parallel)
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: bash scripts/ci/run-shell-tests.sh
+
+      # Keep the runtime generator wired to the action input; the
+      # single-node-scope job above is the live behavior proof.
+      - name: single-node-scope runtime wiring
+        run: bash scripts/ci/render-scope-filters.sh --check
 
       # Catalog-driven drift gates — NOT part of the shell-test suite above: each
       # asserts a committed artifact still matches the catalog (CATALOG_IS_SSOT),
       # kept as named steps so a specific drift failure is legible. Fast (--check).
-      - name: single-node-scope filter drift (CATALOG_IS_SSOT)
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
-        run: bash scripts/ci/render-scope-filters.sh --check
-
       # scheduler-worker endpoint map is catalog-derived; fails if a node-add
       # didn't regenerate it (run `pnpm gen:scheduler-worker-endpoints`).
       - name: scheduler node routing drift
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: bash scripts/ci/render-scheduler-worker-endpoints.sh --check
+
+      # Runtime cannot fs-glob infra/catalog, so this static roster is a generated
+      # fleet projection rather than fleet-specific operator source.
+      - name: network node roster drift (CATALOG_IS_SSOT)
+        run: bash scripts/ci/render-network-nodes.sh --check
 
       # Per-node ApplicationSet drift (CATALOG_IS_SSOT + LANE_ISOLATION, axiom
       # 18). One AppSet object per (env, node) is derived from the catalog rows
       # that declare a candidate_a_branch. Fails if a node was added/removed or
       # an AppSet/kustomization was hand-edited without `pnpm gen:node-appset`.
       - name: per-node ApplicationSet drift (CATALOG_IS_SSOT)
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: bash scripts/ci/render-node-appset.sh --check
 
       # Per-node overlay drift (CATALOG_IS_SSOT + NODE_AT_ROOT_MIGRATE_PATH,
@@ -523,7 +486,6 @@ jobs:
       # Regenerate from the node-template overlay + catalog and fail on drift
       # before flight (run `pnpm gen:node-overlays`).
       - name: per-node overlay drift (NODE_AT_ROOT_MIGRATE_PATH)
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: bash scripts/ci/render-node-overlays.sh --check
 
       # task.5140 Stage B — affected-only unit tests. The suite is two disjoint
@@ -533,34 +495,13 @@ jobs:
       # when neither the operator app nor a package it depends on changed, and
       # runs FULL on merge_group/push (the required-check backstop that catches
       # any PR-time affected miss before merge). Logic + fail-safe live in
-      # scripts/ci/run-unit-tests.sh (SCRIPTS_ARE_THE_API). Coverage stays a
-      # single-flip: ENABLE_SONAR=true runs the full instrumented path so the
-      # sonar job below has an artifact.
+      # scripts/ci/run-unit-tests.sh (SCRIPTS_ARE_THE_API): ROOT config always
+      # full + operator config affected-scoped on PRs, full on merge_group/push.
       - name: Unit + contract tests
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         env:
           CI_EVENT: ${{ github.event_name }}
           TURBO_SCM_BASE: origin/main
-        run: |
-          if [ "${{ vars.ENABLE_SONAR }}" = "true" ]; then
-            pnpm test:ci:coverage
-          else
-            bash scripts/ci/run-unit-tests.sh
-          fi
-
-      # Only produced (and consumed by the sonar job) when Sonar is enabled;
-      # skipped otherwise, so the coverage-free run above can't false-fail on
-      # if-no-files-found.
-      - name: Upload coverage reports
-        if: vars.ENABLE_SONAR == 'true' && needs.env_manager_fast_path.outputs.eligible != 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: coverage-${{ github.sha }}
-          path: |
-            coverage/lcov.info
-            coverage/coverage-summary.json
-          retention-days: 1
-          if-no-files-found: error
+        run: bash scripts/ci/run-unit-tests.sh
 
       - name: CI Telemetry
         if: always()
@@ -609,38 +550,30 @@ jobs:
           [ "$FAST_PATH_ELIGIBLE" != true ] || echo "Signed env-manager fast path accepted"
 
       - uses: pnpm/action-setup@c5ba7f7862a0f64c1b1a05fbac13e0b8e86ba08c # v4
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
       - name: Install dependencies
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Build workspace packages
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm packages:build
 
       - name: Install ripgrep
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1 # v2
         with:
           tool: ripgrep
 
       - name: Verify ripgrep
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: rg --version
 
       - name: Build sandbox runtime image
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm sandbox:docker:build
 
       - name: Component tests (testcontainers)
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm test:component
 
       # Doltgres-migrator regression: boots dolthub/doltgresql:latest in its
@@ -649,7 +582,6 @@ jobs:
       # end-to-end. Proves the silent-skip drift gap is caught at runtime,
       # complementing the static CI guard in `db:check:immutable`.
       - name: Doltgres migrator regression (testcontainers)
-        if: needs.env_manager_fast_path.outputs.eligible != 'true'
         run: pnpm test:doltgres-migrate
 
       - name: CI Telemetry
@@ -660,58 +592,8 @@ jobs:
           loki_user: ${{ secrets.GRAFANA_CLOUD_LOKI_USER }}
           loki_token: ${{ secrets.GRAFANA_CLOUD_LOKI_API_KEY }}
           job_status: ${{ job.status }}
-
-  sonar:
-    runs-on: ubuntu-latest
-    needs: [unit, env_manager_fast_path]
-    # Sonar has no meaning on the merge_group ref; skip to save runtime.
-    if: vars.ENABLE_SONAR == 'true' && needs.unit.result == 'success' && needs.env_manager_fast_path.outputs.eligible != 'true' && github.event_name != 'merge_group'
-    permissions:
-      contents: read
-      pull-requests: write # Required for PR decoration
-      actions: read # Required for CI telemetry
-
-    steps:
-      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
-        with:
-          fetch-depth: 0 # Required for SonarCloud git blame
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Download coverage artifact
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        with:
-          name: coverage-${{ github.sha }}
-          path: coverage/
-
-      - name: SonarCloud Scan
-        uses: SonarSource/sonarqube-scan-action@884b79409bbd464b2a59edc326a4b77dc56b2195 # v5.0.0
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: https://sonarcloud.io
-          GITHUB_TOKEN: ${{ secrets.ACTIONS_AUTOMATION_BOT_PAT }}
-
-      - name: CI Telemetry
-        if: always()
-        uses: ./.github/actions/loki-ci-telemetry
-        with:
-          loki_url: ${{ secrets.GRAFANA_CLOUD_LOKI_URL }}
-          loki_user: ${{ secrets.GRAFANA_CLOUD_LOKI_USER }}
-          loki_token: ${{ secrets.GRAFANA_CLOUD_LOKI_API_KEY }}
-          job_status: ${{ job.status }}
-
-  sonar-disabled:
-    runs-on: ubuntu-latest
-    needs: [unit, env_manager_fast_path]
-    if: vars.ENABLE_SONAR != 'true' && needs.unit.result == 'success' && needs.env_manager_fast_path.outputs.eligible != 'true' && github.event_name != 'merge_group'
-    steps:
-      - name: SonarCloud disabled
-        run: |
-          echo "::notice title=SonarCloud disabled::Set repository variable ENABLE_SONAR=true to restore the PR-time scan."
-          {
-            echo "### SonarCloud disabled"
-            echo ""
-            echo "Set repository variable \`ENABLE_SONAR=true\` to restore the PR-time scan."
-          } >> "$GITHUB_STEP_SUMMARY"
+# NOTE: the SonarCloud jobs (`sonar` + `sonar-disabled`) and the coverage-upload
+# step were removed — Sonar is disabled fleet-wide (repo var ENABLE_SONAR unset),
+# neither job is a required check, and `sonar-disabled` only echoed a notice. If
+# Sonar returns, re-add the job + wire `test:ci:coverage` (still in package.json)
+# back into the Unit step behind the `ENABLE_SONAR` flag.

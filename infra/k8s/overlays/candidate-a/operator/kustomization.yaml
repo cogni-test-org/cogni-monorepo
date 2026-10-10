@@ -67,6 +67,17 @@ patches:
       - op: add
         path: /data/NEXTAUTH_URL
         value: "https://test.cognidao.org"
+      # Test workloads use an isolated public zone while shared substrate remains on cognidao.org.
+      # Keep the workload zone explicit in the app runtime so env-manager renders the same hosts
+      # as the catalog-driven CI generators.
+      - op: add
+        path: /data/FORK_DOMAIN_ROOT
+        value: "cogni-testing.org"
+      # Public, non-secret account identity. The env-manager reads the lease ledger through this
+      # pinned account before it derives a replacement generation; it never receives the key.
+      - op: add
+        path: /data/AKASH_ACTUATOR_ACCOUNT_ID
+        value: "akash12eh8xgpeyumar3sk6wp94y0tq9uh62mkezxjmt"
       # Node-formation mint target — candidate-a mints node repos into the disposable
       # cogni-test-org (zero Cogni-DAO access); cogni-operator-test holds admin there.
       # Fail-closed: the publish route 503s if these are unset.

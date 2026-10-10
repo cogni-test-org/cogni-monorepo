@@ -52,13 +52,24 @@
  *     therefore gets its lease and fails READINESS against the composite's boot SLO — loud and
  *     bounded — which is what bug.5116 actually needed. The paid path consequently needs no
  *     database-adjacent capability at all.
+ *   - IDENTICAL_SDL_IS_A_NO_OP (bug.5238): `update` PUTs the SDL only when it hashes differently
+ *     from the last one applied (persisted on the receipt). A PUT is idempotent for the
+ *     escrow/handle but re-triggers a provider redeploy every time, so re-PUTting a byte-
+ *     identical SDL thrashes a not-yet-serving node; the gate skips only that case and any real
+ *     spec change still applies + records the new hash.
  *   - REFUSAL_IS_OBSERVABLE: every refusal emits a structured log line before it throws
- *     (bug.5115: a wallet block that only reached CR status was invisible for hours).
+ *     (bug.5115: a wallet block that only reached CR status was invisible for hours). The same
+ *     rule now covers what observe ANSWERS, not only what it refuses: every observe states the
+ *     migration verdict its response carries (`akash_tx_observe_migration_verdict`), because
+ *     that one enum is what the composite reads to decide `MigrationFailed`, and nothing else
+ *     in this process logs the RESPONSE (bug.5416). And every observe states what the COMPOSITE
+ *     decided (`akash_tx_observe_composite_verdict`) when the composition sends it: a
+ *     Composition cannot log, so this process is its only telemetry terminal (bug.5416).
  * Side-effects: IO (Akash Console transactions via the injected client; durable allocation and
  *   receipt-linked cost writes; one bounded serving probe per observe when asked)
  * Links: @ports/akash-tx.port, adapters/server/compute/akash-compute.adapter (SDL + provider
  *   screening stay there), adapters/server/compute/akash-tx-allocation-ledger.adapter,
- *   ./akash-tx-wallet, ./akash-tx-http, task.5095
+ *   ./akash-tx-wallet, ./akash-tx-http, task.5095, bug.5416
  * @internal
  */
 
@@ -69,20 +80,25 @@ import {
   type AkashTxActuatorPort,
   type AkashTxAllocationLedgerPort,
   type AkashTxAllocationRecord,
+  type AkashTxCompositeVerdict,
   type AkashTxConsolePort,
   type AkashTxCreateResult,
   AkashTxError,
   type AkashTxErrorCode,
+  type AkashTxLeaseLogSource,
+  type AkashTxLeaseLogSources,
   type AkashTxMigrationPhase,
   type AkashTxMigrationPort,
   type AkashTxMigrationStep,
   type AkashTxObservation,
+  type AkashTxProviderOutcomesPort,
   type AkashTxResource,
   type AkashTxStaleAllocation,
   type AkashTxSweepReport,
   type AkashTxWorkloadIdentity,
   type ComputeCostEvidencePort,
   type ComputeCostStorePort,
+  type NodeMigrationReportStorePort,
 } from "@/ports";
 
 import { runMigrationStep } from "./akash-tx-migration-step";
@@ -94,10 +110,17 @@ export interface AkashTxLogger {
   error(fields: Record<string, unknown>, message: string): void;
 }
 
-/** Single bounded serving proof (exact source SHA + fixed `/readyz`). Never loops. */
+/**
+ * Single bounded serving proof (exact source SHA + fixed `/readyz`). Never loops. When
+ * `publicHost` is present the proof must ALSO hold through the provider's host-routed path —
+ * `serving: true` for a hostnamed workload means the PUBLIC hostname answers with the exact
+ * SHA, not merely the bare lease ingress (bug.5237: a stale deployment owning the hostname
+ * made the bare-ingress proof a lie).
+ */
 export type AkashTxServingProbe = (input: {
   endpoints: readonly string[];
   expectedSourceSha: string;
+  publicHost?: string;
 }) => Promise<boolean>;
 
 export interface AkashTxActuatorDeps {
@@ -112,11 +135,22 @@ export interface AkashTxActuatorDeps {
    * this seam can no longer stop a lease from being created (task.5135).
    */
   readonly migration?: AkashTxMigrationPort;
+  /**
+   * Where a successful migration's RECEIPT is stored as operator-held deployment metadata
+   * (`node_migration_reports`). Omitted → receipts are not collected and the node's schema
+   * readout honestly says "never reported". Never a credential on a node database.
+   */
+  readonly migrationReports?: NodeMigrationReportStorePort;
   /** Paired, receipt-linked cost seams. Production wiring supplies both or startup fails. */
   readonly costEvidence: ComputeCostEvidencePort;
   readonly costStore: ComputeCostStorePort;
   /** Pinned raw Akash deployment/escrow owner; not a Cogni user/DAO/payer identity. */
   readonly providerConsumerAccountId: string;
+  /**
+   * Provider strike/boot-outcome writer (task.5153). Omitted → screening still reads
+   * whatever history exists, but recovery attempts record nothing (test/degraded mode).
+   */
+  readonly outcomes?: AkashTxProviderOutcomesPort;
 }
 
 const NOOP_LOGGER: AkashTxLogger = {
@@ -155,6 +189,22 @@ export function mapConsoleFailure(
         message
       );
     }
+    // A 4xx is Console REFUSING to process the request, decided before anything was broadcast —
+    // the one mutating failure whose outcome is NOT unknown. Calling it `outcome_unknown` made
+    // the reconciler retry a deterministic rejection forever: poly's candidate-a lane looped
+    // ~1.5x/min for five days on a 422, burning lease spend each pass and flooding the XR watch
+    // stream until the circuit opened (bug.5247). 408 and 429 are excluded: those DID reach
+    // Console and may still land, so they keep the safe `outcome_unknown` answer.
+    if (
+      code === "HTTP_ERROR" &&
+      typeof named.httpStatus === "number" &&
+      named.httpStatus >= 400 &&
+      named.httpStatus < 500 &&
+      named.httpStatus !== 408 &&
+      named.httpStatus !== 429
+    ) {
+      return new AkashTxError("provider_rejected", message);
+    }
     if (code === "NO_BIDS" || code === "NO_ELIGIBLE_BIDS") {
       return new AkashTxError("provider_rejected", message);
     }
@@ -174,6 +224,12 @@ export function mapConsoleFailure(
  * receipt is one grep away from the incident that produced it, in logs and in Postgres alike.
  */
 const ROLLED_BACK_FAILURE_CODE = "allocation_rolled_back";
+
+/**
+ * TTL for the logs-scoped provider JWT one `leaseLogSources` call returns. Long enough to
+ * cover a full pump poll cycle with margin, short enough that a leaked token dies in minutes.
+ */
+const LEASE_LOG_TOKEN_TTL_SECONDS = 300;
 
 /**
  * The dseq a failed create is PROVEN to have closed, if the client proved it.
@@ -201,6 +257,19 @@ function identityFields(
     compositeUid: identity.compositeUid,
     compositeGeneration: identity.compositeGeneration,
   };
+}
+
+/**
+ * Split a cogniKey into its generation base and bounded-recovery ordinal (task.5153).
+ * `xcw:<ns>:<node>:<gen>` → ordinal 0; `…:recover:<n>` → ordinal n off the same base.
+ */
+function parseRecoveryKey(cogniKey: string): {
+  baseKey: string;
+  ordinal: number;
+} {
+  const match = /^(.+):recover:(\d+)$/.exec(cogniKey);
+  if (!match) return { baseKey: cogniKey, ordinal: 0 };
+  return { baseKey: match[1] as string, ordinal: Number(match[2]) };
 }
 
 /** True when a receipt already binds a DIFFERENT consumer than the one now asking to spend. */
@@ -247,9 +316,16 @@ export class AkashTxActuator implements AkashTxActuatorPort {
   private readonly log: AkashTxLogger;
   private readonly probe?: AkashTxServingProbe;
   private readonly migration?: AkashTxMigrationPort;
+  private readonly migrationReports?: NodeMigrationReportStorePort;
   private readonly costEvidence: ComputeCostEvidencePort;
   private readonly costStore: ComputeCostStorePort;
   private readonly providerConsumerAccountId: string;
+  private readonly outcomes?: AkashTxProviderOutcomesPort;
+  /**
+   * Per-process load-shed for boot_ok writes on every observe tick — correctness comes
+   * from the DB's unique (lease_id, outcome), never from this cache (task.5153).
+   */
+  private readonly bootOkRecorded = new Set<string>();
 
   constructor(deps: AkashTxActuatorDeps) {
     this.console = deps.console;
@@ -257,25 +333,37 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     this.log = deps.log ?? NOOP_LOGGER;
     if (deps.probe) this.probe = deps.probe;
     if (deps.migration) this.migration = deps.migration;
+    if (deps.migrationReports) this.migrationReports = deps.migrationReports;
     this.costEvidence = deps.costEvidence;
     this.costStore = deps.costStore;
     this.providerConsumerAccountId = deps.providerConsumerAccountId;
+    if (deps.outcomes) this.outcomes = deps.outcomes;
   }
 
   async observe(input: {
     cogniKey: string;
     externalName?: string;
     expectedSourceSha?: string;
+    publicHost?: string;
     migration?: AkashTxMigrationStep;
     workload?: string;
     environment?: string;
+    composite?: AkashTxCompositeVerdict;
   }): Promise<AkashTxObservation> {
+    // THE VERDICT THE COMPOSITE ALREADY REACHED, stated before anything else can throw
+    // (bug.5416). Ordered ahead of the release step on purpose: this reports the PREVIOUS
+    // tick's decision, so it owes nothing to this tick's work and must survive a refusal.
+    this.logCompositeVerdict(input);
     // The RELEASE step. It runs FIRST so the Job is ensured on the very first tick — before
     // there is any lease to observe — and its answer is carried onto whatever the observation
     // turns out to be. It never throws and never short-circuits: an observe that reported
     // "found: false" must keep reporting it, because that is the signal Crossplane uses to
     // create the lease, and a database has no business vetoing that (task.5135).
     const migration = await this.releaseMigration(input);
+    // THE VERDICT THE COMPOSITE WILL READ, stated once per observe (bug.5416). Everything
+    // upstream of this line logs how the step WENT; only this line logs what the RESPONSE
+    // carries, which is the single value `composition.yaml` turns into `MigrationFailed`.
+    this.logMigrationVerdict(input, migration);
     const withMigration = (
       observation: AkashTxObservation
     ): AkashTxObservation =>
@@ -297,7 +385,8 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       return withMigration(
         await this.withServing(
           { found: true, resource },
-          input.expectedSourceSha
+          input.expectedSourceSha,
+          input.publicHost
         )
       );
     }
@@ -312,7 +401,8 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       return withMigration(
         await this.withServing(
           { found: true, resource },
-          input.expectedSourceSha
+          input.expectedSourceSha,
+          input.publicHost
         )
       );
     }
@@ -330,7 +420,8 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       return withMigration(
         await this.withServing(
           { found: true, resource, recovered: true },
-          input.expectedSourceSha
+          input.expectedSourceSha,
+          input.publicHost
         )
       );
     }
@@ -437,6 +528,71 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       );
     }
 
+    // task.5153 — LEDGER-DERIVED TRIED SET + STRIKE ON RECOVERY ENTRY. Crossplane
+    // re-invokes create per bounded-recovery ordinal, so any in-memory exclusion set is
+    // empty on every call and re-picks the same dead provider three times. The durable
+    // record of "who we already tried this generation" ALREADY EXISTS as this key
+    // family's allocation receipts (base and :recover:<n> share the base prefix), so the
+    // set is derived, never duplicated. Reaching ordinal n also PROVES ordinal n-1's
+    // provider failed to serve — that is the strike, recorded against the prior lease
+    // with DB-side exactly-once (unique (lease_id, outcome)). A new leaseGeneration is a
+    // new base key: clean set, per the recovery contract.
+    const recovery = parseRecoveryKey(input.cogniKey);
+    let excludedProviders: ReadonlySet<string> | undefined;
+    if (recovery.ordinal > 0) {
+      const receipts = await this.ledger.listReceipts({
+        nodeId: input.identity.nodeId,
+        environment: input.environment,
+        limit: 50,
+      });
+      const family = receipts.filter(
+        (r) =>
+          r.cogniKey === recovery.baseKey ||
+          r.cogniKey.startsWith(`${recovery.baseKey}:recover:`)
+      );
+      excludedProviders = new Set(
+        family
+          .filter((r) => r.cogniKey !== input.cogniKey && r.providerAccount)
+          .map((r) => r.providerAccount as string)
+      );
+      const prevKey =
+        recovery.ordinal === 1
+          ? recovery.baseKey
+          : `${recovery.baseKey}:recover:${recovery.ordinal - 1}`;
+      const prev = family.find((r) => r.cogniKey === prevKey);
+      if (this.outcomes && prev?.providerAccount && prev.externalName) {
+        try {
+          await this.outcomes.record({
+            computeProvider: "akash",
+            providerAccount: prev.providerAccount,
+            outcome: "slo_timeout",
+            leaseId: prev.externalName,
+            workload: input.spec.name,
+            detail: `bounded recovery: ${input.cogniKey} superseding ${prevKey}`,
+          });
+          this.log.info(
+            {
+              cogniKey: input.cogniKey,
+              strikedProvider: prev.providerAccount,
+              strikedLease: prev.externalName,
+              excludedCount: excludedProviders.size,
+            },
+            "akash_tx_provider_strike_recorded"
+          );
+        } catch (error) {
+          // BEST_EFFORT: a strike write must never block a paid recovery attempt.
+          this.log.warn(
+            {
+              cogniKey: input.cogniKey,
+              strikedProvider: prev.providerAccount,
+              error: String(error),
+            },
+            "akash_tx_provider_strike_write_failed"
+          );
+        }
+      }
+    }
+
     const cursor = await this.readCursor();
     await this.prepare(input.cogniKey, cursor);
     this.log.info(
@@ -453,6 +609,9 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     try {
       allocated = await this.console.allocateAndLease({
         spec: input.spec,
+        ...(excludedProviders && excludedProviders.size > 0
+          ? { excludedProviders }
+          : {}),
         // Durability of the handle is a precondition of every later step: the client closes
         // the deployment if this throws, because an unrecorded dseq is a lease nobody can find.
         onAllocated: async (leaseId) => {
@@ -564,7 +723,90 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       "akash_tx_receipt_rebound"
     );
 
-    // PUT on a handle we already own is idempotent by construction.
+    // PLACEMENT_BINDS_ON_EVERY_REVISION (story.5050). Akash refuses in-place placement change,
+    // so a country requirement can only be honoured by a fresh CREATE — and
+    // `required_placement_countries` lives in the CR's `spec.placement`, NOT in the SDL. Change
+    // the country set and the rendered SDL is BYTE-IDENTICAL, so this update rebinds the
+    // incumbent lease and IDENTICAL_SDL_IS_A_NO_OP below returns success. Nothing in that path
+    // checks whether the lease being re-imaged still satisfies the requirement, so a node can
+    // declare a jurisdiction, see a green verb, green CI and a green promote, and keep running
+    // where it was. This gate makes that outcome impossible to reach SILENTLY.
+    //
+    // NOT motivated by a confirmed incident: story.5050's poly investigation initially read as
+    // one, and that reading was WRONG — poly's gen-20 did mint, in Finland (its XR reports
+    // `endpoints[0] = …ingress.akash.rhite.co.uk`). The Belgian address that suggested otherwise
+    // came from a SERVER-WIDE `pg_stat_activity` and belonged to a different node. What is real
+    // is the hole in the path; treat this as a guard, not a post-mortem fix.
+    //
+    // THE COST, deliberately accepted: the refusal is terminal for this key, and the composition
+    // has no CREATE path out of it. A country set the incumbent violates therefore blocks EVERY
+    // later revision of that workload — including security patches — until a human bumps
+    // `lease_generation`. That is the right trade only because the alternative is serving from an
+    // excluded jurisdiction indefinitely without a signal. The refusal names the remedy.
+    //
+    // Deliberately asymmetric with REQUIRED_FAILS_CLOSED in the bid screen: an unresolvable
+    // country REFUSES a bid (one candidate lost) but must NOT refuse an update, because that
+    // would stop every image shipping fleet-wide on a registry hiccup. Only a RESOLVED country
+    // that contradicts the requirement refuses.
+    const requiredCountries = (
+      input.spec.placement?.requiredCountryCodes ?? []
+    ).map((c) => c.toUpperCase());
+    if (requiredCountries.length > 0 && this.console.providerCountry) {
+      const incumbent = bound.record.providerAccount;
+      const country = incumbent
+        ? (
+            await this.console.providerCountry(incumbent).catch(() => null)
+          )?.toUpperCase()
+        : null;
+      if (country && !requiredCountries.includes(country)) {
+        this.log.error(
+          {
+            cogniKey: input.cogniKey,
+            externalName: input.externalName,
+            providerAccount: incumbent,
+            providerCountry: country,
+            requiredCountries,
+            code: "placement_violated_by_incumbent",
+          },
+          "akash_tx_update_refused_placement_violation"
+        );
+        throw new AkashTxError(
+          "placement_violated_by_incumbent",
+          `lease ${input.externalName} is on a provider in ${country}, which is not in the ` +
+            `workload's required placement [${requiredCountries.join(", ")}]; refusing to ` +
+            "re-image it. Akash cannot move a lease in place — this needs a fresh CREATE at a " +
+            "bumped lease_generation, not an update."
+        );
+      }
+    }
+
+    // IDENTICAL_SDL_IS_A_NO_OP (bug.5238). A PUT is idempotent for the escrow/handle, but NOT
+    // on the provider: Console re-triggers a redeploy on EVERY PUT, so re-PUTting the byte-
+    // identical SDL restarts a rollout the workload may not have finished — a not-yet-serving
+    // node (beacon) is denied the stable window it needs and the composition re-renders update
+    // forever. Skip the PUT when the desired SDL hashes to the last one we applied. Only a
+    // byte-identical SDL is gated: any real change (new image sha, changed spec) hashes
+    // differently, so a genuine promote is NEVER silently skipped.
+    const desiredSdlHash = this.console.sdlHash(input.spec);
+    if (bound.record.lastAppliedSdlHash === desiredSdlHash) {
+      this.log.info(
+        {
+          cogniKey: input.cogniKey,
+          externalName: input.externalName,
+          sdlHash: desiredSdlHash,
+        },
+        "akash_tx_update_noop_identical_sdl"
+      );
+      return this.describe(
+        input.externalName,
+        bound.record.providerAccount,
+        bound.record
+      );
+    }
+
+    // Different (or first-ever) SDL: apply it, then record the hash so the next reconcile that
+    // carries the same SDL no-ops. Recorded AFTER a successful PUT — persisting before would make
+    // a failed apply skip forever.
     try {
       await this.console.updateAllocated({
         resourceId: input.externalName,
@@ -583,8 +825,16 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       );
       throw mapped;
     }
+    await this.ledger.recordAppliedSdlHash({
+      cogniKey: input.cogniKey,
+      sdlHash: desiredSdlHash,
+    });
     this.log.info(
-      { cogniKey: input.cogniKey, externalName: input.externalName },
+      {
+        cogniKey: input.cogniKey,
+        externalName: input.externalName,
+        sdlHash: desiredSdlHash,
+      },
       "akash_tx_updated"
     );
     return this.describe(
@@ -684,14 +934,155 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       {
         log: this.log,
         ...(this.migration ? { migration: this.migration } : {}),
+        ...(this.migrationReports ? { reports: this.migrationReports } : {}),
       },
       {
         step: input.migration,
         cogniKey: input.cogniKey,
         environment: input.environment,
         workload: input.workload,
+        ...(this.migrationReports
+          ? { nodeId: await this.receiptBoundNodeId(input.cogniKey) }
+          : {}),
       }
     );
+  }
+
+  /**
+   * State the verdict THE COMPOSITE ITSELF REACHED — `status.phase` plus the
+   * `status.failure.reason` its own ranking produced (bug.5416).
+   *
+   * `akash_tx_observe_migration_verdict` proves the gate's INPUT. It cannot prove the composite
+   * ACTED on it: `composition.yaml` ranks a terminal refusal and `BootDeadlineExceeded` above
+   * `$migrationFailed`, so a response carrying `failed` and a composite reporting
+   * `BootDeadlineExceeded` are the SAME tick. Which branch won is knowable only to the
+   * composite — and a Crossplane Composition cannot log, emit an Event, or write a metric
+   * (Kubernetes records no Event for a status transition, and `function-go-templating` has no
+   * result meta-kind at any released version), so the observe it already makes every tick is
+   * its only telemetry channel. This line is that channel's terminal.
+   *
+   * Unconditional, NOT change-only, for the same reason as the migration verdict: a gate is a
+   * steady state and has to be readable as one by a bounded-window query. `reported: false`
+   * keeps "the composition does not send it" distinguishable from "the composite is healthy" —
+   * the absence of a marker says nothing at all.
+   *
+   * CARDINALITY: fields only, never stream labels, and the reason is contract-bounded to one
+   * `^[A-Za-z_][A-Za-z0-9_]{0,127}$` token. `failure.message` is NOT carried: it is free text
+   * holding SHAs, lease handles and second counts, and is unbounded by construction.
+   */
+  private logCompositeVerdict(input: {
+    cogniKey: string;
+    workload?: string;
+    environment?: string;
+    composite?: AkashTxCompositeVerdict;
+  }): void {
+    const fields = {
+      cogniKey: input.cogniKey,
+      ...(input.workload ? { workload: input.workload } : {}),
+      ...(input.environment ? { environment: input.environment } : {}),
+      reported: input.composite !== undefined,
+      ...(input.composite
+        ? {
+            compositePhase: input.composite.phase,
+            compositeFailureReason: input.composite.failureReason,
+          }
+        : {}),
+    };
+    if (input.composite?.phase === "Failed") {
+      this.log.error(fields, "akash_tx_observe_composite_verdict");
+      return;
+    }
+    this.log.info(fields, "akash_tx_observe_composite_verdict");
+  }
+
+  /**
+   * State the migration verdict THIS OBSERVE RESPONSE CARRIES — the exact value the composite
+   * reads as `dig "migration" "phase" "" $resp` and turns into `status.failure.reason:
+   * MigrationFailed` (bug.5416).
+   *
+   * Every other migration marker in this feature reports how the STEP went: the Job's outcome,
+   * the receipt, the drift. None of them is the gate's input. A `succeeded` Job that failed the
+   * drift gate logs `akash_tx_migration_succeeded` AND `akash_tx_migration_drift_missing`, and a
+   * reader still has to re-derive which phase the wire ended up with. This line removes the
+   * derivation: one marker, one `phase`, per response.
+   *
+   * Unconditional, NOT change-only. A verdict that is logged only when it CHANGES is invisible
+   * to every bounded window query — which is precisely the failure bug.5416 reports (four
+   * 30-minute Loki searches, zero results, while the gate was demonstrably firing). A gate is a
+   * steady state, so it has to be readable as one. The cost is one line per observe against the
+   * ~20 this feature already emits per digest per 10 minutes.
+   *
+   * PRIVACY, inherited from bug.5415: this line carries an ENUM and the caller's own identifiers.
+   * No tags, no counts sourced from a database row, no DSN, no receipt content. Named migration
+   * tags appear in exactly one place — `akash_tx_migration_drift_missing`, image content only.
+   */
+  private logMigrationVerdict(
+    input: {
+      cogniKey: string;
+      migration?: AkashTxMigrationStep;
+      workload?: string;
+      environment?: string;
+    },
+    phase: AkashTxMigrationPhase | undefined
+  ): void {
+    const fields = {
+      cogniKey: input.cogniKey,
+      ...(input.workload ? { workload: input.workload } : {}),
+      ...(input.environment ? { environment: input.environment } : {}),
+      ...(input.migration
+        ? { bundleDigest: input.migration.bundleDigest }
+        : {}),
+      // `requested: false` is a DIFFERENT fact from any phase, and worth one line: it is how a
+      // gate that was never consulted at all — a composite that stopped attaching the step —
+      // stays distinguishable from a gate that passed. `phase` is absent on exactly that path,
+      // because that is what the response carries.
+      requested: input.migration !== undefined,
+      ...(phase ? { phase } : {}),
+    };
+    if (phase === "failed") {
+      this.log.error(fields, "akash_tx_observe_migration_verdict");
+      return;
+    }
+    if (phase === "unavailable") {
+      this.log.warn(fields, "akash_tx_observe_migration_verdict");
+      return;
+    }
+    this.log.info(fields, "akash_tx_observe_migration_verdict");
+  }
+
+  /**
+   * WHICH NODE this key's workload belongs to, from the ONE place in the operator that holds an
+   * authoritative answer this process can actually read: its own durable allocation receipt,
+   * whose `node_id` was supplied explicitly on the paid wire and is NOT NULL and write-once
+   * (`akash_tx_allocations` IDENTITY_IS_AUTHORITATIVE_NOT_INFERRED / IDENTITY_IS_WRITE_ONCE).
+   *
+   * Deliberately NOT the `nodes` registry: that table is ENABLE + FORCE row-level security, this
+   * process holds the RLS-enforced app role and never opens a tenant scope, so a slug lookup
+   * there succeeds and returns ZERO rows — which is how 32-of-32 applied migrations were reported
+   * as `node_not_registered` and thrown away. Deliberately NOT parsed out of `cogniKey` either:
+   * the key's composition is the caller's business and the Composition says so.
+   *
+   * Undefined — never a throw, never a refusal — when no receipt binds the key yet (a workload's
+   * very first observe precedes its first create by construction) or when the ledger cannot be
+   * read. The migration still runs; only the metadata waits for the next tick.
+   */
+  private async receiptBoundNodeId(
+    cogniKey: string
+  ): Promise<string | undefined> {
+    try {
+      const record = await this.ledger.read({ cogniKey });
+      return record?.identity.nodeId;
+    } catch (error) {
+      this.log.warn(
+        {
+          cogniKey,
+          causeMessage:
+            error instanceof Error ? error.message : "unknown cause",
+        },
+        "akash_tx_migration_receipt_identity_unreadable"
+      );
+      return undefined;
+    }
   }
 
   /**
@@ -875,6 +1266,102 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     return report;
   }
 
+  async leaseLogSources(input: {
+    environment?: string;
+    limit?: number;
+  }): Promise<AkashTxLeaseLogSources> {
+    const limit = Math.min(Math.max(input.limit ?? 32, 1), 64);
+    let records: readonly AkashTxAllocationRecord[];
+    try {
+      // bug.5264: enumerate every LIVE (non-terminal) receipt, not only `allocated` ones — a
+      // lease that boots but never serves is closed on its BootDeadline before its receipt ever
+      // flips past `preparing`, so tailing only `allocated` loses exactly the boot logs we need.
+      records = await this.ledger.listActive({
+        ...(input.environment ? { environment: input.environment } : {}),
+        limit,
+      });
+    } catch (error) {
+      throw this.ledgerUnavailable(error, "*", "listActive");
+    }
+
+    const sources: AkashTxLeaseLogSource[] = [];
+    for (const record of records) {
+      if (!record.externalName) {
+        // A live receipt with no provider handle is unpumpable — but SILENCE here is the very
+        // failure bug.5264 is about, so name it: a booting lease stuck before its handle bound
+        // is now a queryable signal, not an absence.
+        this.log.warn(
+          {
+            cogniKey: record.cogniKey,
+            workload: record.workload,
+            environment: record.environment,
+            state: record.state,
+          },
+          "akash_tx_lease_log_source_no_handle"
+        );
+        continue;
+      }
+      try {
+        const descriptor = await this.console.leaseLogDescriptor({
+          leaseId: record.externalName,
+        });
+        const providerAccount =
+          descriptor.providerAccount ?? record.providerAccount;
+        if (!providerAccount || !descriptor.providerHostUri) {
+          // Fail-open per source: a lease we cannot coordinate is skipped, never a wedge.
+          this.log.warn(
+            {
+              cogniKey: record.cogniKey,
+              externalName: record.externalName,
+              hasProvider: Boolean(providerAccount),
+              hasHostUri: Boolean(descriptor.providerHostUri),
+            },
+            "akash_tx_lease_log_source_unresolvable"
+          );
+          continue;
+        }
+        sources.push({
+          nodeId: record.identity.nodeId,
+          workload: record.workload,
+          environment: record.environment,
+          dseq: record.externalName,
+          gseq: descriptor.gseq,
+          oseq: descriptor.oseq,
+          providerAccount,
+          providerHostUri: descriptor.providerHostUri,
+          services: descriptor.services,
+        });
+      } catch (error) {
+        this.log.warn(
+          {
+            cogniKey: record.cogniKey,
+            externalName: record.externalName,
+            code:
+              error instanceof AkashTxError
+                ? error.code
+                : mapConsoleFailure(error, { mutating: false }).code,
+          },
+          "akash_tx_lease_log_source_skipped"
+        );
+      }
+    }
+
+    if (sources.length === 0) {
+      return { sources, token: "", ttlSeconds: 0 };
+    }
+
+    const providers = [...new Set(sources.map((s) => s.providerAccount))];
+    try {
+      const token = await this.console.mintLeaseLogsToken({
+        providers,
+        ttlSeconds: LEASE_LOG_TOKEN_TTL_SECONDS,
+      });
+      return { sources, token, ttlSeconds: LEASE_LOG_TOKEN_TTL_SECONDS };
+    } catch (error) {
+      throw mapConsoleFailure(error, { mutating: false });
+    }
+  }
+
   private async describe(
     externalName: string,
     providerAccount?: string,
@@ -891,14 +1378,45 @@ export class AkashTxActuator implements AkashTxActuatorPort {
 
   private async withServing(
     observation: AkashTxObservation,
-    expectedSourceSha: string | undefined
+    expectedSourceSha: string | undefined,
+    publicHost?: string
   ): Promise<AkashTxObservation> {
     const endpoints = observation.resource?.endpoints ?? [];
     if (!this.probe || !expectedSourceSha || endpoints.length === 0) {
       return observation;
     }
-    const serving = await this.probe({ endpoints, expectedSourceSha });
+    const serving = await this.probe({
+      endpoints,
+      expectedSourceSha,
+      ...(publicHost ? { publicHost } : {}),
+    });
+    // task.5153 — a positive host-routed serving proof is the live path's boot_ok. Fire and
+    // forget with a per-process cache; exactly-once lives in the DB unique (lease_id, outcome).
+    if (serving === true && observation.resource) {
+      void this.recordBootOk(observation.resource);
+    }
     return { ...observation, serving };
+  }
+
+  private async recordBootOk(resource: AkashTxResource): Promise<void> {
+    if (!this.outcomes || !resource.providerAccount) return;
+    if (this.bootOkRecorded.has(resource.externalName)) return;
+    this.bootOkRecorded.add(resource.externalName);
+    try {
+      await this.outcomes.record({
+        computeProvider: "akash",
+        providerAccount: resource.providerAccount,
+        outcome: "boot_ok",
+        leaseId: resource.externalName,
+      });
+    } catch (error) {
+      // BEST_EFFORT: never let outcome IO shade an observation. Allow a later retry.
+      this.bootOkRecorded.delete(resource.externalName);
+      this.log.warn(
+        { externalName: resource.externalName, error: String(error) },
+        "akash_tx_boot_ok_write_failed"
+      );
+    }
   }
 
   private async readCursor(): Promise<string> {

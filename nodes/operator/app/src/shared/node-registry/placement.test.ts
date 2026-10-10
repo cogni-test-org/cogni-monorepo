@@ -15,10 +15,20 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  controlEnvFor,
   nodeAppBaseUrl,
   providerForEnv,
   toNodeDeploymentPlacement,
 } from "./placement";
+
+describe("controlEnvFor", () => {
+  it("routes external lanes through the configured fleet control env", () => {
+    expect(controlEnvFor("preview", "akash", "candidate-a")).toBe(
+      "candidate-a"
+    );
+    expect(controlEnvFor("preview", "k3s", "candidate-a")).toBe("preview");
+  });
+});
 
 describe("providerForEnv", () => {
   it("defaults an undeclared environment to k3s (K3S_IS_DEFAULT)", () => {
@@ -117,5 +127,46 @@ describe("nodeAppBaseUrl", () => {
         environment: "candidate-a",
       })
     ).toThrow(/no base domain is configured/);
+  });
+});
+
+describe("controlEnvFor (bug.5204/bug.5235 — FLEET_CONTROL_ENV twin of appset-paths.sh)", () => {
+  it("routes every Akash lane through the fleet control env", () => {
+    expect(controlEnvFor("production", "akash")).toBe("production");
+    expect(controlEnvFor("production", "k3s")).toBe("production");
+    expect(controlEnvFor("production", "akash", "candidate-a")).toBe(
+      "candidate-a"
+    );
+  });
+
+  it("keeps a k3s lane reconciled by its own env — placement must be stated to move it", () => {
+    expect(controlEnvFor("candidate-a", "k3s")).toBe("candidate-a");
+    expect(controlEnvFor("preview", "k3s")).toBe("preview");
+    // The fleet control env is IRRELEVANT for a k3s lane: it runs IN its own cluster.
+    expect(controlEnvFor("candidate-a", "k3s", "candidate-a")).toBe(
+      "candidate-a"
+    );
+  });
+
+  it("defaults an akash non-production lane to production when no fleet control env is given (cogni-dao, byte-identical)", () => {
+    expect(controlEnvFor("candidate-a", "akash")).toBe("production");
+    expect(controlEnvFor("preview", "akash")).toBe("production");
+    // An empty/whitespace value is treated as unset — still the production default.
+    expect(controlEnvFor("candidate-a", "akash", "")).toBe("production");
+    expect(controlEnvFor("candidate-a", "akash", "   ")).toBe("production");
+  });
+
+  it("reconciles an akash non-production lane by the FLEET CONTROL ENV on an isolated fleet", () => {
+    // cogni-test-org exports FLEET_CONTROL_ENV=candidate-a — its OWN control plane reconciles +
+    // pays for akash lanes, so the AppSet dir is appsets/candidate-a/, not appsets/production/.
+    expect(controlEnvFor("candidate-a", "akash", "candidate-a")).toBe(
+      "candidate-a"
+    );
+    expect(controlEnvFor("preview", "akash", "candidate-a")).toBe(
+      "candidate-a"
+    );
+    expect(controlEnvFor("candidate-a", "akash", " candidate-a ")).toBe(
+      "candidate-a"
+    );
   });
 });
