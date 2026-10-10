@@ -74,12 +74,15 @@ export * from "./identity.attestation.v1.contract";
 // ── Knowledge ───────────────────────────────────────────────────────────────
 export * from "./knowledge.contributions.v1.contract";
 export * from "./knowledge.domains.v1.contract";
+export * from "./knowledge.index.v1.contract";
 export * from "./knowledge.list.v1.contract";
 // ── Meta ────────────────────────────────────────────────────────────────────
 export * from "./meta.livez.read.v1.contract";
 export * from "./meta.readyz.read.v1.contract";
 export * from "./meta.route-manifest.read.v1.contract";
 export * from "./meta.version.read.v1.contract";
+// ── Nodes ──────────────────────────────────────────────────────────────────
+export * from "./nodes.operations-overview.v1.contract";
 // ── Payments ────────────────────────────────────────────────────────────────
 export * from "./payments.credits.summary.v1.contract";
 export * from "./payments.intent.v1.contract";
