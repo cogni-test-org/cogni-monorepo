@@ -20,7 +20,7 @@
  *     with a stable code so callers and the awareness surface observe their own failures.
  *   - AUDITED_PROVIDERS_ONLY (task.5051): the SDL anchors `signedBy.allOf` to the Overclock
  *     audit account and bids are screened on Console provider data (audited + online +
- *     uptime7d > 0.95 + activeLeases > 0, no 2σ price underbids) — pure logic in
+ *     uptime7d > 0.95, no 2σ price underbids; NOT activeLeases — bug.5334) — pure logic in
  *     ./akash-provider-screen. Metadata-read failure fails open (signedBy stays the hard gate).
  *   - BOOT_SLO_OR_CLOSE (task.5051): after lease, the workload must serve `/version` and its
  *     fixed `/readyz` health endpoint within `bootSloMs` (default 5min), or the deployment
@@ -38,6 +38,8 @@
  * @internal
  */
 
+import { createHash } from "node:crypto";
+
 import type {
   ComputeBalance,
   ComputeResourcePort,
@@ -46,14 +48,20 @@ import type {
   ProvisionState,
 } from "@cogni/ai-tools";
 import type {
+  AkashLeaseLogDescriptor,
   ComputeCostEvidencePort,
   ComputeResourceCostEvidence,
 } from "@/ports";
 import { makeLogger } from "@/shared/observability";
 import {
   type AkashProviderInfo,
+  countrySourcesDisagree,
+  effectiveCountryCode,
+  formatBidRejections,
+  formatBidRoster,
   type ProviderOutcomeStats,
   type ScreenableBid,
+  type ScreenedBids,
   screenBids,
 } from "./akash-provider-screen";
 import { type AkashSdlOptions, buildAkashSdl } from "./akash-sdl";
@@ -67,6 +75,12 @@ import {
 
 const PROVIDER = "akash";
 const MICRO = 1_000_000;
+/** Lease-log descriptor cache TTL — long enough to amortize polling, short enough that an
+ * in-place SDL update's changed service set surfaces within minutes. */
+const DESCRIPTOR_CACHE_TTL_MS = 5 * 60_000;
+/** Provider-country cache TTL. A declared location is near-static; this only bounds staleness
+ * after a provider re-registers, which is rare and non-urgent. */
+const PROVIDER_COUNTRY_CACHE_TTL_MS = 30 * 60_000;
 
 /** Overclock Labs audit account — the `signedBy` anchor Console itself screens on. */
 export const AKASH_OVERCLOCK_AUDITOR =
@@ -134,8 +148,10 @@ export interface AkashComputeAdapterConfig {
    */
   preferredProviders?: readonly string[];
   /**
-   * Optional operator-owned hard provider boundary. When present, only these
-   * provider accounts may be leased; an empty list rejects every bid.
+   * Optional operator-owned provider PIN. A NON-EMPTY list narrows leasing to exactly those
+   * accounts. Absent OR EMPTY means NO pin — bids are judged on policy alone
+   * (PIN_IS_A_PREFERENCE_NOT_A_GATE in ./akash-provider-screen, story.5050). It used to be a
+   * fail-closed boundary where an empty list rejected every bid; it is not one now.
    */
   allowedProviders?: readonly string[];
   /**
@@ -158,7 +174,11 @@ export interface AkashComputeAdapterConfig {
    * compute_provider_outcomes insert failure never fails a live provision, but
    * it must land in logs loudly — silent drops gave provider screening amnesia.
    */
-  log?: { error(fields: Record<string, unknown>, message: string): void };
+  log?: {
+    error(fields: Record<string, unknown>, message: string): void;
+    /** Optional: a country-source disagreement is advisory, not a failure (story.5050). */
+    warn?(fields: Record<string, unknown>, message: string): void;
+  };
   /** SDL pricing knobs (max price per block per service). */
   pricing?: AkashSdlOptions;
   /** API base URL; defaults to the public Console API. */
@@ -211,6 +231,13 @@ interface ConsoleProvider {
   uptime7d?: number;
   leaseCount?: number;
   ipCountryCode?: string | null;
+  /** The provider's own signed on-chain location declaration. Preferred over GeoIP. */
+  country?: string | null;
+  /**
+   * The provider's own declaration that it will serve an SDL `accept:` hostname. OPTIONAL on
+   * Akash — absent means "did not say", which is NOT the same as `false`.
+   */
+  featEndpointCustomDomain?: boolean | null;
 }
 
 interface ConsoleLease {
@@ -252,6 +279,19 @@ interface ConsoleDeploymentList {
 interface ScreeningContext {
   providers: ReadonlyMap<string, AkashProviderInfo>;
   outcomes: ReadonlyMap<string, ProviderOutcomeStats>;
+  /**
+   * Node-owned HARD placement requirement for THIS workload (story.5050), threaded here
+   * rather than through three call signatures because this struct already IS the screening
+   * input bundle. Empty = unconstrained. Unlike the adapter-level latency preference this is
+   * per-provision: it comes off the ProvisionSpec, which comes off the node's catalog row.
+   */
+  requiredCountryCodes: readonly string[];
+  /**
+   * Whether THIS workload serves a custom hostname, i.e. whether any global expose carries
+   * `hosts` (rendered as SDL `accept:`). Per-provision like the country requirement, and for
+   * the same reason: it is a property of the workload, not of the marketplace.
+   */
+  requiresCustomDomain: boolean;
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -261,6 +301,59 @@ const defaultSleep = (ms: number): Promise<void> =>
  * Akash Console compute adapter — read + write halves of ComputeResourcePort over the
  * managed-wallet Console API. One shared account funds every workload (v0 billing).
  */
+/**
+ * A bounded, non-echoing digest of a Console error body.
+ *
+ * Provider bodies can carry the SDL and resolved secrets, so NO free-text value is ever taken —
+ * the pre-existing no-echo guarantee is unchanged. Two things that cannot carry a secret ARE
+ * taken: the body's top-level KEY NAMES (schema, not data) and the values of a short allowlist
+ * of enum-like identifier fields. `message` is deliberately absent from that allowlist: it is
+ * free text and is exactly what the no-echo test forbids.
+ *
+ * Why take anything at all — "Console request failed with HTTP 422" and nothing else is
+ * undiagnosable from logs. poly's candidate-a lane retried that exact deterministic rejection
+ * ~1.5x/min for five days against a PAID API, and naming the cause required redeploying the
+ * actuator (bug.5247). Key names alone identify which error schema Console returned.
+ */
+const PROVIDER_DETAIL_VALUE_KEYS = ["code", "error", "type", "reason"] as const;
+const PROVIDER_DETAIL_MAX_CHARS = 200;
+const PROVIDER_BODY_MAX_CHARS = 2000;
+
+async function readProviderDetail(
+  response: Response
+): Promise<string | undefined> {
+  try {
+    const text = (await response.text()).slice(0, PROVIDER_BODY_MAX_CHARS);
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined;
+    }
+    const record = parsed as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    const parts = keys.length > 0 ? [`keys=${keys.join(",")}`] : [];
+    for (const key of PROVIDER_DETAIL_VALUE_KEYS) {
+      const value = record[key];
+      // Identifier-shaped only. A long or spacey value is prose, not an enum — leave it.
+      if (
+        typeof value === "string" &&
+        value.length <= 48 &&
+        /^[\w.:-]+$/.test(value)
+      ) {
+        parts.push(`${key}=${value}`);
+      } else if (typeof value === "number") {
+        parts.push(`${key}=${value}`);
+      }
+    }
+    const joined = parts.join(" ");
+    return joined === ""
+      ? undefined
+      : joined.slice(0, PROVIDER_DETAIL_MAX_CHARS);
+  } catch {
+    // Unreadable or non-JSON body. Never a reason to fail the request path.
+    return undefined;
+  }
+}
+
 export class AkashComputeAdapter
   implements ComputeResourcePort, ComputeCostEvidencePort
 {
@@ -278,9 +371,39 @@ export class AkashComputeAdapter
   private readonly outcomeStore: ProviderOutcomeStore;
   private readonly log: {
     error(fields: Record<string, unknown>, message: string): void;
+    warn?(fields: Record<string, unknown>, message: string): void;
   };
   private readonly sdlOptions: AkashSdlOptions;
   private readonly now: () => Date;
+  /** Provider gateway URIs by owner account — stable identity, cached per process. */
+  private readonly hostUriCache = new Map<string, string>();
+  /**
+   * Screened country by provider account, short-TTL. A provider's declared location changes on
+   * the order of never, but the UPDATE path consults it on EVERY reconcile (~60s per workload),
+   * and the only read that answers it is the whole `/v1/providers` index — ~1850 entries and
+   * several MB. Without this the placement gate would cost one full registry download per
+   * workload per minute. Same reasoning as `descriptorCache` below.
+   */
+  private readonly providerCountryCache = new Map<
+    string,
+    { country: string | null; expiresAtMs: number }
+  >();
+  /**
+   * Lease-log descriptors by dseq, short-TTL. Coordinates are stable for a lease's life
+   * (an in-place SDL update can change `services`, hence the TTL rather than forever), and
+   * the pump re-enumerates every poll — without this cache the wallet-writer would spend a
+   * Console GET per lease per poll on answers that almost never change.
+   */
+  private readonly descriptorCache = new Map<
+    string,
+    { value: AkashLeaseLogDescriptor; expiresAtMs: number }
+  >();
+  /** Last minted logs JWT, reused for an identical provider set until ~80% of its TTL. */
+  private leaseLogsToken?: {
+    providersKey: string;
+    token: string;
+    expiresAtMs: number;
+  };
 
   constructor(private readonly config: AkashComputeAdapterConfig) {
     this.baseUrl = (
@@ -347,7 +470,10 @@ export class AkashComputeAdapter
     spec: ProvisionSpec;
   }): Promise<ProvisionOutput> {
     const sdl = buildAkashSdl(p.spec, this.sdlOptions);
-    const screening = await this.loadScreeningContext();
+    const screening = this.withPlacement(
+      await this.loadScreeningContext(),
+      p.spec
+    );
     const tried = new Set<string>();
     let finalBootFailureStage: BootFailureStage = "status_unavailable";
     for (let attempt = 1; attempt <= this.maxProviderAttempts; attempt++) {
@@ -393,7 +519,7 @@ export class AkashComputeAdapter
       sdl,
       p.spec.name,
       p.expectedSourceSha,
-      await this.loadScreeningContext(),
+      this.withPlacement(await this.loadScreeningContext(), p.spec),
       new Set<string>(),
       onAllocated
     );
@@ -464,6 +590,39 @@ export class AkashComputeAdapter
     };
   }
 
+  /**
+   * Screened country for one provider account, or null when the registry did not resolve it.
+   * Reuses the SAME `effectiveCountryCode` resolution the bid screen uses (declared attribute
+   * first, GeoIP as fallback) so the update gate and the bid gate can never disagree about
+   * where a provider is.
+   */
+  async providerCountry(providerAccount: string): Promise<string | null> {
+    const cached = this.providerCountryCache.get(providerAccount);
+    if (cached && cached.expiresAtMs > this.now().getTime())
+      return cached.country;
+    const list = await this.request<ConsoleProvider[]>(
+      "GET",
+      "/v1/providers",
+      undefined,
+      this.writeTimeoutMs
+    ).catch(() => undefined);
+    // A FAILED read is never cached: the caller treats `null` as "cannot evaluate" and waves the
+    // update through, so caching it would extend one hiccup into 30 minutes of an unenforced gate.
+    if (!list) return null;
+    const hit = list.find((p) => p.owner === providerAccount);
+    const country = hit
+      ? effectiveCountryCode({
+          declared: hit.country,
+          geoIp: hit.ipCountryCode,
+        })
+      : null;
+    this.providerCountryCache.set(providerAccount, {
+      country,
+      expiresAtMs: this.now().getTime() + PROVIDER_COUNTRY_CACHE_TTL_MS,
+    });
+    return country;
+  }
+
   async status(p: { leaseId: string }): Promise<ProvisionOutput> {
     const detail = await this.request<ConsoleDeploymentDetail>(
       "GET",
@@ -505,9 +664,24 @@ export class AkashComputeAdapter
   }
 
   /**
+   * sha256 hex of the exact SDL bytes `updateAllocated` would PUT for this spec — same render,
+   * same pricing options. Pure and deterministic, so the actuator can compare it to the receipt's
+   * last-applied hash and skip a byte-identical re-PUT (bug.5238): Console re-triggers a provider
+   * redeploy on EVERY PUT, and re-deploying a not-yet-serving node denies it a stable window.
+   * Kept here, next to `buildAkashSdl` + `sdlOptions`, so SDL construction never crosses the port.
+   */
+  sdlHash(spec: ProvisionSpec): string {
+    return createHash("sha256")
+      .update(buildAkashSdl(spec, this.sdlOptions))
+      .digest("hex");
+  }
+
+  /**
    * In-place SDL replacement on a handle we already own. Spends no new escrow and mints no
-   * new handle, so it needs no allocation receipt — the PUT is idempotent by construction.
-   * Returns as soon as Console accepts it; convergence is the caller's level problem.
+   * new handle, so it needs no allocation receipt. The PUT is idempotent for the ESCROW/HANDLE,
+   * but NOT on the provider: Console re-triggers a redeploy on every PUT regardless of whether
+   * the SDL changed, so the caller (actuator) must hash-gate an identical re-PUT — see `sdlHash`
+   * and bug.5238. Returns as soon as Console accepts it; convergence is the caller's level problem.
    */
   async updateAllocated(p: {
     resourceId: string;
@@ -529,6 +703,112 @@ export class AkashComputeAdapter
       undefined,
       this.writeTimeoutMs
     );
+  }
+
+  /** Read-only lease coordinates + service names for provider log reads (bug.5240). */
+  async leaseLogDescriptor(p: {
+    leaseId: string;
+  }): Promise<AkashLeaseLogDescriptor> {
+    const cached = this.descriptorCache.get(p.leaseId);
+    if (cached && cached.expiresAtMs > this.now().getTime()) {
+      return cached.value;
+    }
+    const detail = await this.request<ConsoleDeploymentDetail>(
+      "GET",
+      `/v1/deployments/${encodeURIComponent(p.leaseId)}`
+    );
+    const leases = detail?.leases ?? [];
+    const lease = leases.find((l) => l.state === "active") ?? leases[0];
+    const owner =
+      typeof lease?.id?.provider === "string" ? lease.id.provider : undefined;
+    const descriptor: AkashLeaseLogDescriptor = {
+      gseq: typeof lease?.id?.gseq === "number" ? lease.id.gseq : 1,
+      oseq: typeof lease?.id?.oseq === "number" ? lease.id.oseq : 1,
+      ...(owner ? { providerAccount: owner } : {}),
+      ...(owner
+        ? await this.providerHostUri(owner).then((uri) =>
+            uri ? { providerHostUri: uri } : {}
+          )
+        : {}),
+      services: Object.keys(lease?.status?.services ?? {}),
+      state: mapState(detail?.deployment?.state, leases),
+    };
+    this.descriptorCache.set(p.leaseId, {
+      value: descriptor,
+      expiresAtMs: this.now().getTime() + DESCRIPTOR_CACHE_TTL_MS,
+    });
+    return descriptor;
+  }
+
+  /**
+   * Logs-scoped granular JWT (AEP-64) over the managed wallet. The narrowest read capability
+   * the provider accepts — it can tail lease logs on the named providers and nothing else.
+   */
+  async mintLeaseLogsToken(p: {
+    providers: readonly string[];
+    ttlSeconds: number;
+  }): Promise<string> {
+    const providersKey = [...p.providers].sort().join(",");
+    const nowMs = this.now().getTime();
+    if (
+      this.leaseLogsToken &&
+      this.leaseLogsToken.providersKey === providersKey &&
+      this.leaseLogsToken.expiresAtMs > nowMs
+    ) {
+      return this.leaseLogsToken.token;
+    }
+    const minted = await this.request<{ token?: string }>(
+      "POST",
+      "/v1/create-jwt-token",
+      {
+        data: {
+          ttl: p.ttlSeconds,
+          leases: {
+            access: "granular",
+            permissions: p.providers.map((provider) => ({
+              provider,
+              access: "scoped",
+              scope: ["logs"],
+            })),
+          },
+        },
+      }
+    );
+    if (!minted?.token) {
+      throw new AkashComputeError(
+        "UNEXPECTED_SHAPE",
+        "Console create-jwt-token returned no token"
+      );
+    }
+    // Reuse until 80% of the TTL: a consumer that got this token still has ≥20% of its
+    // life to spend it, and the wallet-writer stops minting once per caller poll.
+    this.leaseLogsToken = {
+      providersKey,
+      token: minted.token,
+      expiresAtMs: nowMs + p.ttlSeconds * 800,
+    };
+    return minted.token;
+  }
+
+  /**
+   * Provider gateway base URI, cached for the process lifetime — a hostUri is DNS-stable
+   * infrastructure identity, and a restart is the refresh path.
+   */
+  private async providerHostUri(owner: string): Promise<string | undefined> {
+    const cached = this.hostUriCache.get(owner);
+    if (cached) return cached;
+    const provider = await this.request<{
+      hostUri?: string;
+      host_uri?: string;
+    }>("GET", `/v1/providers/${encodeURIComponent(owner)}`).catch(
+      () => undefined
+    );
+    const uri = provider?.hostUri ?? provider?.host_uri;
+    if (typeof uri === "string" && uri.length > 0) {
+      this.hostUriCache.set(owner, uri);
+      return uri;
+    }
+    return undefined;
   }
 
   private async listAllDeployments(): Promise<ConsoleDeploymentDetail[]> {
@@ -633,12 +913,19 @@ export class AkashComputeAdapter
      * unrecorded dseq is a paid lease nobody can ever find.
      */
     onAllocated?: (leaseId: string) => Promise<void>;
+    /**
+     * Ledger-derived tried set for this generation's attempt family (task.5153).
+     * Crossplane re-invokes create per recovery ordinal, so anything in-memory here
+     * is empty on every call — which re-picked the same dead provider on every
+     * bounded-recovery attempt. The caller derives this from allocation receipts.
+     */
+    excludedProviders?: ReadonlySet<string>;
   }): Promise<{ leaseId: string; providerAccount: string }> {
     const sdl = buildAkashSdl(p.spec, this.sdlOptions);
     const { dseq, provider } = await this.createAndLease(
       sdl,
-      await this.loadScreeningContext(),
-      new Set<string>(),
+      this.withPlacement(await this.loadScreeningContext(), p.spec),
+      new Set<string>(p.excludedProviders ?? []),
       p.onAllocated
         ? async (resource) => {
             await p.onAllocated?.(resource.leaseId);
@@ -795,10 +1082,19 @@ export class AkashComputeAdapter
   ): Promise<ConsoleBidId> {
     const deadline = Date.now() + this.bidTimeoutMs;
     const preferred = this.config.preferredProviders ?? [];
-    const allowed = this.config.allowedProviders
-      ? new Set(this.config.allowedProviders)
-      : undefined;
+    // An EMPTY configured list collapses to `undefined` == no pin. Spelled out because `[]`
+    // is TRUTHY: the old `config.allowedProviders ? new Set(...)` turned an empty list into
+    // an empty Set, i.e. "no provider is permitted", which refused every bid in silence.
+    const allowed =
+      this.config.allowedProviders && this.config.allowedProviders.length > 0
+        ? new Set(this.config.allowedProviders)
+        : undefined;
     let sawAnyBid = false;
+    // Carried out of the loop so NO_ELIGIBLE_BIDS can name WHICH filter refused everything.
+    // Three independent filters can each empty the set; a static reason list sent operators
+    // hunting the wrong one for a full bid window.
+    let lastRejections: ScreenedBids["rejections"] = {};
+    let lastRoster: ScreenedBids["roster"] = [];
     for (;;) {
       const bids = await this.request<ConsoleBid[]>(
         "GET",
@@ -820,17 +1116,20 @@ export class AkashComputeAdapter
           priceAmount: Number(b.bid?.price?.amount ?? Number.POSITIVE_INFINITY),
         });
       }
-      const ranked = screenBids({
-        bids: allowed
-          ? screenable.filter((bid) => allowed.has(bid.provider))
-          : screenable,
+      const { ranked, rejections, roster } = screenBids({
+        bids: screenable,
+        requiresCustomDomain: screening.requiresCustomDomain,
         providers: screening.providers,
         outcomes: screening.outcomes,
         preferredProviders: preferred,
         preferredCountryCodes: this.preferredCountryCodes,
+        requiredCountryCodes: screening.requiredCountryCodes,
+        allowedProviders: allowed,
         excludedProviders: tried,
         nowMs: Date.now(),
       });
+      lastRejections = rejections;
+      lastRoster = roster;
       const best = ranked[0];
       // A preferred provider that survived screening wins immediately; anyone else
       // waits out the window so late (often better) bids can compete.
@@ -847,7 +1146,14 @@ export class AkashComputeAdapter
           throw new AkashComputeError(
             "NO_ELIGIBLE_BIDS",
             `bids arrived for dseq ${dseq} but none passed provider screening ` +
-              "(audited + online + uptime7d > 0.95 + active leases, no blacklist, no 2σ underbids)"
+              `[refused: ${formatBidRejections(lastRejections)}]` +
+              // The roster names the ADDRESSES so a dry auction is actionable without
+              // re-running it: counts alone cannot tell "nobody eligible bid" from
+              // "we refused the provider we were waiting for" (story.5050).
+              ` [bids: ${formatBidRoster(lastRoster)}]` +
+              (screening.requiredCountryCodes.length > 0
+                ? ` (required placement countries: ${screening.requiredCountryCodes.join(", ")})`
+                : "")
           );
         }
         throw new AkashComputeError(
@@ -966,7 +1272,37 @@ export class AkashComputeAdapter
     }
   }
 
-  /** Load provider metadata + outcome history, each best-effort (advisory inputs only). */
+  /**
+   * Attach the workload's own HARD placement requirement to a marketplace screening read.
+   *
+   * Kept as its own seam so every provision path picks the requirement up the SAME way: a
+   * path that forgot it would silently place a geo-constrained node anywhere, which is
+   * exactly the failure this feature exists to stop (story.5050).
+   */
+  private withPlacement(
+    screening: ScreeningContext,
+    spec: ProvisionSpec
+  ): ScreeningContext {
+    return {
+      ...screening,
+      requiredCountryCodes: spec.placement?.requiredCountryCodes ?? [],
+      // One source of truth with the SDL: buildAkashSdl emits `accept:` from exactly these
+      // `hosts`, so the screen asks for the capability precisely when the manifest will use it.
+      requiresCustomDomain: spec.services.some((service) =>
+        (service.expose ?? []).some(
+          (expose) => expose.global && (expose.hosts?.length ?? 0) > 0
+        )
+      ),
+    };
+  }
+
+  /**
+   * Load provider metadata + outcome history, each best-effort (advisory inputs only).
+   *
+   * `requiredCountryCodes` is deliberately NOT read here: it is per-workload catalog policy,
+   * not a marketplace read, so a caller attaches it from the ProvisionSpec. Defaulting it to
+   * `[]` keeps an unconstrained workload on exactly today's behaviour.
+   */
   private async loadScreeningContext(): Promise<ScreeningContext> {
     const providers = new Map<string, AkashProviderInfo>();
     const list = await this.request<ConsoleProvider[]>(
@@ -983,14 +1319,46 @@ export class AkashComputeAdapter
         isOnline: p.isOnline === true,
         isValidVersion: p.isValidVersion === true,
         uptime7d: Number(p.uptime7d ?? 0),
-        activeLeases: Number(p.leaseCount ?? 0),
-        countryCode: p.ipCountryCode ?? null,
+        // Resolved at the SOURCE so every downstream consumer — the hard country filter,
+        // the latency preference, and the bid roster — reads one consistent country.
+        countryCode: effectiveCountryCode({
+          declared: p.country,
+          geoIp: p.ipCountryCode,
+        }),
+        // Carried as a TRISTATE on purpose: `=== true`/`=== false` are the provider's
+        // declaration, `undefined` is "the registry read did not say". The screen refuses
+        // only on a positive `false`, so one failed marketplace read can never dry an auction.
+        ...(typeof p.featEndpointCustomDomain === "boolean"
+          ? { supportsCustomDomain: p.featEndpointCustomDomain }
+          : {}),
       });
+      if (
+        countrySourcesDisagree({ declared: p.country, geoIp: p.ipCountryCode })
+      ) {
+        // Not an error. This is the ONLY way we notice a stale GeoIP without re-running a
+        // manual audit, and a silently-wrong country refuses a provider for a country it is
+        // not in (story.5050).
+        this.log?.warn?.(
+          {
+            provider: p.owner,
+            declaredCountry: p.country,
+            geoIpCountry: p.ipCountryCode,
+          },
+          "akash_provider_country_source_disagreement"
+        );
+      }
     }
     const outcomes = await this.outcomeStore
       .stats(PROVIDER)
       .catch(() => new Map<string, ProviderOutcomeStats>());
-    return { providers, outcomes };
+    // Unconstrained by default so this seam is TOTAL: a caller that forgets `withPlacement`
+    // gets today's behaviour, never an undefined requirement the screener would crash on.
+    return {
+      providers,
+      outcomes,
+      requiredCountryCodes: [],
+      requiresCustomDomain: false,
+    };
   }
 
   /** Best-effort outcome append (OUTCOME_STORE_IS_ADVISORY). */
@@ -1040,11 +1408,17 @@ export class AkashComputeAdapter
         signal: controller.signal,
       });
       if (!response.ok) {
-        // Never retain provider bodies: they can echo the SDL and future resolved secrets.
-        await response.body?.cancel().catch(() => {});
+        // Provider bodies are still never retained — they echo the SDL and resolved secrets.
+        // What IS taken is a bounded, allowlisted scalar digest, because "HTTP 422" with no
+        // cause is undiagnosable from logs alone: poly's candidate lane retried a deterministic
+        // Console rejection ~1.5x/min for five days against a PAID API and nobody could say why
+        // without redeploying the actuator (bug.5247).
+        const detail = await readProviderDetail(response);
         throw new AkashComputeError(
           "HTTP_ERROR",
-          `Console request failed with HTTP ${response.status}`,
+          `Console request failed with HTTP ${response.status}${
+            detail ? ` (${detail})` : ""
+          }`,
           response.status
         );
       }

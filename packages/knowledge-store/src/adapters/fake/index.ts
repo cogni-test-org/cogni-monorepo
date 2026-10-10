@@ -87,12 +87,18 @@ export class FakeKnowledgeStoreAdapter implements KnowledgeStorePort {
 
   async listKnowledge(
     domain: string,
-    opts?: { tags?: string[]; limit?: number }
+    opts?: { tags?: string[]; limit?: number; q?: string }
   ): Promise<Knowledge[]> {
     let out = Array.from(this.rows.values()).filter((r) => r.domain === domain);
     if (opts?.tags?.length) {
       const wanted = new Set(opts.tags);
       out = out.filter((r) => (r.tags ?? []).some((t) => wanted.has(t)));
+    }
+    const needle = opts?.q?.trim().toLowerCase();
+    if (needle) {
+      // Mirrors the Doltgres adapter: case-insensitive substring on `useWhen`
+      // only; a null trigger never matches.
+      out = out.filter((r) => r.useWhen?.toLowerCase().includes(needle));
     }
     out.sort(
       (a, b) => (b.createdAt?.getTime() ?? 0) - (a.createdAt?.getTime() ?? 0)
@@ -173,6 +179,7 @@ export class FakeKnowledgeStoreAdapter implements KnowledgeStorePort {
       entityId: entry.entityId ?? null,
       title: stripDangerousControlChars(entry.title),
       content: stripDangerousControlChars(entry.content),
+      useWhen: entry.useWhen ? stripDangerousControlChars(entry.useWhen) : null,
       entryType: entry.entryType ?? "finding",
       confidencePct: initializeConfidence(entry).confidencePct,
       sourceType: entry.sourceType,
@@ -217,6 +224,12 @@ export class FakeKnowledgeStoreAdapter implements KnowledgeStorePort {
       }),
       ...(update.content !== undefined && {
         content: stripDangerousControlChars(update.content),
+      }),
+      ...(update.useWhen !== undefined && {
+        useWhen:
+          typeof update.useWhen === "string"
+            ? stripDangerousControlChars(update.useWhen)
+            : update.useWhen,
       }),
       ...(update.entryType !== undefined && { entryType: update.entryType }),
       ...(update.confidencePct !== undefined && {

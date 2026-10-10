@@ -49,6 +49,7 @@ PARALLEL=(
   openbao-clobber-proof.test.sh
   secrets-fanout.test.sh
   secret-materialize.test.sh
+  flight-probe-credentials.test.sh
   reconcile-node-substrate.test.sh
   run-node-substrate.test.sh
   assert-target-substrate.test.sh
@@ -63,10 +64,13 @@ PARALLEL=(
   resolve-substrate-gate.test.sh
   detect-affected.test.sh
   classify-env-manager-fast-path.test.sh
+  resolve-candidate-deploy-repository.test.sh
   reconcile-scheduler-worker-routing.test.sh
   render-node-appset.test.sh
   operator-rollout-strategy.test.sh
   scheduler-runtime-routing.test.sh
+  session-cognition-hook.test.sh
+  no-automatic-fork-source-sync.test.sh
 )
 
 MAX_JOBS="${SHELL_TESTS_JOBS:-$(nproc 2>/dev/null || echo 4)}"

@@ -32,8 +32,10 @@
 #   means it owns ONLY candidate-a's app-of-apps. provision applies ONLY the matching
 #   cogni-${DEPLOY_ENV}-control-plane seed.
 #
-# Test-fleet override: this isolated repository owns its candidate control plane on main.
-# The production operator and its deploy/candidate-a-control-plane ref remain untouched.
+# Why targetRevision is deploy/candidate-a-control-plane (NOT main):
+#   candidate-a must be able to run a REVIEWED-but-UNMERGED control-plane shape. The production
+#   operator fast-forwards that ref to the exact reviewed head via
+#   POST /api/v1/deploy/infra-reconcile; Argo tracks the ref, never a branch it cannot flight.
 #
 # Scope: this root owns ONLY the app-of-apps under control-plane/candidate-a/ (plus itself). It
 #   NEVER manages Argo's own install (install.yaml / ksops / repo-server + cm patches) — those
@@ -59,8 +61,8 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
-    targetRevision: main
+    repoURL: https://github.com/cogni-dao/cogni.git
+    targetRevision: deploy/candidate-a-control-plane
     path: infra/k8s/argocd/control-plane/candidate-a
     directory:
       recurse: false

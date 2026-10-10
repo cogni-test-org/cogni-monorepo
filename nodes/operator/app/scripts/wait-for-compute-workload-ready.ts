@@ -5,7 +5,6 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { parseArgs, promisify } from "node:util";
 
-import { formatComputeWorkloadDiagnostic } from "../src/features/compute/compute-workload-diagnostic.ts";
 import { assessComputeWorkloadReadiness } from "../src/features/compute/compute-workload-readiness.ts";
 
 const execFileAsync = promisify(execFile);
@@ -57,8 +56,7 @@ async function main(): Promise<void> {
       ? "xcomputeworkload"
       : "computeworkload";
   const deadline = Date.now() + timeoutSeconds * 1_000;
-  let lastReason = "not_observed";
-  let firstPoll = true;
+  let lastReason = "not_yet_polled";
 
   while (Date.now() < deadline) {
     const observation = await readLiveWorkload({
@@ -80,49 +78,47 @@ async function main(): Promise<void> {
         return;
       }
       lastReason = assessment.reason;
-      // Logging-only diagnostic (no effect on the readiness verdict above): when the
-      // composite is observable but not ready, the reason a composition renders no
-      // lease lives ONLY in its status.conditions/failure on the cluster — it never
-      // reaches Loki (no create/bid is emitted). Surface it on the FIRST poll so the
-      // root cause appears within ~1 min, not after the full timeout.
-      if (firstPoll) {
-        process.stdout.write(
-          `${formatComputeWorkloadDiagnostic(observation.resource)}\n`
-        );
-        await dumpComposedLeaseRequests({
-          host,
-          identity,
-          namespace,
-          name,
-        });
-      }
     } else {
       lastReason = observation.reason;
     }
-    firstPoll = false;
     process.stdout.write(
       `[compute-workload-ready] ${namespace}/${name} ${lastReason}; waiting\n`
     );
     await delay(5_000);
   }
-  // Final timeout: re-read and dump the terminal diagnostic before failing so the
-  // last observed status is captured even when the first poll was still unobserved.
-  const finalObservation = await readLiveWorkload({
-    host,
-    identity,
-    namespace,
-    name,
-    resource,
-  });
-  if (finalObservation.ok) {
-    process.stdout.write(
-      `${formatComputeWorkloadDiagnostic(finalObservation.resource)}\n`
-    );
-    await dumpComposedLeaseRequests({ host, identity, namespace, name });
-  }
+  const hint = timeoutHint(lastReason);
   throw new Error(
-    `[compute-workload-ready] timed out for ${namespace}/${name}: ${lastReason}`
+    `[compute-workload-ready] timed out for ${namespace}/${name}: ${lastReason}${
+      hint ? ` - ${hint}` : ""
+    }`
   );
+}
+
+/**
+ * A timeout must name the OWNER of the failure, not just the last symptom. These reasons
+ * look alike in a log and have completely different fixes: an absent resource is a
+ * desired-state/Argo problem that waiting can NEVER resolve, while a bundle mismatch is the
+ * actuator still working. poly spent a week being "waited on" for the first while everyone
+ * read it as the second (bug.5262).
+ */
+function timeoutHint(reason: string): string {
+  if (reason.startsWith("bundle_not_observed")) {
+    return "the workload EXISTS but has not observed the desired bundle - the actuator has not applied this revision";
+  }
+  // A latched phase and a dead lease are opposite problems wearing the same word.
+  if (reason.startsWith("phase_not_ready")) {
+    return reason.includes("serving=true")
+      ? "the composite IS serving and the desired bundle already matched, so this phase is most likely LATCHED from a prior generation - verify /version.buildSha against the desired sha before treating this as an outage"
+      : "the composite is NOT serving - this is a real lease/boot problem, not a latched phase";
+  }
+  const hints: Readonly<Record<string, string>> = {
+    resource_absent:
+      "the workload DOES NOT EXIST in this namespace - Git declares it but Argo has not applied it, so waiting can never succeed; inspect the per-node Application sync state",
+    read_forbidden: "the gate's credential may not read this resource",
+    control_plane_unreachable: "the control-plane host did not answer",
+    read_timeout: "the control-plane read timed out",
+  };
+  return hints[reason] ?? "";
 }
 
 async function readLiveWorkload(input: {
@@ -164,92 +160,11 @@ async function readLiveWorkload(input: {
   }
 }
 
-/**
- * Best-effort, logging-only dump of the composed provider-http Requests for this
- * composite. When the akash-lease Request fails closed (e.g. a placeholder/error
- * body) the composition never emits a create — and that provider-http response is
- * the only place the "why no create" is recorded. Every failure here is swallowed:
- * this must never change the readiness verdict or fail the gate.
- */
-async function dumpComposedLeaseRequests(input: {
-  readonly host: string;
-  readonly identity: string;
-  readonly namespace: string;
-  readonly name: string;
-}): Promise<void> {
-  try {
-    const { stdout } = await execFileAsync(
-      "ssh",
-      [
-        "-i",
-        input.identity,
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        "-o",
-        "ConnectTimeout=30",
-        `root@${input.host}`,
-        "kubectl",
-        "-n",
-        input.namespace,
-        "get",
-        "requests.http.m.crossplane.io",
-        "-l",
-        `crossplane.io/composite=${input.name}`,
-        "--request-timeout=20s",
-        "-o",
-        "json",
-      ],
-      { timeout: 40_000, maxBuffer: 4 * 1024 * 1024 }
-    );
-    const parsed = JSON.parse(stdout) as unknown;
-    const items = Array.isArray(record(parsed)?.items)
-      ? (record(parsed)?.items as readonly unknown[])
-      : [];
-    if (items.length === 0) {
-      process.stdout.write(
-        `[compute-workload-diagnostic] no composed http Requests for composite ${input.name}\n`
-      );
-      return;
-    }
-    process.stdout.write(
-      `[compute-workload-diagnostic] composed http Requests (${items.length}) for composite ${input.name}:\n`
-    );
-    for (const item of items) {
-      const meta = record(record(item)?.metadata);
-      const status = record(record(item)?.status);
-      const response = record(status?.response);
-      const reqName = typeof meta?.name === "string" ? meta.name : "(unnamed)";
-      const statusCode =
-        response?.statusCode !== undefined
-          ? String(response.statusCode)
-          : "(absent)";
-      let body: string;
-      try {
-        body =
-          response?.body === undefined
-            ? "(absent)"
-            : typeof response.body === "string"
-              ? response.body
-              : JSON.stringify(response.body);
-      } catch {
-        body = "(unserializable)";
-      }
-      process.stdout.write(
-        `  - request=${reqName} statusCode=${statusCode} body=${body}\n`
-      );
-    }
-  } catch (error: unknown) {
-    process.stdout.write(
-      `[compute-workload-diagnostic] http Request dump skipped: ${classifyReadFailure(error)}\n`
-    );
-  }
-}
-
 function classifyReadFailure(error: unknown): string {
   const detail = record(error);
   const stderr = typeof detail?.stderr === "string" ? detail.stderr : "";
   if (detail?.killed === true) return "read_timeout";
-  if (/\bnot found\b/i.test(stderr)) return "not_observed";
+  if (/\bnot found\b/i.test(stderr)) return "resource_absent";
   if (/\bforbidden\b|\bunauthorized\b/i.test(stderr)) return "read_forbidden";
   if (
     /connection (?:refused|reset|timed out)|no route to host|could not resolve hostname|kex_exchange_identification/i.test(
