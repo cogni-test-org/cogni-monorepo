@@ -162,6 +162,22 @@ ensure_primary_cogni_env
 link_from_primary ".env.cogni"
 link_from_primary ".local-auth"
 
+# Codex requires hook trust per config source. Keep one stable, user-level
+# presenter installed so every local Conductor worktree inherits the
+# already-reviewed hook instead of depending on per-worktree project trust.
+if [[ "${CONDUCTOR_IS_LOCAL:-1}" == "1" ]]; then
+  bash scripts/agent/install-codex-cognition-hook.sh
+fi
+
+# Warm the cognition cache BEFORE the first agent session. The SessionStart hook
+# also writes .cogni/.cognition-cache.md, but it fires too late for the SAME
+# session's AGENTS.md `@import` (Claude Code resolves imports at context assembly,
+# before/at hook time). Pre-populating here is what makes a fresh workspace's
+# FIRST Claude Code boot inject the full bundle instead of an empty import.
+# Best-effort: a failed fetch leaves any existing cache untouched and never
+# blocks setup (the hook retries each session).
+bash scripts/agent/session-cognition.sh >/dev/null 2>&1 || true
+
 pnpm install --offline --frozen-lockfile
 pnpm packages:build
 pnpm worktree:check

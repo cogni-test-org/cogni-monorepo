@@ -86,11 +86,19 @@ import {
   AkashComputeAdapter,
   DrizzleAkashTxAllocationLedger,
   DrizzleComputeCostStore,
+  DrizzleNodeMigrationReportStore,
   DrizzleProviderOutcomeStore,
   KubernetesMigrationJobAdapter,
+  safeHostRoutedVersionProbe,
   safeReadyzProbe,
   safeVersionProbe,
 } from "@/adapters/server";
+import {
+  checkConsoleBalance,
+  classifyConsoleBalance,
+  parseLowWaterUsd,
+  reportConsoleBalance,
+} from "@/features/compute/akash-tx/akash-balance-watch";
 import {
   AkashTxActuator,
   type AkashTxServingProbe,
@@ -212,13 +220,71 @@ const getDb = async (): Promise<Database> => db;
  * answer is permanently 0 the moment 0048 has applied (the constraint makes any other value
  * impossible), so this costs one query and then nothing.
  */
-const legacyScopedReceipts = await db
-  .select({ count: sql<number>`count(*)::int` })
-  .from(akashTxAllocations)
-  .where(
-    sql`${akashTxAllocations.walletScope} !~ ${ACCOUNT_WALLET_SCOPE_PATTERN}`
-  )
-  .then(([row]) => row?.count ?? 0);
+/**
+ * RETRY THE TRANSPORT, NEVER THE VERDICT (bug.5277).
+ *
+ * The gate below must stay fatal when the ledger is UNMIGRATED — that is a safety property and
+ * it is not what this retry touches. But the query throwing because Postgres is momentarily
+ * unreachable is NOT a safety violation, and exiting on it is what killed this actuator ~3s into
+ * startup every time `node-substrate` ran `compose up` on shared Postgres and it answered
+ * `FATAL 57P03 Consistent recovery state has not been yet reached`. Restarts climbed 5 -> 8 in
+ * twenty minutes. While the actuator was down its ledger reads failed, Crossplane could not
+ * determine the result of its creates, and provider-http latched
+ * `crossplane.io/external-create-pending` and refused to proceed — leaving candidate-a
+ * undeployable for FIVE DAYS with one Request pending since 2026-09-23.
+ *
+ * This file already states the intent further down, at the sweeper: "a Console or ledger outage
+ * must never take the actuator". The boot probe was the single path that violated it.
+ *
+ * So: retry the CONNECTION with backoff, and still refuse to serve if the answer, once we can
+ * obtain one, says the ledger is unmigrated. Exhausting the budget is itself fatal — an actuator
+ * that cannot read its ledger must not spend.
+ */
+const LEDGER_PROBE_ATTEMPTS = 10;
+const LEDGER_PROBE_BACKOFF_MS = 3_000;
+
+async function countLegacyScopedReceipts(): Promise<number> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= LEDGER_PROBE_ATTEMPTS; attempt += 1) {
+    try {
+      return await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(akashTxAllocations)
+        .where(
+          sql`${akashTxAllocations.walletScope} !~ ${ACCOUNT_WALLET_SCOPE_PATTERN}`
+        )
+        .then(([row]) => row?.count ?? 0);
+    } catch (error) {
+      lastError = error;
+      if (attempt === LEDGER_PROBE_ATTEMPTS) break;
+      log.warn(
+        {
+          attempt,
+          attempts: LEDGER_PROBE_ATTEMPTS,
+          environment,
+          namespace,
+          cause: error instanceof Error ? error.message : String(error),
+        },
+        "akash_tx_actuator_ledger_probe_retry"
+      );
+      await new Promise((resolve) =>
+        setTimeout(resolve, LEDGER_PROBE_BACKOFF_MS * attempt)
+      );
+    }
+  }
+  log.fatal(
+    {
+      attempts: LEDGER_PROBE_ATTEMPTS,
+      environment,
+      namespace,
+      cause: lastError instanceof Error ? lastError.message : String(lastError),
+    },
+    "akash_tx_actuator_ledger_probe_unreachable"
+  );
+  throw lastError;
+}
+
+const legacyScopedReceipts = await countLegacyScopedReceipts();
 
 try {
   assertLedgerIsAccountScoped(legacyScopedReceipts);
@@ -243,11 +309,24 @@ try {
  * byte-identical to the ComputeWorkload lifecycle adapter's `verifySource`. Never loops —
  * convergence polling is Crossplane's job.
  */
-const probe: AkashTxServingProbe = async ({ endpoints, expectedSourceSha }) => {
+const probe: AkashTxServingProbe = async ({
+  endpoints,
+  expectedSourceSha,
+  publicHost,
+}) => {
   for (const endpoint of endpoints) {
     if (
-      (await safeVersionProbe(endpoint, expectedSourceSha)) &&
-      (await safeReadyzProbe(endpoint))
+      !(await safeVersionProbe(endpoint, expectedSourceSha)) ||
+      !(await safeReadyzProbe(endpoint))
+    ) {
+      continue;
+    }
+    // A hostnamed workload is only serving when the provider's HOST-ROUTED path answers
+    // with the same exact SHA — the bare-ingress proof above cannot see a stale
+    // deployment still owning the public hostname (bug.5237).
+    if (!publicHost) return true;
+    if (
+      await safeHostRoutedVersionProbe(endpoint, publicHost, expectedSourceSha)
     ) {
       return true;
     }
@@ -259,8 +338,13 @@ const preferredProviders = (runtimeEnv.AKASH_PREFERRED_PROVIDERS ?? "")
   .split(",")
   .map((value) => value.trim())
   .filter(Boolean);
-// An empty configured boundary intentionally rejects every provider; provider-enabled
-// environments must opt in their reachable accounts (same contract as the controller).
+// OPTIONAL PIN, NOT A GATE (story.5050). An empty or unset value means "no pin" — bids are
+// screened on policy alone: the SDL `signedBy` audit anchor, the node catalog's fail-closed
+// `required_placement_countries`, the quality filter, price-outlier exclusion, and the derived
+// strike blacklist. It used to mean "refuse every provider", which is why a blanked overlay
+// value (d69e5c29) could close every auction fleet-wide and why an 11-address enumeration,
+// 5 slots of which had gone dead, was the real single-vendor constraint. A NON-EMPTY value
+// still narrows leasing to exactly those accounts, so an operator can force a set on demand.
 const allowedProviders = (runtimeEnv.AKASH_ALLOWED_PROVIDERS ?? "")
   .split(",")
   .map((value) => value.trim())
@@ -287,10 +371,29 @@ const consoleClient = new AkashComputeAdapter({
  * public, git-reviewable account id proves the thing that matters. Any failure (mismatch, empty
  * account set, or Console unreachable) exits non-zero: an unproven wallet is not a degraded mode.
  */
+/**
+ * Low-water balance alarm (story.5013, bug.5302): the account silently hit $0 and the fleet's
+ * leases died over hours with no warning. Threshold is plain env config (USD major units);
+ * absent/invalid falls back to a sane default rather than to no alarm.
+ */
+const balanceLowWaterUsd = parseLowWaterUsd(runtimeEnv.AKASH_BALANCE_LOW_WATER);
+
 try {
-  assertActuatorWalletAccount(
-    wallet.expectedAccountId,
-    await consoleClient.balances()
+  const bootBalances = await consoleClient.balances();
+  assertActuatorWalletAccount(wallet.expectedAccountId, bootBalances);
+  // The wallet-verification read IS a balance observation — classify it for free, so the
+  // alarm state is known from the first boot line, not only after the first interval tick.
+  reportConsoleBalance(
+    classifyConsoleBalance(
+      bootBalances,
+      wallet.expectedAccountId,
+      balanceLowWaterUsd
+    ),
+    {
+      expectedAccountId: wallet.expectedAccountId,
+      lowWaterUsd: balanceLowWaterUsd,
+      log,
+    }
   );
   log.info(
     {
@@ -332,6 +435,11 @@ const actuator = new AkashTxActuator({
   costEvidence: consoleClient,
   costStore: new DrizzleComputeCostStore(getDb),
   providerConsumerAccountId: wallet.expectedAccountId,
+  // task.5153 — the actuator is now the LIVE writer of provider strikes/boot outcomes
+  // (recovery-entry + serving-proof), feeding the same durable history the Console
+  // adapter's screening reads above. One store instance would also do; a second handle
+  // on the same table is harmless and keeps the seams independent.
+  outcomes: new DrizzleProviderOutcomeStore(getDb),
   log,
   probe,
   /**
@@ -351,6 +459,13 @@ const actuator = new AkashTxActuator({
     namespace,
     log
   ),
+  /**
+   * APPLIED migration state as operator-held deployment metadata. The migrator inside the node's
+   * own workload prints what it applied; this seam stores that receipt in the OPERATOR's Postgres
+   * — the same `getDb` the spend ledger uses. No credential here can read a node's database
+   * (docs/spec/multi-node-tenancy.md NO_CROSS_NODE_QUERIES); the operator holds metadata only.
+   */
+  migrationReports: new DrizzleNodeMigrationReportStore(getDb),
 });
 
 const server = createAkashTxActuatorServer({
@@ -410,6 +525,24 @@ const sweepTimer = setInterval(() => {
 sweepTimer.unref();
 
 /**
+ * Balance observation cadence. The depletion took hours to kill the fleet, so 15 minutes
+ * gives many alertable lines inside the reaction window without adding meaningful Console
+ * read load. Failures are logged and swallowed inside `checkConsoleBalance` — a Console
+ * outage must never take the wallet writer down (same doctrine as the sweeper above).
+ */
+const BALANCE_CHECK_INTERVAL_MS = 15 * 60_000;
+
+const balanceTimer = setInterval(() => {
+  void checkConsoleBalance({
+    readBalances: () => consoleClient.balances(),
+    expectedAccountId: wallet.expectedAccountId,
+    lowWaterUsd: balanceLowWaterUsd,
+    log,
+  });
+}, BALANCE_CHECK_INTERVAL_MS);
+balanceTimer.unref();
+
+/**
  * A paid allocation call can spend 30s creating, 90s screening bids, then 30s
  * opening the lease.  The deployment handle is durably published between the
  * first and second phases, so killing the process during bid screening leaves
@@ -422,6 +555,7 @@ const ACTUATOR_DRAIN_TIMEOUT_MS = 180_000;
 function shutdown(signal: string): void {
   log.info({ signal }, "akash_tx_actuator_stopping");
   clearInterval(sweepTimer);
+  clearInterval(balanceTimer);
   // Stop accepting new work and let the one wallet transaction already in flight finish.
   // The durable receipt prevents a second writer; finishing this request prevents a rollout
   // from stranding its handle between deployment creation and provider lease selection.

@@ -115,10 +115,24 @@ export const AkashTxDeprecatedMigrationSchema = z.object({
   policy: z.enum(["Skip", "RequireBeforeTransaction", "RequireBeforeServing"]),
 });
 
+/**
+ * Hard placement requirement for this workload (story.5050). Provider-agnostic ISO 3166-1
+ * alpha-2 — a CONSTRAINT, not a provider identity, so it does not breach the wire's rule that
+ * bids, providers, SDL and dseq never appear here. `min(1)` mirrors the catalog: an empty list
+ * is a typo, never a wildcard, and the actuator fails closed so it would refuse every bid.
+ */
+export const AkashTxPlacementSchema = z.strictObject({
+  requiredCountryCodes: z
+    .array(z.string().regex(/^[A-Z]{2}$/))
+    .min(1)
+    .max(32),
+});
+
 /** The provider-agnostic workload contract (mirrors ProvisionSpec). */
 export const AkashTxSpecSchema = z.strictObject({
   name: ServiceNameSchema,
   services: z.array(AkashTxServiceSpecSchema).min(1),
+  placement: AkashTxPlacementSchema.optional(),
 });
 
 /** Caller-owned idempotency key. Must embed the caller's resource revision. */
@@ -158,6 +172,26 @@ const SourceShaSchema = z
   .string()
   .regex(/^[0-9a-f]{40}$/, "expected a full sha");
 
+const CompositeFailureReasonSchema = z
+  .string()
+  .regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/, "expected an XRD reason token");
+
+/**
+ * The verdict the composite computed and wrote to its OWN status on the previous tick
+ * (bug.5416). REPORT-ONLY by construction: it rides `observe`, the unpaid tick, and no field of
+ * it appears on the create/update/delete bodies, which enumerate their own keys precisely so a
+ * field added for another action can never reach the wire that spends money.
+ *
+ * `failureReason` is bounded to the pattern the XRD already constrains
+ * `status.failure.reason` to. That bound is the point: one token, no separators, 128 chars, so
+ * the verdict is readable as an enum and can never carry a message, a SHA or a lease handle.
+ * The matching `failure.message` is free text and is deliberately NOT on this wire.
+ */
+export const AkashTxCompositeVerdictSchema = z.strictObject({
+  phase: z.enum(["Progressing", "Ready", "Failed"]),
+  failureReason: CompositeFailureReasonSchema,
+});
+
 /**
  * Observe is the UNPAID tick: no wallet slot, no Console POST, no ledger claim. That is exactly
  * why the release-side migration step rides here and not on create/update — asking a question
@@ -167,6 +201,12 @@ export const AkashTxObserveInputSchema = z.strictObject({
   cogniKey: CogniKeySchema,
   externalName: ExternalNameSchema.optional(),
   expectedSourceSha: SourceShaSchema.optional(),
+  /**
+   * The workload's public hostname. When present, the serving probe must prove the exact
+   * SHA through the provider's host-routed path too — the bare lease ingress alone cannot
+   * see a stale deployment still owning the hostname (bug.5237).
+   */
+  publicHost: z.string().min(1).max(253).optional(),
   migration: AkashTxMigrationStepSchema.optional(),
   /**
    * WHOSE database the attached migration step belongs to. Required in practice whenever
@@ -177,6 +217,12 @@ export const AkashTxObserveInputSchema = z.strictObject({
    */
   workload: ServiceNameSchema.optional(),
   environment: EnvironmentSchema.optional(),
+  /**
+   * What the COMPOSITE decided last tick, stated by the composite itself (bug.5416). Optional
+   * so an observe from a composition that does not send it stays byte-identical to the
+   * pre-bug.5416 wire — which is the whole reason this reader ships BEFORE the sender does.
+   */
+  composite: AkashTxCompositeVerdictSchema.optional(),
 });
 
 export const AkashTxCreateInputSchema = z.strictObject({
@@ -206,6 +252,36 @@ export const AkashTxUpdateInputSchema = z.strictObject({
 export const AkashTxDeleteInputSchema = z.strictObject({
   cogniKey: CogniKeySchema,
   externalName: ExternalNameSchema,
+});
+
+/**
+ * Lease-log source enumeration (bug.5240). Unlike the four Crossplane ops above, this wire
+ * DELIBERATELY exposes lease coordinates (dseq/gseq/oseq/provider): its caller is the
+ * lease-log-pump, whose whole job is reading provider logs, and the coordinates plus a
+ * logs-scoped ephemeral JWT are exactly the least capability that job needs.
+ */
+export const AkashTxLeaseLogSourcesInputSchema = z.strictObject({
+  environment: EnvironmentSchema.optional(),
+  limit: z.number().int().min(1).max(64).optional(),
+});
+
+export const AkashTxLeaseLogSourceSchema = z.strictObject({
+  nodeId: z.string().uuid(),
+  workload: z.string().min(1).max(64),
+  environment: EnvironmentSchema,
+  dseq: z.string().min(1).max(32),
+  gseq: z.number().int().positive(),
+  oseq: z.number().int().positive(),
+  providerAccount: z.string().min(1).max(64),
+  providerHostUri: z.string().url(),
+  services: z.array(z.string().min(1).max(64)).max(16),
+});
+
+export const AkashTxLeaseLogSourcesOutputSchema = z.strictObject({
+  sources: z.array(AkashTxLeaseLogSourceSchema).max(64),
+  /** Logs-scoped provider JWT covering every source. Empty when `sources` is empty. */
+  token: z.string(),
+  ttlSeconds: z.number().int().nonnegative(),
 });
 
 export const AkashTxResourceSchema = z.strictObject({
@@ -243,7 +319,13 @@ export const AkashTxErrorOutputSchema = z.strictObject({
 export type AkashTxMigrationStep = z.infer<typeof AkashTxMigrationStepSchema>;
 export type AkashTxMigrationPhase = z.infer<typeof AkashTxMigrationPhaseSchema>;
 export type AkashTxIdentity = z.infer<typeof AkashTxIdentitySchema>;
+export type AkashTxCompositeVerdict = z.infer<
+  typeof AkashTxCompositeVerdictSchema
+>;
 export type AkashTxObserveInput = z.infer<typeof AkashTxObserveInputSchema>;
+export type AkashTxLeaseLogSourcesInput = z.infer<
+  typeof AkashTxLeaseLogSourcesInputSchema
+>;
 export type AkashTxCreateInput = z.infer<typeof AkashTxCreateInputSchema>;
 export type AkashTxUpdateInput = z.infer<typeof AkashTxUpdateInputSchema>;
 export type AkashTxDeleteInput = z.infer<typeof AkashTxDeleteInputSchema>;

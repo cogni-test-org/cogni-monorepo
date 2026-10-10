@@ -1,5 +1,13 @@
 name: Promote and Deploy
 
+# run-name self-labels each run's lane in the Actions list so a preview run
+# (auto, from flight-preview.yml on merge) is distinguishable at a glance from a
+# production run (operator dispatchNodePromote), instead of being reverse-engineered
+# mid-incident. Display metadata only — no behavior, no branching (freeze-safe).
+# GitHub's workflow-runs API does not expose dispatch inputs, so run-name is the
+# only place (node, env, build_sha) becomes readable off a run.
+run-name: "Promote & Deploy · ${{ inputs.nodes || 'all-nodes' }} · ${{ inputs.environment }} · ${{ inputs.build_sha || inputs.source_sha || 'preview-forward' }}"
+
 # Spec: work/items/task.0376 (per-node lane isolation, preview + production matrix).
 # Companion to candidate-flight.yml (task.0372). Same primitive: matrix-fanned
 # per-node cells push to deploy/<env>-<node>; aggregator computes current-sha
@@ -423,6 +431,8 @@ jobs:
     runs-on: ubuntu-latest
     # Identity, secrets and deployment variables follow the control env for Akash. The lane
     # remains `needs.decide.outputs.environment` everywhere desired state is named/written.
+    # Identity, secrets and deployment variables follow the control env for Akash. The lane
+    # remains `needs.decide.outputs.environment` everywhere desired state is named/written.
     environment: ${{ fromJSON(needs.decide.outputs.deployment_provider_by_target_json)[matrix.node] == 'akash' && (vars.FLEET_CONTROL_ENV || 'production') || needs.decide.outputs.environment }}
     env:
       DEPLOYMENT_PROVIDER: ${{ fromJSON(needs.decide.outputs.deployment_provider_by_target_json)[matrix.node] }}
@@ -474,6 +484,10 @@ jobs:
           OPERATOR_SOURCE_SHA: ${{ needs.decide.outputs.head_sha }}
           CATALOG_SOURCE_SHA: ${{ fromJSON(needs.decide.outputs.source_sha_by_target_json)[matrix.node] }}
           PREVIEW_SOURCE_SHA_MAP: ${{ github.workspace }}/preview-src/.promote-state/source-sha-by-app.json
+          # Did the CALLER name its targets? The operator API always dispatches ONE named
+          # node, and for a named node a missing image must fail loudly rather than skip
+          # into a green run (bug.5248). Empty = fleet fan-out, where skipping is correct.
+          EXPLICIT_TARGETS: ${{ inputs.nodes }}
         run: |
           set -euo pipefail
           # shellcheck source=scripts/ci/lib/image-tags.sh
@@ -538,7 +552,11 @@ jobs:
                 | grep -oP 'Digest:\s+\Ksha256:[a-f0-9]+' | head -1 || true)
             fi
             if [ -z "$digest_only" ]; then
-              echo "::warning::Image not found: $full_tag (not built — skipping $NODE)"
+              if [ "$(missing_image_action "$EXPLICIT_TARGETS")" = "fail" ]; then
+                echo "::error::Image not found: $full_tag — $NODE was named by the caller, so skipping it would report SUCCESS for a promote that did nothing (bug.5248). A catalog/GitOps-only merge builds no app image; promote a sha whose image exists."
+                exit 1
+              fi
+              echo "::warning::Image not found: $full_tag (fleet fan-out, $NODE not rebuilt — skipping)"
               echo "digest=" >> "$GITHUB_OUTPUT"
               echo "promoted=false" >> "$GITHUB_OUTPUT"
               exit 0
@@ -640,7 +658,15 @@ jobs:
         env:
           APP: ${{ matrix.node }}
           SOURCE_SHA: ${{ steps.digest.outputs.source_sha }}
-        run: bash ../app-src/scripts/ci/update-source-sha-map.sh
+          NODE: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          # PIN_IS_NEVER_REPINNED_TO_BIRTH (bug.5306) — hand the guard this node's catalog
+          # birth sha so it can refuse a silent rollback. Absent/unreadable leaves the guard
+          # inert, which is the pre-bug.5306 behaviour.
+          CATALOG_BIRTH_SHA="$(yq -N '.source_sha // ""' "../app-src/infra/catalog/${NODE}.yaml" 2>/dev/null || true)"
+          export CATALOG_BIRTH_SHA
+          bash ../app-src/scripts/ci/update-source-sha-map.sh
 
       - name: Commit and push
         id: push
@@ -685,17 +711,37 @@ jobs:
           path: out/
           retention-days: 1
 
+  flight-probe-project:
+    needs: decide
+    if: needs.decide.outputs.has_node_targets == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ${{ fromJson(needs.decide.outputs.node_targets_json) }}
+    uses: ./.github/workflows/flight-probe-project.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      lane: ${{ needs.decide.outputs.environment }}
+      node: ${{ matrix.node }}
+      operation: materialize
+    secrets:
+      VM_HOST: ${{ secrets.VM_HOST }}
+      SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+
   # Per-node provider preflight on EVERY env (Invariants 16-17). All nodes
   # materialize source:agent secrets and reconcile placement-neutral state (DB,
   # ExternalSecret, shared runtime inventory). Only placement-specific steps branch:
   # k3s owns Caddy/NodePort edge mutation; Akash adds read-only controller/credential/
   # secret/egress assertions before promote-k8s writes a ComputeWorkload generation.
   node-substrate:
-    needs: [decide, reconcile-appset, reconcile-dns]
+    needs: [decide, reconcile-appset, reconcile-dns, flight-probe-project]
     if: |
       always() &&
       needs.decide.outputs.has_node_targets == 'true' &&
       needs.reconcile-appset.result == 'success' &&
+      (needs.flight-probe-project.result == 'success' || needs.flight-probe-project.result == 'skipped') &&
       (
         needs.reconcile-dns.result == 'success' ||
         (needs.decide.outputs.has_k3s_node_targets != 'true' && needs.reconcile-dns.result == 'skipped')
@@ -716,6 +762,15 @@ jobs:
     env:
       DEPLOYMENT_PROVIDER: ${{ fromJSON(needs.decide.outputs.deployment_provider_by_target_json)[matrix.node] }}
     steps:
+      # Deployment tooling follows the workflow ref, not the application image
+      # being promoted. Otherwise a forward promotion of an older, already-built
+      # app SHA executes stale substrate logic and cannot be repaired by a
+      # workflow-only fix on main.
+      - name: Checkout workflow tooling
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          path: ci-src
+
       - name: Checkout app source
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
         with:
@@ -809,7 +864,7 @@ jobs:
           DOMAIN: ${{ vars.DOMAIN }}
           APP_SOURCE_DIR: app-src
           COGNI_CATALOG_ROOT: app-src/infra/catalog
-        run: bash app-src/scripts/ci/run-node-substrate.sh "${{ needs.decide.outputs.environment }}" "${{ matrix.node }}"
+        run: bash ci-src/scripts/ci/run-node-substrate.sh "${{ needs.decide.outputs.environment }}" "${{ matrix.node }}"
 
   deploy-infra:
     if: |
@@ -1050,7 +1105,10 @@ jobs:
         run: |
           set -euo pipefail
           source app-src/scripts/setup/lib/cogni-deployment-identity.sh
-          if [ "$DEPLOY_ENVIRONMENT" = "preview" ]; then
+          # k3s jobs already read the lane-scoped GitHub environment, whose DOMAIN is the
+          # final public host. Akash jobs read the fleet-control environment, so only that
+          # foreign-control case needs the preview prefix derived from its configured apex.
+          if [ "$DEPLOY_ENVIRONMENT" = "preview" ] && [ "$DEPLOYMENT_PROVIDER" != "k3s" ]; then
             LANE_DOMAIN="$(cogni_operator_domain_for_env preview "${DOMAIN:?}")" || {
               echo "::error::cannot derive public domain for lane '$DEPLOY_ENVIRONMENT'"
               exit 1

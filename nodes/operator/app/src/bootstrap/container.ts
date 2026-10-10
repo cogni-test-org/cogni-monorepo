@@ -101,12 +101,14 @@ import {
   DrizzleThreadPersistenceAdapter,
   EvmRpcOnChainVerifierAdapter,
   GITHUB_ADAPTER_VERSION,
+  GitHubNodeDeploymentTopologyAdapter,
   GitHubWebhookNormalizer,
   getAppDb,
   LangfuseAdapter,
   LiteLlmAdapter,
   type MimirAdapterConfig,
   MimirMetricsAdapter,
+  PublicGitHubNodeDeploymentFileReader,
   RedisRunStreamAdapter,
   SplitPaymentRailGuardAdapter,
   SystemClock,
@@ -144,6 +146,7 @@ import {
   createNodeAddressResolver,
 } from "@/adapters/server/node-registry/node-address.adapter";
 import { StaticNodeRegistryAdapter } from "@/adapters/server/node-registry/static-node-registry.adapter";
+import { DrizzleNodeMigrationReportStore } from "@/adapters/server/observability/drizzle-node-migration-report.adapter";
 import { ServiceDrizzlePaymentAttemptRepository } from "@/adapters/server/payments/drizzle-payment-attempt.adapter";
 import { SplitTreasurySettlementAdapter } from "@/adapters/server/treasury/split-treasury-settlement.adapter";
 import {
@@ -190,6 +193,7 @@ import type {
   AiTelemetryPort,
   Clock,
   ComputeCostReport,
+  ComputeCostStorePort,
   ConnectionBrokerPort,
   DataSourceRegistration,
   EpochsRead,
@@ -199,6 +203,8 @@ import type {
   MetricsQueryPort,
   ModelCatalogPort,
   ModelProviderResolverPort,
+  NodeDeploymentTopologyPort,
+  NodeMigrationReportStorePort,
   NodeRegistryPort,
   OnChainVerifier,
   OperatorWalletPort,
@@ -237,6 +243,7 @@ import {
 } from "@/shared/config";
 import { nodes } from "@/shared/db/nodes";
 import { serverEnv } from "@/shared/env/server-env";
+import { resolveNodeCatalogSource } from "@/shared/node-registry/catalog-source";
 import { envForApex } from "@/shared/node-registry/deploy-hosts";
 import { baseDomain } from "@/shared/node-registry/resolve";
 import { makeLogger } from "@/shared/observability";
@@ -308,6 +315,12 @@ export interface Container {
   vcsCapability: VcsCapability;
   /** Read-only deploy capability (SEE flow) — undefined when no base domain is configured */
   deployCapability: DeployCapability | undefined;
+  /**
+   * APPLIED migration state as operator-held deployment metadata (`node_migration_reports`).
+   * Read-only on this runtime: the app SERVES receipts, the actuator's migration step WRITES them.
+   * Metadata, never node data access — there is no DSN here for any `cogni_<node>`.
+   */
+  nodeMigrationReportStore: NodeMigrationReportStorePort | undefined;
   /** Tool source with real implementations for AI tool execution */
   toolSource: ToolSourcePort;
   /** External-agent knowledge contribution service — undefined when DOLTGRES_URL is unset */
@@ -735,6 +748,13 @@ function createContainer(): Container {
   // DeployCapability (read-only SEE flow) — probe-backed v0; undefined when no base domain.
   const deployCapability = createDeployCapability(env);
 
+  // Applied-migration readout (the schema readout): a plain read of the OPERATOR's own Postgres.
+  // The rows get there because the node's own migrator reported them, so this seam is metadata,
+  // never node data access (docs/spec/multi-node-tenancy.md NO_CROSS_NODE_QUERIES).
+  const nodeMigrationReportStore = new DrizzleNodeMigrationReportStore(
+    async () => serviceDb
+  );
+
   // KnowledgeCapability + EdoCapability for AI tools (require DOLTGRES_URL)
   let knowledgeCapability: KnowledgeCapability;
   let edoCapability: EdoCapability;
@@ -755,8 +775,23 @@ function createContainer(): Container {
       store: knowledgePort,
     });
     edoCapability = createEdoCapability(knowledgePort, edoResolver);
+    // Branch work gets its own `max: 1` client, deliberately NOT the pool that
+    // serves reads. Dolt branch ops need a session-pinned connection; bounding
+    // them above the pool (FIFO + advisory lock, see `DoltBranchSessionRunner`)
+    // is what keeps a burst of admin rejects from burning every slot — and
+    // keeping them off the read pool is what keeps knowledge reads alive while
+    // a write is degraded (bug.5391, bug.5358).
+    const createKnowledgeBranchClient = () =>
+      buildDoltgresClient({
+        connectionString: env.DOLTGRES_URL as string,
+        applicationName: `cogni_knowledge_branch_${env.SERVICE_NAME ?? "app"}`,
+        max: 1,
+      });
     const contributionPort = new DoltgresKnowledgeContributionAdapter({
       sql: doltClient,
+      branchSql: createKnowledgeBranchClient(),
+      recreateBranchClient: createKnowledgeBranchClient,
+      logger: log,
     });
     const remoteUrl = resolveNodeKnowledgeRemoteUrl({
       slug: getNodeName(),
@@ -781,7 +816,6 @@ function createContainer(): Container {
     knowledgeContributionService = createContributionService({
       port: contributionPort,
       canMergeKnowledge: defaultCanMergeKnowledge,
-      rateLimit: { maxOpenPerPrincipal: 10 },
       // v0 write-pipeline: shape gate only on the contribution path.
       // Provenance is stamped by the adapter (`source_type='external'`,
       // `source_ref='contribution:<id>:<seq>'`), so the provenance gate is
@@ -817,7 +851,7 @@ function createContainer(): Container {
 
   let doltgresWorkItems: WorkItemsDoltgresPort;
   try {
-    doltgresWorkItems = getDoltgresWorkItemsAdapter();
+    doltgresWorkItems = getDoltgresWorkItemsAdapter(log);
   } catch (e) {
     if (!(e instanceof DoltgresNotConfiguredError)) throw e;
     const notConfigured = () => {
@@ -829,6 +863,12 @@ function createContainer(): Container {
       create: notConfigured,
       patch: notConfigured,
       delete: notConfigured,
+      // The shared port carries the creator-bound lease lifecycle. Operator's
+      // own 409-line adapter had no counterpart, so this stub predates them;
+      // they must still fail closed with the same error rather than be absent.
+      claim: notConfigured,
+      heartbeat: notConfigured,
+      release: notConfigured,
     };
   }
 
@@ -1092,6 +1132,7 @@ function createContainer(): Container {
     repoCapability,
     vcsCapability,
     deployCapability,
+    nodeMigrationReportStore,
     toolSource,
     knowledgeContributionService,
     knowledgeStorePort,
@@ -1204,6 +1245,41 @@ export function resolveAppDb(): Database {
  */
 export function resolveServiceDb(): Database {
   return getServiceDb();
+}
+
+let cachedComputeCostStore: ComputeCostStorePort | undefined;
+
+/**
+ * Resolve the read/write compute cost ledger behind its provider-neutral port.
+ * Dashboard callers must use `reportByNodeIds` after resolving principal access.
+ */
+export function resolveComputeCostStore(): ComputeCostStorePort {
+  cachedComputeCostStore ??= new DrizzleComputeCostStore(async () =>
+    resolveServiceDb()
+  );
+  return cachedComputeCostStore;
+}
+
+let cachedNodeDeploymentTopology: NodeDeploymentTopologyPort | undefined;
+
+/**
+ * Resolve the display-safe reader for the exact environment deploy state Argo consumes.
+ * The GitHub App is read-only at this seam; missing configuration is allowed to degrade the
+ * dashboard's Services module without affecting deployment, cost, or governance reads.
+ */
+export function resolveNodeDeploymentTopology(): NodeDeploymentTopologyPort {
+  const env = serverEnv();
+  const catalog = resolveNodeCatalogSource(env);
+  if (!catalog) {
+    throw new Error(
+      "node deployment topology requires a configured catalog source"
+    );
+  }
+  cachedNodeDeploymentTopology ??= new GitHubNodeDeploymentTopologyAdapter(
+    new PublicGitHubNodeDeploymentFileReader(),
+    catalog
+  );
+  return cachedNodeDeploymentTopology;
 }
 
 /**

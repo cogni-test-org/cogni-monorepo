@@ -154,6 +154,18 @@ export PAYMENT_NODES="${PAYMENT_NODES:-poly}"
 [[ -n "${DOMAIN:-}" ]] || fail "DOMAIN is required (derive-env keys build the node FQDN)"
 export DOMAIN
 
+# bug.5240 — CI-derived bootstrap for the lease-log pump's Loki push credential.
+# The lease-log pump (operator control plane) needs LOKI_LEASE_PUSH_{URL,USER,TOKEN} at
+# cogni/<env>/operator or its projected mount fails (bug.5142 ordering). Until a human
+# mints the DEDICATED logs:write token the catalog asks for, fall back to the CI Loki
+# credential the workflows already hold — same trust plane (the token never leaves the
+# operator control plane; the app-push lane that shipped it into leases is superseded).
+# Passthrough seeding below is create-if-absent, so a later `pnpm secrets:set` with a
+# dedicated token is never clobbered. Empty CI env ⇒ the keys are simply skipped.
+export LOKI_LEASE_PUSH_URL="${LOKI_LEASE_PUSH_URL:-${GRAFANA_CLOUD_LOKI_URL:-}}"
+export LOKI_LEASE_PUSH_USER="${LOKI_LEASE_PUSH_USER:-${GRAFANA_CLOUD_LOKI_USER:-}}"
+export LOKI_LEASE_PUSH_TOKEN="${LOKI_LEASE_PUSH_TOKEN:-${GRAFANA_CLOUD_LOKI_API_KEY:-}}"
+
 # shellcheck source=../setup/lib/reconcile-secrets.sh
 # Provides NODE_BASELINE_KEYS, derive_secret, and _resolve_node_value
 # (preserve-existing + per-node generate; no blind ancestor scan). External
@@ -210,26 +222,19 @@ bao_exec() {
 # bug.5159 — a TRANSPORT failure (ssh drop, exec hiccup, OpenBao down) must never read
 # as an EMPTY BUCKET: that lie cascades into "key absent" errors downstream, and worse,
 # a false-empty cache would let materialize re-mint values that already exist. Only the
-# unborn path — signalled EITHER by the "No value found" text (table mode) OR by bao
-# exit status 2 under -format=json — maps to {}; every other non-zero is retried and
-# then fatal, naming the transport.
+# explicit "No value found" answer (a genuinely unborn path) maps to {}; anything else
+# is retried and then fatal, naming the transport.
 prefetch_path() {
-  local svc="$1" env="${2:-$DEPLOY_ENVIRONMENT}" ns="${3:-$1}" json raw attempt rc
+  local svc="$1" env="${2:-$DEPLOY_ENVIRONMENT}" ns="${3:-$1}" json raw attempt
   raw=""
   for attempt in 1 2 3; do
-    raw="$(bao_exec "" "kv get -format=json 'cogni/${env}/${svc}'" 2>&1)" && break
-    rc=$?
-    # bug.5159 — a TRANSPORT failure must never read as an empty bucket. An ABSENT path is
-    # two equivalent signals: the "No value found" text (table mode), OR bao's own exit
-    # status 2 ("no value found at path") — the ONLY thing an unborn path surfaces under
-    # `-format=json`, where kubectl exec relays it as "command terminated with exit code 2"
-    # and DROPS the text (bug.5206: silently failed the candidate flight of a never-in-prod
-    # node). Every OTHER non-zero (ssh 255, kubectl 1, OpenBao down) still retries+fatals.
+    if raw="$(bao_exec "" "kv get -format=json 'cogni/${env}/${svc}'" 2>&1)"; then
+      break
+    fi
     case "$raw" in
       *"No value found"*) raw='{}'; break ;;
     esac
-    [[ "$rc" -eq 2 ]] && { raw='{}'; break; }
-    echo "[secret-materialize] OpenBao read cogni/${env}/${svc} attempt ${attempt}/3 failed (rc=${rc}): $(printf '%s' "$raw" | tail -1)" >&2
+    echo "[secret-materialize] OpenBao read cogni/${env}/${svc} attempt ${attempt}/3 failed: $(printf '%s' "$raw" | tail -1)" >&2
     [[ "$attempt" == 3 ]] && { echo "::error::secret-materialize: transport failure reading cogni/${env}/${svc} after 3 attempts — NOT an absent path (bug.5159)" >&2; exit 1; }
     sleep $((attempt * 5))
   done
