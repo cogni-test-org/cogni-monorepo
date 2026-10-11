@@ -50,7 +50,9 @@ done
 
 # bug.5094 — the value that actually reaches a cluster is the per-env overlay map,
 # and each node's address must follow its OWN catalog placement for THAT env.
-FORK_ROOT="${FORK_DOMAIN_ROOT:-cognidao.org}"
+# Keep expectation derivation byte-aligned with render-scheduler-worker-endpoints.sh.
+# Isolated fleets deliberately separate their workload and substrate domains.
+FORK_ROOT="${DOMAIN:-${FORK_DOMAIN_ROOT:-cognidao.org}}"
 # shellcheck source=scripts/setup/lib/fork-identity.sh
 source "$REPO_ROOT/scripts/setup/lib/fork-identity.sh"
 # shellcheck source=scripts/setup/lib/cogni-deployment-identity.sh
@@ -150,7 +152,8 @@ yq ".name = \"za\" | .path_prefix = \"nodes/za/\" | .node_port = 30402 | .image_
 
 assert_endpoint() {
   local env="$1" want_zk="$2" want_za="$3" csv
-  csv="$(COGNI_CATALOG_ROOT="$PLACEMENT_CATALOG" FORK_DOMAIN_ROOT=example.test \
+  # Clear ambient DOMAIN so this fixture exercises the legacy fork-root fallback.
+  csv="$(COGNI_CATALOG_ROOT="$PLACEMENT_CATALOG" DOMAIN='' FORK_DOMAIN_ROOT=example.test \
     bash scripts/ci/render-scheduler-worker-endpoints.sh --env "$env")" \
     || fail "placement render failed for env $env"
   case ",$csv," in

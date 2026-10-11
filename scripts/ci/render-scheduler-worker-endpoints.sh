@@ -43,10 +43,10 @@ DEPLOYMENT_PATH="$REPO_ROOT/infra/k8s/base/scheduler-worker/deployment.yaml"
 OVERLAY_ROOT="$REPO_ROOT/infra/k8s/overlays"
 PATCH_BASENAME="node-endpoints.patch.yaml"
 
-# The zone this repo's public hosts hang off. Same default the flight workflows
-# use (`vars.FORK_DOMAIN_ROOT || 'cognidao.org'`), so the committed artifact and
-# the CI drift gate agree; a fork exports FORK_DOMAIN_ROOT and re-runs --write.
-FORK_ROOT="${FORK_DOMAIN_ROOT:-cognidao.org}"
+# The public WORKLOAD zone this repo's node hosts hang off. DOMAIN wins when an
+# isolated fleet deliberately separates workload DNS from its substrate root;
+# FORK_DOMAIN_ROOT remains the backward-compatible fallback for plain forks.
+FORK_ROOT="${DOMAIN:-${FORK_DOMAIN_ROOT:-cognidao.org}}"
 
 # The deploy envs, derived — never a hand-kept env list. Placement is a property of
 # a row, not a gate on the env set (PLACEMENT_DOES_NOT_GATE_PROVISIONING, see
