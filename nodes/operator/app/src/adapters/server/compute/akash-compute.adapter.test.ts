@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
 // SPDX-FileCopyrightText: 2026 Cogni-DAO
 
+import { createHash } from "node:crypto";
+
 import { describe, expect, it, vi } from "vitest";
 import { parse as parseYaml } from "yaml";
 import {
@@ -565,6 +567,40 @@ describe("buildAkashSdl", () => {
   });
 });
 
+describe("AkashComputeAdapter.sdlHash", () => {
+  const noopFetch = vi.fn<typeof fetch>(async () => jsonResponse({}));
+
+  it("returns the sha256 of the exact SDL bytes it would PUT (bug.5238)", () => {
+    const adapter = makeAdapter(noopFetch);
+    // The adapter defaults to uakt/10_000 pricing + the Overclock auditor (see its constructor),
+    // so the hash it emits is sha256 over exactly that render.
+    const expected = createHash("sha256")
+      .update(
+        buildAkashSdl(SPEC, {
+          pricingDenom: "uakt",
+          pricingAmount: 10_000,
+          auditors: [AKASH_OVERCLOCK_AUDITOR],
+        })
+      )
+      .digest("hex");
+    expect(adapter.sdlHash(SPEC)).toBe(expected);
+  });
+
+  it("is stable for an identical spec and differs for any spec change", () => {
+    const adapter = makeAdapter(noopFetch);
+    expect(adapter.sdlHash(SPEC)).toBe(adapter.sdlHash(SPEC));
+
+    const changed = {
+      ...SPEC,
+      services: [
+        { ...SPEC.services[0], image: "ghcr.io/cogni-dao/toks4:sha-def" },
+        SPEC.services[1],
+      ],
+    };
+    expect(adapter.sdlHash(changed)).not.toBe(adapter.sdlHash(SPEC));
+  });
+});
+
 describe("AkashComputeAdapter", () => {
   it("maps the managed wallet's micro-unit allowance to a USD ComputeBalance", async () => {
     const fetchImpl = vi.fn<typeof fetch>(async (url, init) => {
@@ -669,6 +705,82 @@ describe("AkashComputeAdapter", () => {
     );
   });
 
+  /**
+   * story.5050 END TO END. The requirement rides the ProvisionSpec, so this is the assertion
+   * that the adapter's threading (`withPlacement`) actually reaches bid screening. Without it
+   * the catalog cell, XRD field, Composition lowering and wire contract are all inert and a
+   * geo-constrained node still places in a refused jurisdiction — silently.
+   */
+  it("refuses a provider outside the spec's required countries, even when it is the only cheap bid", async () => {
+    const h = harness({
+      providers: [
+        providerEntry("akash1be", { ipCountryCode: "BE" }),
+        providerEntry("akash1pt", { ipCountryCode: "PT" }),
+      ],
+      bids: (dseq) => [
+        bidEntry(dseq, "akash1be", "100"),
+        bidEntry(dseq, "akash1pt", "900"),
+      ],
+    });
+
+    const out = await makeAdapter(h.fetchImpl).provision({
+      env: "shared",
+      spec: { ...SPEC, placement: { requiredCountryCodes: ["PT"] } },
+    });
+
+    expect(out.state).toBe("active");
+    // The cheaper Belgian bid would have won on price alone; the requirement filtered it.
+    expect(h.leased).toEqual([{ dseq: "1", provider: "akash1pt" }]);
+  });
+
+  /**
+   * The requirement must be inert when undeclared, or this feature changes placement for the
+   * whole fleet the moment it ships.
+   */
+  it("leaves placement unchanged when the spec declares no requirement", async () => {
+    const h = harness({
+      providers: [
+        providerEntry("akash1be", { ipCountryCode: "BE" }),
+        providerEntry("akash1pt", { ipCountryCode: "PT" }),
+      ],
+      bids: (dseq) => [
+        bidEntry(dseq, "akash1be", "100"),
+        bidEntry(dseq, "akash1pt", "900"),
+      ],
+    });
+
+    await makeAdapter(h.fetchImpl).provision({ env: "shared", spec: SPEC });
+
+    expect(h.leased).toEqual([{ dseq: "1", provider: "akash1be" }]);
+  });
+
+  /**
+   * REQUIRED_FAILS_CLOSED, and the error must NAME the requirement. An operator reading
+   * "none passed provider screening" after a 90s window previously had no way to tell a
+   * jurisdiction refusal from a blanked provider allowlist (the `d69e5c29` class).
+   */
+  it("fails closed and names the requirement when no bid satisfies it", async () => {
+    const h = harness({
+      providers: [providerEntry("akash1be", { ipCountryCode: "BE" })],
+      bids: (dseq) => [bidEntry(dseq, "akash1be", "100")],
+    });
+
+    // ONE provision; the rejected promise is asserted twice (awaiting it again does not
+    // re-run it), so `h.deletes` below still describes a single deployment.
+    const rejected = makeAdapter(h.fetchImpl).provision({
+      env: "shared",
+      spec: { ...SPEC, placement: { requiredCountryCodes: ["PT"] } },
+    });
+
+    await expect(rejected).rejects.toMatchObject({ code: "NO_ELIGIBLE_BIDS" });
+    // Both halves matter: the COUNT says which filter refused, the requirement says what it
+    // was measured against. Either alone still sends an operator hunting the wrong filter.
+    await expect(rejected).rejects.toThrow(/required_country=1/);
+    await expect(rejected).rejects.toThrow(/required placement countries: PT/);
+    // The deployment is closed so escrow refunds rather than paying for a refused placement.
+    expect(h.deletes).toEqual([`${BASE}/v1/deployments/1`]);
+  });
+
   it("throws NO_BIDS when the bid window elapses without an open bid", async () => {
     const h = harness();
     await expect(
@@ -763,8 +875,12 @@ describe("AkashComputeAdapter bid screening", () => {
     const h = harness({
       providers: [
         providerEntry("akash1zen"),
-        // froggy-class: audited on paper, zero active leases (no proof of registry egress)
-        providerEntry("akash1froggy", { leaseCount: 0 }),
+        // froggy-class: audited on paper, but running an incompatible provider version —
+        // it would win on price, take the lease, and fail. NOTE: zero active leases is
+        // deliberately NOT the fixture here; see A_BID_IS_NOT_A_POPULARITY_CONTEST
+        // (bug.5334) — a provider with no current tenant must still be able to win its
+        // first lease, so leaseCount:0 no longer refuses anything.
+        providerEntry("akash1froggy", { isValidVersion: false }),
       ],
       bids: (dseq) => [
         bidEntry(dseq, "akash1zen", "900"),
@@ -906,6 +1022,24 @@ describe("AkashComputeAdapter allowedProviders", () => {
     }).provision({ env: "t", spec: SPEC });
 
     expect(h.leased).toEqual([{ dseq: "1", provider: allowed }]);
+  });
+
+  // story.5050: `[]` is TRUTHY, so the old `config.allowedProviders ? new Set(...)` turned an
+  // empty list into an empty Set == "no provider is permitted" and refused every bid in
+  // silence. An empty pin is now NO pin, which is the whole point of retiring the allowlist
+  // as a gate — an unset/blanked AKASH_ALLOWED_PROVIDERS must place, not close the auction.
+  it("treats an EMPTY allowedProviders list as no pin and leases the best screened bid", async () => {
+    const h = harness({
+      providers: [providerEntry(allowed), providerEntry(stranger)],
+      bids: (dseq) => [bidEntry(dseq, stranger, "1")],
+    });
+
+    await makeAdapter(h.fetchImpl, {
+      bidTimeoutMs: 0,
+      allowedProviders: [],
+    }).provision({ env: "t", spec: SPEC });
+
+    expect(h.leased).toEqual([{ dseq: "1", provider: stranger }]);
   });
 
   it("fails closed without leasing a fallback when no allowed provider bids", async () => {
@@ -1243,6 +1377,58 @@ describe("AkashComputeAdapter failure containment", () => {
     expect(msg).toContain("422");
     expect(msg).not.toContain("invalid manifest");
     expect(msg).not.toContain("supersecret");
+    // Key NAMES are schema, not data — they cannot carry an SDL or a secret, and they are what
+    // makes a 422 diagnosable at all (bug.5247).
+    expect(msg).toContain("keys=echo,message");
+  });
+
+  it("names an identifier-shaped Console error code without echoing its prose (bug.5247)", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(
+      async () =>
+        new Response(
+          '{"code":"INVALID_SDL","message":"service web: resources changed, AUTH_SECRET=supersecret"}',
+          { status: 422, statusText: "Unprocessable Entity" }
+        )
+    );
+    const err = await makeAdapter(fetchImpl)
+      .balances()
+      .catch((e: unknown) => e);
+    const msg = (err as AkashComputeError).message;
+    expect(msg).toContain("422");
+    expect(msg).toContain("code=INVALID_SDL");
+    expect(msg).not.toContain("resources changed");
+    expect(msg).not.toContain("supersecret");
+  });
+
+  it("takes nothing from a prose-valued allowlist field or a non-JSON body (bug.5247)", async () => {
+    // `error` is allowlisted, but this value is a sentence — prose, not an enum.
+    const prose = vi.fn<typeof fetch>(
+      async () =>
+        new Response(
+          '{"error":"the SDL for web is invalid, token=supersecret"}',
+          {
+            status: 422,
+          }
+        )
+    );
+    const proseErr = await makeAdapter(prose)
+      .balances()
+      .catch((e: unknown) => e);
+    expect((proseErr as AkashComputeError).message).not.toContain(
+      "supersecret"
+    );
+    expect((proseErr as AkashComputeError).message).toContain("keys=error");
+
+    const html = vi.fn<typeof fetch>(
+      async () =>
+        new Response("<html>gateway error supersecret</html>", { status: 502 })
+    );
+    const htmlErr = await makeAdapter(html)
+      .balances()
+      .catch((e: unknown) => e);
+    expect((htmlErr as AkashComputeError).message).toBe(
+      "Console request failed with HTTP 502"
+    );
   });
 });
 

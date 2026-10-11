@@ -26,10 +26,11 @@
 #      at the TOP level of the schema. An XRD's openAPIV3Schema may only define `spec` and
 #      `status`, so that rule cannot live here. It is enforced instead by the Composition's
 #      first pipeline step, which refuses to render any managed resource when they disagree.
-#   2. `status.attempt` / `status.recoveryCount` / `status.failure.retryable` are GONE. They
-#      encoded the bespoke controller's retry budget and leader-epoch bookkeeping — exactly
-#      the generic reconciliation Crossplane now owns (retries, backoff, conditions,
-#      finalizers). Keeping them would re-create a second controller in a schema.
+#   2. `status.attempt` / `status.failure.retryable` are GONE. They encoded the bespoke
+#      controller's leader-epoch and transport-retry bookkeeping — generic reconciliation that
+#      Crossplane owns. The PAID replacement budget is deliberately retained as the smaller
+#      `status.recovery` block: Crossplane backoff cannot replace a terminally settled actuator
+#      key, and deleting that three-attempt budget created zero automatic recovery (bug.5287).
 #   3. `spec.migration`, `spec.dns`, `spec.bootPolicy`, `spec.runtime` and `spec.leaseGeneration` are
 #      NEW. Each was implicit policy inside the controller binary or, worse, derived from a
 #      SECRET VALUE. A declarative API reconciled by an OSS engine that never sees a secret has
@@ -84,6 +85,17 @@ spec:
                   message: every service must reference a declared bundle artifact
                 - rule: "self.bundle.artifacts.all(a, self.workload.services.exists(s, s.artifact == a.name))"
                   message: every bundle artifact must be used by at least one service
+                # PLACEMENT_CHANGE_REQUIRES_FRESH_KEY. This must live at spec scope: a
+                # field-scoped rule cannot inspect sibling leaseGeneration and therefore
+                # made the env-manager's documented placement+bump transaction impossible.
+                # Fall back to the served legacy leaseEpoch when upgrading an older XR.
+                - rule: >-
+                    (!has(self.placement) && !has(oldSelf.placement)) ||
+                    (has(self.placement) && has(oldSelf.placement) && self.placement == oldSelf.placement) ||
+                    (has(self.leaseGeneration) && self.leaseGeneration >
+                      (has(oldSelf.leaseGeneration) ? oldSelf.leaseGeneration :
+                        (has(oldSelf.leaseEpoch) ? oldSelf.leaseEpoch : 0)))
+                  message: placement may change only with a leaseGeneration bump
               properties:
                 nodeId:
                   type: string
@@ -303,8 +315,8 @@ spec:
                 dns:
                   description: >-
                     DNS intent. Absent means "publish status.dns.target but write no record" —
-                    the XR still reports the CNAME it WOULD publish, so intent is observable
-                    even where the write path is not configured.
+                    the XR still reports the A or CNAME target it WOULD publish, so intent is
+                    observable even where the write path is not configured.
                   type: object
                   required: [provider, zoneId]
                   properties:
@@ -315,6 +327,42 @@ spec:
                     zoneId:
                       type: string
                       pattern: "^[0-9a-f]{32}$"
+                placement:
+                  description: >-
+                    story.5050 — HARD placement requirement for this workload: the ISO 3166-1
+                    alpha-2 countries its lease MAY be minted in. Distinct from the operator's
+                    fleet-wide latency PREFERENCE, which only RANKS providers: this FILTERS
+                    bids, so a provider outside the set never wins. It exists because a
+                    workload can have an outbound dependency that geo-fences by IP while the
+                    latency preference pulls toward the shared substrate's own neighbourhood,
+                    and for the Baltics substrate those two axes point in opposite directions.
+
+                    REQUIRED_FAILS_CLOSED: the actuator refuses a bid whose provider country is
+                    unknown or whose provider metadata is unavailable, unlike the fail-open
+                    preference path — a requirement that cannot be evaluated is not satisfied.
+
+                    NOT_A_GUARANTEE: the country compared is a provider's advertised/INGRESS
+                    identity, which is measurably not the EGRESS identity its workload presents
+                    to a third party (two providers in two advertised countries have shared one
+                    egress NAT). This narrows the candidate pool; only the workload's own
+                    outbound probe proves reachability.
+
+                    Absent = unconstrained, which is what every existing lease runs under.
+                    Generation-guarded: Akash refuses in-place placement change, so a new
+                    requirement can only bind on a fresh mint behind a spec.leaseGeneration bump
+                    — accepting an edit without that bump would otherwise read as applied desired
+                    state that nothing applies.
+                  type: object
+                  required: [requiredCountries]
+                  properties:
+                    requiredCountries:
+                      type: array
+                      minItems: 1
+                      maxItems: 32
+                      x-kubernetes-list-type: set
+                      items:
+                        type: string
+                        pattern: "^[A-Z]{2}$"
                 bootPolicy:
                   description: >-
                     BOOT_SLO_OR_CLOSE. task.5095 explicitly left give-up policy unowned, so a
@@ -338,6 +386,28 @@ spec:
                       type: string
                       enum: [Hold, Close]
                       default: Hold
+                    onGiveUp:
+                      description: >-
+                        What bounded lease recovery may do when the CURRENT key's lease is
+                        found closed (bug.5287). `Hold` (the PERMANENT default) parks the
+                        workload as LeaseClosed and spends nothing — a human bumps
+                        spec.leaseGeneration to mint a replacement. `Replace` (opt-in per
+                        (node, env), NEVER global) will authorize the bounded `:recover:<n>`
+                        re-mint — but it is deliberately NOT in this enum yet: the schema
+                        admitted only Hold until provider-strike recording was re-homed in
+                        the actuator. That prerequisite SHIPPED (task.5153 — the actuator now
+                        writes `akash_tx_provider_strike_recorded`), so `Replace` is admitted
+                        now. This widening is that later change.
+
+                        `Replace` authorizes the bounded `:recover:<1..3>` re-mint the
+                        Composition already implements: on each attempt the ledger-derived
+                        excluded set skips the provider that just failed, so the retry lands on
+                        a DIFFERENT provider instead of re-picking the dead one. Opt-in per
+                        (node, environment) through the catalog's `boot_recovery` cell, never
+                        global, and never a per-request argument.
+                      type: string
+                      enum: [Hold, Replace]
+                      default: Hold
                 leaseEpoch:
                   description: >-
                     DEPRECATED read-side alias for leaseGeneration, retained ONLY so the
@@ -357,19 +427,21 @@ spec:
                   maximum: 1000000
                 leaseGeneration:
                   description: >-
-                    Operator-driven replacement counter, and the ONLY varying component of the
-                    actuator's wallet-wide idempotence key
+                    Operator-driven BASE replacement counter for the actuator's wallet-wide
+                    idempotence key
                     (`xcw:<namespace>:<name>:<lease-generation>`).
-                    A key that changed on its own — per generation, per resourceVersion, per
-                    retry — would answer "no existing resource" after a promote and mint a
-                    SECOND PAID LEASE, so nothing in this system is allowed to bump it
-                    implicitly. NAME (task.5122): this field was `leaseEpoch`. `epoch` is
+                    A base key that changed on its own — per metadata generation, resourceVersion,
+                    or transport retry — would answer "no existing resource" after a promote and
+                    mint a SECOND PAID LEASE, so nothing in this system is allowed to bump this
+                    field implicitly. Crossplane may derive only the explicitly bounded
+                    `:recover:<1..3>` child keys after actor read-back proves the current key is
+                    terminally closed; that budget is exposed in status.recovery and hard-stops
+                    after three (bug.5287). NAME (task.5122): this field was `leaseEpoch`. `epoch` is
                     reserved for the attribution/distribution domain — contributor activity
                     windows, claimants, payouts — so a compute-lease replacement counter is a
                     GENERATION. The rename changed no VALUE; no idempotence key moved. A human or the materializer bumps it exactly when a terminally
-                    closed lease must be REPLACED (the actuator refuses to re-spend a settled
-                    key by design, which is what makes a stuck workload loud instead of
-                    expensive).
+                    closed generation has exhausted its bounded recovery budget and must be
+                    deliberately re-opened.
                   type: integer
                   minimum: 0
                   maximum: 1000000
@@ -453,9 +525,10 @@ spec:
                     hostname: { type: string, maxLength: 253 }
                     target: { type: string, maxLength: 253 }
                     # OBSERVED, not intended (bug.5152). True only when the provider's zone
-                    # actually holds this hostname as the proxied CNAME to `target`. It used to
-                    # restate `spec.dns is set`, which made a node whose DNS write had been
-                    # failing since birth indistinguishable from a reachable one.
+                    # actually holds this hostname as the proxied A or CNAME record selected
+                    # from `target`. It used to restate `spec.dns is set`, which made a node
+                    # whose DNS write had been failing since birth indistinguishable from a
+                    # reachable one.
                     published: { type: boolean }
                 failure:
                   type: object
@@ -472,4 +545,50 @@ spec:
                         pattern: "^[A-Za-z_][A-Za-z0-9_]{0,127}$",
                       }
                     message: { type: string, maxLength: 256 }
+                # PAID RECOVERY BUDGET (bug.5287). Crossplane owns this state machine; it is not
+                # a shadow controller receipt. The tuple says exactly which operator-controlled
+                # leaseGeneration the count belongs to, the next/active recovery ordinal, the
+                # immutable cap, and the wallet-wide key currently being observed. An explicit
+                # leaseGeneration bump resets the block; reconcile ticks never do.
+                recovery:
+                  type: object
+                  properties:
+                    leaseGeneration:
+                      { type: integer, minimum: 0, maximum: 1000000 }
+                    count: { type: integer, minimum: 1, maximum: 3 }
+                    maxAttempts: { type: integer, enum: [3] }
+                    key: { type: string, minLength: 1, maxLength: 512 }
+                # Latches the generation-qualified provider-http Request child after the first
+                # explicit base-generation replacement. Existing XRs omit it and retain the
+                # historical static child name, so rolling out this field causes zero fleet-wide
+                # Request churn. Once present, a later generation bump selects a fresh child and
+                # therefore the CREATE action instead of trying to UPDATE a settled lease.
+                leaseRequestGeneration:
+                  { type: integer, minimum: 0, maximum: 1000000 }
+                # THE GENERATION PROVEN SERVING (bug.5322). Written ONLY after the composite
+                # observes `active && serving` for the current generation — the same pair
+                # status.serving and the Ready phase are written from — so it names a lease that
+                # has actually answered on the canonical public host with the exact source sha,
+                # not one that was merely minted. It is what makes CLOSE-AFTER-CUTOVER possible:
+                # while it names a generation other than spec.leaseGeneration, the Composition
+                # keeps rendering the child that holds that generation's key ALONGSIDE the
+                # candidate, so Crossplane's GC — and therefore the actuator's irreversible
+                # /v1/akash/delete — cannot reach a live lease until its replacement serves.
+                # Without it, bumping the generation advanced the child name, the old child
+                # stopped being rendered, and the node went DOWN before the replacement served
+                # anything (toks4, 2026-09-30: /readyz 503, stale sha, no lease).
+                # Existing XRs omit it, which the Composition reads as -1 and renders exactly as
+                # it did before this field existed; the field is adopted the first time that
+                # workload is observed serving, so the fleet converges with zero churn.
+                activeLeaseGeneration:
+                  { type: integer, minimum: 0, maximum: 1000000 }
                 bootDeadlineAt: { type: string, format: date-time }
+                # BOOT EPOCH (bug.5244, bug.5287). The (bundle sha, leaseGeneration,
+                # optional recovery ordinal) attempt this XR's boot deadline is anchored to,
+                # and when that window opened. Latched by the composition so a NEW attempt gets
+                # a fresh window instead of inheriting the XR's age.
+                bootEpoch:
+                  type: object
+                  properties:
+                    key: { type: string, maxLength: 128 }
+                    at: { type: string, format: date-time }

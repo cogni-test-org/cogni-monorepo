@@ -233,6 +233,28 @@ services:
   postgres:
     image: postgres:15
     restart: unless-stopped
+    # bug.5011 root cause: postgres is the shared datastore for openfga, litellm
+    # and the app — if the kernel OOM-kills it under a deploy-infra memory spike,
+    # the whole control plane fails. Protect it hardest: oom_score_adj -900 (kill
+    # almost everything else first) + a soft mem_reservation floor. NO hard
+    # mem_limit — postgres sizes its own caches (shared_buffers/work_mem) and a
+    # cgroup cap would OOM it mid-query instead of protecting it.
+    # Root cause + fix: bug.5011 / #2387; hub `prod-oom-misdiagnosis-taxonomy`.
+    mem_reservation: 512m
+    oom_score_adj: -900
+    # bug.5293 root cause: Docker defaults /dev/shm to 64 MiB. Postgres allocates a
+    # shared-memory segment per PARALLEL worker there, so any parallel plan over a
+    # large table fails `could not resize shared memory segment ... No space left on
+    # device` and the BACKEND DIES — the postmaster reports `exited with exit code 2`
+    # and then 57P02-quickdies every other connection. Measured on prod 2026-10-01:
+    # 110 such crashes in 24h, which 503'd the actuator's allocation ledger, wedged
+    # Crossplane with external-create-pending across SIX nodes, and blocked every
+    # node-app deploy. It reads as OOM and is NOT: the host had 16 GB free and no
+    # signal/OOM-kill ever appears (see hub `prod-oom-misdiagnosis-taxonomy`).
+    # 1 GiB is the smallest value that comfortably fits max_parallel_workers
+    # segments for our largest tables; it is an address-space reservation, not a
+    # preallocation, so it costs nothing until used.
+    shm_size: 1gb
     labels:
       # bug.5105: stateful stores are never autohealed. autoheal restarting a
       # database mid-recovery means recovery never finishes — that loop took the
@@ -319,6 +341,17 @@ services:
     # Public-NIC traffic is dropped by infra/provision/cherry/harden-docker-public-ports.sh.
     ports:
       - "8080:8080"
+    # bug.5011 root cause: OpenFGA (the authz singleton) had NO memory
+    # reservation, so a deploy-infra memory spike on the oversubscribed 6GB box
+    # let the kernel OOM-kill it (the "OpenFGA gone" outages — authz_unavailable
+    # storms). mem_reservation is a soft floor the kernel honors under pressure;
+    # oom_score_adj -800 tells the kernel to sacrifice almost anything else
+    # first. mem_limit is a generous ceiling (Go service, postgres-backed, light)
+    # to catch a genuine leak without capping normal load.
+    # Root cause + fix: bug.5011 / #2387; hub `prod-oom-misdiagnosis-taxonomy`.
+    mem_reservation: 256m
+    mem_limit: 768m
+    oom_score_adj: -800
     command: run
     environment:
       - OPENFGA_DATASTORE_ENGINE=postgres
@@ -347,6 +380,15 @@ services:
   db-backup:
     image: postgres:15
     profiles: ["backup"]
+    # A logical backup is a best-effort recovery job, never a reason to evict the
+    # serving database or control plane. Bound the client and make it the first
+    # process sacrificed under host pressure. The PostgreSQL server remains
+    # uncapped and protected with oom_score_adj=-900 below.
+    mem_reservation: 128m
+    mem_limit: 512m
+    cpus: 0.50
+    pids_limit: 128
+    oom_score_adj: 500
     read_only: true
     cap_drop:
       - ALL
@@ -412,6 +454,10 @@ services:
 
   doltgres:
     # Pin deliberately. `:latest` is unsafe for any stateful service: a silent
+    # bug.5293 — Doltgres speaks the Postgres wire protocol and inherits the same
+    # 64 MiB /dev/shm default. Sized to match the app Postgres so the knowledge
+    # plane cannot die the way the operational plane did.
+    shm_size: 1gb
     # tag roll on the next deploy can render the persistent volume unreadable
     # by the new binary (bug.5076 — the 0.56.2 → 0.56.3 roll changed the
     # auth-file serialization layout, breaking every infra flight on 2026-05-26).
@@ -544,12 +590,19 @@ services:
       - ./configs/alloy-config.metrics.alloy:/etc/alloy/config.alloy:ro
       - alloy_data:/var/lib/alloy
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Persistent host journal gives Loki the kernel-side reason for SIGKILL/OOM.
+      # Production bootstrap configures persistent journald at this path.
+      - /var/log/journal:/var/log/journal:ro
       # Host mounts for prometheus.exporter.unix (node-level metrics)
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /:/host/root:ro
       # K8s pod logs for k3s log shipping (no-op on hosts without k3s)
       - /var/log/pods:/var/log/pods:ro
+    # Journal files are root/systemd-journal readable. Alloy already has the
+    # Docker socket and read-only host mounts; root grants read access only, while
+    # the container remains without host write mounts.
+    user: "0:0"
     command:
       - run
       - /etc/alloy/config.alloy
@@ -566,6 +619,21 @@ services:
       - PROMETHEUS_USERNAME=${PROMETHEUS_USERNAME:-}
       - COGNI_DEFAULT_NODE_ID=${COGNI_DEFAULT_NODE_ID:-}
       - PROMETHEUS_PASSWORD=${PROMETHEUS_PASSWORD:-}
+      # Postgres metrics identity (bug.5293) for prometheus.exporter.postgres.
+      # pg_monitor-granted read role; alloy is on the `internal` network so it
+      # dials postgres:5432 directly. deploy-infra.sh already writes both into
+      # the runtime .env (lines ~1045-1048), so this adds no new secret. It is
+      # NOT least-privilege — see the credential note in
+      # configs/alloy-config.metrics.alloy and task.5162.
+      #
+      # THIS PAIRING IS LOAD-BEARING: the DSN is assembled in the alloy CONFIG
+      # from sys.env(), so the config and this env block must change together.
+      # Measured 2026-09-30 — a revert pulled this file back to main while
+      # re-adding the exporter to the config alone, and sys.env() returned empty,
+      # yielding `postgresql://app_readonly:@postgres:5432/...` and a
+      # silent-looking `pg_up 0`. If you touch one, touch the other.
+      - APP_DB_READONLY_USER=${APP_DB_READONLY_USER:-app_readonly}
+      - APP_DB_READONLY_PASSWORD=${APP_DB_READONLY_PASSWORD:-}
 
   alloy-k8s-events:
     image: grafana/alloy:v1.9.2
@@ -622,6 +690,10 @@ services:
 
   temporal-postgres:
     # Dedicated Postgres for Temporal (not shared with app DB)
+    # bug.5293 — same 64 MiB /dev/shm trap as the app Postgres above. Temporal's
+    # history/visibility tables grow unbounded and its own maintenance scans go
+    # parallel, so an undersized segment kills a backend the same way.
+    shm_size: 1gb
     # Aligned to postgres:15 for consistency with app DB
     image: postgres:15
     restart: unless-stopped

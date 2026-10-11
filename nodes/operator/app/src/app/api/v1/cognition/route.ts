@@ -39,6 +39,7 @@ import {
   isCognitionEntry,
   type OrientationEntry,
   renderBundleMarkdown,
+  resolveOrientation,
   SESSION_BOOTSTRAP_INVARIANTS,
 } from "./_bundle";
 
@@ -116,6 +117,7 @@ export const GET = wrapRouteHandlerWithLogging(
           skillsIndex.push({
             id: r.id,
             title: r.title,
+            useWhen: r.useWhen ?? null,
             entryType: r.entryType ?? "guide",
             domain: r.domain,
           });
@@ -123,16 +125,11 @@ export const GET = wrapRouteHandlerWithLogging(
       }
     }
 
-    let orientation: OrientationEntry | null = null;
-    if (port && orientationId) {
-      const entry = await port.getKnowledge(orientationId);
-      if (entry) {
-        orientation = {
-          id: entry.id,
-          content: entry.content,
-        };
-      }
-    }
+    // Direct lookup, not scan-dependent: the scan above is capped at
+    // PER_DOMAIN_LIMIT rows per domain and misses older entries (bug.5280).
+    const orientation: OrientationEntry | null = port
+      ? await resolveOrientation(port, exactOrientationId, orientationId)
+      : null;
 
     const toolingInvariants = [...SESSION_BOOTSTRAP_INVARIANTS];
     const recallProtocol =

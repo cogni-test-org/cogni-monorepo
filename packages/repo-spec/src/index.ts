@@ -71,6 +71,7 @@ export {
   type ResolvedNodeArtifactBundle,
   type ResolvedNodeServiceArtifact,
   resolveNodeArtifactBundle,
+  resolveNodeArtifactBundleForEnvironment,
 } from "./artifact-bundle.js";
 export {
   hasDeploymentActivationSpec,
@@ -79,9 +80,11 @@ export {
 export {
   COGNI_NODE_APP_V1_DEPLOYMENT,
   COGNI_NODE_APP_V1_REQUIRED_SECRET_KEYS,
+  COGNI_WORKFLOW_WORKER_V1_REQUIRED_SECRET_KEYS,
   LEGACY_DEFAULT_NODE_DEPLOYMENT,
   missingRuntimeProfileSecretKeys,
   renderNodeDeploymentYaml,
+  resolveRuntimeProfileSecretRefs,
 } from "./node-app-deployment.js";
 export { parseRepoSpec } from "./parse.js";
 export {
@@ -99,6 +102,8 @@ export {
   aiRuleGateSchema,
   type CreditsTopupSpec,
   creditsTopupSpecSchema,
+  type DeploymentEnvName,
+  deploymentEnvNameSchema,
   type GateConfig,
   type GovernanceScheduleSpec,
   type GovernanceSpec,

@@ -19,6 +19,7 @@
  * @internal
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
@@ -27,6 +28,7 @@ import { describe, expect, it } from "vitest";
 
 import type {
   AkashAllocationProbe,
+  AkashLeaseLogDescriptor,
   AkashTxAllocationLedgerPort,
   AkashTxAllocationRecord,
   AkashTxConsolePort,
@@ -37,10 +39,16 @@ import type {
   ComputeCostStorePort,
   ComputeResourceCostEvidence,
   ComputeWorkloadMigrationInput,
+  NodeMigrationReportStorePort,
+  RecordNodeMigrationReportInput,
 } from "@/ports";
 import { AkashTxError } from "@/ports";
 
-import { AkashTxActuator, type AkashTxLogger } from "./akash-tx-actuator";
+import {
+  AkashTxActuator,
+  type AkashTxLogger,
+  mapConsoleFailure,
+} from "./akash-tx-actuator";
 
 const SPEC: ProvisionSpec = {
   name: "toks9",
@@ -91,13 +99,40 @@ class FakeMigration implements AkashTxMigrationPort {
   calls: ComputeWorkloadMigrationInput[] = [];
   outcome: "succeeded" | "running" | "failed" = "succeeded";
   throws?: Error;
+  /** What the node's own migrator printed; null = this fake produced no receipt. */
+  receiptStdout: string | null = null;
 
   async ensure(input: ComputeWorkloadMigrationInput) {
     this.calls.push(input);
     if (this.throws) throw this.throws;
     return this.outcome;
   }
+
+  async readReceipt() {
+    return this.receiptStdout;
+  }
 }
+
+/** Receipt-cell writer. Records the key it was handed, so a test can prove WHERE it came from. */
+class FakeReports implements NodeMigrationReportStorePort {
+  readonly recorded: RecordNodeMigrationReportInput[] = [];
+
+  async record(input: RecordNodeMigrationReportInput) {
+    this.recorded.push(input);
+    return "recorded" as const;
+  }
+
+  async read() {
+    return null;
+  }
+}
+
+/** The line the fork image's migrator prints on a successful migrate. */
+const RECEIPT_STDOUT = `COGNI_MIGRATION_RECEIPT_V1 ${JSON.stringify({
+  node: "toks9",
+  declared: ["0000_init"],
+  applied: [{ tag: "0000_init", hash: "abc", appliedAtMs: 1 }],
+})}`;
 
 /** Console error shape the adapter publishes (name + code); mapped structurally. */
 function consoleError(code: string, httpStatus?: number): Error {
@@ -147,6 +182,7 @@ class FakeLedger implements AkashTxAllocationLedgerPort {
       receiptId: `receipt-${input.cogniKey}`,
       cogniKey: input.cogniKey,
       identity: input.identity,
+      workload: input.workload,
       environment: input.environment,
       state: "preparing",
     };
@@ -210,6 +246,15 @@ class FakeLedger implements AkashTxAllocationLedgerPort {
       ...(input.providerAccount
         ? { providerAccount: row.providerAccount ?? input.providerAccount }
         : {}),
+    });
+  }
+
+  async recordAppliedSdlHash(input: { cogniKey: string; sdlHash: string }) {
+    const row = this.rows.get(input.cogniKey);
+    if (!row) throw new Error("unknown key");
+    this.rows.set(input.cogniKey, {
+      ...row,
+      lastAppliedSdlHash: input.sdlHash,
     });
   }
 
@@ -288,6 +333,24 @@ class FakeLedger implements AkashTxAllocationLedgerPort {
       )
       .slice(0, input.limit);
   }
+
+  async listActive(input: {
+    nodeId?: string;
+    environment?: string;
+    limit: number;
+  }) {
+    if (this.failReads) throw new Error("ledger down");
+    return [...this.rows.values()]
+      .filter(
+        (row) =>
+          (row.state === "preparing" || row.state === "allocated") &&
+          (input.nodeId === undefined ||
+            row.identity.nodeId === input.nodeId) &&
+          (input.environment === undefined ||
+            row.environment === input.environment)
+      )
+      .slice(0, input.limit);
+  }
 }
 
 function seedAllocated(
@@ -299,10 +362,30 @@ function seedAllocated(
     receiptId: `receipt-${cogniKey}`,
     cogniKey,
     identity: IDENTITY,
+    workload: "operator",
     environment: "candidate-a",
     state: "allocated",
     externalName,
     providerAccount: "akash1provider",
+  });
+}
+
+/** A live lease whose receipt is still `preparing` — the boot window bug.5264 must cover. */
+function seedPreparing(
+  ledger: FakeLedger,
+  cogniKey: string,
+  externalName?: string
+): void {
+  ledger.rows.set(cogniKey, {
+    receiptId: `receipt-${cogniKey}`,
+    cogniKey,
+    identity: IDENTITY,
+    workload: "operator",
+    environment: "candidate-a",
+    state: "preparing",
+    ...(externalName
+      ? { externalName, providerAccount: "akash1provider" }
+      : {}),
   });
 }
 
@@ -375,6 +458,10 @@ class FakeCost implements ComputeCostEvidencePort, ComputeCostStorePort {
   async reportByNode() {
     return [];
   }
+
+  async reportByNodeIds(_nodeIds: readonly string[]) {
+    return [];
+  }
 }
 
 function costDeps(cost = new FakeCost()) {
@@ -405,8 +492,16 @@ class FakeConsole implements AkashTxConsolePort {
   recoverCalls = 0;
   statusCalls = 0;
   updateCalls = 0;
+  /** Country per provider account, as the registry would resolve it. Absent = unresolvable. */
+  providerCountryByAccount: Record<string, string> = {};
+  /** The account the last allocation landed on, so a test can target it by name. */
+  lastProviderAccount = "akash1provider";
   releaseCalls: string[] = [];
   nextLeaseId = "7001";
+  /** Descriptors served by `leaseLogDescriptor`, keyed by leaseId (dseq). */
+  logDescriptors = new Map<string, AkashLeaseLogDescriptor>();
+  mintedTokenProviders: string[][] = [];
+  mintTokenError?: Error;
 
   constructor(private readonly options: FakeConsoleOptions = {}) {
     this.loseResponse = options.loseResponseAfterAllocation ?? false;
@@ -415,6 +510,10 @@ class FakeConsole implements AkashTxConsolePort {
   async allocationCursor(): Promise<string> {
     this.cursorCalls += 1;
     return this.options.cursor ?? "7000";
+  }
+
+  async providerCountry(providerAccount: string): Promise<string | null> {
+    return this.providerCountryByAccount[providerAccount] ?? null;
   }
 
   async allocateAndLease(input: {
@@ -458,8 +557,34 @@ class FakeConsole implements AkashTxConsolePort {
     this.updateCalls += 1;
   }
 
+  /**
+   * Deterministic stand-in for the adapter's `sha256(buildAkashSdl(spec))`: identical spec →
+   * identical hash, any spec change → a different hash. That is the exact property the actuator's
+   * no-op gate relies on, so hashing the spec directly is a faithful fake.
+   */
+  sdlHash(spec: ProvisionSpec): string {
+    return createHash("sha256").update(JSON.stringify(spec)).digest("hex");
+  }
+
   async release(input: { leaseId: string }): Promise<void> {
     this.releaseCalls.push(input.leaseId);
+  }
+
+  async leaseLogDescriptor(input: {
+    leaseId: string;
+  }): Promise<AkashLeaseLogDescriptor> {
+    const described = this.logDescriptors.get(input.leaseId);
+    if (!described) throw new Error(`no descriptor for ${input.leaseId}`);
+    return described;
+  }
+
+  async mintLeaseLogsToken(input: {
+    providers: readonly string[];
+    ttlSeconds: number;
+  }): Promise<string> {
+    this.mintedTokenProviders.push([...input.providers]);
+    if (this.mintTokenError) throw this.mintTokenError;
+    return "jwt-logs-token";
   }
 }
 
@@ -975,6 +1100,31 @@ describe("AkashTxActuator.observe", () => {
     expect(probes).toBe(1);
   });
 
+  it("hands the probe the public hostname so serving is proven host-routed (bug.5237)", async () => {
+    const ledger = new FakeLedger();
+    const api = new FakeConsole();
+    let seenPublicHost: string | undefined;
+    const actuator = new AkashTxActuator({
+      console: api,
+      ledger,
+      log: recordingLogger(),
+      ...costDeps(),
+      probe: async ({ publicHost }) => {
+        seenPublicHost = publicHost;
+        return false;
+      },
+    });
+    seedAllocated(ledger);
+    const observation = await actuator.observe({
+      cogniKey: "k1",
+      externalName: "7001",
+      expectedSourceSha: "a".repeat(40),
+      publicHost: "toks5.cognidao.org",
+    });
+    expect(observation.serving).toBe(false);
+    expect(seenPublicHost).toBe("toks5.cognidao.org");
+  });
+
   it("never probes when no expected sha is supplied", async () => {
     const ledger = new FakeLedger();
     const api = new FakeConsole();
@@ -1025,6 +1175,210 @@ describe("AkashTxActuator.update / delete", () => {
     expect(api.allocateCalls).toBe(spent.allocate);
     // And no second receipt: the identity re-bind lands on the SAME row the create opened.
     expect(ledger.rows.size).toBe(1);
+  });
+
+  /**
+   * PLACEMENT_BINDS_ON_EVERY_REVISION (story.5050). This is poly gen-20, exactly: the catalog
+   * said [FI, NL, PT], the verb succeeded, CI and the promote were green — and because
+   * required_placement_countries lives in the CR's spec.placement and NOT in the SDL, the
+   * rendered SDL was byte-identical, so the update rebound the incumbent lease and the
+   * no-op gate returned success. The workload kept serving from Belgium for four days
+   * (pg_stat_activity.client_addr 80.200.246.35, AS5432 Proximus, Antwerp). A silent wrong
+   * placement is the one outcome this gate must make impossible.
+   */
+  it("REFUSES to re-image a lease whose provider violates the required placement", async () => {
+    const { actuator, api } = build();
+    await actuator.create({
+      cogniKey: "k1",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    // The incumbent provider resolves to BE; the workload now requires FI/NL/PT.
+    api.providerCountryByAccount = { [api.lastProviderAccount]: "BE" };
+    const updatesBefore = api.updateCalls;
+
+    await expect(
+      actuator.update({
+        cogniKey: "k1",
+        externalName: "7001",
+        environment: "candidate-a",
+        identity: IDENTITY,
+        spec: {
+          ...SPEC,
+          placement: { requiredCountryCodes: ["FI", "NL", "PT"] },
+        },
+      })
+    ).rejects.toMatchObject({ code: "placement_violated_by_incumbent" });
+
+    // The provider must be left completely untouched — no re-image of a lease we are refusing.
+    expect(api.updateCalls).toBe(updatesBefore);
+  });
+
+  /**
+   * THE ACCEPTED COST, encoded so nobody discovers it in an incident. The refusal is terminal for
+   * this key and the composition has no CREATE path out of it, so a country set the incumbent
+   * violates blocks EVERY later revision of that workload — including a security patch — until a
+   * human bumps lease_generation. That is the deliberate trade (the alternative is serving from an
+   * excluded jurisdiction with no signal), but it must be a KNOWN property, not a surprise.
+   */
+  it("keeps refusing every subsequent revision until the generation is bumped", async () => {
+    const { actuator, api } = build();
+    await actuator.create({
+      cogniKey: "k1",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    api.providerCountryByAccount = { [api.lastProviderAccount]: "BE" };
+    const constrained = {
+      ...SPEC,
+      placement: { requiredCountryCodes: ["FI"] },
+    };
+    const updatesBefore = api.updateCalls;
+
+    // A NEW image (different SDL, so the no-op gate is not what stops it) still cannot ship.
+    const [service] = constrained.services;
+    if (!service) throw new Error("SPEC fixture must declare a service");
+    for (const image of ["sha-new1", "sha-new2"]) {
+      await expect(
+        actuator.update({
+          cogniKey: "k1",
+          externalName: "7001",
+          environment: "candidate-a",
+          identity: IDENTITY,
+          spec: { ...constrained, services: [{ ...service, image }] },
+        })
+      ).rejects.toMatchObject({ code: "placement_violated_by_incumbent" });
+    }
+    expect(api.updateCalls).toBe(updatesBefore);
+  });
+
+  it("allows the update when the incumbent provider IS in the required set", async () => {
+    const { actuator, api } = build();
+    await actuator.create({
+      cogniKey: "k1",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    api.providerCountryByAccount = { [api.lastProviderAccount]: "FI" };
+
+    const resource = await actuator.update({
+      cogniKey: "k1",
+      externalName: "7001",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: {
+        ...SPEC,
+        placement: { requiredCountryCodes: ["FI", "NL", "PT"] },
+      },
+    });
+    expect(resource.externalName).toBe("7001");
+  });
+
+  /**
+   * Deliberately asymmetric with REQUIRED_FAILS_CLOSED in the bid screen. An unresolvable
+   * country refuses a BID (one candidate lost, nothing else). Refusing an UPDATE on the same
+   * evidence would stop every image from shipping fleet-wide on one registry hiccup, so an
+   * unknown country does NOT refuse here.
+   */
+  it("does not refuse when the provider's country cannot be resolved", async () => {
+    const { actuator, api } = build();
+    await actuator.create({
+      cogniKey: "k1",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    api.providerCountryByAccount = {}; // registry read resolves nothing
+
+    const resource = await actuator.update({
+      cogniKey: "k1",
+      externalName: "7001",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: {
+        ...SPEC,
+        placement: { requiredCountryCodes: ["FI"] },
+      },
+    });
+    expect(resource.externalName).toBe("7001");
+  });
+
+  it("no-ops a byte-identical re-PUT and leaves the receipt hash untouched (bug.5238)", async () => {
+    const { actuator, api, ledger } = build();
+    await actuator.create({
+      cogniKey: "k1",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+
+    // First update applies the SDL once and records its hash on the receipt.
+    await actuator.update({
+      cogniKey: "k1",
+      externalName: "7001",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    expect(api.updateCalls).toBe(1);
+    const recordedHash = ledger.rows.get("k1")?.lastAppliedSdlHash;
+    expect(recordedHash).toBe(api.sdlHash(SPEC));
+
+    // Reconciling again with the SAME spec must NOT re-PUT — that is the thrash the fix stops.
+    const resource = await actuator.update({
+      cogniKey: "k1",
+      externalName: "7001",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    expect(resource.externalName).toBe("7001");
+    expect(api.updateCalls).toBe(1);
+    // The receipt hash is unchanged — the no-op wrote nothing.
+    expect(ledger.rows.get("k1")?.lastAppliedSdlHash).toBe(recordedHash);
+  });
+
+  it("still PUTs and updates the hash when a genuine spec change yields a different SDL (bug.5238 anti-over-gate)", async () => {
+    const { actuator, api, ledger } = build();
+    await actuator.create({
+      cogniKey: "k1",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+
+    await actuator.update({
+      cogniKey: "k1",
+      externalName: "7001",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    expect(api.updateCalls).toBe(1);
+    const firstHash = ledger.rows.get("k1")?.lastAppliedSdlHash;
+
+    // A real promote: new image sha → different SDL → different hash → the PUT MUST still fire.
+    const nextSpec: ProvisionSpec = {
+      ...SPEC,
+      services: SPEC.services.map((service) => ({
+        ...service,
+        image: "ghcr.io/cogni-dao/toks9:sha-def",
+      })),
+    };
+    await actuator.update({
+      cogniKey: "k1",
+      externalName: "7001",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: nextSpec,
+    });
+    expect(api.updateCalls).toBe(2);
+    const secondHash = ledger.rows.get("k1")?.lastAppliedSdlHash;
+    expect(secondHash).toBe(api.sdlHash(nextSpec));
+    expect(secondHash).not.toBe(firstHash);
   });
 
   it("releases the provider resource and settles the key", async () => {
@@ -1660,6 +2014,7 @@ describe("AkashTxActuator.sweepStaleAllocations", () => {
       receiptId: `receipt-${input.cogniKey}`,
       cogniKey: input.cogniKey,
       identity: IDENTITY,
+      workload: "operator",
       environment: "candidate-a",
       state: "preparing",
       ...(input.allocationCursor
@@ -1798,5 +2153,675 @@ describe("AkashTxActuator.sweepStaleAllocations", () => {
     await expect(actuator.sweepStaleAllocations(STALE)).rejects.toMatchObject({
       code: "ledger_unavailable",
     });
+  });
+});
+
+describe("AkashTxActuator.leaseLogSources", () => {
+  const DESCRIPTOR = {
+    gseq: 1,
+    oseq: 1,
+    providerAccount: "akash1provider",
+    providerHostUri: "https://provider.example.com:8443",
+    services: ["app", "paper-trader"],
+    state: "active",
+  } as const;
+
+  it("enumerates every allocated lease with coordinates, services and ONE shared token", async () => {
+    const { actuator, ledger, api } = build();
+    seedAllocated(ledger, "k1", "7001");
+    seedAllocated(ledger, "k2", "7002");
+    api.logDescriptors.set("7001", { ...DESCRIPTOR });
+    api.logDescriptors.set("7002", { ...DESCRIPTOR, services: ["app"] });
+
+    const result = await actuator.leaseLogSources({});
+
+    expect(result.sources).toHaveLength(2);
+    expect(result.sources.map((s) => s.dseq).sort()).toEqual(["7001", "7002"]);
+    expect(result.sources[0]).toMatchObject({
+      workload: "operator",
+      environment: "candidate-a",
+      providerAccount: "akash1provider",
+      providerHostUri: "https://provider.example.com:8443",
+    });
+    expect(result.token).toBe("jwt-logs-token");
+    expect(result.ttlSeconds).toBeGreaterThan(0);
+    // One mint covering the deduped provider set — never one mint per lease.
+    expect(api.mintedTokenProviders).toEqual([["akash1provider"]]);
+  });
+
+  it("skips a lease whose descriptor cannot be resolved and keeps the rest (fail-open)", async () => {
+    const { actuator, ledger, api, log } = build();
+    seedAllocated(ledger, "k1", "7001");
+    seedAllocated(ledger, "k2", "7002");
+    api.logDescriptors.set("7002", { ...DESCRIPTOR });
+    // 7001 has no descriptor: the fake console throws for it.
+
+    const result = await actuator.leaseLogSources({});
+
+    expect(result.sources.map((s) => s.dseq)).toEqual(["7002"]);
+    expect(
+      log.lines.some((l) => l.marker === "akash_tx_lease_log_source_skipped")
+    ).toBe(true);
+  });
+
+  it("enumerates a still-`preparing` lease that already bound a handle (boot window, bug.5264)", async () => {
+    const { actuator, ledger, api } = build();
+    seedPreparing(ledger, "k1", "7001");
+    api.logDescriptors.set("7001", { ...DESCRIPTOR });
+
+    const result = await actuator.leaseLogSources({});
+
+    // Before bug.5264 this was 0: listAllocated hid `preparing`, so the booting lease's logs
+    // were lost when its BootDeadline closed the lease.
+    expect(result.sources.map((s) => s.dseq)).toEqual(["7001"]);
+  });
+
+  it("logs a live receipt that has no handle rather than silently skipping it (bug.5264)", async () => {
+    const { actuator, ledger, api, log } = build();
+    seedPreparing(ledger, "k1"); // preparing, no external handle yet
+    seedAllocated(ledger, "k2", "7002");
+    api.logDescriptors.set("7002", { ...DESCRIPTOR });
+
+    const result = await actuator.leaseLogSources({});
+
+    expect(result.sources.map((s) => s.dseq)).toEqual(["7002"]);
+    expect(
+      log.lines.some((l) => l.marker === "akash_tx_lease_log_source_no_handle")
+    ).toBe(true);
+  });
+
+  it("returns an empty snapshot without minting when nothing is active", async () => {
+    const { actuator, api } = build();
+    const result = await actuator.leaseLogSources({});
+    expect(result).toEqual({ sources: [], token: "", ttlSeconds: 0 });
+    expect(api.mintedTokenProviders).toEqual([]);
+  });
+
+  it("refuses the whole call when the token cannot be minted", async () => {
+    const { actuator, ledger, api } = build();
+    seedAllocated(ledger, "k1", "7001");
+    api.logDescriptors.set("7001", { ...DESCRIPTOR });
+    api.mintTokenError = new Error("console down");
+
+    await expect(actuator.leaseLogSources({})).rejects.toMatchObject({
+      name: "AkashTxError",
+    });
+  });
+
+  it("refuses when the ledger is unreadable", async () => {
+    const { actuator, ledger } = build();
+    ledger.failReads = true;
+    await expect(actuator.leaseLogSources({})).rejects.toMatchObject({
+      code: "ledger_unavailable",
+    });
+  });
+});
+
+describe("mapConsoleFailure — a 4xx is a decision, not an unknown (bug.5247)", () => {
+  // poly's candidate-a XCW looped `POST /v1/akash/update` -> Console 422 -> outcome_unknown ->
+  // retry, ~1.5x/min for five days, emitting a cost observation each pass and flooding the XR
+  // watch stream until Crossplane opened the circuit. Console refused BEFORE broadcasting, so
+  // the outcome was never unknown.
+  it.each([
+    400, 403, 409, 422,
+  ])("maps a mutating HTTP %i to the terminal provider_rejected", (status) => {
+    const mapped = mapConsoleFailure(consoleError("HTTP_ERROR", status), {
+      mutating: true,
+    });
+    expect(mapped.code).toBe("provider_rejected");
+  });
+
+  it.each([
+    408, 429,
+  ])("keeps HTTP %i as outcome_unknown — it reached Console and may still land", (status) => {
+    const mapped = mapConsoleFailure(consoleError("HTTP_ERROR", status), {
+      mutating: true,
+    });
+    expect(mapped.code).toBe("outcome_unknown");
+  });
+
+  it("leaves a mutating 5xx as outcome_unknown", () => {
+    expect(
+      mapConsoleFailure(consoleError("HTTP_ERROR", 503), { mutating: true })
+        .code
+    ).toBe("outcome_unknown");
+  });
+
+  it("still maps 404 to not_found, ahead of the 4xx rule", () => {
+    expect(
+      mapConsoleFailure(consoleError("HTTP_ERROR", 404), { mutating: true })
+        .code
+    ).toBe("not_found");
+  });
+
+  it("carries the adapter message through, so the Console detail reaches the log", () => {
+    const error = consoleError("HTTP_ERROR", 422);
+    error.message =
+      "Console request failed with HTTP 422 (keys=code,message code=INVALID_SDL)";
+    expect(mapConsoleFailure(error, { mutating: true }).message).toContain(
+      "code=INVALID_SDL"
+    );
+  });
+});
+
+/**
+ * task.5153 — ledger-derived provider exclusions + actuator-owned strike recording.
+ * The load-bearing property: exclusions survive across SEPARATE actuator instances,
+ * because Crossplane re-invokes create per recovery ordinal in fresh calls and the
+ * previous implementation's in-memory `new Set()` was empty on every one of them —
+ * which re-picked the same dead provider for the entire bounded-recovery budget.
+ */
+describe("AkashTxActuator provider strikes (task.5153)", () => {
+  class FakeOutcomes {
+    readonly records: {
+      computeProvider: string;
+      providerAccount: string;
+      outcome: "boot_ok" | "slo_timeout";
+      leaseId?: string;
+      workload?: string;
+      detail?: string;
+    }[] = [];
+    failWrites = false;
+    async record(rec: (typeof this.records)[number]): Promise<void> {
+      if (this.failWrites) throw new Error("outcomes store down");
+      this.records.push(rec);
+    }
+  }
+
+  class CapturingConsole extends FakeConsole {
+    lastExcluded: ReadonlySet<string> | undefined;
+    override async allocateAndLease(input: {
+      spec: ProvisionSpec;
+      onAllocated?: (leaseId: string) => Promise<void>;
+      excludedProviders?: ReadonlySet<string>;
+    }): Promise<{ leaseId: string; providerAccount: string }> {
+      this.lastExcluded = input.excludedProviders;
+      return super.allocateAndLease(input);
+    }
+  }
+
+  const BASE_KEY = "xcw:cogni-preview:node-9:4";
+
+  function strikeBuild(outcomes: FakeOutcomes, ledger = new FakeLedger()) {
+    const api = new CapturingConsole();
+    const log = recordingLogger();
+    const costs = costDeps();
+    const actuator = new AkashTxActuator({
+      console: api,
+      ledger,
+      log,
+      costEvidence: costs.costEvidence,
+      costStore: costs.costStore,
+      providerConsumerAccountId: costs.providerConsumerAccountId,
+      outcomes,
+    });
+    return { actuator, ledger, api, log };
+  }
+
+  it("derives exclusions from receipts across separate actuator instances and strikes the prior provider", async () => {
+    const outcomes = new FakeOutcomes();
+    const ledger = new FakeLedger();
+
+    // Attempt 0: a fresh instance creates the base-key lease on akash1provider.
+    const first = strikeBuild(outcomes, ledger);
+    await first.actuator.create({
+      cogniKey: BASE_KEY,
+      environment: "preview",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    expect(first.api.lastExcluded).toBeUndefined();
+    expect(outcomes.records).toHaveLength(0);
+
+    // Recovery ordinal 1 arrives on a BRAND-NEW instance (fresh process, empty memory):
+    // the tried set must come from the ledger, and reaching :recover:1 IS the proof that
+    // attempt 0's provider failed — the strike names its lease.
+    const second = strikeBuild(outcomes, ledger);
+    await second.actuator.create({
+      cogniKey: `${BASE_KEY}:recover:1`,
+      environment: "preview",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    expect([...(second.api.lastExcluded ?? [])]).toEqual(["akash1provider"]);
+    expect(outcomes.records).toEqual([
+      expect.objectContaining({
+        computeProvider: "akash",
+        providerAccount: "akash1provider",
+        outcome: "slo_timeout",
+        leaseId: "7001",
+        workload: SPEC.name,
+      }),
+    ]);
+    expect(
+      second.log.lines.some(
+        (l) => l.marker === "akash_tx_provider_strike_recorded"
+      )
+    ).toBe(true);
+  });
+
+  it("a strike-write failure degrades loudly and never blocks the paid recovery attempt", async () => {
+    const outcomes = new FakeOutcomes();
+    const ledger = new FakeLedger();
+    const first = strikeBuild(outcomes, ledger);
+    await first.actuator.create({
+      cogniKey: BASE_KEY,
+      environment: "preview",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+
+    outcomes.failWrites = true;
+    const second = strikeBuild(outcomes, ledger);
+    const result = await second.actuator.create({
+      cogniKey: `${BASE_KEY}:recover:1`,
+      environment: "preview",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    expect(result.externalName).toBe("7001");
+    expect([...(second.api.lastExcluded ?? [])]).toEqual(["akash1provider"]);
+    expect(
+      second.log.lines.some(
+        (l) => l.marker === "akash_tx_provider_strike_write_failed"
+      )
+    ).toBe(true);
+  });
+
+  it("records boot_ok once per lease on a positive serving proof", async () => {
+    const outcomes = new FakeOutcomes();
+    const ledger = new FakeLedger();
+    const api = new FakeConsole();
+    const costs = costDeps();
+    const actuator = new AkashTxActuator({
+      console: api,
+      ledger,
+      log: recordingLogger(),
+      costEvidence: costs.costEvidence,
+      costStore: costs.costStore,
+      providerConsumerAccountId: costs.providerConsumerAccountId,
+      probe: async () => true,
+      outcomes,
+    });
+    await actuator.create({
+      cogniKey: BASE_KEY,
+      environment: "preview",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    await actuator.observe({
+      cogniKey: BASE_KEY,
+      externalName: "7001",
+      expectedSourceSha: "abc123",
+    });
+    await actuator.observe({
+      cogniKey: BASE_KEY,
+      externalName: "7001",
+      expectedSourceSha: "abc123",
+    });
+    const bootOks = outcomes.records.filter((r) => r.outcome === "boot_ok");
+    expect(bootOks).toEqual([
+      expect.objectContaining({
+        providerAccount: "akash1provider",
+        leaseId: "7001",
+      }),
+    ]);
+  });
+});
+
+describe("AkashTxActuator release-migration receipt identity", () => {
+  /** The actuator as the akash-tx composition root wires it: with a receipt store. */
+  function buildWithReports() {
+    const ledger = new FakeLedger();
+    const migration = new FakeMigration();
+    migration.receiptStdout = RECEIPT_STDOUT;
+    const reports = new FakeReports();
+    const log = recordingLogger();
+    const costs = costDeps();
+    const actuator = new AkashTxActuator({
+      console: new FakeConsole(),
+      ledger,
+      log,
+      migration,
+      migrationReports: reports,
+      costEvidence: costs.costEvidence,
+      costStore: costs.costStore,
+      providerConsumerAccountId: costs.providerConsumerAccountId,
+    });
+    return { actuator, ledger, migration, reports, log };
+  }
+
+  it("keys the cell on the node id its OWN allocation receipt binds, not on the slug", async () => {
+    // The proven cause of the lost receipts: the write key used to be re-derived from the
+    // workload slug via the `nodes` registry, which is FORCE row-level security and therefore
+    // invisible to this session-less process — every receipt was discarded as
+    // `node_not_registered` while 32 of 32 declared migrations were applied. The key now comes
+    // from the durable allocation receipt, whose node_id arrived explicitly on the PAID wire and
+    // is NOT NULL and write-once. `workload` here is deliberately a DIFFERENT string from the
+    // receipt's own, so a slug-derived key could not pass this test.
+    const { actuator, ledger, reports } = buildWithReports();
+    seedAllocated(ledger);
+
+    await expect(
+      actuator.observe({
+        cogniKey: "k1",
+        workload: "toks9",
+        environment: "candidate-a",
+        migration: STEP,
+      })
+    ).resolves.toMatchObject({ migration: { phase: "succeeded" } });
+
+    expect(reports.recorded).toEqual([
+      {
+        nodeId: IDENTITY.nodeId,
+        environment: "candidate-a",
+        declared: ["0000_init"],
+        applied: [{ tag: "0000_init", hash: "abc", appliedAtMs: 1 }],
+        bundleDigest: STEP.bundleDigest,
+        reporter: "migration-job",
+      },
+    ]);
+  });
+
+  it("still migrates — and still reports the phase — when no receipt binds the key yet", async () => {
+    // A workload's first observe precedes its first create by construction, so there is nothing
+    // to resolve an identity from. NEVER_REFUSES holds: the phase is unchanged and only the
+    // metadata waits for the tick after the lease exists.
+    const { actuator, reports, log } = buildWithReports();
+
+    await expect(
+      actuator.observe({
+        cogniKey: "k1",
+        workload: "toks9",
+        environment: "candidate-a",
+        migration: STEP,
+      })
+    ).resolves.toMatchObject({
+      found: false,
+      migration: { phase: "succeeded" },
+    });
+
+    expect(reports.recorded).toEqual([]);
+    expect(log.lines.map((line) => line.marker)).toContain(
+      "akash_tx_migration_receipt_unbound"
+    );
+  });
+});
+
+/**
+ * bug.5416: the drift gate FIRED on candidate-a (`akash_tx_migration_drift_missing`, poly) and
+ * whether it GATED anything was unreadable from telemetry — the composite decides from the
+ * observe RESPONSE, and the response was never logged. These pin the verdict line.
+ */
+describe("AkashTxActuator observe migration verdict", () => {
+  /** A receipt with drift on BOTH axes: one declared tag absent, one ledger row unrecognised. */
+  const DECLARED_BUT_MISSING = "0071_gigantic_sister_grimm";
+  const DATABASE_ONLY_ROW = "0070_row_the_image_never_declared";
+  const DRIFTED_RECEIPT_STDOUT = `COGNI_MIGRATION_RECEIPT_V1 ${JSON.stringify({
+    node: "toks9",
+    declared: ["0000_init", DECLARED_BUT_MISSING],
+    applied: [
+      { tag: "0000_init", hash: "abc", appliedAtMs: 1 },
+      { tag: DATABASE_ONLY_ROW, hash: "def", appliedAtMs: 2 },
+    ],
+  })}`;
+
+  function buildWithReports(receiptStdout: string) {
+    const ledger = new FakeLedger();
+    const migration = new FakeMigration();
+    migration.receiptStdout = receiptStdout;
+    const log = recordingLogger();
+    const costs = costDeps();
+    const actuator = new AkashTxActuator({
+      console: new FakeConsole(),
+      ledger,
+      log,
+      migration,
+      migrationReports: new FakeReports(),
+      costEvidence: costs.costEvidence,
+      costStore: costs.costStore,
+      providerConsumerAccountId: costs.providerConsumerAccountId,
+    });
+    return { actuator, ledger, migration, log };
+  }
+
+  function verdicts(log: ReturnType<typeof recordingLogger>) {
+    return log.lines.filter(
+      (line) => line.marker === "akash_tx_observe_migration_verdict"
+    );
+  }
+
+  it("states the phase the response carries, exactly once per observe", async () => {
+    const { actuator, ledger, log } = buildWithReports(RECEIPT_STDOUT);
+    seedAllocated(ledger);
+
+    const observation = await actuator.observe({
+      cogniKey: "k1",
+      workload: "toks9",
+      environment: "candidate-a",
+      migration: STEP,
+    });
+
+    expect(observation.migration).toEqual({ phase: "succeeded" });
+    expect(verdicts(log)).toEqual([
+      {
+        level: "info",
+        marker: "akash_tx_observe_migration_verdict",
+        fields: {
+          cogniKey: "k1",
+          workload: "toks9",
+          environment: "candidate-a",
+          bundleDigest: STEP.bundleDigest,
+          requested: true,
+          phase: "succeeded",
+        },
+      },
+    ]);
+  });
+
+  it("states a FAILED verdict at error level when the drift gate fails the step", async () => {
+    // The gate's input, readable on its own without re-deriving it from
+    // `akash_tx_migration_succeeded` + `akash_tx_migration_drift_missing`. `phase: "failed"` is
+    // the one value `composition.yaml` turns into status.failure.reason: MigrationFailed.
+    const { actuator, ledger, log } = buildWithReports(DRIFTED_RECEIPT_STDOUT);
+    seedAllocated(ledger);
+
+    const observation = await actuator.observe({
+      cogniKey: "k1",
+      workload: "toks9",
+      environment: "candidate-a",
+      migration: STEP,
+    });
+
+    expect(observation.migration).toEqual({ phase: "failed" });
+    expect(verdicts(log)).toEqual([
+      expect.objectContaining({
+        level: "error",
+        fields: expect.objectContaining({ requested: true, phase: "failed" }),
+      }),
+    ]);
+  });
+
+  it("never names a migration tag — least of all one read out of the database", async () => {
+    // PROVENANCE (bug.5415, preserved): declared/missing tags are IMAGE content and may be
+    // named on the drift verdict; `unexpected` tags are DATABASE ROW content and are counted,
+    // never named. This line is an ENUM plus the caller's own identifiers, so it carries
+    // NEITHER — and the database-sourced tag must not appear anywhere in it.
+    const { actuator, ledger, log } = buildWithReports(DRIFTED_RECEIPT_STDOUT);
+    seedAllocated(ledger);
+
+    await actuator.observe({
+      cogniKey: "k1",
+      workload: "toks9",
+      environment: "candidate-a",
+      migration: STEP,
+    });
+
+    const serialized = JSON.stringify(verdicts(log));
+    expect(serialized).not.toContain(DATABASE_ONLY_ROW);
+    expect(serialized).not.toContain(DECLARED_BUT_MISSING);
+    expect(serialized).not.toContain("0000_init");
+    // And the provenance rule itself still holds on the line that DOES name tags.
+    const driftLine = log.lines.find(
+      (line) => line.marker === "akash_tx_migration_drift_missing"
+    );
+    expect(driftLine?.fields.missing).toEqual([DECLARED_BUT_MISSING]);
+    expect(JSON.stringify(driftLine)).not.toContain(DATABASE_ONLY_ROW);
+  });
+
+  it("says the gate was NOT CONSULTED when the composite attached no step", async () => {
+    // A composite that stops attaching the step makes the gate silently inert. `requested:
+    // false` with no `phase` keeps that distinguishable from a gate that passed — the absence
+    // of a marker cannot be told apart from an operator that is not deployed.
+    const { actuator, ledger, log } = buildWithReports(RECEIPT_STDOUT);
+    seedAllocated(ledger);
+
+    const observation = await actuator.observe({ cogniKey: "k1" });
+
+    expect(observation.migration).toBeUndefined();
+    expect(verdicts(log)).toEqual([
+      {
+        level: "info",
+        marker: "akash_tx_observe_migration_verdict",
+        fields: { cogniKey: "k1", requested: false },
+      },
+    ]);
+  });
+
+  it("states `unavailable` at warn level when the step's target was unstated", async () => {
+    const { actuator, ledger, log } = buildWithReports(RECEIPT_STDOUT);
+    seedAllocated(ledger);
+
+    const observation = await actuator.observe({
+      cogniKey: "k1",
+      migration: STEP,
+    });
+
+    expect(observation.migration).toEqual({ phase: "unavailable" });
+    expect(verdicts(log)).toEqual([
+      {
+        level: "warn",
+        marker: "akash_tx_observe_migration_verdict",
+        fields: {
+          cogniKey: "k1",
+          bundleDigest: STEP.bundleDigest,
+          requested: true,
+          phase: "unavailable",
+        },
+      },
+    ]);
+  });
+});
+
+/**
+ * bug.5416, second half. `akash_tx_observe_migration_verdict` proves what the RESPONSE carried;
+ * it cannot prove the composite acted, because `composition.yaml` ranks a terminal refusal and
+ * `BootDeadlineExceeded` above `$migrationFailed`. These pin the composite's own verdict line —
+ * the only telemetry a Composition can produce, since Kubernetes records no Event for a status
+ * transition and `function-go-templating` has no result meta-kind.
+ */
+describe("AkashTxActuator observe composite verdict", () => {
+  function verdicts(log: ReturnType<typeof recordingLogger>) {
+    return log.lines.filter(
+      (line) => line.marker === "akash_tx_observe_composite_verdict"
+    );
+  }
+
+  it("states the composite's phase and reason at error level when it FAILED", async () => {
+    const { actuator, log } = build();
+
+    await actuator.observe({
+      cogniKey: "k1",
+      workload: "poly",
+      environment: "candidate-a",
+      composite: { phase: "Failed", failureReason: "MigrationFailed" },
+    });
+
+    expect(verdicts(log)).toEqual([
+      {
+        level: "error",
+        marker: "akash_tx_observe_composite_verdict",
+        fields: {
+          cogniKey: "k1",
+          workload: "poly",
+          environment: "candidate-a",
+          reported: true,
+          compositePhase: "Failed",
+          compositeFailureReason: "MigrationFailed",
+        },
+      },
+    ]);
+  });
+
+  it("distinguishes the branch that WON from the migration verdict on the same tick", async () => {
+    // The whole point: a response carrying `failed` and a composite reporting
+    // `BootDeadlineExceeded` are one tick. Two markers, two facts, no re-derivation.
+    const { actuator, log } = build();
+
+    await actuator.observe({
+      cogniKey: "k1",
+      composite: { phase: "Failed", failureReason: "BootDeadlineExceeded" },
+    });
+
+    expect(verdicts(log)[0]?.fields).toMatchObject({
+      compositeFailureReason: "BootDeadlineExceeded",
+    });
+  });
+
+  it("states the cleared-failure sentinel rather than omitting it", async () => {
+    // `status.failure.reason` is written UNCONDITIONALLY by the composition (bug.5287); "None"
+    // is cleared, and a reader must see it to tell a healthy composite from a silent one.
+    const { actuator, log } = build();
+
+    await actuator.observe({
+      cogniKey: "k1",
+      composite: { phase: "Ready", failureReason: "None" },
+    });
+
+    expect(verdicts(log)).toEqual([
+      {
+        level: "info",
+        marker: "akash_tx_observe_composite_verdict",
+        fields: {
+          cogniKey: "k1",
+          reported: true,
+          compositePhase: "Ready",
+          compositeFailureReason: "None",
+        },
+      },
+    ]);
+  });
+
+  it("says the composite REPORTED NOTHING when the composition does not send it", async () => {
+    // The reader ships before the sender. Absence of a marker cannot be told apart from an
+    // operator that is not deployed, so the not-sent case gets its own line.
+    const { actuator, log } = build();
+
+    await actuator.observe({ cogniKey: "k1" });
+
+    expect(verdicts(log)).toEqual([
+      {
+        level: "info",
+        marker: "akash_tx_observe_composite_verdict",
+        fields: { cogniKey: "k1", reported: false },
+      },
+    ]);
+  });
+
+  it("carries no failure MESSAGE — the bounded reason token is the whole payload", async () => {
+    const { actuator, log } = build();
+
+    await actuator.observe({
+      cogniKey: "k1",
+      composite: { phase: "Failed", failureReason: "RecoveryLimitExceeded" },
+    });
+
+    const fields = verdicts(log)[0]?.fields ?? {};
+    expect(Object.keys(fields).sort()).toEqual([
+      "cogniKey",
+      "compositeFailureReason",
+      "compositePhase",
+      "reported",
+    ]);
   });
 });

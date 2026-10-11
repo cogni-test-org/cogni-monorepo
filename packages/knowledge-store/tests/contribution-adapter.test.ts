@@ -45,10 +45,18 @@ const reviewer: Principal = {
 class FakeReservedSql {
   readonly queries: string[] = [];
 
+  constructor(private readonly hasUseWhen = true) {}
+
   async unsafe(
     query: string
   ): Promise<Record<string, unknown>[] & { count?: number }> {
     this.queries.push(query);
+    // Admission control takes a session advisory lock before any branch work
+    // (bug.5391); a fake that cannot answer it would fail every write as busy.
+    if (query.includes("pg_try_advisory_lock"))
+      return [{ pg_try_advisory_lock: true }];
+    if (query.includes("pg_advisory_unlock"))
+      return [{ pg_advisory_unlock: true }];
     if (query.includes("dolt_hashof")) {
       return [{ dolt_hashof: "head123" }];
     }
@@ -57,6 +65,12 @@ class FakeReservedSql {
     }
     if (query.includes("FROM domains")) {
       return [{ "?column?": 1 }];
+    }
+    if (
+      query.includes("information_schema.columns") &&
+      query.includes("'use_when'")
+    ) {
+      return this.hasUseWhen ? [{ "?column?": 1 }] : [];
     }
     if (query.includes("dolt_merge")) {
       return [{ dolt_merge: ["merge123"] }];
@@ -105,11 +119,14 @@ class FakeReservedSql {
 
 class FakeSql {
   readonly queries: string[] = [];
-  readonly conn = new FakeReservedSql();
+  readonly conn: FakeReservedSql;
 
   constructor(
-    private readonly contributionRecord: Record<string, unknown> = record
-  ) {}
+    private readonly contributionRecord: Record<string, unknown> = record,
+    hasUseWhen = true
+  ) {
+    this.conn = new FakeReservedSql(hasUseWhen);
+  }
 
   async unsafe(query: string): Promise<Record<string, unknown>[]> {
     this.queries.push(query);
@@ -169,6 +186,12 @@ class FakeMergeReservedSql {
     query: string
   ): Promise<Record<string, unknown>[] & { count?: number }> {
     this.queries.push(query);
+    // Admission control takes a session advisory lock before any branch work
+    // (bug.5391); a fake that cannot answer it would fail every write as busy.
+    if (query.includes("pg_try_advisory_lock"))
+      return [{ pg_try_advisory_lock: true }];
+    if (query.includes("pg_advisory_unlock"))
+      return [{ pg_advisory_unlock: true }];
     if (query.includes("dolt_merge('--abort')")) {
       return [{ dolt_merge: ["", "0", "0", "aborted"] }];
     }
@@ -512,6 +535,151 @@ describe("DoltgresKnowledgeContributionAdapter", () => {
     expect(sql).toContain(`keep${chr(0x0a)}drop`);
   });
 
+  it("persists use_when on an insert edit (explicit column list regression)", async () => {
+    // The adapter writes knowledge rows with hand-written column lists, so a
+    // new column is silently dropped unless every list is updated. That is
+    // exactly what shipped and had to be caught on a live candidate: the API
+    // accepted `useWhen` and the stored row came back null.
+    const fake = new FakeSql();
+
+    await adapterFor(fake).appendCommit({
+      contributionId: "contrib-agent-1-abc123",
+      principal: { id: "agent-1", kind: "agent" },
+      message: "new atom with a retrieval trigger",
+      edits: [
+        {
+          op: "insert",
+          entry: {
+            id: "shelf-one-axis",
+            domain: "method",
+            title: "A shelf sorts on one axis",
+            content: "Body.",
+            useWhen: "designing a knowledge domain set",
+          },
+        },
+      ],
+    });
+
+    const insert = fake.conn.queries.find(
+      (q) => q.startsWith("INSERT INTO knowledge ") && q.includes("use_when")
+    );
+    expect(insert).toBeDefined();
+    expect(insert).toContain("designing a knowledge domain set");
+  });
+
+  it("persists use_when on an update edit", async () => {
+    const fake = new FakeSql();
+
+    await adapterFor(fake).appendCommit({
+      contributionId: "contrib-agent-1-abc123",
+      principal: { id: "agent-1", kind: "agent" },
+      message: "move the trigger out of content",
+      edits: [
+        {
+          op: "update",
+          targetRowId: "shelf-one-axis",
+          entry: {
+            id: "shelf-one-axis",
+            domain: "method",
+            title: "A shelf sorts on one axis",
+            content: "Body without the trigger line.",
+            useWhen: "designing a knowledge domain set",
+          },
+        },
+      ],
+    });
+
+    const update = fake.conn.queries.find(
+      (q) => q.startsWith("UPDATE knowledge SET") && q.includes("use_when")
+    );
+    expect(update).toBeDefined();
+    expect(update).toContain("designing a knowledge domain set");
+  });
+
+  it("updates a historical branch that predates the optional use_when column", async () => {
+    const fake = new FakeSql(record, false);
+
+    await adapterFor(fake).appendCommit({
+      contributionId: "contrib-agent-1-abc123",
+      principal: { id: "agent-1", kind: "agent" },
+      message: "refresh a long-lived visual",
+      edits: [
+        {
+          op: "update",
+          targetRowId: "node-birth-fastlane",
+          entry: {
+            id: "node-birth-fastlane",
+            domain: "substrate",
+            title: "Generated PR fast lane status",
+            content: "Current visual.",
+          },
+        },
+      ],
+    });
+
+    const update = fake.conn.queries.find((q) =>
+      q.startsWith("UPDATE knowledge SET")
+    );
+    expect(update).toBeDefined();
+    expect(update).not.toContain("use_when");
+    expect(update).toContain("Current visual.");
+  });
+
+  it("inserts into a historical branch that predates the optional use_when column", async () => {
+    const fake = new FakeSql(record, false);
+
+    await adapterFor(fake).appendCommit({
+      contributionId: "contrib-agent-1-abc123",
+      principal: { id: "agent-1", kind: "agent" },
+      message: "append a historical-branch atom",
+      edits: [
+        {
+          op: "insert",
+          entry: {
+            id: "historical-branch-atom",
+            domain: "substrate",
+            title: "Historical branch atom",
+            content: "Current content.",
+          },
+        },
+      ],
+    });
+
+    const insert = fake.conn.queries.find((q) =>
+      q.startsWith("INSERT INTO knowledge (")
+    );
+    expect(insert).toBeDefined();
+    expect(insert).not.toContain("use_when");
+    expect(insert).toContain("Current content.");
+  });
+
+  it("writes NULL use_when when the edit omits it", async () => {
+    const fake = new FakeSql();
+
+    await adapterFor(fake).appendCommit({
+      contributionId: "contrib-agent-1-abc123",
+      principal: { id: "agent-1", kind: "agent" },
+      message: "atom without a trigger",
+      edits: [
+        {
+          op: "insert",
+          entry: {
+            id: "no-trigger",
+            domain: "method",
+            title: "No trigger here",
+            content: "Body.",
+          },
+        },
+      ],
+    });
+
+    const insert = fake.conn.queries.find((q) =>
+      q.startsWith("INSERT INTO knowledge ")
+    );
+    expect(insert).toContain("use_when");
+    expect(insert).toMatch(/,\s*NULL,/);
+  });
+
   it("applies a cite edit as a citations insert + cited-row confidence recompute", async () => {
     const fake = new FakeSql();
 
@@ -748,6 +916,12 @@ class CrossPlaneFakeReservedSql {
     query: string
   ): Promise<Record<string, unknown>[] & { count?: number }> {
     this.queries.push(query);
+    // Admission control takes a session advisory lock before any branch work
+    // (bug.5391); a fake that cannot answer it would fail every write as busy.
+    if (query.includes("pg_try_advisory_lock"))
+      return [{ pg_try_advisory_lock: true }];
+    if (query.includes("pg_advisory_unlock"))
+      return [{ pg_advisory_unlock: true }];
     if (query.includes("dolt_hashof")) return [{ dolt_hashof: "head123" }];
     if (query.includes("dolt_commit")) return [{ dolt_commit: ["{next456}"] }];
     if (query.includes("SELECT 1 FROM knowledge WHERE id"))

@@ -21,7 +21,6 @@ const fakes = vi.hoisted(() => ({
   deliver: vi.fn(),
   review: vi.fn(),
   preview: vi.fn(),
-  sync: vi.fn(),
   signal: vi.fn(),
 }));
 
@@ -65,9 +64,6 @@ vi.mock("@/app/_facades/review/dispatch.server", () => ({
 }));
 vi.mock("@/app/_facades/deploy/node-preview-promote.server", () => ({
   dispatchNodePreviewPromote: fakes.preview,
-}));
-vi.mock("@/app/_facades/deploy/canonical-fork-sync.server", () => ({
-  dispatchCanonicalForkSync: fakes.sync,
 }));
 vi.mock("@/features/governance/services/signal-dispatch", () => ({
   dispatchSignalExecution: fakes.signal,
@@ -125,8 +121,77 @@ describe("POST internal webhook verification boundary", () => {
     expect(fakes.deliver).not.toHaveBeenCalled();
     expect(fakes.review).not.toHaveBeenCalled();
     expect(fakes.preview).not.toHaveBeenCalled();
-    expect(fakes.sync).not.toHaveBeenCalled();
     expect(fakes.signal).not.toHaveBeenCalled();
+  });
+
+  it("uses push as the one node-preview signal (direct + merge-queue safe)", async () => {
+    fakes.verify.mockResolvedValue(true);
+    fakes.catalogLookup.mockResolvedValue({
+      status: "matched",
+      repo: "cogni-dao/poly",
+      target: {
+        id: "poly-id",
+        slug: "poly",
+        repo: { owner: "cogni-dao", repo: "poly" },
+      },
+    });
+    fakes.normalize.mockResolvedValue([]);
+
+    const payload = {
+      ref: "refs/heads/main",
+      after: "d".repeat(40),
+      repository: {
+        full_name: "cogni-dao/poly",
+        name: "poly",
+        default_branch: "main",
+        owner: { login: "cogni-dao" },
+      },
+    };
+    const response = await post(payload, "push");
+
+    expect(response.status).toBe(200);
+    expect(fakes.preview).toHaveBeenCalledOnce();
+    expect(fakes.preview).toHaveBeenCalledWith(
+      payload,
+      expect.anything(),
+      logger
+    );
+    expect(fakes.review).not.toHaveBeenCalled();
+  });
+
+  it("does not acknowledge a push when the promotion dispatch is unobserved", async () => {
+    fakes.verify.mockResolvedValue(true);
+    fakes.catalogLookup.mockResolvedValue({
+      status: "matched",
+      repo: "cogni-dao/poly",
+      target: {
+        id: "poly-id",
+        slug: "poly",
+        repo: { owner: "cogni-dao", repo: "poly" },
+      },
+    });
+    fakes.normalize.mockResolvedValue([]);
+    fakes.preview.mockRejectedValueOnce(new Error("run identity missing"));
+
+    const response = await post(
+      {
+        ref: "refs/heads/main",
+        after: "d".repeat(40),
+        repository: {
+          full_name: "cogni-dao/poly",
+          name: "poly",
+          default_branch: "main",
+          owner: { login: "cogni-dao" },
+        },
+      },
+      "push"
+    );
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      error: "Ingestion failed",
+    });
   });
 
   it("force-refreshes a warm pre-spawn snapshot and routes the first verified fresh-node event once", async () => {

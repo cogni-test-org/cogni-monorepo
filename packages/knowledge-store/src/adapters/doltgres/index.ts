@@ -61,6 +61,7 @@ function rowToKnowledge(row: Record<string, unknown>): Knowledge {
     entityId: (row.entity_id as string) ?? null,
     title: row.title as string,
     content: row.content as string,
+    useWhen: (row.use_when as string) ?? null,
     entryType: row.entry_type as string,
     confidencePct:
       row.confidence_pct != null ? Number(row.confidence_pct) : null,
@@ -92,6 +93,12 @@ function knowledgeInsertColumns(entry: NewKnowledge): SqlColumnValue[] {
     { column: "entity_id", value: entry.entityId ?? undefined },
     { column: "title", value: stripDangerousControlChars(entry.title) },
     { column: "content", value: stripDangerousControlChars(entry.content) },
+    {
+      column: "use_when",
+      value: entry.useWhen
+        ? stripDangerousControlChars(entry.useWhen)
+        : undefined,
+    },
     { column: "entry_type", value: entry.entryType ?? undefined },
     { column: "confidence_pct", value: confidence },
     { column: "source_type", value: entry.sourceType },
@@ -118,7 +125,8 @@ function knowledgeUpdateColumns(
     // PRESERVE_MARKDOWN_WHITESPACE: strip dangerous control chars from the
     // free-text fields on write (bug.5062), same as the insert path.
     const value =
-      (key === "title" || key === "content") && typeof raw === "string"
+      (key === "title" || key === "content" || key === "useWhen") &&
+      typeof raw === "string"
         ? stripDangerousControlChars(raw)
         : raw;
     columns.push({ column, value });
@@ -128,6 +136,7 @@ function knowledgeUpdateColumns(
   push("entity_id", "entityId");
   push("title", "title");
   push("content", "content");
+  push("use_when", "useWhen");
   push("entry_type", "entryType");
   push("confidence_pct", "confidencePct");
   push("source_type", "sourceType");
@@ -205,7 +214,7 @@ export class DoltgresKnowledgeStoreAdapter implements KnowledgeStorePort {
 
   async listKnowledge(
     domain: string,
-    opts?: { tags?: string[]; limit?: number }
+    opts?: { tags?: string[]; limit?: number; q?: string }
   ): Promise<Knowledge[]> {
     const conditions = [`domain = ${escapeValue(domain)}`];
 
@@ -219,6 +228,34 @@ export class DoltgresKnowledgeStoreAdapter implements KnowledgeStorePort {
     }
 
     const limit = opts?.limit ?? 100;
+    const needle = opts?.q?.trim().toLowerCase();
+
+    // `q` matches case-insensitively in the APP LAYER, not in Doltgres SQL —
+    // the same idiom `searchKnowledge` already uses, and for the same reason:
+    // Doltgres has no ILIKE, and LOWER() panics on out-of-line TEXT storage
+    // (*val.TextStorage). `use_when` is a `text` column too, so it carries the
+    // same hazard; there is no SQL case-folding idiom in this adapter that is
+    // proven safe on `text`. The `q` path therefore fetches the shelf (domain
+    // is indexed) WITHOUT the SQL LIMIT and truncates after filtering —
+    // limiting first would silently drop matches outside the newest N. Both
+    // collapse into the pgvector search index when it lands
+    // (DOLT_IS_SOURCE_OF_TRUTH).
+    if (needle) {
+      const rows = await this.sql.unsafe(
+        `SELECT * FROM knowledge WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC`
+      );
+      const matched: Knowledge[] = [];
+      for (const r of rows) {
+        const entry = rowToKnowledge(r as Record<string, unknown>);
+        // A null trigger never matches: an entry with no `useWhen` has not
+        // stated a situation, so it cannot claim to fit the caller's.
+        if (!entry.useWhen?.toLowerCase().includes(needle)) continue;
+        matched.push(entry);
+        if (matched.length >= limit) break;
+      }
+      return matched;
+    }
+
     const rows = await this.sql.unsafe(
       `SELECT * FROM knowledge WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC LIMIT ${limit}`
     );
@@ -583,3 +620,9 @@ export {
   DoltgresEdoResolverAdapter,
   type DoltgresEdoResolverConfig,
 } from "./edo-resolver.js";
+export {
+  type BranchSessionLogger,
+  type BranchSessionOptions,
+  DoltBranchSessionRunner,
+  KNOWLEDGE_BRANCH_LOCK_KEY,
+} from "./session-admission.js";

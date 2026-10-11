@@ -28,7 +28,6 @@ import {
 import {
   ContributionForbiddenError,
   ContributionNotFoundError,
-  ContributionQuotaError,
   ContributionStateError,
   type CreateEdoDecisionInput,
   type CreateEdoHypothesisInput,
@@ -69,7 +68,6 @@ export interface ListQuery {
 export interface ContributionServiceDeps {
   port: KnowledgeContributionPort;
   canMergeKnowledge: (p: Principal) => boolean;
-  rateLimit: { maxOpenPerPrincipal: number };
   /**
    * Write-pipeline gates run against every insert/update edit before it is
    * forwarded to the port. Throws `KnowledgeGateError` on failure; the HTTP
@@ -153,7 +151,18 @@ export function createContributionService(
     for (const edit of edits) {
       // delete + cite carry no entry payload — nothing for the write gates
       // (shape/provenance) to validate; forward unchanged.
-      if (edit.op === "delete" || edit.op === "cite") {
+      //
+      // `patch` is forwarded unchanged too, and this is NOT a gate bypass:
+      // PATCH_CARRIES_ONLY_UNGATED_FIELDS. The partial can carry only `useWhen`
+      // and `entryType`, the two entry fields neither v0 gate has an opinion
+      // about — `shapeGate` governs id/title/content/tags, `provenanceGate`
+      // governs sourceType/sourceRef. Every gate-governed field is absent from
+      // `KnowledgeEntryPatchSchema`, so running the chain here would have
+      // nothing to check; and a caller wanting to change one of those must use
+      // `op:'update'`, which does run the chain. `useWhen`'s own rules land in
+      // task.5204 item 8 — a band is pointless while the only way to apply it
+      // is a 64 KiB whole-entry replace.
+      if (edit.op === "delete" || edit.op === "cite" || edit.op === "patch") {
         out.push(edit);
         continue;
       }
@@ -194,24 +203,10 @@ export function createContributionService(
     return prior.find((r) => r.idempotencyKey === idempotencyKey) ?? null;
   }
 
-  async function enforceOpenQuota(principal: Principal): Promise<void> {
-    const open = await deps.port.list({
-      state: "open",
-      principalId: principal.id,
-      limit: 100,
-    });
-    if (open.length >= deps.rateLimit.maxOpenPerPrincipal) {
-      throw new ContributionQuotaError(
-        `max open contributions per principal = ${deps.rateLimit.maxOpenPerPrincipal}`
-      );
-    }
-  }
-
   return {
     async create({ principal, body }) {
       const replayed = await idempotencyReplay(principal, body.idempotencyKey);
       if (replayed) return replayed;
-      await enforceOpenQuota(principal);
       const gated = await gateEdits(body.edits);
       return deps.port.create({
         principal,
@@ -238,7 +233,6 @@ export function createContributionService(
           ...body,
         });
       }
-      await enforceOpenQuota(principal);
       return deps.port.createEdoHypothesis({ principal, ...body });
     },
 
@@ -253,7 +247,6 @@ export function createContributionService(
           ...body,
         });
       }
-      await enforceOpenQuota(principal);
       return deps.port.createEdoDecision({ principal, ...body });
     },
 
@@ -268,7 +261,6 @@ export function createContributionService(
           ...body,
         });
       }
-      await enforceOpenQuota(principal);
       return deps.port.createEdoOutcome({ principal, ...body });
     },
 

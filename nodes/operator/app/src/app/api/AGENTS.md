@@ -5,7 +5,7 @@
 ## Metadata
 
 - **Owners:** @derek @core-dev
-- **Last reviewed:** 2026-09-11
+- **Last reviewed:** 2026-10-09
 - **Status:** draft
 
 ## Purpose
@@ -41,6 +41,7 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
   - `/api/auth/[...nextauth]` [GET, POST]
   - `/api/setup/verify` [POST] - DAO formation verification
   - `/api/v1/nodes` [GET, POST] - managed-node registry: list owner's nodes + create a new registration
+  - `/api/v1/dashboard/nodes` [GET] - authenticated principal's display-safe node operations overview (owner-scoped in v0)
   - `/api/v1/nodes/[id]` [GET, PATCH] - read + state-machine-aware update of a registered node row
   - `/api/v1/nodes/[id]/developers` [POST] - owner-gated approve/reject for registered agent developer flight authority
   - `/api/v1/nodes/[id]/reconcile-merge-queue` [POST] - env-manager-gated convergence of a node repo's live merge queue to the git-owned operator policy
@@ -49,8 +50,10 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
   - `/api/v1/nodes/[id]/activate-distributions` [POST] - terminal owner/developer-gated repo-spec PR; verifies distributor ownership/token and paired CAS publishing authority before recording active
   - `/api/v1/nodes/[id]/distributions-status` [GET] - owner/developer-gated read of the git-plane activation record (repo-spec main + open/merged activation PR + distributor addresses)
   - `/api/v1/nodes/[id]/reset-dao` [POST] - owner-only destructive reset of a node's DAO record (clears dao/token, status -> dao_pending) so it can be re-formed
-  - `/api/v1/deploy/infra-reconcile` [POST] - production-promoter-gated, operator-node-only infra reconcile through the operator GitHub App; preserves the deployed app source pin
+  - `/api/v1/nodes/[id]/observability/db/schema` [GET] - developer-gated (`node.flight`) read of a node's APPLIED migration state per `?env=`, from operator-held deployment metadata reported by the node's own migrator; distinguishes `never_reported` from reported-with-zero. The operator never queries a node database.
+  - `/api/v1/deploy/infra-reconcile` [POST] - operator-node-only infra reconcile through the operator GitHub App; preserves the requested lane's deployed app source pin. `preview` is env-manager-gated (`node.manage_envs`), `production`/`candidate-a` production-promoter-gated
   - `/api/internal/billing/ingest` [POST] - LiteLLM generic_api callback receiver (bearer auth, Docker-internal only)
+  - `/api/internal/flight-probe-credentials` [POST] - control-only GitHub-OIDC projection of one catalog node's bounded flight-prober key ring
   - `/api/internal/ops/governance/schedules/sync` [POST] - deploy-time governance sync trigger (bearer auth)
   - `/api/v1/chat/completions` [POST] - OpenAI-compatible chat completions (streaming + non-streaming, `cogni_status` extension); see [completions spec](../../../docs/spec/completions-api.md)
   - `/api/v1/ai/chat` [POST] - streaming chat with server-authoritative thread persistence
@@ -68,8 +71,8 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
   - `/api/v1/attribution/epochs/[id]/pool-components` [POST] - record pool component (SIWE + approver)
   - `/api/v1/users/me` [GET, PATCH] - current profile
   - `/api/v1/users/me/ownership` [GET] - current ownership summary derived from linked identities
-  - `/api/v1/work/items` [GET] - list work items with optional filters (SIWE auth)
-  - `/api/v1/work/items/[id]` [GET] - get single work item by ID (SIWE auth)
+  - `/api/v1/work/items` [GET, POST] - list/create node-local work items (Bearer or SIWE auth)
+  - `/api/v1/work/items/[id]` [GET, PATCH, DELETE] - read/update/delete a node-local work item (Bearer or SIWE auth)
   - `/api/v1/work/items/[id]/claims` [POST] - claim an operator work-item execution session (Bearer or SIWE auth)
   - `/api/v1/work/items/[id]/heartbeat` [POST] - refresh the authenticated user's active work-item session
   - `/api/v1/work/items/[id]/pr` [POST] - link branch/PR metadata to the active work-item session and durable work item

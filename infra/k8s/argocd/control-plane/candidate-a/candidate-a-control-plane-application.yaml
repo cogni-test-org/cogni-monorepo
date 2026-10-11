@@ -20,8 +20,12 @@
 #   the operator deploy route re-validates BOTH files against a Zod strictObject before it
 #   will move the deploy ref (422 candidate_control_plane_self_object_invalid otherwise).
 #
-# Test-fleet override: this isolated repository owns its candidate control plane on main.
-# The production operator and its deploy/candidate-a-control-plane ref remain untouched.
+# Why targetRevision is deploy/candidate-a-control-plane (NOT main):
+#   The candidate-a control plane must be able to run a REVIEWED-but-UNMERGED shape. The
+#   production operator fast-forwards the deploy/candidate-a-control-plane ref to the exact
+#   reviewed head via POST /api/v1/deploy/infra-reconcile; Argo then tracks that ref. main
+#   would make candidate-a un-flightable for control-plane changes — the whole point of a
+#   candidate env is to prove the change BEFORE it is on main.
 #
 # directory.recurse: false — own only the manifests directly in control-plane/candidate-a/,
 #   never descend. repoURL is the LITERAL upstream: the bootstrap apply path does NO envsubst,
@@ -44,8 +48,8 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
-    targetRevision: main
+    repoURL: https://github.com/cogni-dao/cogni.git
+    targetRevision: deploy/candidate-a-control-plane
     path: infra/k8s/argocd/control-plane/candidate-a
     directory:
       recurse: false

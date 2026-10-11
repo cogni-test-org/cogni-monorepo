@@ -49,6 +49,41 @@ function bundleMismatchReason(observed: unknown, expected: unknown): string {
   return `bundle_not_observed:observed=${sha(observed)}:expected=${sha(expected)}`;
 }
 
+/**
+ * Not-Ready reason for both authority kinds, surfacing the controller's failure
+ * reason (e.g. MigrationFailed) so a promote-gate timeout names the actual blocker
+ * instead of a generic phase. "None" is the composition's cleared-failure sentinel
+ * (bug.5287): `status.failure` is emitted UNCONDITIONALLY there because an omitted
+ * key survives the status merge and latches the previous reason — so "None" means
+ * no failure, never `phase_not_ready:None`. This reader tolerance ships BEFORE the
+ * composition emits the sentinel (akash-actuator-first-rollout: the reader accepts
+ * the new shape before the writer produces it). Keep this compatibility arm until
+ * every deployed composition revision has stopped emitting the sentinel.
+ */
+function phaseNotReadyReason(status: Record<string, unknown>): string {
+  const failureReason = asRecord(status.failure)?.reason;
+  return typeof failureReason === "string" &&
+    failureReason.length > 0 &&
+    failureReason !== "None"
+    ? `phase_not_ready:${failureReason}`
+    : "phase_not_ready";
+}
+
+/**
+ * The composite's own serving verdict, named alongside any phase reason.
+ *
+ * `serving` is the field the canon treats as authoritative for "is this lease
+ * carrying traffic", so a promote-gate timeout must state it rather than leave the
+ * reader to infer it from a phase that may be latched.
+ */
+function servingSuffix(status: Record<string, unknown>): string {
+  return status.serving === true
+    ? "serving=true"
+    : status.serving === false
+      ? "serving=false"
+      : "serving=absent";
+}
+
 /** Compare live controller state with the exact Git-rendered desired state. */
 export function assessComputeWorkloadReadiness(input: {
   readonly expected: unknown;
@@ -107,16 +142,7 @@ export function assessComputeWorkloadReadiness(input: {
     return { ready: false, reason: "generation_pending" };
   }
   if (status.phase !== "Ready") {
-    // Surface the controller's terminal failure reason (e.g. MigrationFailed) so
-    // a promote-gate timeout names the actual blocker instead of a generic phase.
-    const failureReason = asRecord(status.failure)?.reason;
-    return {
-      ready: false,
-      reason:
-        typeof failureReason === "string" && failureReason.length > 0
-          ? `phase_not_ready:${failureReason}`
-          : "phase_not_ready",
-    };
+    return { ready: false, reason: phaseNotReadyReason(status) };
   }
   if (stableJson(status.observedBundle) !== stableJson(expectedBundle)) {
     return {
@@ -223,14 +249,19 @@ function assessXComputeWorkloadReadiness(input: {
       };
     }
   }
+  // `phase` is checked first, so without the serving suffix a latched phase and a
+  // genuinely dead lease produce the SAME reason. They need opposite responses:
+  // `akash-mint-legibility-traps` records that `status.phase` recomputes each tick
+  // but LATCHES a prior generation's failure until the composite serves the desired
+  // SHA, so `phase_not_ready` beside `serving=true` and an already-matched bundle is
+  // the expected shape of a converging deploy — while `serving=false` is the lease
+  // actually not carrying traffic. poly promote run 37720716454 timed out on bare
+  // `phase_not_ready` 900s after the app began serving the desired SHA, and the log
+  // could not say which of the two it was (bug.5390).
   if (status.phase !== "Ready") {
-    const failureReason = asRecord(status.failure)?.reason;
     return {
       ready: false,
-      reason:
-        typeof failureReason === "string" && failureReason.length > 0
-          ? `phase_not_ready:${failureReason}`
-          : "phase_not_ready",
+      reason: `${phaseNotReadyReason(status)}:${servingSuffix(status)}`,
     };
   }
   if (status.serving !== true) {

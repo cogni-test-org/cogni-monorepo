@@ -7,6 +7,9 @@ namespace: cogni-candidate-a
 
 resources:
   - ../../../base/node-app
+  - ../../../base/openfga-external
+  - ./external-secret.yaml
+  - ./secrets-writer-sa.yaml
   - ../../../base/akash-tx-actuator
   - ./akash-tx-actuator-external-secret.yaml
   - ./akash-tx-actuator-auth-external-secret.yaml
@@ -67,6 +70,17 @@ patches:
       - op: add
         path: /data/NEXTAUTH_URL
         value: "https://test.cognidao.org"
+      # Test workloads use an isolated public zone while shared substrate remains on cognidao.org.
+      # Keep the workload zone explicit in the app runtime so env-manager renders the same hosts
+      # as the catalog-driven CI generators.
+      - op: add
+        path: /data/FORK_DOMAIN_ROOT
+        value: "cogni-testing.org"
+      # Public, non-secret account identity. The env-manager reads the lease ledger through this
+      # pinned account before it derives a replacement generation; it never receives the key.
+      - op: add
+        path: /data/AKASH_ACTUATOR_ACCOUNT_ID
+        value: "akash12eh8xgpeyumar3sk6wp94y0tq9uh62mkezxjmt"
       # Node-formation mint target — candidate-a mints node repos into the disposable
       # cogni-test-org (zero Cogni-DAO access); cogni-operator-test holds admin there.
       # Fail-closed: the publish route 503s if these are unset.
@@ -85,6 +99,12 @@ patches:
       - op: add
         path: /data/NODE_SUBMODULE_PARENT_REPO
         value: "cogni-monorepo"
+      - op: add
+        path: /data/OPENFGA_API_URL
+        value: "http://operator-openfga-external:8080"
+      - op: add
+        path: /data/OPENBAO_NODE_SECRETS_WRITER_ROLE
+        value: "candidate-a-node-secrets-writer"
   - target:
       kind: Service
       name: node-app
@@ -111,6 +131,32 @@ patches:
       - op: add
         path: /spec/template/metadata/labels/app.kubernetes.io~1instance
         value: "operator"
+
+  # Keep the operator's OpenBao identity atomic: the ServiceAccount resource,
+  # projected audience token, and pod binding ship in the same overlay.
+  - target:
+      kind: Deployment
+      name: node-app
+    patch: |
+      - op: add
+        path: /spec/template/spec/serviceAccountName
+        value: secrets-writer
+      - op: add
+        path: /spec/template/spec/volumes
+        value:
+          - name: openbao-token
+            projected:
+              sources:
+                - serviceAccountToken:
+                    path: token
+                    audience: cogni-openbao
+                    expirationSeconds: 3600
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts
+        value:
+          - name: openbao-token
+            mountPath: /var/run/secrets/openbao
+            readOnly: true
 
   # task.0423: Doltgres knowledge-plane migrator runs as a second initContainer
   # on the operator Deployment. DATABASE_URL maps to DOLTGRES_URL (separate from
@@ -172,6 +218,16 @@ patches:
       kind: Service
       metadata:
         name: litellm-external
+      spec:
+        type: ExternalName
+        externalName: cogni-candidate-a.vm.cognidao.org
+        clusterIP: null
+  - target: { kind: Service, name: openfga-external }
+    patch: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: openfga-external
       spec:
         type: ExternalName
         externalName: cogni-candidate-a.vm.cognidao.org

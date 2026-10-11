@@ -39,7 +39,14 @@ done
 shift
 [ "${1:-}" = "-s" ] && shift
 [ "${1:-}" = "--" ] && shift
-PATH="${FAKE_REMOTE_PATH}:${PATH}" bash -s -- "$@"
+remote_args=()
+for arg in "$@"; do
+  if [ "${FAKE_SSH_DROP_EMPTY_ARGS:-}" = "1" ] && [ -z "$arg" ]; then
+    continue
+  fi
+  remote_args+=("$arg")
+done
+PATH="${FAKE_REMOTE_PATH}:${PATH}" bash -s -- "${remote_args[@]}"
 EOF
 chmod +x "$FAKEBIN/ssh"
 
@@ -384,6 +391,17 @@ YAML
 cat > "$EXTERNAL_BIN/kubectl" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
+  # bug.5394 — the lane/cluster addressing guard runs before every namespaced lookup.
+  # FAKE_LANE_NOT_HOSTED=1 makes this cluster deny hosting the lane, i.e. the #2602
+  # shape: right lane name, wrong cluster.
+  *"get namespace cogni-"*)
+    [ "${FAKE_LANE_NOT_HOSTED:-}" = "1" ] && exit 1
+    exit 0
+    ;;
+  *"get namespace -o name"*)
+    echo "namespace/cogni-production"
+    exit 0
+    ;;
   # The legacy controller is RETIRED (task.5138) — a crossplane row touching it is drift.
   *compute-workload-controller*)
     echo "fake external kubectl: legacy controller must never be touched: $*" >&2
@@ -397,7 +415,11 @@ case "$*" in
   *"get composition xcomputeworkload-akash"*) exit 0 ;;
   *"get clusterproviderconfigs.http.m.crossplane.io cogni-http"*) exit 0 ;;
   *"get deployment operator-akash-tx-actuator"*status.availableReplicas*) echo 1; exit 0 ;;
-  *"get deployment operator-akash-tx-actuator"*AKASH_ALLOWED_PROVIDERS*)
+  *"get deployment operator-akash-tx-actuator"*AKASH_ALLOWED_PROVIDERS*.name}*)
+    echo AKASH_ALLOWED_PROVIDERS
+    exit 0
+    ;;
+  *"get deployment operator-akash-tx-actuator"*AKASH_ALLOWED_PROVIDERS*.value}*)
     echo akash16yr3wxt97ae045a06kr3ycde9srcgpg8syjxxm
     exit 0
     ;;
@@ -453,7 +475,7 @@ deployment:
     - name: echo
       secret_refs: []
 YAML
-env "${EXTERNAL_ENV[@]}" FAKE_EMPTY_WORKLOAD_SECRET=1 \
+env "${EXTERNAL_ENV[@]}" FAKE_EMPTY_WORKLOAD_SECRET=1 FAKE_SSH_DROP_EMPTY_ARGS=1 \
   bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/external-no-secret-refs.out"
 grep -q "all declared workload secret refs are materialized" "$TMPROOT/external-no-secret-refs.out"
 
@@ -469,7 +491,7 @@ grep -q "all declared workload secret refs are materialized" "$TMPROOT/external-
 
 grep -q "compute_api=crossplane" "$TMPROOT/external-success.out"
 grep -q "cogni-candidate-a/operator-akash-tx-actuator is available" "$TMPROOT/external-success.out"
-grep -q "AKASH_ALLOWED_PROVIDERS is non-empty" "$TMPROOT/external-success.out"
+grep -q "AKASH_ALLOWED_PROVIDERS is declared" "$TMPROOT/external-success.out"
 if grep -q "compute workload controller" "$TMPROOT/external-success.out"; then
   echo "expected the crossplane path to assert no legacy controller" >&2
   exit 1
@@ -534,6 +556,17 @@ YAML
 cat > "$XCW_BIN/kubectl" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
+  # bug.5394 — the lane/cluster addressing guard runs before every namespaced lookup.
+  # FAKE_LANE_NOT_HOSTED=1 makes this cluster deny hosting the lane, i.e. the #2602
+  # shape: right lane name, wrong cluster.
+  *"get namespace cogni-"*)
+    [ "${FAKE_LANE_NOT_HOSTED:-}" = "1" ] && exit 1
+    exit 0
+    ;;
+  *"get namespace -o name"*)
+    echo "namespace/cogni-production"
+    exit 0
+    ;;
   *compute-workload-controller*)
     echo "fake xcw kubectl: legacy controller must never be touched on a crossplane row: $*" >&2
     exit 1
@@ -561,7 +594,14 @@ case "$*" in
     echo 1
     exit 0
     ;;
-  *"get deployment operator-akash-tx-actuator"*AKASH_ALLOWED_PROVIDERS*)
+  # story.5050: the pin's VALUE may legitimately be empty, so the two reads are faked
+  # separately — DECLARED-ness (by name) is the assertion, the value is only reported.
+  *"get deployment operator-akash-tx-actuator"*AKASH_ALLOWED_PROVIDERS*.name}*)
+    [ "${FAKE_UNDECLARED_ALLOWED_PROVIDERS:-}" = 1 ] && exit 0
+    echo AKASH_ALLOWED_PROVIDERS
+    exit 0
+    ;;
+  *"get deployment operator-akash-tx-actuator"*AKASH_ALLOWED_PROVIDERS*.value}*)
     [ "${FAKE_EMPTY_ALLOWED_PROVIDERS:-}" = 1 ] && exit 0
     echo akash16yr3wxt97ae045a06kr3ycde9srcgpg8syjxxm
     exit 0
@@ -612,13 +652,41 @@ grep -q "ClusterProviderConfig/cogni-http exists" "$TMPROOT/xcw-success.out"
 grep -q "cogni-candidate-a/operator-akash-tx-actuator is available" "$TMPROOT/xcw-success.out"
 grep -q "Secret cogni-candidate-a/akash-tx-actuator-auth carries key 'token'" "$TMPROOT/xcw-success.out"
 grep -q "Secret cogni-candidate-a/akash-tx-actuator-env-secrets exists" "$TMPROOT/xcw-success.out"
-grep -q "AKASH_ALLOWED_PROVIDERS is non-empty" "$TMPROOT/xcw-success.out"
+grep -q "AKASH_ALLOWED_PROVIDERS is declared on cogni-candidate-a/operator-akash-tx-actuator (pinned to 1 provider(s))" "$TMPROOT/xcw-success.out"
 # Authority-independent checks still run on the crossplane path.
 grep -q "all declared workload secret refs are materialized" "$TMPROOT/xcw-success.out"
 grep -q "catalog compute egress CIDRs are installed" "$TMPROOT/xcw-success.out"
 grep -q "External compute preconditions ready for toks5" "$TMPROOT/xcw-success.out"
 if grep -q "compute workload controller" "$TMPROOT/xcw-success.out"; then
   echo "expected the crossplane branch to assert no legacy controller" >&2
+  exit 1
+fi
+
+# ── bug.5394 — LANE_AND_CLUSTER_MUST_AGREE ──────────────────────────────────────
+# #2602 pointed this job's SSH at the production VM while still passing
+# DEPLOY_ENVIRONMENT=candidate-a. The cluster-scoped Crossplane assertions all pass on
+# production, so the first NAMESPACED lookup was the one that noticed — and it blamed
+# the actuator ("availableReplicas='0'") for a deployment that was healthy in
+# candidate-a's own cluster. Eight consecutive poly/red preflights failed on that
+# message and four root-cause theories were burned on a phantom outage. The guard must
+# diagnose the ADDRESS and must not let any per-resource verdict be reported at all.
+if env "${XCW_ENV[@]}" FAKE_LANE_NOT_HOSTED=1 \
+  bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/xcw-wrong-cluster.out" 2>&1; then
+  echo "expected a lane the cluster does not host to fail" >&2
+  exit 1
+fi
+grep -q "lane candidate-a is not hosted by the cluster reachable from 192.0.2.10" "$TMPROOT/xcw-wrong-cluster.out"
+grep -q "namespace cogni-candidate-a does not exist there" "$TMPROOT/xcw-wrong-cluster.out"
+grep -q "cogni-\* namespaces present: cogni-production" "$TMPROOT/xcw-wrong-cluster.out"
+grep -q "ADDRESSING failure, not a substrate failure" "$TMPROOT/xcw-wrong-cluster.out"
+# The whole point: no per-resource verdict may be emitted about a lane this cluster
+# does not host. A single "availableReplicas" in this output is the bug.5394 regression.
+if grep -q "availableReplicas" "$TMPROOT/xcw-wrong-cluster.out"; then
+  echo "expected no actuator verdict when the cluster does not host the lane" >&2
+  exit 1
+fi
+if grep -q "is available" "$TMPROOT/xcw-wrong-cluster.out"; then
+  echo "expected no availability verdict when the cluster does not host the lane" >&2
   exit 1
 fi
 
@@ -651,7 +719,29 @@ xcw_expect_fail actuator-unavailable "akash transaction actuator is not availabl
 xcw_expect_fail missing-auth-secret "Secret cogni-candidate-a/akash-tx-actuator-auth is missing" FAKE_MISSING_AUTH_SECRET=1
 xcw_expect_fail missing-auth-token-key "carries no 'token' key" FAKE_MISSING_AUTH_TOKEN_KEY=1
 xcw_expect_fail missing-actuator-env-secret "Secret cogni-candidate-a/akash-tx-actuator-env-secrets is missing" FAKE_MISSING_ACTUATOR_ENV_SECRET=1
-xcw_expect_fail empty-allowed-providers "AKASH_ALLOWED_PROVIDERS is empty or unset on cogni-candidate-a/operator-akash-tx-actuator" FAKE_EMPTY_ALLOWED_PROVIDERS=1
+# story.5050: DECLARED-ness is the assertion, not a non-empty value. An overlay that
+# stopped merging the base actuator env contract by name is still a loud stop...
+xcw_expect_fail undeclared-allowed-providers "AKASH_ALLOWED_PROVIDERS is not declared on cogni-candidate-a/operator-akash-tx-actuator" FAKE_UNDECLARED_ALLOWED_PROVIDERS=1
+
+# ...but a DECLARED-and-EMPTY pin is a SUPPORTED configuration and must PASS, reporting that
+# placement rests on the policy gates alone. This is the crux of the allowlist retirement:
+# before story.5050 this very input was the guard's one hard failure.
+env "${XCW_ENV[@]}" FAKE_EMPTY_ALLOWED_PROVIDERS=1 bash scripts/ci/assert-target-substrate.sh \
+  >"$TMPROOT/xcw-unpinned.out" 2>&1 || {
+  echo "expected an empty AKASH_ALLOWED_PROVIDERS to PASS (empty == no pin, story.5050)" >&2
+  cat "$TMPROOT/xcw-unpinned.out" >&2
+  exit 1
+}
+grep -q "AKASH_ALLOWED_PROVIDERS is declared on cogni-candidate-a/operator-akash-tx-actuator (no provider pin" "$TMPROOT/xcw-unpinned.out" || {
+  echo "expected the unpinned run to report that there is no provider pin" >&2
+  cat "$TMPROOT/xcw-unpinned.out" >&2
+  exit 1
+}
+grep -q "External compute preconditions ready for toks5" "$TMPROOT/xcw-unpinned.out" || {
+  echo "expected the unpinned run to reach the final readiness line" >&2
+  cat "$TMPROOT/xcw-unpinned.out" >&2
+  exit 1
+}
 
 # An unknown authority is a loud stop, never a silent fall-through to legacy.
 BAD_SRC="$TMPROOT/bad-authority-src"

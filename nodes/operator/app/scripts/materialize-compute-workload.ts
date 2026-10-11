@@ -36,16 +36,19 @@ import {
   NODE_BUNDLE_PAYLOAD_FILE,
   verifyNodeBundleManifest,
 } from "@/features/compute/node-artifact-bundle-oci";
+import { resolveNodeBootRecovery } from "@/features/compute/node-boot-recovery";
 import { resolveNodeComputeApi } from "@/features/compute/node-compute-api";
 import {
   deploymentEnvironmentSchema,
   resolveNodeDeploymentProvider,
 } from "@/features/compute/node-deployment-provider";
 import {
+  isInfraOnlyPromoteNoop,
   resolveDeploymentTargets,
   resolvePromoteDeploymentTargets,
 } from "@/features/compute/node-deployment-targets";
 import { resolveNodeLeaseGeneration } from "@/features/compute/node-lease-generation";
+import { resolveNodeRequiredPlacement } from "@/features/compute/node-required-placement";
 import { assertDeclaredNodeDeployment } from "@/features/compute/node-services-workload-spec";
 import { hostForNode } from "@/shared/node-registry/resolve";
 
@@ -181,6 +184,15 @@ async function main(): Promise<void> {
   // never a CLI flag: a generation a caller could pass would be a generation automation could
   // bump, and NOTHING may bump it implicitly. Absent cell resolves to 0.
   const leaseGeneration = resolveNodeLeaseGeneration({ catalog, environment });
+  // Node-owned HARD placement requirement, same operator-reviewed row and never a CLI flag: a
+  // requirement a caller could pass would be a requirement a flight could relax. Absent = [].
+  const requiredPlacementCountries = resolveNodeRequiredPlacement({
+    catalog,
+    environment,
+  });
+  // story.5050 — whether a never-serving lease is held for a human or closed so the bounded
+  // re-mint can try the NEXT provider. Same operator-reviewed row, never a CLI flag.
+  const bootRecovery = resolveNodeBootRecovery({ catalog, environment });
   const dnsZoneId = values["dns-zone-id"]?.trim();
   if (dnsZoneId && !CLOUDFLARE_ZONE_ID.test(dnsZoneId)) {
     throw new Error(
@@ -199,6 +211,10 @@ async function main(): Promise<void> {
     ),
     computeApi,
     leaseGeneration,
+    ...(requiredPlacementCountries.length > 0
+      ? { requiredPlacementCountries }
+      : {}),
+    bootRecovery,
     // DNS intent is Crossplane-only: the legacy controller resolves its own zone in-cluster.
     ...(computeApi === "crossplane" && dnsZoneId
       ? { dns: { provider: "cloudflare" as const, zoneId: dnsZoneId } }
@@ -207,12 +223,33 @@ async function main(): Promise<void> {
       ? { runtime: { substrateHost: values["substrate-host"].trim() } }
       : {}),
   });
+  // Read the resolved secret refs straight off the workload the manifest builder just emitted,
+  // so the projected secrets MATCH the workload exactly. The builder already unions each service's
+  // runtime-profile keys (PROFILE_SUPPLIES_ITS_SECRET_REFS) AND applies the per-service `envs`
+  // gate (story.5043), so a sidecar dropped from this environment contributes no service here and
+  // therefore no secret keys either — the projection can never re-introduce a gated-out service's
+  // secrets. This keeps the "projected secrets match the workload" invariant true by construction.
+  const resolvedSecretRefs = manifest.spec.workload.services.flatMap(
+    (service) => service.secretRefs ?? []
+  );
+  // Observability (stderr — stdout is the machine contract): make the EXACT set of secret keys
+  // this flight will project into the workload visible in the flight log. Key NAMES are public
+  // (they live in the git repo-spec); values never touch logs. This is the signal that turns a
+  // missing node-specific secret_ref (e.g. PAPER_ENFORCE_MODE) from a silent runtime no-op into
+  // a one-glance diff — "the flight materialized these keys, and yours isn't among them."
+  process.stderr.write(
+    `${JSON.stringify({
+      event: "compute.workload.secret_refs_resolved",
+      nodeSlug: catalogIdentity.slug,
+      environment,
+      keyCount: resolvedSecretRefs.length,
+      keys: resolvedSecretRefs.map((ref) => ref.key),
+    })}\n`
+  );
   const secretResources = buildComputeSecretResources({
     slug: catalogIdentity.slug,
     environment,
-    secretRefs: bundle.services.flatMap(
-      (service) => service.service.secretRefs
-    ),
+    secretRefs: resolvedSecretRefs,
   });
   // ONE_AUTHORITY_PER_WORKLOAD (task.5097). The kustomization lists exactly one compute
   // resource, and the deploy-branch writer rsyncs this directory with `--delete`, so the
@@ -322,9 +359,9 @@ async function selectPromoteTargets(input: {
     ),
     previewForwardMode: input.previewForwardMode,
   });
-  // AN EMPTY PROMOTE IS A REFUSAL, NOT A SUCCESS (bug.5203). Every downstream job gates on
-  // `has_targets`, so a promote that resolves nothing SKIPS its way to a green conclusion
-  // indistinguishable from a successful deploy.
+  // AN EMPTY APP PROMOTE IS A REFUSAL, NOT A SILENT SUCCESS (bug.5203). Every downstream job
+  // gates on `has_targets`, so a promote that resolves nothing otherwise SKIPS its way to a
+  // green conclusion indistinguishable from a successful deploy.
   //
   // Observed twice on 2026-09-17: the node-merge webhook dispatches env=preview, #2238 retired
   // every preview node slot, so beacon's and toks5's merges each left only
@@ -336,12 +373,25 @@ async function selectPromoteTargets(input: {
   // selected environment" asserts it returns [] rather than throwing, and it is right. The
   // question "I was ASKED to deploy and deployed nothing" is only answerable where the request
   // is known. Fleet-wide promotes (no explicit CSV) legitimately match nothing and stay silent.
+  //
+  // Infra images are the typed exception (bug.5361): pr-build legitimately resolves them, but
+  // their runtime is Compose and never the app promotion lane. Report that as a loud, truthful
+  // no-op instead of rejecting a healthy main merge. Unknown targets still fail in the resolver;
+  // an out-of-environment node or rejected service still hits the refusal below.
   if (requestedTargets.length > 0 && selection.deployment.length === 0) {
-    throw new Error(
-      `[materialize-compute-workload] promote named ${requestedTargets.length} target(s) ` +
-        `(${requestedTargets.join(", ")}) but NONE deploy to '${input.environment}'. ` +
-        `Refusing to report a no-op promote as success — check those rows' catalog 'envs:'.`
-    );
+    if (isInfraOnlyPromoteNoop({ requestedTargets, selection })) {
+      const message =
+        `[materialize-compute-workload] promote resolved only catalog infra artifact(s) ` +
+        `(${selection.infra.join(", ")}); none deploy through the '${input.environment}' app lane. ` +
+        `Explicit no-op: no app digest was promoted.`;
+      process.stderr.write(`::warning::${message}\n`);
+    } else {
+      throw new Error(
+        `[materialize-compute-workload] promote named ${requestedTargets.length} target(s) ` +
+          `(${requestedTargets.join(", ")}) but NONE deploy to '${input.environment}'. ` +
+          `Refusing to report a no-op promote as success — check those rows' catalog 'envs:'.`
+      );
+    }
   }
 
   const outputs = {

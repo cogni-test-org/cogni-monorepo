@@ -16,11 +16,18 @@
  *     placeholder; a literal value in this directory is unrecoverable once it reaches git.
  *   - WIRE_IS_THE_5095_CONTRACT: @contracts/compute.akash-tx.v1 is a zod strictObject, so an
  *     extra key is a permanent 400 rather than a degraded mode.
- *   - KEY_IS_STABLE: the actuator's cogniKey is the wallet-wide idempotence boundary. A key
- *     built from anything that changes per reconcile mints a SECOND PAID LEASE.
+ *   - KEY_IS_BOUNDED: the actuator's cogniKey is the wallet-wide idempotence boundary. Its base
+ *     never changes per reconcile; only a terminal actor read-back may select one of three
+ *     deterministic recovery children.
  *   - CLOSED_IS_REMOVED: a released lease still resolves to a handle, so `found` alone would
  *     never go false and a deleted XR could never finish deleting.
  *   - NARROWEST_ACTIVATION: exactly one managed type is activated, and it is namespaced.
+ *   - DNS_TYPE_FOLLOWS_TARGET: hostnames publish as CNAME; IPv4-only ingress publishes as A.
+ *   - DNS_CREATE_AMBIGUITY_RECOVERS_BY_NAME: only provider-confirmed ambiguous DNS creates are
+ *     released to the name-addressed OBSERVE path; paid lease creates remain fail-closed.
+ *   - OVERLAP_BEFORE_CLOSE: a lease close is IRREVERSIBLE and its idempotence key is refused
+ *     forever once settled, so the outgoing lease is held open until the incoming one is proven
+ *     serving and DNS has flipped. Never more than two lease children for one (node, env).
  * Side-effects: IO (reads repo manifests)
  * Links: story.5016 R2.3, task.5095, task.5096, infra/crossplane/AGENTS.md
  * @public
@@ -73,12 +80,11 @@ const templateCode = template
 
 const xrdSpec = xrd.spec as YamlObject;
 const version = (xrdSpec.versions as YamlObject[])[0] as YamlObject;
-const specSchema = (
-  (
-    ((version.schema as YamlObject).openAPIV3Schema as YamlObject)
-      .properties as YamlObject
-  ).spec as YamlObject
-).properties as YamlObject;
+const specObjectSchema = (
+  ((version.schema as YamlObject).openAPIV3Schema as YamlObject)
+    .properties as YamlObject
+).spec as YamlObject;
+const specSchema = specObjectSchema.properties as YamlObject;
 const statusSchema = (
   (
     ((version.schema as YamlObject).openAPIV3Schema as YamlObject)
@@ -119,6 +125,9 @@ describe("XComputeWorkload composite API (task.5096)", () => {
       "leaseGeneration",
       "migration",
       "nodeId",
+      // story.5050 — node-owned HARD placement requirement. Optional and immutable, so no
+      // existing XR changes and a new requirement can only bind on a fresh mint.
+      "placement",
       "runtime",
       "workload",
     ]);
@@ -187,8 +196,42 @@ describe("XComputeWorkload composite API (task.5096)", () => {
     expect(template).toContain("BootDeadlineExceeded");
     // Only a workload that NEVER served may be closed for budget.
     expect(template).toContain(
-      '$neverServed := and (not $serving) (eq $prevSha "")'
+      // bug.5287: the deadline binds to the CURRENT attempt via $hasServedDesired.
+      // The retired '$neverServed' form keyed on a LATCHED field, so it could only ever be
+      // true on a first boot and made BOOT_SLO_OR_CLOSE unreachable thereafter.
+      "$deadlineExceeded := and (not $hasServedDesired) (gt $ageSeconds $bootDeadlineSeconds)"
     );
+  });
+
+  it("anchors the boot deadline to the current attempt, not the XR's age (bug.5244)", () => {
+    // Anchored to creationTimestamp, a never-served XR older than the deadline was a
+    // roach motel: $closeForBudget latched true, the lease Request stopped rendering, so
+    // no OBSERVE could ever set $prevSha and no spec change could revive the workload.
+    // The anchor must be the (bundle sha, leaseGeneration) attempt, latched via status.
+    expect(template).toContain(
+      '$bootKey := printf "%s:%d" $desiredSha $leaseGeneration'
+    );
+    expect(template).toContain('dig "status" "bootEpoch" "key" "" $xr');
+    // The window resets ONLY when the attempt key changes — a mere re-render of the same
+    // attempt must keep the recorded start, or the deadline could never fire at all.
+    expect(template).toContain(
+      'and (eq $prevBootKey $bootKey) (ne $prevBootAt "")'
+    );
+    // The latch is persisted where the next render reads it.
+    const bootEpoch = (statusSchema.bootEpoch as YamlObject)
+      .properties as YamlObject;
+    expect(Object.keys(bootEpoch)).toEqual(["key", "at"]);
+  });
+
+  it("emits the host-routed serving proof after the phase-1 reader rollout (bug.5237)", () => {
+    // A stale deployment still owning the public hostname made the bare-ingress serving
+    // probe a lie. The fix is OBSERVE handing the actuator the public hostname — but the
+    // actuator's observe schema is a strictObject, so emitting the key before every
+    // environment's actuator image accepts it would 400 every observe and freeze
+    // reconciliation fleet-wide. Phase 1 deployed that strict-schema reader fleet-wide;
+    // phase 2 now emits `publicHost` and must never regress to bare-ingress truth.
+    expect(template).toContain("bug.5237 PHASE 2");
+    expect(templateCode).toContain("publicHost: {{ $publicHost | quote }}");
   });
 
   it("declares the empty-birth schema policy WITHOUT claiming it gates payment", () => {
@@ -229,6 +272,38 @@ describe("XComputeWorkload composite API (task.5096)", () => {
 });
 
 describe("XComputeWorkload Composition (task.5096)", () => {
+  it("binds the boot deadline to the current attempt, not to ever-served (bug.5287)", () => {
+    // $prevSha is LATCHED, so `eq $prevSha ""` is only ever true on a first boot. Keying the
+    // deadline on it made BOOT_SLO_OR_CLOSE unreachable for the rest of an XR's life — toks5
+    // production billed three generations with bootDeadlineAt hours past and reason=None.
+    expect(templateCode).toContain(
+      "$deadlineExceeded := and (not $hasServedDesired) (gt $ageSeconds $bootDeadlineSeconds)"
+    );
+    // no live template expression may reference the retired predicate
+    const live = templateCode
+      .split("\n")
+      .filter((l) => l.includes("$neverServed") && l.includes("{{-"));
+    expect(live).toEqual([]);
+  });
+
+  it("never latches a migration failure into a terminal phase (bug.5309)", () => {
+    // The DISPLAY latch is correct and must stay: status.migration.phase falls back to the
+    // previous phase so it does not blink out on ticks carrying no migration answer.
+    expect(templateCode).toContain(
+      '$migrationPhase := dig "migration" "phase" $prevMigrationPhase $resp'
+    );
+    // The TERMINAL decision must read the CURRENT response only. Deciding from the latched
+    // $migrationPhase made one transient failure permanent: toks4 candidate-a sat
+    // Failed/MigrationFailed with a succeeded Job, a present database and the actuator
+    // logging akash_tx_migration_succeeded, and could never recover.
+    expect(templateCode).toContain(
+      '$migrationFailed := eq (dig "migration" "phase" "" $resp) "failed"'
+    );
+    expect(templateCode).not.toMatch(
+      /\$migrationFailed\s*:=\s*eq\s+\$migrationPhase/
+    );
+  });
+
   it("delegates all generic reconciliation to pinned OSS functions", () => {
     expect(compositionSpec.mode).toBe("Pipeline");
     expect(
@@ -256,10 +331,20 @@ describe("XComputeWorkload Composition (task.5096)", () => {
 
   it("sends the actuator its exact strict-contract wire shape", () => {
     // @contracts/compute.akash-tx.v1 accepts EXACTLY {cogniKey, environment, spec}; the spec
-    // is `{name, services[]}`. An extra key is a 400 forever, never a partially-honoured call.
-    expect(template).toContain(
-      '$payload := dict "cogniKey" $cogniKey "environment" $env "identity" $identity "spec" (dict "name" $slug "services" $services)'
+    // is `{name, services[], placement?}`. An extra key is a 400 forever, never a
+    // partially-honoured call — so the spec dict must be assembled from exactly those keys.
+    expect(templateCode).toContain(
+      '$specDict := dict "name" $slug "services" $services'
     );
+    expect(templateCode).toContain(
+      '$payload := dict "cogniKey" $cogniKey "environment" $env "identity" $identity "spec" $specDict'
+    );
+    // story.5050 is the ONLY conditional key the spec dict may gain. Anything else set on it
+    // would reach the strict contract as an unknown field and 400 every create.
+    const specDictWrites = [
+      ...templateCode.matchAll(/set \$specDict "([a-zA-Z]+)"/g),
+    ].map((m) => m[1]);
+    expect(specDictWrites).toEqual(["placement"]);
     // The four bounded ops map 1:1 onto provider-http's four actions — no Cogni code decides
     // WHEN to act.
     for (const [action, route] of [
@@ -276,22 +361,52 @@ describe("XComputeWorkload Composition (task.5096)", () => {
     expect(template).toContain("$desiredSha := $spec.bundle.source.sha");
   });
 
-  it("keeps the idempotence key stable for the life of the workload", () => {
-    // namespace + name are immutable (name == nodeId). The ONLY varying component is
-    // spec.leaseGeneration, which nothing bumps implicitly — a key that changed per reconcile
-    // would report "no existing resource" after a promote and mint a SECOND PAID LEASE.
+  it("keeps the base idempotence key stable and bounds terminal recovery", () => {
+    // namespace + name are immutable (name == nodeId). The base varies only with the explicit
+    // spec.leaseGeneration; reconcile ticks and metadata generations cannot mint another lease.
     expect(template).toContain(
-      '$cogniKey := printf "xcw:%s:%s:%d" $ns $name $leaseGeneration'
+      '$baseCogniKey := printf "xcw:%s:%s:%d" $ns $name $leaseGeneration'
     );
-    // Scoped to the KEY, not the whole template: task.5103 legitimately reads
-    // metadata.generation for the spend receipt's provenance. What must never happen is that
-    // per-reconcile value leaking into the IDEMPOTENCE key, where it would report "no existing
-    // resource" after a promote and mint a SECOND PAID LEASE. The two uses are opposites — one
-    // records which revision asked, the other must not vary at all.
+    // Scoped to the BASE KEY, not the whole template: task.5103 legitimately reads
+    // metadata.generation for receipt provenance, but it must never leak into paid identity.
     const keyInputs = ["$ns", "$name", "$leaseGeneration"];
     const keyLiteral =
-      /\$cogniKey := printf "[^"]*"([^}]*)\}\}/.exec(templateCode)?.[1] ?? "";
+      /\$baseCogniKey := printf "[^"]*"([^}]*)\}\}/.exec(templateCode)?.[1] ??
+      "";
     expect(keyLiteral.trim().split(/\s+/)).toEqual(keyInputs);
+    // bug.5287: a settled actor key cannot be re-spent, so Crossplane may advance only through
+    // three deterministic children, and only after the response is tied to the CURRENT key and
+    // proves it closed. There is no clock/resourceVersion/reconcile-derived namespace.
+    expect(templateCode).toContain("$maxRecoveryAttempts := 3");
+    expect(templateCode).toContain(
+      '$currentKey = printf "%s:recover:%d" $baseCogniKey $recoveryCount'
+    );
+    expect(templateCode).toContain(
+      "$closedForCurrentKey := and $closed (eq $responseKey $currentKey)"
+    );
+    // An explicit base-generation bump must select a NEW provider-http Request child. Updating
+    // the old child invokes UPDATE, which cannot mint the replacement the generation promises.
+    // The latch is absent on existing XRs, preserving their static child with zero rollout churn.
+    expect(templateCode).toContain(
+      '$leaseRequestGeneration := int (dig "status" "leaseRequestGeneration" -1 $xr)'
+    );
+    expect(templateCode).toContain(
+      '$leaseResourceName = printf "akash-lease-g%d" $leaseGeneration'
+    );
+    expect(templateCode).toContain(
+      "gotemplating.fn.crossplane.io/composition-resource-name: {{ $leaseResourceName }}"
+    );
+    expect(statusSchema.leaseRequestGeneration).toMatchObject({
+      type: "integer",
+      minimum: 0,
+      maximum: 1000000,
+    });
+    expect(templateCode).toContain(
+      "$recoveryExhausted := and $closedForCurrentKey (ge $recoveryCount $maxRecoveryAttempts)"
+    );
+    expect(templateCode).toContain(
+      "if and $closedForCurrentKey (not $recoveryExhausted)"
+    );
     // ZERO-DOWNTIME WIRE RENAME (task.5105 -> task.5122). NOTHING writes leaseEpoch any more
     // (see compute-workload-manifest.test.ts "never writes the deprecated leaseEpoch alias"),
     // but XRs committed on deploy/<env>-<node> refs BEFORE the rename still carry it, so the
@@ -317,7 +432,7 @@ describe("XComputeWorkload Composition (task.5096)", () => {
       templateCode.indexOf(
         "spec.leaseEpoch and spec.leaseGeneration disagree; refusing to choose an idempotence key"
       )
-    ).toBeLessThan(templateCode.indexOf("$cogniKey := printf"));
+    ).toBeLessThan(templateCode.indexOf("$baseCogniKey := printf"));
     expect(templateCode).toContain(
       '$leaseGeneration = int (get $spec "leaseGeneration")'
     );
@@ -496,7 +611,7 @@ describe("XComputeWorkload migration decoupling (task.5135)", () => {
    */
   function leaseMappings(): Record<string, string> {
     const leaseBlock = template.slice(
-      template.indexOf("composition-resource-name: akash-lease"),
+      template.indexOf("composition-resource-name: {{ $leaseResourceName }}"),
       template.indexOf("composition-resource-name: dns-record")
     );
     expect(leaseBlock.length).toBeGreaterThan(0);
@@ -582,7 +697,9 @@ describe("XComputeWorkload migration decoupling (task.5135)", () => {
     // The loudness half of the fix. A migration that will never succeed must not hide behind a
     // retryable refusal's "Progressing" — that is what an indefinite silent stall looks like.
     expect(template).toContain(
-      '$migrationFailed := eq $migrationPhase "failed"'
+      // bug.5309: the terminal decision reads the CURRENT response, never the latched
+      // $migrationPhase — latching it made one transient failure permanent.
+      '$migrationFailed := eq (dig "migration" "phase" "" $resp) "failed"'
     );
     expect(template).toContain("{{- else if $migrationFailed }}");
     expect(template).toContain('$failReason = "MigrationFailed"');
@@ -648,7 +765,7 @@ describe("XComputeWorkload spend attribution (task.5103)", () => {
     // mints no lease, but it still mutates a PAID resource, so it says whose it is.
     expect(template).toContain('"identity" $identity');
     const leaseBlock = template.slice(
-      template.indexOf("composition-resource-name: akash-lease"),
+      template.indexOf("composition-resource-name: {{ $leaseResourceName }}"),
       template.indexOf("composition-resource-name: dns-record")
     );
     const mappings = Object.fromEntries(
@@ -735,6 +852,70 @@ describe("XComputeWorkload refusal observability (bug.5115)", () => {
     // server and takes the whole status write — and the refusal — down with it.
     expect(failureProps.message).toMatchObject({ maxLength: 256 });
     expect(template).toContain("$failMessage = substr 0 256 $refusalMessage");
+  });
+
+  it("emits failure unconditionally — 'None' sentinel clears a stale reason (bug.5287)", () => {
+    // Omitting the key does not clear it: the status merge preserves the previous value, so
+    // a recovered workload kept its stale failure.reason (ledger_unavailable under
+    // Progressing) latched for days on four XRs — status lied until someone bumped the
+    // generation. The composition therefore ALWAYS writes failure, with "None" as the
+    // cleared sentinel; compute-workload-readiness treats "None" as absent (reader
+    // tolerance shipped FIRST — akash-actuator-first-rollout).
+    expect(template).toContain('reason: "None"');
+    // The sentinel must satisfy the XRD reason pattern or the whole status write is rejected.
+    expect("None").toMatch(reasonPattern);
+  });
+
+  it("reports a settled-key closed lease as LeaseClosed, not a Progressing lie (task.5156)", () => {
+    // The render side PARKS a closed lease observed under a non-current key (the Axiom 26 fence
+    // above). The status side must tell the same truth. $heldClosed only catches
+    // $closedForCurrentKey, so before this branch a closed-under-foreign-key lease with no
+    // recovery in flight missed every fail branch and fell through to the default
+    // Progressing/reason:"None" — status claimed a permanently-parked lease was still coming up.
+    expect(template).toContain("{{- else if $closed }}");
+    // Ordered strictly AFTER the active-recovery branch, or it would swallow
+    // LeaseRecoveryInProgress and report a recovering lease as terminally closed.
+    const chain = template.slice(
+      template.lastIndexOf('{{- $phase := "Progressing" }}')
+    );
+    expect(chain.indexOf("LeaseRecoveryInProgress")).toBeLessThan(
+      chain.indexOf("{{- else if $closed }}")
+    );
+  });
+
+  it("keeps paid replacement OPT-IN and BOUNDED now that Replace is admitted (story.5050)", () => {
+    // The second fence has moved, not vanished. This test previously pinned `enum: [Hold]`
+    // because provider-strike recording did not yet live in the actuator — without it, a retry
+    // re-picked the provider that had just failed. task.5153 re-homed strikes (the actuator emits
+    // `akash_tx_provider_strike_recorded`), which is the stated precondition the XRD named, so
+    // Replace is admitted. What must NOT weaken:
+    //   - Hold stays the DEFAULT, so admitting Replace changes no existing row.
+    //   - The composition still gates the recovery-key bump on onGiveUp == Replace.
+    //   - The bump stays BOUNDED by $recoveryExhausted; Replace must never mean unbounded spend.
+    //   - Hold still parks a closed lease as LeaseClosed with zero spend.
+    expect(template).toContain(
+      'if and $closedForCurrentKey (not $recoveryExhausted) (eq $onGiveUp "Replace")'
+    );
+    const onGiveUp = (
+      (specSchema.bootPolicy as YamlObject).properties as YamlObject
+    ).onGiveUp as YamlObject;
+    expect(onGiveUp.enum).toEqual(["Hold", "Replace"]);
+    expect(onGiveUp.default).toBe("Hold");
+    expect(template).toContain('$failReason = "LeaseClosed"');
+    // The retry is only useful because it lands ELSEWHERE — the excluded set is what makes a
+    // bounded re-mint progress instead of re-picking the dead provider three times.
+    expect(templateCode).toContain("$desiredRecoveryPrefix");
+  });
+
+  it("never re-renders a lease Request under a settled key (Axiom 26 fence)", () => {
+    // Closed current and foreign keys remain parked exactly as before. A different explicit base
+    // generation is handled by selecting a NEW generation-qualified child above this fence.
+    expect(template).toContain(
+      "$renderLease := not (or $closeForBudget $recoveryExhausted $heldClosed (and $closed (not $closedForCurrentKey)))"
+    );
+    expect(template).toContain(
+      '$heldClosed := and $closedForCurrentKey (ne $onGiveUp "Replace")'
+    );
   });
 
   it("derives retryability from the HTTP status, not a table of codes", () => {
@@ -872,15 +1053,41 @@ describe("XComputeWorkload public reachability (bug.5152)", () => {
     expect(templateCode).not.toMatch(/select\(\.type == "(MX|TXT|NS|SRV|CAA)"/);
   });
 
-  it("publishes a PROXIED CNAME, because the provider's certificate is not ours", () => {
-    // The Akash provider ingress serves `*.ingress.zencloud.eu`. A grey-cloud CNAME from the
-    // cogni name to it fails TLS on a subject-name mismatch before a byte of HTTP is exchanged,
-    // so an unproxied record resolves and STILL cannot be reached.
+  it("publishes a PROXIED address record, because the provider's certificate is not ours", () => {
+    // Whether the provider target is a hostname or IPv4 address, a grey-cloud record bypasses
+    // Cloudflare's TLS termination for the Cogni hostname.
     expect(dnsBlock).not.toContain("proxied: false");
     // CREATE body + UPDATE body.
     expect(dnsBlock.match(/proxied: true/g)?.length).toBe(2);
     // ...and drift back to grey-cloud is not "up to date".
     expect(dnsBlock).toContain("| .[0].proxied) == true");
+  });
+
+  it("uses a hostname CNAME when available and falls back to an IPv4 A record", () => {
+    // A provider hostname is more stable than its current ingress IP, so retain the existing
+    // preference. RHITE proved that rejecting every IPv4 target leaves a healthy paid lease
+    // permanently unreachable, so the first IPv4 is the bounded fallback.
+    expect(templateCode).toContain('$dnsHostnameTarget := ""');
+    expect(templateCode).toContain('$dnsIpv4Target := ""');
+    expect(templateCode).toContain("(ne $h $publicHost)");
+    expect(templateCode).toContain("$dnsTarget := $dnsHostnameTarget");
+    expect(templateCode).toContain(
+      'if eq $dnsTarget "" }}{{ $dnsTarget = $dnsIpv4Target'
+    );
+    expect(templateCode).toContain('$dnsRecordType := "CNAME"');
+    expect(templateCode).toContain('$dnsRecordType = "A"');
+  });
+
+  it("carries the target-derived record type through create, update, drift, and status", () => {
+    expect(templateCode).toContain(
+      '$cfPayload := dict "name" $publicHost "content" $effectiveDnsTarget "type" $dnsRecordType'
+    );
+    // CREATE and UPDATE consume the same payload type.
+    expect(dnsBlock.match(/type: \.payload\.body\.type/g)?.length).toBe(2);
+    expect(dnsBlock).toContain(
+      "({{ $cfAdoptable }} | .[0].type) == .payload.body.type"
+    );
+    expect(templateCode).toContain('(eq (dig "type" "" .) $dnsRecordType)');
   });
 
   it("reports published as an observation, never as an echo of the intent", () => {
@@ -890,6 +1097,90 @@ describe("XComputeWorkload public reachability (bug.5152)", () => {
     expect(templateCode).toContain("published: {{ $dnsPublished }}");
     expect(templateCode).not.toContain("published: {{ if $dns }}");
     expect(templateCode).toContain('index $observedResources "dns-record"');
+  });
+
+  it("recovers only provider-confirmed ambiguous DNS creates through name observation", () => {
+    expect(templateCode).toContain('$dnsCreatePending := ""');
+    expect(templateCode).toContain("$dnsCreateAmbiguous := false");
+    expect(templateCode).toContain(
+      'get $dnsAnnotations "crossplane.io/external-create-pending"'
+    );
+    expect(templateCode).toContain(
+      'contains "cannot determine creation result"'
+    );
+    expect(dnsBlock).toContain(
+      "crossplane.io/external-create-succeeded: {{ $dnsCreatePending | quote }}"
+    );
+    expect(dnsBlock).toContain(
+      'if and $dnsCreateAmbiguous (ne $dnsCreatePending "")'
+    );
+
+    // The paid lease Request must retain Crossplane's leak-prevention refusal. This recovery is
+    // safe only because the DNS OBSERVE is name-addressed and adoption precedes CREATE.
+    const leaseBlock = templateCode.slice(
+      templateCode.indexOf(
+        "composition-resource-name: {{ $leaseResourceName }}"
+      ),
+      templateCode.indexOf("composition-resource-name: dns-record")
+    );
+    expect(leaseBlock).not.toContain("external-create-succeeded");
+  });
+});
+
+describe("XComputeWorkload DNS survives a promotion transition (bug.5188)", () => {
+  // Everything from the Cloudflare Request to the end of the template, prose-stripped: the
+  // assertions here pin the last-known-good DNS latch that keeps a promotion from withdrawing
+  // the live public record when the current observe carries an ERROR body with no endpoints.
+  const dnsBlock = templateCode.slice(
+    templateCode.indexOf("composition-resource-name: dns-record")
+  );
+
+  it("latches the last-known-good target from status, exactly like $prevSha/$prevResource", () => {
+    // provider-http overwrites status.response.body with the ERROR body of a failed mutation
+    // (see the lease-handle latch), which has no endpoints, so $dnsTarget collapses to "" while
+    // a promotion's migration runs. The last-served target is read back from status.dns.target
+    // and carried forward — the same posture the observed-bundle and lease-handle latches take.
+    expect(templateCode).toContain(
+      '$prevDnsTarget := dig "status" "dns" "target" ""'
+    );
+    expect(templateCode).toContain("$effectiveDnsTarget");
+  });
+
+  it("gates the composed dns-record child on the LATCHED target, never the collapsing one", () => {
+    // The render gate is what a transient endpoint-less observe used to fail: an omitted child
+    // is garbage-collected, which fires a real Cloudflare DELETE and takes the live proxied
+    // CNAME to NXDOMAIN. The gate must read the latched value so the child keeps rendering.
+    expect(templateCode).toContain('if and $dns (ne $effectiveDnsTarget "")');
+    expect(templateCode).not.toContain('if and $dns (ne $dnsTarget "")');
+  });
+
+  it("never couples DNS publication to lease liveness (bug.5301)", () => {
+    // Third instance of this hazard class: an omitted dns-record child is a REAL Cloudflare
+    // DELETE. bug.5188 defended the mid-promote collapse with the last-known-good latch, but
+    // the gate still shared $renderLease — so every terminal lease condition (budget close,
+    // recovery exhaustion, Hold-park, foreign-key closure) took the public hostname to
+    // NXDOMAIN (beacon/node-template, 2026-09-28). Once onGiveUp: Replace is armed, closure
+    // is ROUTINE and each recovery cycle would open an NXDOMAIN window. The hostname
+    // withdraws only on genuine XR deletion via finalization.
+    expect(templateCode).not.toMatch(/if and \$dns [^\n]*\$renderLease/);
+  });
+
+  it("adopts a genuinely-new target only once the new revision actually serves", () => {
+    // PROVE_BEFORE_TRAFFIC: a different, non-empty $dnsTarget is only trusted while the workload
+    // is active AND serving. Until then the record keeps pointing at the last-known-good target,
+    // so a mid-flight endpoint change can never repoint the live name at a not-yet-serving lease.
+    expect(templateCode).toContain(
+      '{{- else if and (ne $prevDnsTarget "") (ne $dnsTarget $prevDnsTarget) (not (and $active $serving)) }}'
+    );
+  });
+
+  it("writes the latched target onto the Cloudflare record content", () => {
+    // The record the composite intends to hold must be the latched target, not the collapsed
+    // one — otherwise the CREATE/UPDATE body would publish "" the instant the observe errored.
+    expect(dnsBlock.length).toBeGreaterThan(0);
+    expect(templateCode).toContain(
+      '$cfPayload := dict "name" $publicHost "content" $effectiveDnsTarget "type" $dnsRecordType'
+    );
   });
 });
 
@@ -930,18 +1221,890 @@ describe("catalog lease generation naming", () => {
   });
 
   /**
-   * THE VALUE IS THE MONEY (bug.5192). toks5 production's generation-0 receipt is terminally
-   * settled, so its row MUST resolve to key suffix `:1`. The rename may not move a VALUE: a
+   * THE VALUE IS THE MONEY (bug.5192). toks5 production and preview each have terminally
+   * settled receipts, so their rows MUST stay on explicit replacement generations. A
    * changed suffix answers "no existing resource" and mints a SECOND PAID LEASE, and a suffix
    * that reverted to 0 re-deads the node against a key the actuator already spent.
    */
-  it("keeps toks5 production on replacement generation 1 when that fleet row exists", () => {
+  it("keeps toks5 environments on their explicit replacement generations when that fleet row exists", () => {
     const toks5Path = path.join(CATALOG_DIR, "toks5.yaml");
     if (!existsSync(toks5Path)) return;
 
     const toks5 = parse(readFileSync(toks5Path, "utf8")) as {
       lease_generation?: Record<string, number>;
     };
-    expect(toks5.lease_generation?.production).toBe(1);
+    // story.5047: bumped 1->2 to force a fresh mint delivering DOLTGRES_URL (knowledge heal).
+    // bug.5302: bumped 2->3 — the gen-2 lease died in the 2026-09-29 account-depletion
+    // event (escrow drained fleet-wide); 3 is the funded replacement mint.
+    // bug.5287: bumped 3->4 — the gen-3 lease reached the chain and bills but its workload
+    // never came up; the actuator replay path treats that partial receipt as settled and
+    // returns the dead handle forever (64x create_replayed, 0 create-family). A fresh key
+    // cannot replay, so 4 forces createAndLease. Durable fix: task.5157 (settled/serving gate).
+    // bug.5287: bumped 4->5 — gen-4's fresh createAndLease reached allocation_recorded then
+    // hit manifest_not_delivered (HTTP 404, deployment closed, escrow refunding, rolled back
+    // before akash_tx_leased). Its receipt is stuck allocated+external_name over a verified-
+    // closed lease, so a retry under :4 would replay the dead handle (task.5157 case c). toks5's
+    // SDL is identical to healthy toks4, so gen-4's 404 reads as transient; 5 is a fresh key
+    // that re-enters createAndLease to retry the manifest delivery.
+    // task.5180: preview gen-1 reached BootDeadlineClosed after a provider-http UPDATE wedge;
+    // its closed lease makes :1 spent, so :2 is the reviewed replacement.
+    expect(toks5.lease_generation?.preview).toBe(2);
+    expect(toks5.lease_generation?.production).toBe(5);
+  });
+});
+
+describe("XComputeWorkload placement requirement (story.5050)", () => {
+  const placement = specSchema.placement as Record<string, never> &
+    Record<string, unknown>;
+  const placementRule = (
+    (specObjectSchema["x-kubernetes-validations"] ?? []) as {
+      rule: string;
+      message: string;
+    }[]
+  ).find((rule) => /placement may change/.test(rule.message));
+
+  /**
+   * Truth table for the transition contract expressed by placementRule. Kubernetes is the CEL
+   * runtime, so candidate-a remains the executable integration proof; this pins both semantic
+   * directions that the old field-scoped presence assertion could not distinguish.
+   */
+  function allowsPlacementTransition(input: {
+    samePlacement: boolean;
+    oldGeneration?: number;
+    oldEpoch?: number;
+    newGeneration?: number;
+  }): boolean {
+    if (input.samePlacement) return true;
+    if (input.newGeneration === undefined) return false;
+    return input.newGeneration > (input.oldGeneration ?? input.oldEpoch ?? 0);
+  }
+
+  /**
+   * Akash refuses in-place placement change, so an accepted edit without a fresh key would be
+   * desired state nothing applies — the node keeps serving from its old jurisdiction while the
+   * XR claims otherwise. The rule must live at spec scope so it can admit the env-manager's
+   * atomic placement + leaseGeneration bump while rejecting a placement-only edit.
+   */
+  it("allows re-placement only alongside a leaseGeneration bump", () => {
+    expect(placementRule?.rule.replace(/\s+/g, " ").trim()).toBe(
+      "(!has(self.placement) && !has(oldSelf.placement)) || " +
+        "(has(self.placement) && has(oldSelf.placement) && self.placement == oldSelf.placement) || " +
+        "(has(self.leaseGeneration) && self.leaseGeneration > " +
+        "(has(oldSelf.leaseGeneration) ? oldSelf.leaseGeneration : " +
+        "(has(oldSelf.leaseEpoch) ? oldSelf.leaseEpoch : 0)))"
+    );
+    expect(placement["x-kubernetes-validations"]).toBeUndefined();
+  });
+
+  it.each([
+    {
+      case: "admits present-to-different-present with a generation increase",
+      input: { samePlacement: false, oldGeneration: 6, newGeneration: 7 },
+      expected: true,
+    },
+    {
+      case: "rejects present-to-different-present without a generation increase",
+      input: { samePlacement: false, oldGeneration: 6, newGeneration: 6 },
+      expected: false,
+    },
+    {
+      case: "rejects a generation decrease that could replay a spent key",
+      input: { samePlacement: false, oldGeneration: 6, newGeneration: 5 },
+      expected: false,
+    },
+    {
+      case: "admits an unchanged placement without spending a generation",
+      input: { samePlacement: true, oldGeneration: 6, newGeneration: 6 },
+      expected: true,
+    },
+    {
+      case: "compares against the legacy epoch while upgrading an older XR",
+      input: { samePlacement: false, oldEpoch: 6, newGeneration: 7 },
+      expected: true,
+    },
+  ])("$case", ({ input, expected }) => {
+    expect(allowsPlacementTransition(input)).toBe(expected);
+  });
+
+  /**
+   * EMPTY_IS_A_TYPO_NOT_A_WILDCARD. The actuator fails closed on this field, so an empty list
+   * would refuse every bid and present as "no provider bid for this workload" — the most
+   * expensive possible way to learn about a typo. The API server must reject it first.
+   */
+  it("rejects an empty country list rather than accepting a lease-refusing wildcard", () => {
+    const countries = (
+      placement["properties"] as Record<string, Record<string, unknown>>
+    )["requiredCountries"];
+    expect(countries["minItems"]).toBe(1);
+    expect(countries["x-kubernetes-list-type"]).toBe("set");
+    expect((countries["items"] as Record<string, unknown>)["pattern"]).toBe(
+      "^[A-Z]{2}$"
+    );
+  });
+
+  /**
+   * The wire is a zod strictObject, so the Composition must lower the XR field onto the
+   * contract's own name. A rename drift here is a 400 at create time, not a silently
+   * unconstrained lease — but only if the lowering exists at all.
+   */
+  it("lowers onto the actuator wire under the contract's name", () => {
+    expect(templateCode).toContain(
+      '$requiredCountries := dig "placement" "requiredCountries" (list) $spec'
+    );
+    expect(templateCode).toContain(
+      'set $specDict "placement" (dict "requiredCountryCodes" $requiredCountries)'
+    );
+    // Absent must stay ABSENT: an empty list on the wire fails closed in the actuator.
+    expect(templateCode).toContain("{{- if gt (len $requiredCountries) 0 }}");
+  });
+});
+
+/**
+ * OVERLAP_BEFORE_CLOSE (bug.5322). Crossplane garbage-collects whatever the render function
+ * stops returning, and for a live Akash lease that GC is a REMOVE -> /v1/akash/delete. So
+ * advancing the generation-qualified child name on a leaseGeneration bump ALSO closed the
+ * incumbent lease before its replacement had served anything (toks4, 2026-09-30: /readyz 503,
+ * stale sha, no lease). A close is IRREVERSIBLE and its idempotence key is refused forever once
+ * settled, so the ordering must be mint -> prove serving -> flip DNS -> close.
+ *
+ * The Go render itself cannot run in this suite (function-go-templating is a Go binary), so the
+ * behavioural cases below drive a TypeScript MODEL of the three decisions this change touches:
+ * which lease children are rendered, which key the retained one carries, and when
+ * status.activeLeaseGeneration advances. The model is kept honest by
+ * "the model mirrors the template it stands in for" below, which pins every expression it
+ * mirrors against the real template source — the same contract `renderCogniKey` and
+ * `allowsPlacementTransition` already use in this file.
+ */
+describe("XComputeWorkload holds the outgoing lease until the replacement serves (bug.5322)", () => {
+  type LeaseResponse = {
+    found?: boolean;
+    serving?: boolean;
+    code?: string;
+    resource?: {
+      state?: string;
+      externalName?: string;
+      endpoints?: string[];
+    };
+  };
+  type ObservedChild = {
+    /** status.requestDetails.body.cogniKey — the key that actually minted this child's lease. */
+    requestKey?: string;
+    /** status.response.body */
+    response?: LeaseResponse;
+  };
+  type XrState = {
+    leaseGeneration: number;
+    status: {
+      leaseRequestGeneration?: number;
+      activeLeaseGeneration?: number;
+      dns?: { target?: string };
+    };
+    observed: Record<string, ObservedChild>;
+  };
+
+  const NS = "cogni-production";
+  const NAME = "toks4";
+  const PUBLIC_HOST = "toks4.cognidao.org";
+  const INCUMBENT_TARGET = "provider-blue.akash.example";
+  const CANDIDATE_TARGET = "provider-green.akash.example";
+
+  /**
+   * Mirrors, in order: GENERATION_BUMP_REPLACES_THE_REQUEST (unchanged by this PR),
+   * OVERLAP_BEFORE_CLOSE, the candidate observation, the last-known-good DNS latch, and the
+   * status.activeLeaseGeneration write.
+   *
+   * Scope: assumes $renderLease is true (the terminal fences it is built from — $closeForBudget,
+   * $recoveryExhausted, $heldClosed, the settled-key clause — are untouched by this change and
+   * are pinned verbatim by "never re-renders a lease Request under a settled key"). The DNS leg
+   * models the provider-HOSTNAME branch only; the IPv4/A-record split is pinned by
+   * "uses a hostname CNAME when available and falls back to an IPv4 A record".
+   */
+  function render(xr: XrState) {
+    const observed = xr.observed;
+    const baseCogniKey = `xcw:${NS}:${NAME}:${xr.leaseGeneration}`;
+
+    // ---- GENERATION_BUMP_REPLACES_THE_REQUEST (pre-existing, unchanged)
+    let leaseRequestGeneration = xr.status.leaseRequestGeneration ?? -1;
+    let leaseResourceName =
+      leaseRequestGeneration >= 0
+        ? `akash-lease-g${leaseRequestGeneration}`
+        : "akash-lease";
+    const initialResponseKey = observed[leaseResourceName]?.requestKey ?? "";
+    const initialMatchesDesired =
+      initialResponseKey === baseCogniKey ||
+      initialResponseKey.startsWith(`${baseCogniKey}:recover:`);
+    if (
+      (leaseRequestGeneration >= 0 &&
+        leaseRequestGeneration !== xr.leaseGeneration) ||
+      (leaseRequestGeneration < 0 &&
+        initialResponseKey !== "" &&
+        !initialMatchesDesired)
+    ) {
+      leaseRequestGeneration = xr.leaseGeneration;
+      leaseResourceName = `akash-lease-g${xr.leaseGeneration}`;
+    }
+
+    // ---- OVERLAP_BEFORE_CLOSE (bug.5322)
+    const activeLeaseGeneration = xr.status.activeLeaseGeneration ?? -1;
+    let retainedResourceName = "";
+    let retainedKey = "";
+    let retainedResp: LeaseResponse = {};
+    if (
+      activeLeaseGeneration >= 0 &&
+      activeLeaseGeneration !== xr.leaseGeneration
+    ) {
+      const activeBaseKey = `xcw:${NS}:${NAME}:${activeLeaseGeneration}`;
+      const activeRecoveryPrefix = `${activeBaseKey}:recover:`;
+      // `range` over a Go map walks the keys in sorted order; first match wins.
+      for (const childName of Object.keys(observed).sort()) {
+        if (
+          retainedResourceName !== "" ||
+          !childName.startsWith("akash-lease") ||
+          childName === leaseResourceName
+        ) {
+          continue;
+        }
+        const childKey = observed[childName].requestKey ?? "";
+        if (
+          childKey === activeBaseKey ||
+          (childKey !== "" && childKey.startsWith(activeRecoveryPrefix))
+        ) {
+          retainedResourceName = childName;
+          retainedKey = childKey;
+          retainedResp = observed[childName].response ?? {};
+        }
+      }
+    }
+    const retainedRes = retainedResp.resource ?? {};
+    const retainedState = retainedRes.state ?? "unknown";
+    const retainedFound =
+      retainedResp.found ?? (retainedRes.externalName ?? "") !== "";
+    const retainedObserved = Object.hasOwn(retainedResp, "found");
+    const retainedGone =
+      retainedObserved && (!retainedFound || retainedState === "closed");
+    const holdOutgoingLease = retainedResourceName !== "" && !retainedGone;
+
+    // ---- the CANDIDATE child's observation (what $active/$serving read)
+    const resp = observed[leaseResourceName]?.response ?? {};
+    const res = resp.resource ?? {};
+    const state = res.state ?? "unknown";
+    const externalName = res.externalName ?? "";
+    const found = resp.found ?? externalName !== "";
+    const serving = resp.serving ?? false;
+    const active = found && state === "active";
+
+    // ---- DNS target + LAST-KNOWN-GOOD latch (bug.5188, unchanged)
+    let dnsTarget = "";
+    for (const endpoint of res.endpoints ?? []) {
+      const host = endpoint
+        .replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, "")
+        .split("/")[0]
+        .split(":")[0]
+        .toLowerCase()
+        .replace(/\.$/, "");
+      if (host !== "" && host !== PUBLIC_HOST && dnsTarget === "") {
+        dnsTarget = host;
+      }
+    }
+    const prevDnsTarget = xr.status.dns?.target ?? "";
+    let effectiveDnsTarget = dnsTarget;
+    if (dnsTarget === "") {
+      effectiveDnsTarget = prevDnsTarget;
+    } else if (
+      prevDnsTarget !== "" &&
+      dnsTarget !== prevDnsTarget &&
+      !(active && serving)
+    ) {
+      effectiveDnsTarget = prevDnsTarget;
+    }
+
+    return {
+      /** Every composed LEASE child this render returns, sorted. */
+      leaseChildren: (holdOutgoingLease
+        ? [retainedResourceName, leaseResourceName]
+        : [leaseResourceName]
+      ).sort(),
+      candidateChild: leaseResourceName,
+      retainedCogniKey: holdOutgoingLease ? retainedKey : undefined,
+      effectiveDnsTarget,
+      status: {
+        leaseRequestGeneration,
+        activeLeaseGeneration:
+          active && serving
+            ? xr.leaseGeneration
+            : activeLeaseGeneration >= 0
+              ? activeLeaseGeneration
+              : undefined,
+      },
+    };
+  }
+
+  /** A live lease that answers OBSERVE as active and serving its exact sha. */
+  const servingOn = (
+    externalName: string,
+    target: string
+  ): ObservedChild["response"] => ({
+    found: true,
+    serving: true,
+    resource: {
+      state: "active",
+      externalName,
+      endpoints: [`http://${target}:32001`],
+    },
+  });
+
+  it("declares the proven-serving generation in status, bounded like its neighbours", () => {
+    expect(statusSchema.activeLeaseGeneration).toMatchObject({
+      type: "integer",
+      minimum: 0,
+      maximum: 1000000,
+    });
+    // The field is the cutover latch; the API must say what writes it and why, or the next
+    // reader re-derives "bump the generation and let GC sort it out" — which is the bug.
+    const raw = readFileSync(path.join(DIR, "xrd.yaml"), "utf8");
+    const doc = raw.slice(
+      raw.indexOf("# THE GENERATION PROVEN SERVING (bug.5322)"),
+      raw.indexOf("activeLeaseGeneration:")
+    );
+    expect(doc).toContain("active && serving");
+    expect(doc).toContain("CLOSE-AFTER-CUTOVER");
+  });
+
+  it("the model mirrors the template it stands in for", () => {
+    // Every expression the model above reproduces, pinned against the real source. If the
+    // template changes shape, this fails and the behavioural cases below stop being evidence.
+    for (const expression of [
+      '$activeLeaseGeneration := int (dig "status" "activeLeaseGeneration" -1 $xr)',
+      "if and (ge $activeLeaseGeneration 0) (ne $activeLeaseGeneration $leaseGeneration)",
+      '$activeBaseKey := printf "xcw:%s:%s:%d" $ns $name $activeLeaseGeneration',
+      '$activeRecoveryPrefix := printf "%s:recover:" $activeBaseKey',
+      "range $childName, $child := $observedResources",
+      'if and (eq $retainedResourceName "") (hasPrefix "akash-lease" $childName) (ne $childName $leaseResourceName)',
+      '$childBodyRaw := dig "status" "requestDetails" "body" "" $child.resource',
+      'if ne $childBodyRaw "" }}{{ $childKey = dig "cogniKey" "" (fromJson $childBodyRaw) }}',
+      'if or (eq $childKey $activeBaseKey) (and (ne $childKey "") (hasPrefix $activeRecoveryPrefix $childKey))',
+      "$retainedResourceName = $childName",
+      "$retainedKey = $childKey",
+      '$retainedState := dig "state" "unknown" $retainedRes',
+      '$retainedFound := dig "found" (ne (dig "externalName" "" $retainedRes) "") $retainedResp',
+      '$retainedObserved := hasKey $retainedResp "found"',
+      '$retainedGone := and $retainedObserved (or (not $retainedFound) (eq $retainedState "closed"))',
+      '$holdOutgoingLease := and (ne $retainedResourceName "") (not $retainedGone)',
+      "{{- if and $active $serving }}",
+      "activeLeaseGeneration: {{ $leaseGeneration }}",
+      "{{- else if ge $activeLeaseGeneration 0 }}",
+      "activeLeaseGeneration: {{ $activeLeaseGeneration }}",
+    ]) {
+      expect(templateCode, expression).toContain(expression);
+    }
+  });
+
+  it("renders byte-identically in steady state — one lease child, no retention", () => {
+    // active == desired, so the whole block is inert: there is nothing to hold and nothing to
+    // cut over to. This is every healthy workload in the fleet on every reconcile tick.
+    const out = render({
+      leaseGeneration: 7,
+      status: {
+        leaseRequestGeneration: 7,
+        activeLeaseGeneration: 7,
+        dns: { target: INCUMBENT_TARGET },
+      },
+      observed: {
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7`,
+          response: servingOn("lease-7", INCUMBENT_TARGET),
+        },
+      },
+    });
+    expect(out.leaseChildren).toEqual(["akash-lease-g7"]);
+    expect(out.retainedCogniKey).toBeUndefined();
+    expect(out.effectiveDnsTarget).toBe(INCUMBENT_TARGET);
+    // Idempotent: a serving steady state keeps re-asserting the same generation.
+    expect(out.status.activeLeaseGeneration).toBe(7);
+  });
+
+  it("renders byte-identically for a fleet XR that has no activeLeaseGeneration yet", () => {
+    // EVERY XR in the fleet omits the field today. Absent digs to -1, which disables retention
+    // entirely — so rolling this composition out changes no render anywhere until a workload is
+    // next observed serving. The bump below therefore still behaves exactly as main does.
+    const bumped = render({
+      leaseGeneration: 1,
+      status: { dns: { target: INCUMBENT_TARGET } },
+      observed: {
+        "akash-lease": {
+          requestKey: `xcw:${NS}:${NAME}:0`,
+          response: servingOn("lease-0", INCUMBENT_TARGET),
+        },
+      },
+    });
+    expect(bumped.leaseChildren).toEqual(["akash-lease-g1"]);
+    expect(bumped.retainedCogniKey).toBeUndefined();
+    expect(bumped.status.activeLeaseGeneration).toBeUndefined();
+
+    // ADOPTION, with zero churn: the first tick that observes the workload serving writes the
+    // field, and from then on its next bump is protected.
+    const adopting = render({
+      leaseGeneration: 0,
+      status: { dns: { target: INCUMBENT_TARGET } },
+      observed: {
+        "akash-lease": {
+          requestKey: `xcw:${NS}:${NAME}:0`,
+          response: servingOn("lease-0", INCUMBENT_TARGET),
+        },
+      },
+    });
+    expect(adopting.leaseChildren).toEqual(["akash-lease"]);
+    expect(adopting.status.activeLeaseGeneration).toBe(0);
+  });
+
+  it("holds the live serving incumbent alongside the candidate, DNS unmoved", () => {
+    // THE bug. Before this change the g7 child stopped being rendered the instant the bump
+    // landed, Crossplane GC'd it, provider-http issued REMOVE, and the actuator closed a lease
+    // that was still the only thing answering on the public hostname.
+    const out = render({
+      leaseGeneration: 8,
+      status: {
+        leaseRequestGeneration: 7,
+        activeLeaseGeneration: 7,
+        dns: { target: INCUMBENT_TARGET },
+      },
+      observed: {
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7`,
+          response: servingOn("lease-7", INCUMBENT_TARGET),
+        },
+        "akash-lease-g8": {
+          requestKey: `xcw:${NS}:${NAME}:8`,
+          response: {
+            found: true,
+            serving: false,
+            resource: {
+              state: "active",
+              externalName: "lease-8",
+              endpoints: [`http://${CANDIDATE_TARGET}:32001`],
+            },
+          },
+        },
+      },
+    });
+    expect(out.leaseChildren).toEqual(["akash-lease-g7", "akash-lease-g8"]);
+    expect(out.candidateChild).toBe("akash-lease-g8");
+    // The retained child must close under the key that MINTED it, read back from its own
+    // request body. A reconstructed key would hand REMOVE something the actuator never
+    // allocated and leave a live lease billing forever.
+    expect(out.retainedCogniKey).toBe(`xcw:${NS}:${NAME}:7`);
+    // PROVE_BEFORE_TRAFFIC: the candidate is leased and has endpoints, but is not serving, so
+    // the public name stays on the incumbent.
+    expect(out.effectiveDnsTarget).toBe(INCUMBENT_TARGET);
+    expect(out.status.activeLeaseGeneration).toBe(7);
+  });
+
+  it("retains a lease minted under a bounded recovery key under THAT key", () => {
+    // bug.5287's `:recover:<n>` children are real minted leases. Closing one requires its own
+    // key, which is exactly why the retained key is read back rather than rebuilt from
+    // $activeLeaseGeneration.
+    const out = render({
+      leaseGeneration: 8,
+      status: { leaseRequestGeneration: 7, activeLeaseGeneration: 7 },
+      observed: {
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7:recover:2`,
+          response: servingOn("lease-7r2", INCUMBENT_TARGET),
+        },
+      },
+    });
+    expect(out.leaseChildren).toEqual(["akash-lease-g7", "akash-lease-g8"]);
+    expect(out.retainedCogniKey).toBe(`xcw:${NS}:${NAME}:7:recover:2`);
+  });
+
+  it("retains NOTHING when the outgoing lease is already closed", () => {
+    // The ordinary replace-a-terminally-spent-lease flow (PR #2582 replaced a spent toks5
+    // preview lease). There is no live lease to protect, so the render must be exactly what it
+    // is on main: the candidate alone. Regressing this would double-bill every recovery.
+    const out = render({
+      leaseGeneration: 8,
+      status: {
+        leaseRequestGeneration: 7,
+        activeLeaseGeneration: 7,
+        dns: { target: INCUMBENT_TARGET },
+      },
+      observed: {
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7`,
+          response: {
+            found: true,
+            resource: { state: "closed", externalName: "lease-7" },
+          },
+        },
+      },
+    });
+    expect(out.leaseChildren).toEqual(["akash-lease-g8"]);
+    expect(out.retainedCogniKey).toBeUndefined();
+  });
+
+  it("keeps retaining through a refusal body that carries no observation", () => {
+    // provider-http overwrites status.response.body with the ERROR body of a failed mutation —
+    // the fact bug.5188's DNS latch exists for. That body has no `found`, so reading "not
+    // observed found" as "nothing to protect" would close the LIVE incumbent on a transient
+    // refusal. Retention ends only on a POSITIVE closed observation.
+    const out = render({
+      leaseGeneration: 8,
+      status: { leaseRequestGeneration: 7, activeLeaseGeneration: 7 },
+      observed: {
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7`,
+          response: { code: "ledger_unavailable" },
+        },
+      },
+    });
+    expect(out.leaseChildren).toEqual(["akash-lease-g7", "akash-lease-g8"]);
+  });
+
+  it("stops retaining on a POSITIVE found:false, so no settled key is re-rendered", () => {
+    // The other direction of the same fence. An OBSERVE that answers `found: false` is read by
+    // isRemovedCheck as "the external resource does not exist", so continuing to render that
+    // child would fire CREATE under an already-settled key on every reconcile forever — the
+    // Axiom 26 churn $renderLease exists to prevent. The presence of the `found` KEY is what
+    // separates this from the refusal body above, which carries no observation at all.
+    const out = render({
+      leaseGeneration: 8,
+      status: { leaseRequestGeneration: 7, activeLeaseGeneration: 7 },
+      observed: {
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7`,
+          response: { found: false },
+        },
+      },
+    });
+    expect(out.leaseChildren).toEqual(["akash-lease-g8"]);
+    expect(out.retainedCogniKey).toBeUndefined();
+  });
+
+  it("does not advance the latch while the candidate is not serving", () => {
+    // A leased-but-not-serving candidate is the toks5 shape: on the chain, billing, nothing
+    // answering. It must never be mistaken for a cutover.
+    for (const candidate of [
+      undefined,
+      { found: false },
+      { found: true, serving: false, resource: { state: "pending" } },
+      {
+        found: true,
+        serving: false,
+        resource: {
+          state: "active",
+          externalName: "lease-8",
+          endpoints: [`http://${CANDIDATE_TARGET}:32001`],
+        },
+      },
+    ] as (LeaseResponse | undefined)[]) {
+      const out = render({
+        leaseGeneration: 8,
+        status: {
+          leaseRequestGeneration: 7,
+          activeLeaseGeneration: 7,
+          dns: { target: INCUMBENT_TARGET },
+        },
+        observed: {
+          "akash-lease-g7": {
+            requestKey: `xcw:${NS}:${NAME}:7`,
+            response: servingOn("lease-7", INCUMBENT_TARGET),
+          },
+          "akash-lease-g8": {
+            requestKey: `xcw:${NS}:${NAME}:8`,
+            response: candidate,
+          },
+        },
+      });
+      expect(out.status.activeLeaseGeneration).toBe(7);
+      expect(out.leaseChildren).toEqual(["akash-lease-g7", "akash-lease-g8"]);
+      expect(out.effectiveDnsTarget).toBe(INCUMBENT_TARGET);
+    }
+  });
+
+  it("flips DNS and advances the latch once the candidate serves, then closes the old lease", () => {
+    // TICK 1 — the candidate is active AND serving its exact sha (the same pair status.serving
+    // and the Ready phase are written from). DNS flips; the latch advances. The incumbent is
+    // STILL rendered on this tick, so nothing closes before the cutover is recorded.
+    const cutover = render({
+      leaseGeneration: 8,
+      status: {
+        leaseRequestGeneration: 7,
+        activeLeaseGeneration: 7,
+        dns: { target: INCUMBENT_TARGET },
+      },
+      observed: {
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7`,
+          response: servingOn("lease-7", INCUMBENT_TARGET),
+        },
+        "akash-lease-g8": {
+          requestKey: `xcw:${NS}:${NAME}:8`,
+          response: servingOn("lease-8", CANDIDATE_TARGET),
+        },
+      },
+    });
+    expect(cutover.effectiveDnsTarget).toBe(CANDIDATE_TARGET);
+    expect(cutover.status.activeLeaseGeneration).toBe(8);
+    expect(cutover.leaseChildren).toEqual(["akash-lease-g7", "akash-lease-g8"]);
+
+    // TICK 2 — the latch written by tick 1 is read back: active == desired, so the incumbent is
+    // no longer rendered. THAT is the close: Crossplane GCs the child and provider-http's
+    // REMOVE closes the old lease exactly once, AFTER the replacement served and DNS moved.
+    // No new delete call exists anywhere in this change.
+    const afterCutover = render({
+      leaseGeneration: 8,
+      status: {
+        leaseRequestGeneration: 8,
+        activeLeaseGeneration: cutover.status.activeLeaseGeneration,
+        dns: { target: cutover.effectiveDnsTarget },
+      },
+      observed: {
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7`,
+          response: servingOn("lease-7", INCUMBENT_TARGET),
+        },
+        "akash-lease-g8": {
+          requestKey: `xcw:${NS}:${NAME}:8`,
+          response: servingOn("lease-8", CANDIDATE_TARGET),
+        },
+      },
+    });
+    expect(afterCutover.leaseChildren).toEqual(["akash-lease-g8"]);
+    expect(afterCutover.effectiveDnsTarget).toBe(CANDIDATE_TARGET);
+  });
+
+  it("never renders a third lease child, whatever the observed history", () => {
+    // AT MOST TWO leases for one (node, env). A second bump during an overlap must still find
+    // the PROVEN-SERVING child — not the never-served candidate the first bump left behind —
+    // and must not resurrect the stale one as a third.
+    const doubleBump = render({
+      leaseGeneration: 9,
+      status: {
+        leaseRequestGeneration: 8,
+        activeLeaseGeneration: 7,
+        dns: { target: INCUMBENT_TARGET },
+      },
+      observed: {
+        "akash-lease-g6": {
+          requestKey: `xcw:${NS}:${NAME}:6`,
+          response: {
+            found: true,
+            resource: { state: "closed", externalName: "lease-6" },
+          },
+        },
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7`,
+          response: servingOn("lease-7", INCUMBENT_TARGET),
+        },
+        "akash-lease-g8": {
+          requestKey: `xcw:${NS}:${NAME}:8`,
+          response: { found: true, resource: { state: "pending" } },
+        },
+      },
+    });
+    expect(doubleBump.leaseChildren).toEqual([
+      "akash-lease-g7",
+      "akash-lease-g9",
+    ]);
+    expect(doubleBump.retainedCogniKey).toBe(`xcw:${NS}:${NAME}:7`);
+
+    // Exhaustive sweep: every combination of observed children and candidate states still
+    // renders at most two lease children, and never the same name twice.
+    const states: (LeaseResponse | undefined)[] = [
+      undefined,
+      { found: false },
+      { found: true, resource: { state: "pending" } },
+      { found: true, resource: { state: "closed", externalName: "x" } },
+      servingOn("x", INCUMBENT_TARGET),
+    ];
+    for (const activeLeaseGeneration of [undefined, 6, 7, 8]) {
+      for (const sevenState of states) {
+        for (const eightState of states) {
+          const out = render({
+            leaseGeneration: 8,
+            status: { leaseRequestGeneration: 7, activeLeaseGeneration },
+            observed: {
+              "akash-lease": {
+                requestKey: `xcw:${NS}:${NAME}:0`,
+                response: servingOn("lease-0", INCUMBENT_TARGET),
+              },
+              "akash-lease-g7": {
+                requestKey: `xcw:${NS}:${NAME}:7`,
+                response: sevenState,
+              },
+              "akash-lease-g8": {
+                requestKey: `xcw:${NS}:${NAME}:8`,
+                response: eightState,
+              },
+            },
+          });
+          expect(out.leaseChildren.length).toBeLessThanOrEqual(2);
+          expect(new Set(out.leaseChildren).size).toBe(
+            out.leaseChildren.length
+          );
+          expect(out.leaseChildren).toContain(out.candidateChild);
+        }
+      }
+    }
+  });
+
+  it("holds the incumbent even when the candidate's own Request is fenced off", () => {
+    // $renderLease parks a candidate whose key settled closed (Axiom 26). Before this change
+    // that left NO lease child at all once the bump had already GC'd the incumbent. Retention
+    // is independent of the candidate's fate, so the node keeps serving while the XR reports
+    // the terminal truth about the candidate.
+    const out = render({
+      leaseGeneration: 8,
+      status: { leaseRequestGeneration: 7, activeLeaseGeneration: 7 },
+      observed: {
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7`,
+          response: servingOn("lease-7", INCUMBENT_TARGET),
+        },
+      },
+    });
+    expect(out.leaseChildren).toContain("akash-lease-g7");
+    expect(out.retainedCogniKey).toBe(`xcw:${NS}:${NAME}:7`);
+  });
+
+  /**
+   * The retained Request is a DELIBERATE COPY of the paid lease Request. A copy that drifts is
+   * worse than no copy: REMOVE is how the retained child eventually closes its lease, so it has
+   * to keep speaking the same actuator wire as the child that minted it.
+   */
+  describe("the retained Request is the paid Request, modulo four documented differences", () => {
+    const COMMENT = /\{\{-?\s*\/\*[\s\S]*?\*\/\s*-?\}\}/g;
+    const retainedBlock = template.slice(
+      template.lastIndexOf("{{- if $holdOutgoingLease }}"),
+      template.indexOf(
+        "{{- /* ---------- composed: the paid Akash lease ---------- */ -}}"
+      )
+    );
+    const candidateBlock = template.slice(
+      template.indexOf("{{- if $renderLease }}"),
+      template.indexOf(
+        "{{- /* ---------- composed: DNS intent ---------- */ -}}"
+      )
+    );
+
+    /**
+     * Drops prose, YAML comments, whole-line template actions (the render guards) and the four
+     * known differences, then substitutes the retained variable names back to the originals.
+     */
+    function normalized(block: string): string[] {
+      return block
+        .replace(COMMENT, "")
+        .split("\n")
+        .map((line) => line.trimEnd())
+        .filter((line) => {
+          const t = line.trim();
+          return (
+            t !== "" &&
+            t !== "---" &&
+            !t.startsWith("#") &&
+            !/^\{\{-?[^{}]*\}\}$/.test(t) &&
+            !t.startsWith(
+              "gotemplating.fn.crossplane.io/composition-resource-name:"
+            ) &&
+            !t.startsWith("gotemplating.fn.crossplane.io/ready:")
+          );
+        })
+        .map((line) =>
+          line
+            .replace("$retainedPayload", "$payload")
+            .replace("$retainedUpToDateLogic", "$upToDateLogic")
+        );
+    }
+
+    it("has both blocks", () => {
+      expect(retainedBlock).toContain("kind: Request");
+      expect(candidateBlock).toContain("kind: Request");
+      // Guard against the comparison below passing on two empty lists if a marker moves.
+      expect(normalized(retainedBlock).length).toBeGreaterThan(40);
+    });
+
+    it("differs nowhere else — same baseUrl, auth, mappings and isRemovedCheck", () => {
+      expect(normalized(retainedBlock)).toEqual(normalized(candidateBlock));
+      // The four differences, asserted positively so a future edit cannot quietly merge them.
+      expect(retainedBlock).toContain(
+        "composition-resource-name: {{ $retainedResourceName }}"
+      );
+      expect(candidateBlock).toContain(
+        "composition-resource-name: {{ $leaseResourceName }}"
+      );
+      expect(retainedBlock).toContain("body: {{ toJson $retainedPayload");
+      expect(retainedBlock).toContain("logic: {{ $retainedUpToDateLogic");
+      // The incumbent is never marked ready by the composite: auto-ready reads the Request's
+      // own condition, and only the CANDIDATE's serving proof may claim the XR is Ready.
+      expect(candidateBlock).toContain("gotemplating.fn.crossplane.io/ready");
+      expect(retainedBlock).not.toContain(
+        "gotemplating.fn.crossplane.io/ready"
+      );
+    });
+
+    it("is OBSERVE-only: expectedResponseCheck can never choose UPDATE on a live lease", () => {
+      // expectedResponseCheck is the ONLY thing that triggers UPDATE, and an UPDATE here is an
+      // in-place SDL replacement — it would restart the incumbent on the CANDIDATE's image.
+      // The logic is satisfied by every response under which the child is retained (`active`,
+      // or an error body whose .resource.state is null); the one response that falsifies it is
+      // the positive `closed` that also stops the child rendering.
+      expect(templateCode).toContain(
+        '$retainedUpToDateLogic := "(.response.body.resource.state != \\"closed\\")"'
+      );
+      // It must NOT inherit the convergence clause: `serving` is probed against the CANDIDATE's
+      // sha, which a healthy incumbent can never satisfy, so the armed logic would mean an SDL
+      // UPDATE on the live lease on every single poll.
+      expect(retainedBlock).not.toContain("$upToDateLogic");
+      expect(retainedBlock).not.toContain(".response.body.serving == true");
+      // CLOSED_IS_REMOVED is preserved verbatim: it is what makes the eventual GC actually
+      // close the lease instead of leaving an undeletable Request.
+      expect(retainedBlock).toContain(
+        '(.response.body.found == false) or (.response.body.resource.state == "closed")'
+      );
+      // The paid lease's leak-prevention refusal is not relaxed for the retained child either.
+      expect(retainedBlock).not.toContain("external-create-succeeded");
+    });
+
+    it("introduces no new close or delete path", () => {
+      // The close is Crossplane's ordinary GC of a child this function stops returning. Exactly
+      // two REMOVE mappings exist in the whole template — one per lease Request — and the only
+      // delete route is the actuator's own.
+      expect(templateCode.match(/\/v1\/akash\/delete/g)?.length).toBe(2);
+      expect(templateCode.match(/action: REMOVE/g)?.length).toBe(3); // 2 lease + 1 DNS
+    });
+  });
+
+  it("weakens none of the fences it rides on", () => {
+    // Everything bug.5322 is built on top of must survive unchanged. These are restatements of
+    // assertions elsewhere in this file, gathered here because this change is the one most
+    // likely to be tempted into relaxing them.
+    expect(template).toContain(
+      "$renderLease := not (or $closeForBudget $recoveryExhausted $heldClosed (and $closed (not $closedForCurrentKey)))"
+    );
+    expect(templateCode).toContain("$maxRecoveryAttempts := 3");
+    expect(templateCode).toContain(
+      "$recoveryExhausted := and $closedForCurrentKey (ge $recoveryCount $maxRecoveryAttempts)"
+    );
+    expect(templateCode).toContain(
+      '$closeForBudget := and $deadlineExceeded (eq $onDeadline "Close")'
+    );
+    expect(templateCode).toContain(
+      '$heldClosed := and $closedForCurrentKey (ne $onGiveUp "Replace")'
+    );
+    // The DNS latch still refuses to flip until the CANDIDATE is active AND serving, and
+    // $active/$serving are still read from the candidate child alone.
+    expect(templateCode).toContain(
+      '{{- else if and (ne $prevDnsTarget "") (ne $dnsTarget $prevDnsTarget) (not (and $active $serving)) }}'
+    );
+    expect(templateCode).toContain(
+      "$leaseObs := index $observedResources $leaseResourceName"
+    );
+    expect(templateCode).toContain(
+      '$active := and $found (eq $state "active")'
+    );
+    // The host-routed serving proof is untouched: it connects to the lease's OWN endpoint while
+    // presenting the public host, which is exactly why a candidate can be proven serving BEFORE
+    // DNS points at it. A DNS-resolved probe would deadlock this whole design.
+    expect(templateCode).toContain("publicHost: {{ $publicHost | quote }}");
   });
 });
