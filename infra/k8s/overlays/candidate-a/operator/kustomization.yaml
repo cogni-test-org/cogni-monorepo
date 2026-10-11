@@ -8,6 +8,7 @@ namespace: cogni-candidate-a
 resources:
   - ../../../base/node-app
   - ./external-secret.yaml
+  - ./secrets-writer-sa.yaml
   - ../../../base/akash-tx-actuator
   - ./akash-tx-actuator-external-secret.yaml
   - ./akash-tx-actuator-auth-external-secret.yaml
@@ -19,7 +20,7 @@ transformers:
 
 images:
   - name: ghcr.io/cogni-dao/cogni-template
-    newName: ghcr.io/cogni-test-org/cogni-template
+    newName: ghcr.io/cogni-dao/cogni-template
     digest: "sha256:5e80e3625bddf9827381092cee4194f0bdcfe94bbef4eb95f74edc698c1210be"
 
 patches:
@@ -97,6 +98,9 @@ patches:
       - op: add
         path: /data/NODE_SUBMODULE_PARENT_REPO
         value: "cogni-monorepo"
+      - op: add
+        path: /data/OPENBAO_NODE_SECRETS_WRITER_ROLE
+        value: "candidate-a-node-secrets-writer"
   - target:
       kind: Service
       name: node-app
@@ -123,6 +127,32 @@ patches:
       - op: add
         path: /spec/template/metadata/labels/app.kubernetes.io~1instance
         value: "operator"
+
+  # Keep the operator's OpenBao identity atomic: the ServiceAccount resource,
+  # projected audience token, and pod binding ship in the same overlay.
+  - target:
+      kind: Deployment
+      name: node-app
+    patch: |
+      - op: add
+        path: /spec/template/spec/serviceAccountName
+        value: secrets-writer
+      - op: add
+        path: /spec/template/spec/volumes
+        value:
+          - name: openbao-token
+            projected:
+              sources:
+                - serviceAccountToken:
+                    path: token
+                    audience: cogni-openbao
+                    expirationSeconds: 3600
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts
+        value:
+          - name: openbao-token
+            mountPath: /var/run/secrets/openbao
+            readOnly: true
 
   # task.0423: Doltgres knowledge-plane migrator runs as a second initContainer
   # on the operator Deployment. DATABASE_URL maps to DOLTGRES_URL (separate from
