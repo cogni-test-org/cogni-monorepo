@@ -8,6 +8,9 @@ dockerfile: nodes/node-template/app/Dockerfile
 image_tag_suffix: "-node-template"
 migrator_tag_suffix: "-node-template-migrate"
 source_repo: https://github.com/cogni-test-org/node-template.git
+# task.5233 — off-cluster planning resolves the immutable child bundle from
+# this test-owned source revision before the Crossplane renderer materializes it.
+source_sha: 39e9dd5ba5d42d83b0473c8cda0d8e49e611d191
 image_repository: ghcr.io/cogni-test-org/node-template
 # task.0320 — per-env deploy branches (see operator.yaml).
 candidate_a_branch: deploy/candidate-a-node-template

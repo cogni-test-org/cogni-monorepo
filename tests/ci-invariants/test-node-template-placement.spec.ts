@@ -7,6 +7,7 @@
  * Scope: Test-parent catalog policy only; does not change canonical placement, which remains owned by Cogni-DAO/cogni.
  * Invariants:
  *   NODE_TEMPLATE_WORKER_USES_EXACT_SET_RENDERER: candidate-a uses Akash/Crossplane, never the node-app-only k3s overlay.
+ *   OFF_CLUSTER_SOURCE_IS_IMMUTABLE: the test fixture resolves the exact qualified child bundle before materialization.
  *   TEST_OWNER_USES_TEST_WRITER: the fixture stays in cogni-test-org so owner-based actuator routing selects the isolated test account.
  * Side-effects: IO (reads infra/catalog/node-template.yaml)
  * Links: task.5233, story.5076, docs/spec/node-baas-architecture.md, docs/spec/temporal-patterns.md
@@ -22,6 +23,7 @@ const REPO_ROOT = path.resolve(__dirname, "../..");
 
 interface NodeTemplateCatalog {
   source_repo?: string;
+  source_sha?: string;
   envs?: string[];
   deployment_provider?: Record<string, string>;
   compute_api?: Record<string, string>;
@@ -39,6 +41,7 @@ describe("test-parent node-template workflow placement (task.5233)", () => {
     expect(row.deployment_provider?.["candidate-a"]).toBe("akash");
     expect(row.compute_api?.["candidate-a"]).toBe("crossplane");
     expect(row.lease_generation?.["candidate-a"]).toBe(0);
+    expect(row.source_sha).toBe("39e9dd5ba5d42d83b0473c8cda0d8e49e611d191");
     expect(
       row.compute_egress_cidrs?.some(({ cidr }) => cidr === "80.200.246.35/32")
     ).toBe(true);
