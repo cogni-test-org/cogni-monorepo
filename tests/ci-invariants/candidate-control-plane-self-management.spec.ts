@@ -3,8 +3,8 @@
 
 /**
  * Module: `@tests/ci-invariants/candidate-control-plane-self-management`
- * Purpose: Pins the candidate-a control-plane root Application to one shape in both its apply-once seed and its self-managing copy.
- * Scope: Static assertions over the two YAML manifests; does not contact a cluster, Argo CD, or GitHub.
+ * Purpose: Pins the candidate-a control-plane root and app-of-apps Applications to the isolated test parent.
+ * Scope: Static assertions over the three YAML manifests; does not contact a cluster, Argo CD, or GitHub.
  * Invariants:
  *   SEED_AND_SELF_ARE_THE_SAME_OBJECT: the apply-once seed under roots/ and the
  *     self-managing copy inside control-plane/candidate-a/ parse to the same
@@ -13,9 +13,11 @@
  *   CONTROL_PLANE_TRACKS_TEST_PARENT_MAIN: both copies stay on the isolated
  *     test-parent repository and protected main, so self-management cannot
  *     revert the live root to the canonical deploy ref.
+ *   APPSETS_TRACK_TEST_PARENT_MAIN: the child app-of-apps stays on the same
+ *     isolated source, so it cannot restore canonical per-node ApplicationSets.
  *   CONTROL_PLANE_OWNS_ONLY_ITS_ENV_DIR: the root's source path is scoped to
  *     infra/k8s/argocd/control-plane/candidate-a, preventing a foreign-env fan-out.
- * Side-effects: IO (reads the two candidate-a control-plane Application manifests)
+ * Side-effects: IO (reads the three candidate-a control-plane Application manifests)
  * Links: infra/k8s/argocd/control-plane/roots/candidate-a-control-plane-application.yaml, nodes/operator/app/src/adapters/server/vcs/github-repo-write.ts
  * @public
  */
@@ -31,6 +33,7 @@ const TEST_PARENT_REPO_URL =
 const CONTROL_PLANE_REF = "main";
 const CONTROL_PLANE_PATH = "infra/k8s/argocd/control-plane/candidate-a";
 const SELF_PATH = `${CONTROL_PLANE_PATH}/candidate-a-control-plane-application.yaml`;
+const APPSETS_PATH = `${CONTROL_PLANE_PATH}/candidate-a-appsets-application.yaml`;
 const SEED_PATH =
   "infra/k8s/argocd/control-plane/roots/candidate-a-control-plane-application.yaml";
 
@@ -68,6 +71,7 @@ function identityOf(app: ControlPlaneApplication) {
 
 const self = loadApplication(SELF_PATH);
 const seed = loadApplication(SEED_PATH);
+const appsets = loadApplication(APPSETS_PATH);
 
 describe("candidate-a control-plane self-management", () => {
   it("seeds and self-manages the same Application identity", () => {
@@ -93,6 +97,14 @@ describe("candidate-a control-plane self-management", () => {
     expect(seed.spec?.source?.repoURL).toBe(TEST_PARENT_REPO_URL);
     expect(self.spec?.source?.targetRevision).toBe(CONTROL_PLANE_REF);
     expect(seed.spec?.source?.targetRevision).toBe(CONTROL_PLANE_REF);
+  });
+
+  it("keeps the child app-of-apps on the isolated test-parent main", () => {
+    expect(appsets.spec?.source?.repoURL).toBe(TEST_PARENT_REPO_URL);
+    expect(appsets.spec?.source?.targetRevision).toBe(CONTROL_PLANE_REF);
+    expect(appsets.spec?.source?.path).toBe(
+      "infra/k8s/argocd/appsets/candidate-a"
+    );
   });
 
   it("owns only the candidate-a control-plane directory", () => {
