@@ -40,7 +40,7 @@ describe("test-parent node-template workflow placement (task.5233)", () => {
     expect(row.envs).toContain("candidate-a");
     expect(row.deployment_provider?.["candidate-a"]).toBe("akash");
     expect(row.compute_api?.["candidate-a"]).toBe("crossplane");
-    expect(row.lease_generation?.["candidate-a"]).toBe(0);
+    expect(row.lease_generation?.["candidate-a"]).toBe(1);
     expect(row.source_sha).toBe("39e9dd5ba5d42d83b0473c8cda0d8e49e611d191");
     expect(
       row.compute_egress_cidrs?.some(({ cidr }) => cidr === "80.200.246.35/32")
