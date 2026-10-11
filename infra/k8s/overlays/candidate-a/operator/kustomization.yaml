@@ -7,6 +7,7 @@ namespace: cogni-candidate-a
 
 resources:
   - ../../../base/node-app
+  - ./external-secret.yaml
   - ../../../base/akash-tx-actuator
   - ./akash-tx-actuator-external-secret.yaml
   - ./akash-tx-actuator-auth-external-secret.yaml
