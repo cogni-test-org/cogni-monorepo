@@ -7,6 +7,7 @@ namespace: cogni-candidate-a
 
 resources:
   - ../../../base/node-app
+  - ../../../base/openfga-external
   - ./external-secret.yaml
   - ./secrets-writer-sa.yaml
   - ../../../base/akash-tx-actuator
@@ -98,6 +99,9 @@ patches:
       - op: add
         path: /data/NODE_SUBMODULE_PARENT_REPO
         value: "cogni-monorepo"
+      - op: add
+        path: /data/OPENFGA_API_URL
+        value: "http://operator-openfga-external:8080"
       - op: add
         path: /data/OPENBAO_NODE_SECRETS_WRITER_ROLE
         value: "candidate-a-node-secrets-writer"
@@ -214,6 +218,16 @@ patches:
       kind: Service
       metadata:
         name: litellm-external
+      spec:
+        type: ExternalName
+        externalName: cogni-candidate-a.vm.cognidao.org
+        clusterIP: null
+  - target: { kind: Service, name: openfga-external }
+    patch: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: openfga-external
       spec:
         type: ExternalName
         externalName: cogni-candidate-a.vm.cognidao.org
