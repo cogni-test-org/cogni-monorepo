@@ -8,9 +8,6 @@ dockerfile: nodes/node-template/app/Dockerfile
 image_tag_suffix: "-node-template"
 migrator_tag_suffix: "-node-template-migrate"
 source_repo: https://github.com/cogni-test-org/node-template.git
-# task.5233 — off-cluster planning resolves the immutable child bundle from
-# this test-owned source revision before the Crossplane renderer materializes it.
-source_sha: 39e9dd5ba5d42d83b0473c8cda0d8e49e611d191
 image_repository: ghcr.io/cogni-test-org/node-template
 # task.0320 — per-env deploy branches (see operator.yaml).
 candidate_a_branch: deploy/candidate-a-node-template
@@ -19,20 +16,9 @@ production_branch: deploy/production-node-template
 path_prefix: nodes/node-template/
 envs: [candidate-a, preview, production]
 deployment_provider:
-  # task.5233 — node-template's repo-spec declares a public app plus the private
-  # cogni-workflow-worker-v1 service. Only the exact-set Akash/Crossplane renderer
-  # consumes that multi-service bundle; the legacy k3s overlay renders node-app only.
-  candidate-a: akash
+  candidate-a: k3s
   preview: k3s
   production: k3s
-compute_api:
-  candidate-a: crossplane
-lease_generation:
-  # Generation 0 is settled/closed; use a fresh immutable actuator key.
-  candidate-a: 1
-compute_egress_cidrs:
-  - cidr: 80.200.246.35/32
-    comment: shared egress NAT of Akash providers zencloud + digitalfrontier (story.5016)
 activity_env: candidate-a
 owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
 node_id: b927a9dd-6132-4fc9-a51e-e3cee2568e3c
