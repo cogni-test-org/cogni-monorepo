@@ -48,6 +48,7 @@ interface WorkflowJob {
 }
 
 const parsed = yaml.parse(WORKFLOW) as {
+  env?: Record<string, unknown>;
   jobs: Record<string, WorkflowJob>;
 };
 
@@ -88,6 +89,12 @@ describe("candidate-a manifest source", () => {
       namedStep("assert-substrate", "Assert target substrate").env?.CHECK_DNS
     ).toBe(
       "${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ZONE_ID != '' && 'true' || 'false' }}"
+    );
+  });
+
+  it("passes the configured workload domain to fleet-derived routing", () => {
+    expect(parsed.env?.DOMAIN).toBe(
+      "${{ vars.DOMAIN || vars.FORK_DOMAIN_ROOT || 'cognidao.org' }}"
     );
   });
 
@@ -153,6 +160,12 @@ describe("candidate-a manifest source", () => {
     expect(namedStep("flight", "Checkout app source").with?.ref).toBe(
       "${{ needs.decide.outputs.head_sha }}"
     );
+    expect(
+      namedStep(
+        "reconcile-scheduler-worker-routing",
+        "Checkout app source (PR catalog + base manifests)"
+      ).with?.ref
+    ).toBe("${{ needs.decide.outputs.head_sha }}");
     expect(WORKFLOW).toContain(
       "rsync -a --delete app-src/infra/k8s/base/ deploy-branch/infra/k8s/base/"
     );
