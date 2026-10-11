@@ -16,9 +16,20 @@ production_branch: deploy/production-node-template
 path_prefix: nodes/node-template/
 envs: [candidate-a, preview, production]
 deployment_provider:
-  candidate-a: k3s
+  # task.5233 — node-template's repo-spec declares a public app plus the private
+  # cogni-workflow-worker-v1 service. Only the exact-set Akash/Crossplane renderer
+  # consumes that multi-service bundle; the legacy k3s overlay renders node-app only.
+  candidate-a: akash
   preview: k3s
   production: k3s
+compute_api:
+  candidate-a: crossplane
+lease_generation:
+  # First candidate-a Akash lease for this node/repository tuple.
+  candidate-a: 0
+compute_egress_cidrs:
+  - cidr: 80.200.246.35/32
+    comment: shared egress NAT of Akash providers zencloud + digitalfrontier (story.5016)
 activity_env: candidate-a
 owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
 node_id: b927a9dd-6132-4fc9-a51e-e3cee2568e3c
