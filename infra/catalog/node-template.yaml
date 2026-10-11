@@ -28,8 +28,8 @@ deployment_provider:
 compute_api:
   candidate-a: crossplane
 lease_generation:
-  # First candidate-a Akash lease for this node/repository tuple.
-  candidate-a: 0
+  # Generation 0 is settled/closed; use a fresh immutable actuator key.
+  candidate-a: 1
 compute_egress_cidrs:
   - cidr: 80.200.246.35/32
     comment: shared egress NAT of Akash providers zencloud + digitalfrontier (story.5016)
