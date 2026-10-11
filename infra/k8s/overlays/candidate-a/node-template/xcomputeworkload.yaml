@@ -1,0 +1,70 @@
+apiVersion: compute.cogni.io/v1alpha1
+kind: XComputeWorkload
+metadata:
+  name: b927a9dd-6132-4fc9-a51e-e3cee2568e3c
+  namespace: cogni-candidate-a
+  labels:
+    cogni.io/node-id: b927a9dd-6132-4fc9-a51e-e3cee2568e3c
+    cogni.io/environment: candidate-a
+    cogni.io/node: node-template
+spec:
+  nodeId: b927a9dd-6132-4fc9-a51e-e3cee2568e3c
+  environment: candidate-a
+  bundle:
+    ref: ghcr.io/cogni-test-org/node-template@sha256:409d675ea407e1358d3d8009845d0065fb34e8d279343e82f04220f2ee1c6bac
+    source:
+      repository: cogni-test-org/node-template
+      sha: 39e9dd5ba5d42d83b0473c8cda0d8e49e611d191
+    artifacts:
+      - name: app
+        image: ghcr.io/cogni-test-org/node-template@sha256:b1ba7a8a9d01e4444cd34c2ee25ab4cd7ed268ee82fc5239e92f1db5880b2bef
+      - name: workflow-worker
+        image: ghcr.io/cogni-test-org/node-template-workflow-worker@sha256:b9a50307346843bc4b17c13e7015aa1f363c27dbf711b11ebcd3a93ac09dea4f
+  workload:
+    name: node-template
+    publicHost: node-template.cogni-testing.org
+    services:
+      - name: app
+        artifact: app
+        runtimeProfile: cogni-node-app-v1
+        secretRefs:
+          - key: AUTH_SECRET
+          - key: DATABASE_URL
+          - key: DATABASE_SERVICE_URL
+          - key: DOLTGRES_URL
+          - key: EVM_RPC_URL
+          - key: LITELLM_VIRTUAL_KEY
+          - key: SCHEDULER_API_TOKEN
+          - key: BILLING_INGEST_TOKEN
+          - key: FLIGHT_PROBE_API_KEY
+        port: 3200
+        visibility: public
+        bindings: {}
+        bindHost: 0.0.0.0
+        cpuUnits: 2
+        memoryMi: 2048
+        storageMi: 4096
+      - name: workflow-worker
+        artifact: workflow-worker
+        runtimeProfile: cogni-workflow-worker-v1
+        secretRefs:
+          - key: SCHEDULER_API_TOKEN
+        port: 9100
+        visibility: private
+        bindings: {}
+        bindHost: 0.0.0.0
+        cpuUnits: 1
+        memoryMi: 1024
+        storageMi: 1024
+  migration:
+    policy: RequireBeforeServing
+  bootPolicy:
+    onDeadline: Close
+    onGiveUp: Hold
+  leaseGeneration: 0
+  actuatorNamespace: cogni-candidate-a
+  dns:
+    provider: cloudflare
+    zoneId: 23220356c352c5831c6af57887b11a27
+  runtime:
+    substrateHost: cogni-candidate-a.vm.cognidao.org
