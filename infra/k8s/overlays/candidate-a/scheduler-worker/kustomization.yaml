@@ -23,7 +23,7 @@ patches:
         value: "cogni-candidate-a"
       - op: replace
         path: /data/IMAGE_DIGEST
-        value: "candidate-a-placeholder-scheduler-worker"
+        value: "sha256:400c2bded1b450af42147ce867893243cbe5cdb2957dc5e2c4e9b70252dd1334"
 
   # bug.0295: VM discovery via DNS (cogni-candidate-a.vm.cognidao.org).
   # Convert base headless Services → ExternalName; delete EndpointSlices.
