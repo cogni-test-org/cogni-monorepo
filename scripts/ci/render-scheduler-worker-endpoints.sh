@@ -43,9 +43,11 @@ DEPLOYMENT_PATH="$REPO_ROOT/infra/k8s/base/scheduler-worker/deployment.yaml"
 OVERLAY_ROOT="$REPO_ROOT/infra/k8s/overlays"
 PATCH_BASENAME="node-endpoints.patch.yaml"
 
-# The public WORKLOAD zone this repo's node hosts hang off. DOMAIN wins when an
-# isolated fleet deliberately separates workload DNS from its substrate root;
-# FORK_DOMAIN_ROOT remains the backward-compatible fallback for plain forks.
+# The public WORKLOAD zone this repo's node hosts hang off. Comes from DOMAIN
+# (e.g. cogni-testing.org on the test-parent mirror), falling back to the substrate
+# root FORK_DOMAIN_ROOT (cognidao.org) for a plain fork — identical precedence to
+# render-node-overlays.sh so the committed artifact and the CI drift gate agree on
+# an isolated fleet where the two DIVERGE (bug.5330). A fork exports DOMAIN/FORK_DOMAIN_ROOT and re-runs --write.
 FORK_ROOT="${DOMAIN:-${FORK_DOMAIN_ROOT:-cognidao.org}}"
 
 # The deploy envs, derived — never a hand-kept env list. Placement is a property of

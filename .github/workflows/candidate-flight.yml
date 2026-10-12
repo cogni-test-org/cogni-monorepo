@@ -36,10 +36,7 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/cogni-template
   SLOT: candidate-a
   OVERLAY_ENV: candidate-a
-  # Public workload zone for fork-aware generated scheduler routes. This must
-  # remain distinct from the substrate/control root in isolated test fleets.
-  DOMAIN: ${{ vars.DOMAIN || vars.FORK_DOMAIN_ROOT || 'cognidao.org' }}
-  # Shared substrate/control root for a plain fork.
+  # Public workload zone for fork-aware generated scheduler routes.
   FORK_DOMAIN_ROOT: ${{ vars.FORK_DOMAIN_ROOT || 'cognidao.org' }}
   # FLEET_CONTROL_ENV (subtask.5007): the env whose cluster reconciles + pays for akash
   # lanes. Default 'production' (cogni-dao fleet); an isolated fleet (cogni-test-org) sets
@@ -984,41 +981,15 @@ jobs:
           path: assert-marker-out/assert-ok-${{ matrix.node }}.txt
           retention-days: 1
 
-  flight-probe-project:
-    needs: decide
-    if: needs.decide.outputs.has_deployment_node_targets == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        node: ${{ fromJson(needs.decide.outputs.deployment_node_targets_json) }}
-    uses: ./.github/workflows/flight-probe-project.yml
-    permissions:
-      contents: read
-      id-token: write
-    with:
-      lane: candidate-a
-      node: ${{ matrix.node }}
-      operation: materialize
-    secrets:
-      VM_HOST: ${{ secrets.VM_HOST }}
-      SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
-
   node-substrate:
     needs:
-      [
-        decide,
-        reconcile-appset,
-        reconcile-dns,
-        prepare-substrate-deploy-branch,
-        flight-probe-project,
-      ]
+      [decide, reconcile-appset, reconcile-dns, prepare-substrate-deploy-branch]
     if: |
       always() &&
       needs.decide.outputs.has_substrate_node_targets == 'true' &&
       needs.reconcile-appset.result == 'success' &&
       needs.reconcile-dns.result == 'success' &&
-      needs.prepare-substrate-deploy-branch.result == 'success' &&
-      needs.flight-probe-project.result == 'success'
+      needs.prepare-substrate-deploy-branch.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -1146,14 +1117,7 @@ jobs:
           labels: workflow=candidate-flight kind=target_substrate_reconcile slot=candidate-a
 
   flight:
-    needs:
-      [
-        decide,
-        reconcile-appset,
-        node-substrate,
-        assert-substrate,
-        flight-probe-project,
-      ]
+    needs: [decide, reconcile-appset, node-substrate, assert-substrate]
     # Per-cell isolation (Axiom 18): this job runs whenever there are flight
     # targets. It does NOT gate on the matrix-aggregate node-substrate /
     # assert-substrate result — that rollup goes failure if ANY node's substrate
@@ -1163,8 +1127,7 @@ jobs:
     if: |
       always() &&
       needs.decide.outputs.has_flight_targets == 'true' &&
-      needs.reconcile-appset.result == 'success' &&
-      (needs.flight-probe-project.result == 'success' || needs.flight-probe-project.result == 'skipped')
+      needs.reconcile-appset.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -1580,9 +1543,10 @@ jobs:
       - name: Checkout app source (PR catalog + base manifests)
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
         with:
-          # `decide` is the single authority: PR and in-repo node-ref flights use the
-          # reviewed head; remote-node flights resolve head_sha to this workflow revision.
-          ref: ${{ needs.decide.outputs.head_sha }}
+          # PR flights reconcile the PR's catalog/manifests. Node-ref flights reconcile the
+          # target fleet's workflow source; an in-repo operator SHA can come from canonical and
+          # must not replace an isolated fork's catalog/domain state.
+          ref: ${{ inputs.pr_number != '' && needs.decide.outputs.head_sha || github.sha }}
           path: app-src
 
       - name: Reconcile scheduler-worker routing (propagate to per-env deploy branch)
