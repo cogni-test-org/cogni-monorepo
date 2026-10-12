@@ -10,8 +10,8 @@ resources:
 
 images:
   - name: ghcr.io/cogni-dao/cogni-template
-    newName: ghcr.io/cogni-test-org/cogni-template
-    digest: "sha256:5be6f2c0bfe3f054836cbbde9509a056943d8e50170b1b4959a6a2a9e8b36cf3"
+    newName: ghcr.io/cogni-dao/cogni-template
+    digest: "sha256:d68eec9dfccfd06ee4ba17d725f02c9f5dc6e4698dd14feb8fcf58e41edbbbda"
 
 patches:
   # PROVIDER-RESOLVED COGNI_NODE_ENDPOINTS. bug.5094 — a node placed on akash has
@@ -29,7 +29,7 @@ patches:
         value: "cogni-candidate-a"
       - op: replace
         path: /data/IMAGE_DIGEST
-        value: "candidate-a-placeholder-scheduler-worker"
+        value: "sha256:d68eec9dfccfd06ee4ba17d725f02c9f5dc6e4698dd14feb8fcf58e41edbbbda"
 
   # bug.0295: VM discovery via DNS (cogni-candidate-a.vm.cogni-testing.org).
   # Convert base headless Services → ExternalName; delete EndpointSlices.
