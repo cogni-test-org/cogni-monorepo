@@ -24,6 +24,9 @@ patches:
       - op: replace
         path: /data/IMAGE_DIGEST
         value: "sha256:6baf5a89437e549716d8c64548c91f2d16ccca9871623e7cf13ea72cfe86885f"
+      - op: add
+        path: /data/GIT_SHA
+        value: "83882122c1aa21b7de636003ff56e3cd03405554"
 
   # bug.0295: VM discovery via DNS (cogni-candidate-a.vm.cognidao.org).
   # Convert base headless Services → ExternalName; delete EndpointSlices.
