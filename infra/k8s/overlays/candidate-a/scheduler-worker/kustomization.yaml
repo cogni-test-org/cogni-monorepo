@@ -10,10 +10,16 @@ resources:
 
 images:
   - name: ghcr.io/cogni-dao/cogni-template
-    newName: ghcr.io/cogni-dao/cogni-template
-    digest: "sha256:400c2bded1b450af42147ce867893243cbe5cdb2957dc5e2c4e9b70252dd1334"
+    newName: ghcr.io/cogni-test-org/cogni-template
+    digest: "sha256:66f97a8d5fc86e5d124d647cfc701f1aca3a81d78d73d0d4b0dbe8c4310a6761"
 
 patches:
+  # PROVIDER-RESOLVED COGNI_NODE_ENDPOINTS. bug.5094 — a node placed on akash has
+  # no in-cluster Service, so its address is env-variant and belongs here, not in
+  # the shared base. Listed first so the base default is replaced before the
+  # env-specific ops below apply.
+  - path: node-endpoints.patch.yaml
+
   - target:
       kind: ConfigMap
       name: scheduler-worker-config
@@ -25,7 +31,7 @@ patches:
         path: /data/IMAGE_DIGEST
         value: "candidate-a-placeholder-scheduler-worker"
 
-  # bug.0295: VM discovery via DNS (cogni-candidate-a.vm.cognidao.org).
+  # bug.0295: VM discovery via DNS (cogni-candidate-a.vm.cogni-testing.org).
   # Convert base headless Services → ExternalName; delete EndpointSlices.
   - target: { kind: Service, name: temporal }
     patch: |
@@ -35,7 +41,7 @@ patches:
         name: temporal
       spec:
         type: ExternalName
-        externalName: cogni-candidate-a.vm.cognidao.org
+        externalName: cogni-candidate-a.vm.cogni-testing.org
         clusterIP: null
   - target: { kind: Service, name: postgres }
     patch: |
@@ -45,7 +51,7 @@ patches:
         name: postgres
       spec:
         type: ExternalName
-        externalName: cogni-candidate-a.vm.cognidao.org
+        externalName: cogni-candidate-a.vm.cogni-testing.org
         clusterIP: null
   - target: { kind: Service, name: app }
     patch: |
@@ -55,7 +61,7 @@ patches:
         name: app
       spec:
         type: ExternalName
-        externalName: cogni-candidate-a.vm.cognidao.org
+        externalName: cogni-candidate-a.vm.cogni-testing.org
         clusterIP: null
   - target: { kind: Service, name: poly-app }
     patch: |
@@ -72,7 +78,7 @@ patches:
         name: resy-app
       spec:
         type: ExternalName
-        externalName: cogni-candidate-a.vm.cognidao.org
+        externalName: cogni-candidate-a.vm.cogni-testing.org
         clusterIP: null
   - target: { kind: EndpointSlice, name: temporal-1 }
     patch: |
