@@ -52,7 +52,8 @@ done
 # and each node's address must follow its OWN catalog placement for THAT env.
 # Keep expectation derivation byte-aligned with render-scheduler-worker-endpoints.sh.
 # Isolated fleets deliberately separate their workload and substrate domains.
-FORK_ROOT="${DOMAIN:-${FORK_DOMAIN_ROOT:-cognidao.org}}"
+PUBLIC_ROOT="${DOMAIN:-${FORK_DOMAIN_ROOT:-cognidao.org}}"
+SUBSTRATE_ROOT="${FORK_DOMAIN_ROOT:-cognidao.org}"
 # shellcheck source=scripts/setup/lib/fork-identity.sh
 source "$REPO_ROOT/scripts/setup/lib/fork-identity.sh"
 # shellcheck source=scripts/setup/lib/cogni-deployment-identity.sh
@@ -69,7 +70,7 @@ for env in "${DEPLOY_ENVS[@]}"; do
   grep -q 'node-endpoints.patch.yaml' "$overlay" \
     || fail "$overlay does not apply node-endpoints.patch.yaml (env would fall back to the k3s base default)"
   env_endpoints="$(yq -r '.data.COGNI_NODE_ENDPOINTS // ""' "$patch_file")"
-  domain="$(domain_for_env "$env" "$FORK_ROOT")" || fail "no domain for env $env"
+  domain="$(domain_for_env "$env" "$PUBLIC_ROOT")" || fail "no domain for env $env"
   for node in "${NODE_TARGETS[@]}"; do
     node_id="$(node_id_for_target "$node")"
     provider="$(deployment_provider_for_target "$node" "$env")" \
@@ -220,7 +221,7 @@ check_scheduler_vm_alias() {
 
 SUBSTRATE_SLUG="$(cogni_deployment_slug)"
 for env in "${DEPLOY_ENVS[@]}"; do
-  check_scheduler_vm_alias "$env" "$(cogni_vm_host_for_env "$env" "$FORK_ROOT" "$SUBSTRATE_SLUG")"
+  check_scheduler_vm_alias "$env" "$(cogni_vm_host_for_env "$env" "$SUBSTRATE_ROOT" "$SUBSTRATE_SLUG")"
 done
 
 echo "[5/5] the Crossplane materializer's substrate host IS that same env VM alias"
@@ -239,8 +240,8 @@ grep -q -- 'cogni_deployment_slug' "$ACTION_YML" \
 for env in "${DEPLOY_ENVS[@]}"; do
   file="infra/k8s/overlays/$env/scheduler-worker/kustomization.yaml"
   [ -f "$file" ] || { echo "  skip - $env scheduler-worker overlay missing"; continue; }
-  expected="$(cogni_vm_host_for_env "$env" "$FORK_ROOT" "$SUBSTRATE_SLUG")"
-  apex="$(domain_for_env "$env" "$FORK_ROOT" || true)"
+  expected="$(cogni_vm_host_for_env "$env" "$SUBSTRATE_ROOT" "$SUBSTRATE_SLUG")"
+  apex="$(domain_for_env "$env" "$PUBLIC_ROOT" || true)"
   [ "$expected" != "$apex" ] \
     || fail "$env substrate host resolved to the Cloudflare-proxied public apex '$apex', which drops 7233/6379/4000"
   mapfile -t external_names < <(grep -oE 'externalName: [^ ]+' "$file" | awk '{print $2}' | sort -u)
