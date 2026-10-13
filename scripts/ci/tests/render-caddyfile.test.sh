@@ -8,12 +8,14 @@
 #   2. Every type:node gets an edge block (the regression the hand-maintained
 #      roster shipped: a catalog node with no edge route). The generic
 #      NODE_TARGETS loop covers every node, so no single node is special-cased.
-#   3. catalog node_port == per-env overlay Service nodePort (the one coupling
+#   3. Runtime Caddyfiles materialize current hosts/upstreams without env placeholders.
+#   4. Runtime base-domain validation rejects invalid DNS labels.
+#   5. catalog node_port == per-env overlay Service nodePort (the one coupling
 #      this design introduces; assert it can't drift into split-brain).
-#   4. Caddy runtime + access logs go to stdout for Alloy Docker collection.
-#   5. The edge-saturation metric set survives Alloy's strict allowlist.
-#   6. The derived node DB inventory includes every catalog node.
-#   7. Infra reconcile cannot inline/overlap production backups, and Postgres
+#   6. Caddy runtime + access logs go to stdout for Alloy Docker collection.
+#   7. The edge-saturation metric set survives Alloy's strict allowlist.
+#   8. The derived node DB inventory includes every catalog node.
+#   9. Infra reconcile cannot inline/overlap production backups, and Postgres
 #      crash attribution remains observable.
 #
 # Run: bash scripts/ci/tests/render-caddyfile.test.sh
@@ -29,12 +31,12 @@ source "$REPO_ROOT/scripts/ci/lib/image-tags.sh"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "  ok — $*"; }
 
-echo "[1/7] Caddyfile.tmpl ↔ catalog drift gate"
+echo "[1/9] Caddyfile.tmpl ↔ catalog drift gate"
 bash scripts/ci/render-caddyfile.sh --check >/dev/null \
   || fail "render-caddyfile.sh --check: committed Caddyfile.tmpl is stale (run: pnpm gen:caddyfile)"
 pass "committed Caddyfile.tmpl matches the catalog"
 
-echo "[2/7] every type:node has an edge block (catalog-driven, no node special-cased)"
+echo "[2/9] every type:node has an edge block (catalog-driven, no node special-cased)"
 RENDERED="$(bash scripts/ci/render-caddyfile.sh)"
 local_certs_count="$(grep -c '^  local_certs$' <<<"$RENDERED")"
 [ "$local_certs_count" = "1" ] \
@@ -55,7 +57,33 @@ for node in "${NODE_TARGETS[@]}"; do
   fi
 done
 
-echo "[3/7] catalog node_port == overlay Service nodePort (no split-brain)"
+echo "[3/9] runtime Caddyfile contains current values, not env placeholders"
+DOMAIN_UNDER_TEST="test.cognidao.org"
+MATERIALIZED="$(bash scripts/ci/render-caddyfile.sh --domain "$DOMAIN_UNDER_TEST")"
+if grep -Fq '{$' <<<"$MATERIALIZED"; then
+  fail "materialized Caddyfile still depends on the running container's stale env"
+fi
+for node in "${NODE_TARGETS[@]}"; do
+  grep -Fq "$(host_for_node "$node" "$DOMAIN_UNDER_TEST") {" <<<"$MATERIALIZED" \
+    || fail "materialized Caddyfile missing current host for '$node'"
+  grep -Fq "reverse_proxy host.docker.internal:$(node_port_for_target "$node")" <<<"$MATERIALIZED" \
+    || fail "materialized Caddyfile missing current upstream for '$node'"
+done
+pass "all catalog routes are materialized for $DOMAIN_UNDER_TEST"
+
+echo "[4/9] base domain validation is label-aware"
+for valid_domain in localhost a.b foo-bar.example.com; do
+  bash scripts/ci/render-caddyfile.sh --domain "$valid_domain" >/dev/null \
+    || fail "valid base domain was rejected: $valid_domain"
+done
+for invalid_domain in foo.-bar.com foo-.bar.com -foo.example.com foo.example.com- foo..example.com; do
+  if bash scripts/ci/render-caddyfile.sh --domain "$invalid_domain" >/dev/null 2>&1; then
+    fail "invalid base domain was accepted: $invalid_domain"
+  fi
+done
+pass "localhost remains supported; labels with boundary hyphens are rejected"
+
+echo "[5/9] catalog node_port == overlay Service nodePort (no split-brain)"
 for node in "${NODE_TARGETS[@]}"; do
   cat_port="$(node_port_for_target "$node")"
   for env in candidate-a candidate-b preview production; do
@@ -70,7 +98,7 @@ for node in "${NODE_TARGETS[@]}"; do
   done
 done
 
-echo "[4/7] Caddy logs are collectible from container stdout"
+echo "[6/9] Caddy logs are collectible from container stdout"
 stdout_loggers="$(grep -c 'output stdout' <<<"$RENDERED")"
 expected_loggers="$(( ${#NODE_TARGETS[@]} + 1 ))"
 [ "$stdout_loggers" = "$expected_loggers" ] \
@@ -80,7 +108,7 @@ if grep -q 'output file /data/logs/caddy' <<<"$RENDERED"; then
 fi
 pass "global + per-site JSON logs emit to stdout"
 
-echo "[5/7] Alloy keeps edge saturation counters"
+echo "[7/9] Alloy keeps edge saturation counters"
 ALLOY_CONFIG="infra/compose/runtime/configs/alloy-config.metrics.alloy"
 for metric in \
   node_nf_conntrack_entries \
@@ -93,7 +121,7 @@ for metric in \
 done
 pass "conntrack, listen-overflow, SYN-cookie, and abort-on-memory counters are allowlisted"
 
-echo "[6/7] catalog node DB inventory includes every type:node"
+echo "[8/9] catalog node DB inventory includes every type:node"
 dbs="$(node_database_csv)"
 for node in "${NODE_TARGETS[@]}"; do
   expected_db="$(node_database_for_target "$node")"
@@ -103,7 +131,7 @@ for node in "${NODE_TARGETS[@]}"; do
   esac
 done
 
-echo "[7/7] production reconcile contains backup load and retries the OpenBao login seam"
+echo "[9/9] production reconcile contains backup load and retries the OpenBao login seam"
 DEPLOY_INFRA="scripts/ci/deploy-infra.sh"
 RUNTIME_COMPOSE="infra/compose/runtime/docker-compose.yml"
 grep -Fq 'if [[ "$DEPLOY_ENVIRONMENT" == candidate-* ]]; then' "$DEPLOY_INFRA" \
