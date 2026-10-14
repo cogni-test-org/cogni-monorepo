@@ -33,6 +33,9 @@ resources:
   # bug.5240 — the keyless lease-log pump rides wherever an actuator runs: it enumerates the
   # actuator's ledger (read-only op) and ships every live lease's logs to Loki.
   - ../../../base/lease-log-pump
+  # task.5247 — private autonomous database containment/status controller.
+  - ../../../base/database-reliability-actuator
+  - ./database-reliability-actuator-external-secret.yaml
   - ./secrets-writer-sa.yaml
   - ./compute-workload-platform-application.yaml
 
@@ -43,6 +46,7 @@ namePrefix: operator-
 # ../../../base/akash-tx-actuator-service-name for why the prefix is what gives.
 transformers:
   - ../../../base/akash-tx-actuator-service-name
+  - ../../../base/database-reliability-actuator-service-name
 
 images:
   - name: ghcr.io/cogni-dao/cogni-template
@@ -59,6 +63,46 @@ replacements:
         fieldPaths: [metadata.namespace]
 
 patches:
+  - target:
+      kind: Deployment
+      name: database-reliability-actuator
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: database-reliability-actuator
+      spec:
+        template:
+          spec:
+            containers:
+              - name: actuator
+                env:
+                  - name: DEPLOY_ENVIRONMENT
+                    value: candidate-a
+                  - name: FORK_DOMAIN_ROOT
+                    value: cogni-testing.org
+  - target:
+      kind: Deployment
+      name: node-app
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: node-app
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                env:
+                  - name: DATABASE_RELIABILITY_ACTUATOR_URL
+                    value: http://database-reliability-actuator:8080
+                  - name: DATABASE_RELIABILITY_STATUS_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: database-reliability-status-client
+                        key: DATABASE_RELIABILITY_STATUS_TOKEN
+                        optional: true
   # story.5016 Gate 0b: actuator env values are set BY NAME via strategic
   # merge (env lists merge on `name`), never by positional JSON-pointer index.
   # A positional `/env/N/value` patch silently repoints when the base list
