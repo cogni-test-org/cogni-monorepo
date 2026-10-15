@@ -517,3 +517,10 @@ patches:
       kind: EndpointSlice
       metadata:
         name: doltgres-external-1
+
+# task.5246: retired writers; existing status monitoring remains active.
+replicas:
+  - name: database-reliability-watchdog
+    count: 0
+  - name: database-reliability-readmitter
+    count: 0
