@@ -2,17 +2,13 @@
 # SPDX-FileCopyrightText: 2025 Cogni-DAO
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-
 namespace: cogni-candidate-a
-
 resources:
   - ../../../base/scheduler-worker
-
 images:
   - name: ghcr.io/cogni-dao/cogni-template
     newName: ghcr.io/cogni-dao/cogni-template
     digest: "sha256:34dc22b373f6b31f16b6dec8129660836de8e6a840f0702d961bdb3f3699fa70"
-
 patches:
   - target:
       kind: ConfigMap
@@ -27,10 +23,9 @@ patches:
       - op: add
         path: /data/GIT_SHA
         value: "534bf600a7a19a6e9a1f4ffb99ce09287b1568af"
-
   # bug.0295: VM discovery via DNS (cogni-candidate-a.vm.cognidao.org).
   # Convert base headless Services → ExternalName; delete EndpointSlices.
-  - target: { kind: Service, name: temporal }
+  - target: {kind: Service, name: temporal}
     patch: |
       apiVersion: v1
       kind: Service
@@ -40,7 +35,7 @@ patches:
         type: ExternalName
         externalName: cogni-candidate-a.vm.cognidao.org
         clusterIP: null
-  - target: { kind: Service, name: postgres }
+  - target: {kind: Service, name: postgres}
     patch: |
       apiVersion: v1
       kind: Service
@@ -50,7 +45,7 @@ patches:
         type: ExternalName
         externalName: cogni-candidate-a.vm.cognidao.org
         clusterIP: null
-  - target: { kind: Service, name: app }
+  - target: {kind: Service, name: app}
     patch: |
       apiVersion: v1
       kind: Service
@@ -60,14 +55,14 @@ patches:
         type: ExternalName
         externalName: cogni-candidate-a.vm.cognidao.org
         clusterIP: null
-  - target: { kind: Service, name: poly-app }
+  - target: {kind: Service, name: poly-app}
     patch: |
       $patch: delete
       apiVersion: v1
       kind: Service
       metadata:
         name: poly-app
-  - target: { kind: Service, name: resy-app }
+  - target: {kind: Service, name: resy-app}
     patch: |
       apiVersion: v1
       kind: Service
@@ -77,38 +72,42 @@ patches:
         type: ExternalName
         externalName: cogni-candidate-a.vm.cognidao.org
         clusterIP: null
-  - target: { kind: EndpointSlice, name: temporal-1 }
+  - target: {kind: EndpointSlice, name: temporal-1}
     patch: |
       $patch: delete
       apiVersion: discovery.k8s.io/v1
       kind: EndpointSlice
       metadata:
         name: temporal-1
-  - target: { kind: EndpointSlice, name: postgres-1 }
+  - target: {kind: EndpointSlice, name: postgres-1}
     patch: |
       $patch: delete
       apiVersion: discovery.k8s.io/v1
       kind: EndpointSlice
       metadata:
         name: postgres-1
-  - target: { kind: EndpointSlice, name: app-1 }
+  - target: {kind: EndpointSlice, name: app-1}
     patch: |
       $patch: delete
       apiVersion: discovery.k8s.io/v1
       kind: EndpointSlice
       metadata:
         name: app-1
-  - target: { kind: EndpointSlice, name: poly-app-1 }
+  - target: {kind: EndpointSlice, name: poly-app-1}
     patch: |
       $patch: delete
       apiVersion: discovery.k8s.io/v1
       kind: EndpointSlice
       metadata:
         name: poly-app-1
-  - target: { kind: EndpointSlice, name: resy-app-1 }
+  - target: {kind: EndpointSlice, name: resy-app-1}
     patch: |
       $patch: delete
       apiVersion: discovery.k8s.io/v1
       kind: EndpointSlice
       metadata:
         name: resy-app-1
+  - path: node-endpoints.patch.yaml
+  - path: serial-rollout.patch.yaml
+  - path: replicas.patch.yaml
+  - path: config-checksum.patch.yaml
