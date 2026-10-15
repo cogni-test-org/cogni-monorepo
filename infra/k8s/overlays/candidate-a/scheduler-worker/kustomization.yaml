@@ -11,7 +11,7 @@ resources:
 images:
   - name: ghcr.io/cogni-dao/cogni-template
     newName: ghcr.io/cogni-dao/cogni-template
-    digest: "sha256:6904330eb61425e2a0b20e467076c04ed78071783d0477753a4a6801c3b3c99f"
+    digest: "sha256:2d0e82f4af5a5212d3921baeceb17e6a36b5a6f97314f3e1a6aff01e78e72bc9"
 
 patches:
   - target:
@@ -23,10 +23,10 @@ patches:
         value: "cogni-candidate-a"
       - op: replace
         path: /data/IMAGE_DIGEST
-        value: "sha256:6904330eb61425e2a0b20e467076c04ed78071783d0477753a4a6801c3b3c99f"
+        value: "sha256:2d0e82f4af5a5212d3921baeceb17e6a36b5a6f97314f3e1a6aff01e78e72bc9"
       - op: add
         path: /data/GIT_SHA
-        value: "4b3b11f7b6c9806a7370074bdd91568240f0f468"
+        value: "80e358eab236ac523df510ddfd248c4aef62d909"
 
   # bug.0295: VM discovery via DNS (cogni-candidate-a.vm.cognidao.org).
   # Convert base headless Services → ExternalName; delete EndpointSlices.
