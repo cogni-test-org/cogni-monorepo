@@ -52,12 +52,6 @@ spec:
               value: replace-in-overlay
             - name: FORK_DOMAIN_ROOT
               value: replace-in-overlay
-            - name: PROMETHEUS_QUERY_URL
-              valueFrom:
-                secretKeyRef:
-                  name: operator-env-secrets
-                  key: PROMETHEUS_QUERY_URL
-                  optional: true
             - name: GRAFANA_URL
               valueFrom:
                 secretKeyRef:
@@ -149,12 +143,6 @@ spec:
               value: replace-in-overlay
             - name: DATABASE_RELIABILITY_ACTUATOR_URL
               value: replace-in-overlay
-            - name: PROMETHEUS_QUERY_URL
-              valueFrom:
-                secretKeyRef:
-                  name: operator-env-secrets
-                  key: PROMETHEUS_QUERY_URL
-                  optional: true
           ports:
             - name: http
               containerPort: 8081
@@ -274,6 +262,19 @@ spec:
       ports:
         - { protocol: TCP, port: 443 }
         - { protocol: TCP, port: 5432 }
+    # Dedicated cells use provider-assigned public TLS ports. The runtime selects
+    # only sealed cell endpoints; private and link-local destinations stay excluded.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        - { protocol: TCP, port: 1, endPort: 65535 }
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -310,3 +311,16 @@ spec:
       ports:
         - { protocol: TCP, port: 443 }
         - { protocol: TCP, port: 5432 }
+    # Dedicated cells use provider-assigned public TLS ports. The runtime selects
+    # only sealed cell endpoints; private and link-local destinations stay excluded.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        - { protocol: TCP, port: 1, endPort: 65535 }
