@@ -1366,7 +1366,7 @@ describe("XComputeWorkload DNS survives a promotion transition (bug.5188)", () =
     // is active AND serving. Until then the record keeps pointing at the last-known-good target,
     // so a mid-flight endpoint change can never repoint the live name at a not-yet-serving lease.
     expect(templateCode).toContain(
-      '{{- else if and (ne $prevDnsTarget "") (ne $dnsTarget $prevDnsTarget) (not (and $active $serving)) }}'
+      '{{- else if and (ne $prevDnsTarget "") (ne $dnsTarget $prevDnsTarget) (not (and $active $serving $hostAdmitted)) }}'
     );
   });
 
@@ -1593,9 +1593,13 @@ describe("XComputeWorkload holds the outgoing lease until the replacement serves
     status: {
       leaseRequestGeneration?: number;
       activeLeaseGeneration?: number;
-      dns?: { target?: string };
+      // bug.5322 — `observedContent` is the LIVE Cloudflare record content (read back, never
+      // an intent echo); the close is gated on it carrying the candidate's target.
+      dns?: { target?: string; observedContent?: string };
     };
     observed: Record<string, ObservedChild>;
+    /** spec.dns present (default). Without it there is no edge to move. */
+    dnsManaged?: boolean;
   };
 
   const NS = "cogni-production";
@@ -1688,6 +1692,17 @@ describe("XComputeWorkload holds the outgoing lease until the replacement serves
     const found = resp.found ?? externalName !== "";
     const serving = resp.serving ?? false;
     const active = found && state === "active";
+    // HOST_ADMITTED_BY_THE_CANDIDATE (story.5038 K2): the lease's OWN endpoints must carry the
+    // public host; a shared-ingress answer from the incumbent is not the candidate's proof.
+    const hostAdmitted = (res.endpoints ?? []).some(
+      (endpoint) =>
+        endpoint
+          .replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, "")
+          .split("/")[0]
+          .split(":")[0]
+          .toLowerCase()
+          .replace(/\.$/, "") === PUBLIC_HOST
+    );
 
     // ---- DNS target + LAST-KNOWN-GOOD latch (bug.5188, unchanged)
     let dnsTarget = "";
@@ -1709,10 +1724,21 @@ describe("XComputeWorkload holds the outgoing lease until the replacement serves
     } else if (
       prevDnsTarget !== "" &&
       dnsTarget !== prevDnsTarget &&
-      !(active && serving)
+      !(active && serving && hostAdmitted)
     ) {
       effectiveDnsTarget = prevDnsTarget;
     }
+
+    // bug.5322 (measured twice): "the record matches current INTENT" ($dnsPublished) is true
+    // at once during a cutover, because the intent is still the INCUMBENT while the latch holds.
+    // The close needs "the LIVE record carries the CANDIDATE target". Fixtures express the live
+    // record as dns.observedContent; default = the latched target, so pre-existing cases keep
+    // their meaning.
+    const observedContent =
+      xr.status.dns?.observedContent ?? effectiveDnsTarget;
+    const dnsCutoverObserved =
+      dnsTarget !== "" && observedContent === dnsTarget;
+    const edgeCutoverObserved = xr.dnsManaged === false || dnsCutoverObserved;
 
     return {
       /** Every composed LEASE child this render returns, sorted. */
@@ -1725,8 +1751,12 @@ describe("XComputeWorkload holds the outgoing lease until the replacement serves
       effectiveDnsTarget,
       status: {
         leaseRequestGeneration,
+        // bug.5322 (2026-10-08): EDGE-observed, not lease-observed. `serving` only proves the
+        // candidate COULD serve the public host; the live record carrying the candidate's
+        // target proves the edge DOES. Advancing on `serving` alone closed the incumbent while
+        // Cloudflare still pointed at it -> nginx 404 for ~7 minutes on spawny-boi candidate-a.
         activeLeaseGeneration:
-          active && serving
+          active && serving && hostAdmitted && edgeCutoverObserved
             ? xr.leaseGeneration
             : activeLeaseGeneration >= 0
               ? activeLeaseGeneration
@@ -1736,16 +1766,20 @@ describe("XComputeWorkload holds the outgoing lease until the replacement serves
   }
 
   /** A live lease that answers OBSERVE as active and serving its exact sha. */
+  /** A live lease that answers OBSERVE as active and serving its exact sha. `admitted` = the
+   * provider lists the public host among the lease's endpoints (every serving lease in the
+   * fleet does); false reproduces the K2 shared-ingress false positive. */
   const servingOn = (
     externalName: string,
-    target: string
+    target: string,
+    admitted = true
   ): ObservedChild["response"] => ({
     found: true,
     serving: true,
     resource: {
       state: "active",
       externalName,
-      endpoints: [`http://${target}:32001`],
+      endpoints: [...(admitted ? [PUBLIC_HOST] : []), `http://${target}:32001`],
     },
   });
 
@@ -1786,7 +1820,12 @@ describe("XComputeWorkload holds the outgoing lease until the replacement serves
       '$retainedObserved := hasKey $retainedResp "found"',
       '$retainedGone := and $retainedObserved (or (not $retainedFound) (eq $retainedState "closed"))',
       '$holdOutgoingLease := and (ne $retainedResourceName "") (not $retainedGone)',
-      "{{- if and $active $serving }}",
+      '{{- if and (ne $dnsTarget "") (eq $recordContent $dnsTarget) }}{{ $dnsCutoverObserved = true }}{{ end }}',
+      "{{- $edgeCutoverObserved := or (not $dns) $dnsCutoverObserved }}",
+      '{{- $hostAdmitted := eq $publicHost "" }}',
+      '{{- if eq (regexReplaceAll "^[A-Za-z][A-Za-z0-9+.-]*://" . "" | splitList "/" | first | splitList ":" | first | lower | trimSuffix ".") $publicHost }}{{ $hostAdmitted = true }}{{ end }}',
+      "(not (and $active $serving $hostAdmitted))",
+      "{{- if and $active $serving $hostAdmitted $edgeCutoverObserved }}",
       "activeLeaseGeneration: {{ $leaseGeneration }}",
       "{{- else if ge $activeLeaseGeneration 0 }}",
       "activeLeaseGeneration: {{ $activeLeaseGeneration }}",
@@ -1974,6 +2013,157 @@ describe("XComputeWorkload holds the outgoing lease until the replacement serves
     });
     expect(out.leaseChildren).toEqual(["akash-lease-g8"]);
     expect(out.retainedCogniKey).toBeUndefined();
+  });
+
+  it("does NOT advance while the live record still carries the INCUMBENT (bug.5322)", () => {
+    // The 2026-10-08 outage: the candidate was serving on its OWN lease endpoint, so `serving`
+    // was true, but Cloudflare still pointed at the incumbent. Advancing here closed gen-1 and
+    // the public host returned nginx 404 for ~7 minutes. `published` is read back from the live
+    // zone, so it is the only signal that proves the EDGE carries the candidate.
+    const r = render({
+      leaseGeneration: 3,
+      status: {
+        activeLeaseGeneration: 1,
+        leaseRequestGeneration: 3,
+        dns: { target: INCUMBENT_TARGET, observedContent: INCUMBENT_TARGET },
+      },
+      observed: {
+        "akash-lease-g1": {
+          requestKey: `xcw:${NS}:${NAME}:1`,
+          response: servingOn("lease-1", INCUMBENT_TARGET),
+        },
+        "akash-lease-g3": {
+          requestKey: `xcw:${NS}:${NAME}:3`,
+          response: servingOn("lease-3", CANDIDATE_TARGET),
+        },
+      },
+    });
+    expect(r.status.activeLeaseGeneration).toBe(1);
+    expect(r.leaseChildren).toEqual(["akash-lease-g1", "akash-lease-g3"]);
+  });
+
+  it("advances only once the live record carries the CANDIDATE (bug.5322)", () => {
+    const r = render({
+      leaseGeneration: 3,
+      status: {
+        activeLeaseGeneration: 1,
+        leaseRequestGeneration: 3,
+        dns: { target: CANDIDATE_TARGET, observedContent: CANDIDATE_TARGET },
+      },
+      observed: {
+        "akash-lease-g1": {
+          requestKey: `xcw:${NS}:${NAME}:1`,
+          response: servingOn("lease-1", INCUMBENT_TARGET),
+        },
+        "akash-lease-g3": {
+          requestKey: `xcw:${NS}:${NAME}:3`,
+          response: servingOn("lease-3", CANDIDATE_TARGET),
+        },
+      },
+    });
+    expect(r.status.activeLeaseGeneration).toBe(3);
+  });
+
+  it("does NOT advance while the candidate has no target the edge could carry (bug.5322)", () => {
+    // An endpoint-less candidate observe must never satisfy the edge gate, even though the
+    // live record still matches the latched (incumbent) intent.
+    const r = render({
+      leaseGeneration: 3,
+      status: {
+        activeLeaseGeneration: 1,
+        leaseRequestGeneration: 3,
+        dns: { target: INCUMBENT_TARGET, observedContent: INCUMBENT_TARGET },
+      },
+      observed: {
+        "akash-lease-g1": {
+          requestKey: `xcw:${NS}:${NAME}:1`,
+          response: servingOn("lease-1", INCUMBENT_TARGET),
+        },
+        "akash-lease-g3": {
+          requestKey: `xcw:${NS}:${NAME}:3`,
+          response: {
+            found: true,
+            serving: true,
+            resource: {
+              state: "active",
+              externalName: "lease-3",
+              endpoints: [],
+            },
+          },
+        },
+      },
+    });
+    expect(r.status.activeLeaseGeneration).toBe(1);
+    expect(r.leaseChildren).toEqual(["akash-lease-g1", "akash-lease-g3"]);
+  });
+
+  it("a workload with no spec.dns advances on serving: there is no edge to move (bug.5322)", () => {
+    const r = render({
+      leaseGeneration: 3,
+      dnsManaged: false,
+      status: { activeLeaseGeneration: 1, leaseRequestGeneration: 3 },
+      observed: {
+        "akash-lease-g1": {
+          requestKey: `xcw:${NS}:${NAME}:1`,
+          response: servingOn("lease-1", INCUMBENT_TARGET),
+        },
+        "akash-lease-g3": {
+          requestKey: `xcw:${NS}:${NAME}:3`,
+          response: servingOn("lease-3", CANDIDATE_TARGET),
+        },
+      },
+    });
+    expect(r.status.activeLeaseGeneration).toBe(3);
+  });
+
+  it("same provider + same SHA: a candidate whose host the provider never admitted takes no traffic (story.5038 K2)", () => {
+    // Measured 2026-10-16: gen-7 landed on the incumbent's provider at the SAME sha; the shared
+    // ingress answered the host-routed probe from gen-6's rule, so serving=true while gen-7's own
+    // endpoints never listed the public host. DNS moved, gen-6 closed, public host went 404.
+    const r = render({
+      leaseGeneration: 7,
+      status: {
+        activeLeaseGeneration: 6,
+        leaseRequestGeneration: 7,
+        dns: { target: INCUMBENT_TARGET, observedContent: INCUMBENT_TARGET },
+      },
+      observed: {
+        "akash-lease-g6": {
+          requestKey: `xcw:${NS}:${NAME}:6`,
+          response: servingOn("lease-6", INCUMBENT_TARGET),
+        },
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7`,
+          response: servingOn("lease-7", CANDIDATE_TARGET, false),
+        },
+      },
+    });
+    expect(r.effectiveDnsTarget).toBe(INCUMBENT_TARGET);
+    expect(r.status.activeLeaseGeneration).toBe(6);
+    expect(r.leaseChildren).toEqual(["akash-lease-g6", "akash-lease-g7"]);
+  });
+
+  it("same provider + same SHA: never closes the incumbent even if the record already moved (story.5038 K2)", () => {
+    const r = render({
+      leaseGeneration: 7,
+      status: {
+        activeLeaseGeneration: 6,
+        leaseRequestGeneration: 7,
+        dns: { target: CANDIDATE_TARGET, observedContent: CANDIDATE_TARGET },
+      },
+      observed: {
+        "akash-lease-g6": {
+          requestKey: `xcw:${NS}:${NAME}:6`,
+          response: servingOn("lease-6", INCUMBENT_TARGET),
+        },
+        "akash-lease-g7": {
+          requestKey: `xcw:${NS}:${NAME}:7`,
+          response: servingOn("lease-7", CANDIDATE_TARGET, false),
+        },
+      },
+    });
+    expect(r.status.activeLeaseGeneration).toBe(6);
+    expect(r.leaseChildren).toEqual(["akash-lease-g6", "akash-lease-g7"]);
   });
 
   it("does not advance the latch while the candidate is not serving", () => {
@@ -2296,7 +2486,7 @@ describe("XComputeWorkload holds the outgoing lease until the replacement serves
     // The DNS latch still refuses to flip until the CANDIDATE is active AND serving, and
     // $active/$serving are still read from the candidate child alone.
     expect(templateCode).toContain(
-      '{{- else if and (ne $prevDnsTarget "") (ne $dnsTarget $prevDnsTarget) (not (and $active $serving)) }}'
+      '{{- else if and (ne $prevDnsTarget "") (ne $dnsTarget $prevDnsTarget) (not (and $active $serving $hostAdmitted)) }}'
     );
     expect(templateCode).toContain(
       "$leaseObs := index $observedResources $leaseResourceName"
