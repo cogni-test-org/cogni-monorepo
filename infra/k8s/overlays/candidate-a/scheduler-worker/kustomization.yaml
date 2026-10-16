@@ -108,6 +108,9 @@ patches:
       metadata:
         name: resy-app-1
   - path: node-endpoints.patch.yaml
-  - path: serial-rollout.patch.yaml
   - path: replicas.patch.yaml
+  - path: serial-rollout.patch.yaml
   - path: config-checksum.patch.yaml
+replicas:
+  - name: scheduler-worker
+    count: 1
