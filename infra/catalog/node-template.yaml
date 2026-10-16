@@ -15,6 +15,10 @@ preview_branch: deploy/preview-node-template
 production_branch: deploy/production-node-template
 path_prefix: nodes/node-template/
 envs: [candidate-a, preview, production]
+database:
+  candidate-a: { tier: shared, budget_profile: shared-default-v1 }
+  preview: { tier: shared, budget_profile: shared-default-v1 }
+  production: { tier: shared, budget_profile: shared-default-v1 }
 deployment_provider:
   candidate-a: k3s
   preview: k3s
