@@ -12,6 +12,9 @@ preview_branch: deploy/preview-anotha
 production_branch: deploy/production-anotha
 path_prefix: nodes/anotha/
 envs: [preview, production]
+database:
+  preview: { tier: shared, budget_profile: shared-default-v1 }
+  production: { tier: shared, budget_profile: shared-default-v1 }
 deployment_provider:
   preview: k3s
   production: k3s
