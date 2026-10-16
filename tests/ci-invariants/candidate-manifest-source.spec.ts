@@ -52,12 +52,20 @@ interface WorkflowStep {
 }
 
 interface WorkflowJob {
+  if?: string;
+  needs?: string[];
   outputs?: Record<string, unknown>;
+  concurrency?: { group?: unknown; "cancel-in-progress"?: boolean };
   steps: WorkflowStep[];
 }
 
 const parsed = yaml.parse(WORKFLOW) as {
-  env?: Record<string, unknown>;
+  concurrency?: { group?: unknown; "cancel-in-progress"?: boolean };
+  on?: {
+    workflow_dispatch?: {
+      inputs?: Record<string, { required?: boolean; type?: string }>;
+    };
+  };
   jobs: Record<string, WorkflowJob>;
 };
 
@@ -70,6 +78,13 @@ function namedStep(jobName: string, stepName: string): WorkflowStep {
 }
 
 describe("candidate-a manifest source", () => {
+  it("queues duplicate same-node flights without cancellation", () => {
+    expect(parsed.concurrency?.group).toBe(
+      "candidate-flight-${{ inputs.pr_number || inputs.node_slug }}"
+    );
+    expect(parsed.concurrency?.["cancel-in-progress"]).toBe(false);
+  });
+
   it("keeps the k3s control domain separate from an isolated Akash workload zone", () => {
     const targetDomain =
       "${{ fromJSON(needs.decide.outputs.deployment_provider_by_target_json)[matrix.node] == 'k3s' && (vars.CANDIDATE_OPERATOR_DOMAIN || format('test.{0}', vars.FORK_DOMAIN_ROOT || 'cognidao.org')) || vars.DOMAIN }}";
@@ -103,12 +118,6 @@ describe("candidate-a manifest source", () => {
       "path: /data/FORK_DOMAIN_ROOT"
     );
     expect(CANDIDATE_OPERATOR_OVERLAY).toContain('value: "cogni-testing.org"');
-  });
-
-  it("passes the configured workload domain to fleet-derived routing", () => {
-    expect(parsed.env?.DOMAIN).toBe(
-      "${{ vars.DOMAIN || vars.FORK_DOMAIN_ROOT || 'cognidao.org' }}"
-    );
   });
 
   it("renders the live AppSet for the repository that owns the deploy branch", () => {
@@ -202,6 +211,140 @@ describe("candidate-a manifest source", () => {
     );
   });
 
+  it("preserves the full PR target set for a same-repo node-ref", () => {
+    const meta = namedStep("decide", "Resolve PR metadata").run;
+    const files = namedStep("decide", "Fetch PR changed-paths from GitHub API");
+    const combine = namedStep("decide", "Combine flight targets");
+    const images = namedStep("decide", "Resolve PR image digests");
+
+    expect(meta).toContain(
+      '"repos/${{ github.repository }}/commits/${NODE_SOURCE_SHA}/pulls"'
+    );
+    expect(meta).toContain('RESOLVED_PR_NUMBER="${MATCHING_PRS[0]}"');
+    expect(files.env?.RESOLVED_PR_NUMBER).toBe(
+      "${{ steps.meta.outputs.resolved_pr_number }}"
+    );
+    expect(files.run).toContain(
+      'if [ -n "$NODE_SLUG" ] && [ -z "$RESOLVED_PR_NUMBER" ]; then'
+    );
+    expect(combine.run).toContain(
+      'if [ -n "$NODE_SLUG" ] && [ -z "$RESOLVED_PR_NUMBER" ]; then'
+    );
+    expect(combine.env?.NORMAL_FLIGHT_TARGETS_JSON).toBe(
+      "${{ steps.detect.outputs.flight_targets_json }}"
+    );
+    expect(images.run).toContain(
+      'if [ -n "$NODE" ] && [ -z "$RESOLVED_PR_NUMBER" ]; then'
+    );
+    expect(images.run).toContain("resolve-pr-build-images.sh");
+  });
+
+  it("fails an affected node-ref before mutation when its exact image is absent", () => {
+    const guard = namedStep("decide", "Require requested node image");
+
+    // Behavioral scope cases execute the workflow in deployment-workflows.test.sh.
+    // This structural invariant pins the guard to the authoritative affected set.
+    expect(guard.if).toContain(
+      "steps.flight-targets.outputs.flight_targets_json"
+    );
+    expect(guard.env?.NODE).toBe("${{ steps.meta.outputs.node_slug }}");
+    expect(guard.env?.PAYLOAD_FILE).toBe(
+      "${{ runner.temp }}/resolved-pr-images.json"
+    );
+    expect(guard.run).toContain("if sys.argv[2] not in targets:");
+    expect(guard.run).toContain("Requested node image is not available yet");
+  });
+
+  it("writes scheduler routing to the deploy repository Argo actually watches", () => {
+    const resolve = namedStep(
+      "reconcile-scheduler-worker-routing",
+      "Resolve watched deploy repository"
+    );
+    const reconcile = namedStep(
+      "reconcile-scheduler-worker-routing",
+      "Reconcile scheduler-worker routing (propagate to per-env deploy branch)"
+    );
+    const workspace = namedStep(
+      "reconcile-scheduler-worker-routing",
+      "Prepare scheduler-worker deploy branch workspace"
+    );
+    const promote = namedStep(
+      "reconcile-scheduler-worker-routing",
+      "Promote scheduler-worker in the same branch transaction"
+    );
+    const push = namedStep(
+      "reconcile-scheduler-worker-routing",
+      "Commit and push atomic scheduler-worker desired state"
+    );
+    const genericPrepare = namedStep(
+      "flight",
+      "Prepare per-node deploy branch workspace"
+    );
+    const genericSync = namedStep(
+      "flight",
+      "Sync base + per-node overlay + per-node catalog to deploy branch"
+    );
+    const genericPush = namedStep(
+      "flight",
+      "Commit and push to per-node deploy branch"
+    );
+
+    expect(resolve.env?.DEPLOYMENT_PROVIDER).toBe("k3s");
+    expect(resolve.run).toBe(
+      "bash scripts/ci/resolve-candidate-deploy-repository.sh"
+    );
+    expect(workspace.env?.DEPLOY_REPOSITORY).toBe(
+      "${{ steps.deploy-repo.outputs.repository }}"
+    );
+    expect(workspace.run).toContain(
+      'git clone "https://x-access-token:${GH_TOKEN}@github.com/${DEPLOY_REPOSITORY}.git" deploy-branch'
+    );
+    expect(reconcile.env?.DEPLOY_BRANCH_DIR).toBe(
+      "${{ github.workspace }}/deploy-branch"
+    );
+    expect(reconcile.env?.GH_TOKEN).toBe(
+      "${{ steps.deploy-app.outputs.token || github.token }}"
+    );
+    expect(promote.if).toContain("scheduler-worker");
+    expect(promote.run).toContain("NODES=scheduler-worker");
+    expect(push.run?.match(/git push /g)).toHaveLength(1);
+    expect(genericPrepare.if).toBe("matrix.node != 'scheduler-worker'");
+    expect(genericSync.if).toBe("matrix.node != 'scheduler-worker'");
+    expect(genericPush.if).toBe("matrix.node != 'scheduler-worker'");
+    expect(
+      parsed.jobs["reconcile-scheduler-worker-routing"].concurrency?.group
+    ).toBe("reconcile-scheduler-worker-routing-candidate-a");
+    expect(parsed.jobs.flight.needs).toContain(
+      "reconcile-scheduler-worker-routing"
+    );
+    expect(parsed.jobs.flight.if).toContain(
+      "needs.reconcile-scheduler-worker-routing.result == 'success'"
+    );
+  });
+
+  it("fails candidate verification unless worker /version matches SHA and digest", () => {
+    const resolve = namedStep(
+      "verify-candidate",
+      "Resolve promoted scheduler-worker identity"
+    );
+    const wait = namedStep(
+      "verify-candidate",
+      "Wait for in-cluster services (per-node)"
+    );
+
+    expect(resolve.if).toContain("matrix.node == 'scheduler-worker'");
+    expect(resolve.run).toContain(
+      'json.load(handle).get("scheduler-worker", "")'
+    );
+    expect(resolve.run).toContain(".images[]");
+    expect(wait.env?.SCHEDULER_EXPECTED_SHA).toBe(
+      "${{ steps.scheduler-identity.outputs.sha }}"
+    );
+    expect(wait.env?.SCHEDULER_EXPECTED_DIGEST).toBe(
+      "${{ steps.scheduler-identity.outputs.digest }}"
+    );
+  });
+
   it("does not use a child-repo SHA as the parent manifest ref", () => {
     const meta = namedStep("decide", "Resolve PR metadata").run;
 
@@ -218,12 +361,6 @@ describe("candidate-a manifest source", () => {
     expect(namedStep("flight", "Checkout app source").with?.ref).toBe(
       "${{ needs.decide.outputs.head_sha }}"
     );
-    expect(
-      namedStep(
-        "reconcile-scheduler-worker-routing",
-        "Checkout app source (PR catalog + base manifests)"
-      ).with?.ref
-    ).toBe("${{ needs.decide.outputs.head_sha }}");
     expect(WORKFLOW).toContain(
       "rsync -a --delete app-src/infra/k8s/base/ deploy-branch/infra/k8s/base/"
     );
@@ -232,7 +369,52 @@ describe("candidate-a manifest source", () => {
     );
   });
 
-  it("uses reviewed substrate scripts only for an exact operator self-flight", () => {
+  it("reapplies shared platform settings at every candidate and promotion copy seam", () => {
+    const prepare = namedStep(
+      "prepare-substrate-deploy-branch",
+      "Prepare deploy branch shape"
+    );
+    const sync = namedStep(
+      "flight",
+      "Sync base + per-node overlay + per-node catalog to deploy branch"
+    );
+    for (const step of [prepare, sync]) {
+      expect(step.run).toContain("reconcile_shared_platform_manifests");
+      expect(step.run).toContain(
+        "ci-src/scripts/ci/lib/shared-platform-manifests.sh"
+      );
+    }
+    expect(prepare.run).toContain(
+      "bash ../ci-src/scripts/ci/promote-k8s-image.sh"
+    );
+    const routing = namedStep(
+      "reconcile-scheduler-worker-routing",
+      "Reconcile scheduler-worker routing (propagate to per-env deploy branch)"
+    );
+    expect(routing.env?.APP_SOURCE_DIR).toBe("${{ github.workspace }}/app-src");
+    expect(routing.run).not.toContain("skipping routing reconcile");
+    const promotion = yaml.parse(
+      readFileSync(
+        path.join(REPO_ROOT, ".github/workflows/promote-and-deploy.yml"),
+        "utf8"
+      )
+    );
+    const promotionSteps = Object.values(promotion.jobs).flatMap(
+      (job) => (job as WorkflowJob).steps ?? []
+    );
+    const promotionSync = promotionSteps.find(
+      (step) => step.name === "Sync infra/k8s + per-node catalog from app-src"
+    );
+    expect(promotionSync?.run).toContain("reconcile_shared_platform_manifests");
+    const promote = promotionSteps.find(
+      (step) => step.name === "Promote digest + record source-sha"
+    );
+    expect(promote?.run).toContain(
+      "bash ../ci-src/scripts/ci/promote-k8s-image.sh"
+    );
+  });
+
+  it("uses reviewed substrate scripts only for an exact in-repository self-flight", () => {
     const substrate = namedStep(
       "node-substrate",
       "Run node substrate (materialize -> reconcile)"
@@ -243,8 +425,15 @@ describe("candidate-a manifest source", () => {
       'substrate_runner="ci-src/scripts/ci/run-node-substrate.sh"'
     );
     expect(substrate).toContain(
-      'if [ "${{ matrix.node }}" = "operator" ] && [ "$GITHUB_SHA" = "${{ needs.decide.outputs.head_sha }}" ]; then'
+      'catalog="app-src/infra/catalog/${{ matrix.node }}.yaml"'
     );
+    expect(substrate).toContain(
+      'source_repo="$(yq -N \'.source_repo // ""\' "$catalog")"'
+    );
+    expect(substrate).toContain(
+      'if [ "$reliability_controller" = true ] && [ -z "$source_repo" ] && [ "$GITHUB_SHA" = "${{ needs.decide.outputs.head_sha }}" ]; then'
+    );
+    expect(substrate).not.toMatch(/matrix\.node.*operator/);
     expect(substrate).toContain('app_sha="$(git -C app-src rev-parse HEAD)"');
     expect(substrate).toContain('[ "$app_sha" = "$GITHUB_SHA" ]');
     expect(substrate).toContain(

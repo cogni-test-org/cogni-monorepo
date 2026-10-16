@@ -101,26 +101,51 @@ describe("test-parent divergence policy", () => {
     "infra/k8s/overlays/candidate-a/scheduler-worker/node-endpoints.patch.yaml",
     "infra/k8s/overlays/preview/scheduler-worker/node-endpoints.patch.yaml",
     "infra/k8s/overlays/production/scheduler-worker/node-endpoints.patch.yaml",
-    "infra/k8s/overlays/production/operator/external-secret.yaml",
     "infra/k8s/argocd/appsets/candidate-a/kustomization.yaml",
     "infra/k8s/argocd/control-plane/roots/candidate-a-control-plane-application.yaml",
     "infra/k8s/argocd/control-plane/candidate-a/candidate-a-control-plane-application.yaml",
     "infra/k8s/argocd/control-plane/candidate-a/candidate-a-appsets-application.yaml",
     "infra/k8s/base/scheduler-worker/configmap.yaml",
     "infra/compose/edge/configs/Caddyfile.tmpl",
-    "infra/catalog/operator.yaml",
     "nodes/operator/app/src/adapters/server/node-registry/network-nodes.data.ts",
+    "infra/catalog/operator.yaml",
     ".cogni/repo-spec.yaml",
   ])("requires the generated control-plane path, frees only its content — %s", (p) => {
     expect(policy.hubDisposition(p)).toBe("content_free");
   });
 
-  it("regenerates the mirror runtime roster from the restored catalog", () => {
-    const sync = fs.readFileSync(
-      path.join(REPO_ROOT, "scripts/ci/sync-test-parent.mjs"),
-      "utf8"
-    );
-    expect(sync).toContain('render-network-nodes.sh", "--write"');
+  // CONTENT_MUST_MATCH_BEATS_ROSTER_GLOBS (story.5038) — control-plane platform wiring nested in
+  // the roster globs mirrors canonical byte-for-byte and is never kept at the mirror's fork.
+  it.each([
+    "infra/k8s/overlays/candidate-a/operator/kustomization.yaml",
+    "infra/k8s/overlays/candidate-a/operator/akash-tx-actuator-external-secret.yaml",
+    "infra/k8s/overlays/production/operator/external-secret.yaml",
+    "infra/k8s/overlays/candidate-a/scheduler-worker/kustomization.yaml",
+    "infra/k8s/overlays/production/scheduler-worker/replicas.patch.yaml",
+  ])("mirrors control-plane platform wiring 1:1 — %s", (p) => {
+    expect(policy.hubDisposition(p)).toBe("mirror");
+    expect(policy.isArtifactOnlyDeclared(p)).toBe(false);
+  });
+
+  it("GENERATED_IS_REDERIVED — the sync re-runs the canonical generators with the mirror's identity", () => {
+    expect(policy.regenerate.commands).toEqual([
+      "scripts/ci/render-scheduler-worker-endpoints.sh --write",
+      "scripts/ci/render-node-appset.sh --write",
+      "scripts/ci/render-node-overlays.sh --write",
+    ]);
+    // task.5270 — identity is DECLARED on the artifact entry; the sync never reads repo
+    // variables, so the writer App keeps 1:1 permission parity with the production operator App.
+    expect(policy.regenerate.identity).toEqual({
+      DOMAIN: "cogni-testing.org",
+      FORK_DOMAIN_ROOT: "cognidao.org",
+      FLEET_CONTROL_ENV: "candidate-a",
+    });
+    // A generated file inside a must-match directory stays content-free (re-derived per roster).
+    expect(
+      policy.isArtifactOnlyDeclared(
+        "infra/k8s/overlays/candidate-a/scheduler-worker/node-endpoints.patch.yaml"
+      )
+    ).toBe(true);
   });
 
   // CONTENT_MAY_DIFFER_WINS — the control-plane cases above are nested inside these omissions.

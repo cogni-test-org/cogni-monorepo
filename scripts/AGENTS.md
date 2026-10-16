@@ -36,8 +36,8 @@ Build-time scripts for migrations, seeds, type generation, development utilities
 ## Public Surface
 
 - **Exports:** none
-- **CLI (if any):** Migration, seed, database drop, validation, worktree readiness, and workspace-check/package-build orchestration commands
-- **Env/Config keys:** Database connection, development flags, `TURBO_SCM_BASE`/`TURBO_SCM_HEAD` scope overrides, CI-style test env fallbacks for `run-turbo-checks.sh`
+- **CLI (if any):** `scripts/lib/run-node-substrate.ts` (placement-aware day-2 readiness; shared lanes delegate to the existing runner), migration, seed, database drop, validation, worktree readiness, and workspace-check/package-build orchestration commands
+- **Env/Config keys:** Database connection, development flags, `TURBO_SCM_BASE`/`TURBO_SCM_HEAD` scope overrides, CI-style test env fallbacks for `run-turbo-checks.sh`, explicit `SET_SECRET_EXPECTED_VERSION` for the canonical CLI’s three allowed dynamic manual-cell input keys
 - **Files considered API:** setup/bootstrap.sh and setup/provision-env-vm.sh (bootstrap/provisioning), conductor-worktree-setup.sh (Conductor workspace bootstrap), validate-agents-md.mjs (validation script), db/drop-test-db.ts (test database utility), grafana-pdc-token-preflight.sh / grafana-postgres-datasource.sh / grafana-postgres-query.sh (Grafana Cloud Postgres support helpers), worktree-check.sh (fresh-worktree readiness check), run-turbo-checks.sh (workspace-scoped local check helper), run-scoped-package-build.mjs (affected package declaration helper)
 
 ## Ports (optional)
@@ -83,7 +83,7 @@ pnpm check:agentsmd             # Validate all AGENTS.md files
 
 - Scripts must be idempotent and safe to re-run
 - AGENTS.md validator enforces hexagonal import standards for AGENTS.md
-- `conductor-worktree-setup.sh` is the Conductor setup entrypoint. It ensures the primary checkout has `COGNI_NODE_API_KEY`, then symlinks `.env.cogni` and `.local-auth` from the primary checkout so secrets and captured auth do not drift across worktrees.
+- `conductor-worktree-setup.sh` is the Conductor setup entrypoint. It ensures the primary checkout has `COGNI_NODE_API_KEY`, then symlinks `.env.cogni` and `.local-auth` from the primary checkout so secrets and captured auth do not drift across worktrees. Dependency setup prefers the local pnpm store, fetches newly pinned packages when absent, and retries one transient install failure.
 - `run-scoped-package-build.mjs` scopes local package declaration refreshes against `origin/main` by default, falls back to all declaration refs when global build inputs change, and emits a warning so developers notice the scope expansion. JavaScript package artifacts belong to explicit `pnpm packages:build`, not `check:fast`.
 - `worktree-check.sh` is non-mutating and checks whether a fresh worktree has the minimum local state needed before an agent runs expensive gates.
 - For PR verification, push and monitor GitHub checks. `check-fast.sh` and `check-all.sh` exist for explicit local repro or human-requested local validation; they run `workspace:lint` via `run-turbo-checks.sh` so local checks catch the same per-workspace Biome/ESLint failures that CI's workspace runs would catch.

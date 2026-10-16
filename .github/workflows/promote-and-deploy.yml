@@ -64,6 +64,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  FORK_DOMAIN_ROOT: ${{ vars.FORK_DOMAIN_ROOT }}
   # FLEET_CONTROL_ENV (subtask.5007): the env whose cluster reconciles + pays for akash
   # lanes. Default 'production' (cogni-dao); an isolated fleet (cogni-test-org) sets the repo
   # var to 'candidate-a'. Read by control_env_for (scripts/ci/lib/appset-paths.sh).
@@ -166,12 +167,12 @@ jobs:
 
   reconcile-compute-egress:
     needs: decide
-    # A lane VM exists for k3s targets. Akash-only lanes whose fleet control lives elsewhere
-    # have no lane VM; their allowlist is applied by the control-env twin below.
+    # Every Akash lane owns Postgres on its lane VM, even with foreign compute custody.
     if: |
       needs.decide.result == 'success' &&
       (
         needs.decide.outputs.has_k3s_node_targets == 'true' ||
+        needs.decide.outputs.has_external_compute_node_targets == 'true' ||
         needs.decide.outputs.environment == (vars.FLEET_CONTROL_ENV || 'production')
       )
     runs-on: ubuntu-latest
@@ -189,6 +190,7 @@ jobs:
         with:
           app_source_root: ${{ github.workspace }}/app-src
           environment: ${{ needs.decide.outputs.environment }}
+          fork_domain_root: ${{ vars.FORK_DOMAIN_ROOT }}
           vm_host: ${{ secrets.VM_HOST }}
           ssh_deploy_key: ${{ secrets.SSH_DEPLOY_KEY }}
 
@@ -221,6 +223,8 @@ jobs:
         with:
           app_source_root: ${{ github.workspace }}/app-src
           environment: ${{ needs.decide.outputs.environment }}
+          destination_environment: ${{ vars.FLEET_CONTROL_ENV || 'production' }}
+          fork_domain_root: ${{ vars.FORK_DOMAIN_ROOT }}
           vm_host: ${{ secrets.VM_HOST }}
           ssh_deploy_key: ${{ secrets.SSH_DEPLOY_KEY }}
 
@@ -437,6 +441,11 @@ jobs:
     env:
       DEPLOYMENT_PROVIDER: ${{ fromJSON(needs.decide.outputs.deployment_provider_by_target_json)[matrix.node] }}
     steps:
+      - name: Checkout workflow tooling
+        uses: actions/checkout@v4
+        with:
+          path: ci-src
+
       - name: Checkout app source
         uses: actions/checkout@v4
         with:
@@ -628,6 +637,8 @@ jobs:
           rsync -a --delete --exclude='env-state.yaml' \
             "app-src/infra/k8s/overlays/${OVERLAY_ENV}/${NODE}/" \
             "deploy-branch/infra/k8s/overlays/${OVERLAY_ENV}/${NODE}/"
+          . ci-src/scripts/ci/lib/shared-platform-manifests.sh
+          reconcile_shared_platform_manifests "$GITHUB_WORKSPACE/ci-src" "$GITHUB_WORKSPACE/deploy-branch" "$OVERLAY_ENV" "$NODE"
           mkdir -p deploy-branch/infra/catalog
           cp "app-src/infra/catalog/${NODE}.yaml" "deploy-branch/infra/catalog/${NODE}.yaml"
           if [ "$DEPLOYMENT_PROVIDER" = "k3s" ] && [ -d "app-src/nodes/${NODE}/k8s/external-secrets/${OVERLAY_ENV}" ]; then
@@ -647,10 +658,11 @@ jobs:
           SOURCE_SHA: ${{ steps.digest.outputs.source_sha }}
         run: |
           set -euo pipefail
-          ../app-src/scripts/ci/promote-k8s-image.sh --no-commit \
-            --env "$OVERLAY_ENV" --app "$NODE" --digest "$DIGEST"
+          bash ../ci-src/scripts/ci/promote-k8s-image.sh --no-commit \
+            --env "$OVERLAY_ENV" --app "$NODE" --digest "$DIGEST" \
+            --source-sha "$SOURCE_SHA"
           APP="$NODE" SOURCE_SHA="$SOURCE_SHA" \
-            bash ../app-src/scripts/ci/update-source-sha-map.sh
+            bash ../ci-src/scripts/ci/update-source-sha-map.sh
 
       - name: Record external workload source-sha
         if: steps.digest.outputs.promoted == 'true' && env.DEPLOYMENT_PROVIDER == 'akash'
@@ -659,14 +671,20 @@ jobs:
           APP: ${{ matrix.node }}
           SOURCE_SHA: ${{ steps.digest.outputs.source_sha }}
           NODE: ${{ matrix.node }}
+          NODE_SOURCE_SHA: ${{ inputs.node_source_sha }}
         run: |
           set -euo pipefail
           # PIN_IS_NEVER_REPINNED_TO_BIRTH (bug.5306) — hand the guard this node's catalog
           # birth sha so it can refuse a silent rollback. Absent/unreadable leaves the guard
           # inert, which is the pre-bug.5306 behaviour.
           CATALOG_BIRTH_SHA="$(yq -N '.source_sha // ""' "../app-src/infra/catalog/${NODE}.yaml" 2>/dev/null || true)"
+          # An exact source-addressed request is deliberate deploy authority.
+          # Keep the birth-regression fence for every implicit or mismatched pin.
+          if [ -n "$NODE_SOURCE_SHA" ] && [ "$NODE_SOURCE_SHA" = "$SOURCE_SHA" ]; then
+            CATALOG_BIRTH_SHA=""
+          fi
           export CATALOG_BIRTH_SHA
-          bash ../app-src/scripts/ci/update-source-sha-map.sh
+          bash ../ci-src/scripts/ci/update-source-sha-map.sh
 
       - name: Commit and push
         id: push
@@ -711,37 +729,17 @@ jobs:
           path: out/
           retention-days: 1
 
-  flight-probe-project:
-    needs: decide
-    if: needs.decide.outputs.has_node_targets == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        node: ${{ fromJson(needs.decide.outputs.node_targets_json) }}
-    uses: ./.github/workflows/flight-probe-project.yml
-    permissions:
-      contents: read
-      id-token: write
-    with:
-      lane: ${{ needs.decide.outputs.environment }}
-      node: ${{ matrix.node }}
-      operation: materialize
-    secrets:
-      VM_HOST: ${{ secrets.VM_HOST }}
-      SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
-
   # Per-node provider preflight on EVERY env (Invariants 16-17). All nodes
   # materialize source:agent secrets and reconcile placement-neutral state (DB,
   # ExternalSecret, shared runtime inventory). Only placement-specific steps branch:
   # k3s owns Caddy/NodePort edge mutation; Akash adds read-only controller/credential/
   # secret/egress assertions before promote-k8s writes a ComputeWorkload generation.
   node-substrate:
-    needs: [decide, reconcile-appset, reconcile-dns, flight-probe-project]
+    needs: [decide, reconcile-appset, reconcile-dns]
     if: |
       always() &&
       needs.decide.outputs.has_node_targets == 'true' &&
       needs.reconcile-appset.result == 'success' &&
-      (needs.flight-probe-project.result == 'success' || needs.flight-probe-project.result == 'skipped') &&
       (
         needs.reconcile-dns.result == 'success' ||
         (needs.decide.outputs.has_k3s_node_targets != 'true' && needs.reconcile-dns.result == 'skipped')
@@ -758,7 +756,7 @@ jobs:
       group: node-substrate-${{ needs.decide.outputs.environment }}-${{ matrix.node }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    environment: ${{ needs.decide.outputs.environment }}
+    environment: ${{ fromJSON(needs.decide.outputs.deployment_provider_by_target_json)[matrix.node] == 'akash' && (vars.FLEET_CONTROL_ENV || 'production') || needs.decide.outputs.environment }}
     env:
       DEPLOYMENT_PROVIDER: ${{ fromJSON(needs.decide.outputs.deployment_provider_by_target_json)[matrix.node] }}
     steps:
@@ -778,6 +776,22 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.ACTIONS_AUTOMATION_BOT_PAT || github.token }}
           path: app-src
+
+      - uses: pnpm/action-setup@c5ba7f7862a0f64c1b1a05fbac13e0b8e86ba08c # v4
+        with: { version: 9.12.2 }
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: |
+            ci-src/pnpm-lock.yaml
+            app-src/pnpm-lock.yaml
+
+      - name: Install typed substrate dependencies
+        run: |
+          pnpm --dir ci-src install --frozen-lockfile
+          pnpm --dir app-src install --frozen-lockfile
 
       - name: Checkout per-node preview branch (preview-forward mode)
         if: fromJSON(needs.decide.outputs.preview_forward_by_target_json)[matrix.node]
@@ -840,11 +854,6 @@ jobs:
           CATALOG_DIR="app-src/infra/catalog" . app-src/scripts/ci/lib/appset-paths.sh
           CONTROL_ENV="$(CATALOG_DIR=app-src/infra/catalog control_env_for "$LANE" "$NODE")"
           echo "control_env=$CONTROL_ENV" >> "$GITHUB_OUTPUT"
-          if [ "$CONTROL_ENV" != "$LANE" ]; then
-            echo "::notice::$NODE's $LANE lane is custodied by '$CONTROL_ENV' — the custodian replay owns substrate reconciliation."
-            echo "has_vm=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           if [ -z "$VM_HOST" ]; then
             echo "::error::VM_HOST is required for node substrate"
             exit 1
@@ -864,7 +873,7 @@ jobs:
           DOMAIN: ${{ vars.DOMAIN }}
           APP_SOURCE_DIR: app-src
           COGNI_CATALOG_ROOT: app-src/infra/catalog
-        run: bash ci-src/scripts/ci/run-node-substrate.sh "${{ needs.decide.outputs.environment }}" "${{ matrix.node }}"
+        run: pnpm --dir ci-src exec tsx scripts/lib/run-node-substrate.ts "${{ needs.decide.outputs.environment }}" "${{ matrix.node }}"
 
   deploy-infra:
     if: |
@@ -1183,7 +1192,7 @@ jobs:
           EXPECTED_BUILDSHA: ${{ needs.decide.outputs.build_sha }}
           NODES: ${{ matrix.node }}
           MARKER_DIR: out
-          CUTOVER_TIMEOUT: ${{ env.DEPLOYMENT_PROVIDER == 'akash' && '420' || '90' }}
+          CUTOVER_TIMEOUT: "420"
         run: bash app-src/scripts/ci/verify-buildsha.sh
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

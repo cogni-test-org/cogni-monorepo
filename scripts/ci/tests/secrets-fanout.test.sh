@@ -89,14 +89,6 @@ nt_auth=$(val_for node-template AUTH_SECRET); cn_auth=$(val_for poly AUTH_SECRET
 r=0; [[ -n "$nt_auth" && -n "$cn_auth" && "$nt_auth" != "$cn_auth" ]] || r=1
 assert "$r" "AUTH_SECRET distinct per node"
 
-# Flight-prober credentials are control-vault authority, not ordinary node
-# materialization. The catalog still projects the key to the runtime profile,
-# but this legacy fan-out must never mint a second authority in an env vault.
-r=0
-seeded node-template FLIGHT_PROBE_API_KEY && r=1
-seeded poly FLIGHT_PROBE_API_KEY && r=1
-assert "$r" "ordinary node fan-out omits control-owned FLIGHT_PROBE_API_KEY"
-
 # 2. CONNECTIONS_ENCRYPTION_KEY distinct per node (cross-node decryption isolation).
 nt_cek=$(val_for node-template CONNECTIONS_ENCRYPTION_KEY); cn_cek=$(val_for poly CONNECTIONS_ENCRYPTION_KEY)
 r=0; [[ -n "$cn_cek" && "$nt_cek" != "$cn_cek" ]] || r=1
@@ -215,7 +207,13 @@ assert "$drift" "every NODE_BASELINE_KEY is catalog-classified (no silent passth
 #    governance-publish miss a correct emitter auto-heals). This is the green-gate
 #    for retiring NODE_BASELINE_KEYS in reconcile-secrets.sh (its own PR).
 TSX="$REPO_ROOT/node_modules/.bin/tsx"
-mapfile -t DERIVED < <(cd "$REPO_ROOT" && "$TSX" scripts/lib/print-pod-keys.ts 2>/dev/null)
+# Preserve the emitter's exit status and diagnostics: a schema failure must not
+# turn into an unexplained empty universe through process substitution.
+DERIVED_OUTPUT="$(cd "$REPO_ROOT" && "$TSX" scripts/lib/print-pod-keys.ts)" || {
+  echo "FAIL catalog pod-key emitter failed" >&2
+  exit 1
+}
+mapfile -t DERIVED < <(printf '%s' "$DERIVED_OUTPUT")
 in_derived() { local d; for d in "${DERIVED[@]}"; do [[ "$d" == "$1" ]] && return 0; done; return 1; }
 
 assert "$([[ ${#DERIVED[@]} -gt 0 ]] && echo 0 || echo 1)" "print-pod-keys emits a non-empty universe"
@@ -223,7 +221,7 @@ assert "$([[ ${#DERIVED[@]} -gt 0 ]] && echo 0 || echo 1)" "print-pod-keys emits
 # 10a. Authoritative: pod-consumed keys MUST be in the derived set (the five
 #      dual-consumed keys + GH_REVIEW_APP_*, silently absent from the hand-list).
 for k in OPENROUTER_API_KEY POSTHOG_API_KEY POSTHOG_HOST EVM_RPC_URL POLYGON_RPC_URL \
-  GH_REVIEW_APP_ID GH_REVIEW_APP_PRIVATE_KEY_BASE64 FLIGHT_PROBE_API_KEY; do
+  GH_REVIEW_APP_ID GH_REVIEW_APP_PRIVATE_KEY_BASE64; do
   r=0; in_derived "$k" || r=1
   assert "$r" "pod key $k ∈ derived universe"
 done

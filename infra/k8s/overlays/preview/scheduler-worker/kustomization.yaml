@@ -13,9 +13,10 @@ resources:
 images:
   - name: ghcr.io/cogni-dao/cogni-template
     newName: ghcr.io/cogni-dao/cogni-template
-    digest: "sha256:7c4170927e7916262a6e0a9fa7fdb8946da48184e2d7353e13d2494c45d79072"
+    digest: "sha256:6501b509ac2bec3e3dacd7a3abb40952c5d8f5a23e1fbe39745844d4c4e3bd18"
 
 patches:
+  # GENERATED sibling (render-scheduler-worker-endpoints.sh): this env's
   # PROVIDER-RESOLVED COGNI_NODE_ENDPOINTS. bug.5094 — a node placed on akash has
   # no in-cluster Service, so its address is env-variant and belongs here, not in
   # the shared base. Listed first so the base default is replaced before the
@@ -30,11 +31,14 @@ patches:
       - op: replace
         path: /data/TEMPORAL_NAMESPACE
         value: "cogni-preview"
+      - op: add
+        path: /data/DEPLOY_ENVIRONMENT
+        value: "preview"
       - op: replace
         path: /data/IMAGE_DIGEST
         value: "staging-placeholder-scheduler-worker"
 
-  # bug.0295: VM discovery via DNS (cogni-preview.vm.cogni-testing.org).
+  # bug.0295: VM discovery via DNS (cogni-preview.vm.cognidao.org).
   # Convert base headless Services → ExternalName; delete EndpointSlices.
   - target: { kind: Service, name: temporal }
     patch: |
@@ -44,7 +48,7 @@ patches:
         name: temporal
       spec:
         type: ExternalName
-        externalName: cogni-preview.vm.cogni-testing.org
+        externalName: cogni-preview.vm.cognidao.org
         clusterIP: null
   - target: { kind: Service, name: postgres }
     patch: |
@@ -54,7 +58,7 @@ patches:
         name: postgres
       spec:
         type: ExternalName
-        externalName: cogni-preview.vm.cogni-testing.org
+        externalName: cogni-preview.vm.cognidao.org
         clusterIP: null
   - target: { kind: Service, name: app }
     patch: |
@@ -64,27 +68,7 @@ patches:
         name: app
       spec:
         type: ExternalName
-        externalName: cogni-preview.vm.cogni-testing.org
-        clusterIP: null
-  - target: { kind: Service, name: poly-app }
-    patch: |
-      apiVersion: v1
-      kind: Service
-      metadata:
-        name: poly-app
-      spec:
-        type: ExternalName
-        externalName: cogni-preview.vm.cogni-testing.org
-        clusterIP: null
-  - target: { kind: Service, name: resy-app }
-    patch: |
-      apiVersion: v1
-      kind: Service
-      metadata:
-        name: resy-app
-      spec:
-        type: ExternalName
-        externalName: cogni-preview.vm.cogni-testing.org
+        externalName: cogni-preview.vm.cognidao.org
         clusterIP: null
   - target: { kind: EndpointSlice, name: temporal-1 }
     patch: |
@@ -107,17 +91,3 @@ patches:
       kind: EndpointSlice
       metadata:
         name: app-1
-  - target: { kind: EndpointSlice, name: poly-app-1 }
-    patch: |
-      $patch: delete
-      apiVersion: discovery.k8s.io/v1
-      kind: EndpointSlice
-      metadata:
-        name: poly-app-1
-  - target: { kind: EndpointSlice, name: resy-app-1 }
-    patch: |
-      $patch: delete
-      apiVersion: discovery.k8s.io/v1
-      kind: EndpointSlice
-      metadata:
-        name: resy-app-1

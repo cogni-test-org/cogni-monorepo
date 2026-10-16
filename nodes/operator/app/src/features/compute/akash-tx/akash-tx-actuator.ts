@@ -73,6 +73,9 @@
  * @internal
  */
 
+import { createHash, X509Certificate } from "node:crypto";
+import { rootCertificates } from "node:tls";
+
 import type { ProvisionOutput, ProvisionSpec } from "@cogni/ai-tools";
 
 import {
@@ -151,6 +154,33 @@ export interface AkashTxActuatorDeps {
    * whatever history exists, but recovery attempts record nothing (test/degraded mode).
    */
   readonly outcomes?: AkashTxProviderOutcomesPort;
+}
+
+const SYSTEM_ROOT_FINGERPRINTS = new Set(
+  rootCertificates.map((pem) => new X509Certificate(pem).fingerprint256)
+);
+
+function usesSystemTrust(ca: string | undefined): boolean {
+  if (!ca) return true;
+  const pem = ca.replaceAll("\\n", "\n").trim();
+  const certificates = pem.match(
+    /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g
+  );
+  if (
+    !certificates ||
+    certificates.length > 16 ||
+    certificates.join("").replace(/\s/g, "") !== pem.replace(/\s/g, "")
+  )
+    return false;
+  try {
+    return certificates.every((certificate) =>
+      SYSTEM_ROOT_FINGERPRINTS.has(
+        new X509Certificate(certificate).fingerprint256
+      )
+    );
+  } catch {
+    return false;
+  }
 }
 
 const NOOP_LOGGER: AkashTxLogger = {
@@ -354,11 +384,17 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     // (bug.5416). Ordered ahead of the release step on purpose: this reports the PREVIOUS
     // tick's decision, so it owes nothing to this tick's work and must survive a refusal.
     this.logCompositeVerdict(input);
-    // The RELEASE step. It runs FIRST so the Job is ensured on the very first tick — before
-    // there is any lease to observe — and its answer is carried onto whatever the observation
-    // turns out to be. It never throws and never short-circuits: an observe that reported
-    // "found: false" must keep reporting it, because that is the signal Crossplane uses to
-    // create the lease, and a database has no business vetoing that (task.5135).
+    // An applied cell validates its admitted runtime boundary before its migration Job.
+    // Once that identity guard passes, migration status never vetoes lease creation:
+    // releaseMigration reports its result without throwing, including before a lease exists
+    // (task.5135). A failed migration gates readiness rather than becoming a paid-lease gate.
+    if (input.migration && input.environment === "production" && input.workload)
+      await this.requireQualifiedCellRelease({
+        cogniKey: input.cogniKey,
+        environment: input.environment,
+        workload: input.workload,
+        requestedShas: input.expectedSourceSha ? [input.expectedSourceSha] : [],
+      });
     const migration = await this.releaseMigration(input);
     // THE VERDICT THE COMPOSITE WILL READ, stated once per observe (bug.5416). Everything
     // upstream of this line logs how the step WENT; only this line logs what the RESPONSE
@@ -436,10 +472,22 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     identity: AkashTxWorkloadIdentity;
     spec: ProvisionSpec;
   }): Promise<AkashTxCreateResult> {
-    // The claim IS the receipt, and it is the FIRST thing this method does: its INSERT carries
+    await this.requireQualifiedCellRelease({
+      cogniKey: input.cogniKey,
+      environment: input.environment,
+      nodeId: input.identity.nodeId,
+      workload: input.spec.name,
+      requestedShas: input.spec.services.flatMap((service) =>
+        service.env?.COGNI_REPO_SHA === undefined
+          ? []
+          : [service.env.COGNI_REPO_SHA]
+      ),
+      spec: input.spec,
+    });
+    // The claim IS the receipt, and it is the FIRST mutation this method does: its INSERT carries
     // {nodeId, environment, compositeUid, compositeGeneration, cogniKey}. Everything below this
     // line — the cursor read and the paid POST — happens strictly after that row is durable.
-    // Nothing precedes it any more; the migration gate that used to sit here was severed by
+    // No provider mutation precedes it; the migration gate that used to sit here was severed by
     // task.5135, and RECEIPT_BEFORE_TRANSACTION is stronger for it.
     const claim = await this.claim(input);
 
@@ -658,6 +706,10 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       externalName: allocated.leaseId,
       providerAccount: allocated.providerAccount,
     });
+    await this.ledger.recordAppliedSdlHash({
+      cogniKey: input.cogniKey,
+      sdlHash: this.console.sdlHash(input.spec),
+    });
     const allocationRecord = await this.requireStoredHandle(
       input.cogniKey,
       allocated.leaseId,
@@ -688,11 +740,28 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     identity: AkashTxWorkloadIdentity;
     spec: ProvisionSpec;
   }): Promise<AkashTxResource> {
+    await this.requireQualifiedCellRelease({
+      cogniKey: input.cogniKey,
+      environment: input.environment,
+      nodeId: input.identity.nodeId,
+      workload: input.spec.name,
+      requestedShas: input.spec.services.flatMap((service) =>
+        service.env?.COGNI_REPO_SHA === undefined
+          ? []
+          : [service.env.COGNI_REPO_SHA]
+      ),
+      spec: input.spec,
+    });
     // An update mints no handle and opens no escrow, so it needs no wallet slot — but it does
     // put a new revision in front of a resource that is already burning money, so it must be
     // attributable BEFORE the provider is contacted. This writes the advancing generation onto
     // the SAME receipt row the create opened; there is no second ledger and no second table.
-    const bound = await this.bindIdentity(input);
+    const bound = await this.bindIdentity({
+      ...input,
+      ...(retainsStorage(input.spec)
+        ? { retentionPolicy: "retain" as const }
+        : {}),
+    });
     if (bound.state !== "bound") {
       throw this.identityConflict({
         cogniKey: input.cogniKey,
@@ -710,6 +779,24 @@ export class AkashTxActuator implements AkashTxActuatorPort {
         environment: input.environment,
         record: bound.record,
       });
+    }
+    // Ordinary app updates have no proof that replacing a stateful layout is safe.
+    // Preserve byte-identical no-ops; all changed retained SDL needs audited state lifecycle.
+    if (
+      (bound.record.retentionPolicy === "retain" ||
+        bound.record.appliedDatabaseCellBinding?.length ||
+        retainsStorage(input.spec)) &&
+      (!bound.record.lastAppliedSdlHash ||
+        bound.record.lastAppliedSdlHash !== this.console.sdlHash(input.spec))
+    ) {
+      this.log.warn(
+        { cogniKey: input.cogniKey, receiptId: bound.record.receiptId },
+        "akash_tx_retained_storage_update_refused"
+      );
+      throw new AkashTxError(
+        "invalid_request",
+        "retained storage permits only an identical SDL no-op; changes require audited state lifecycle"
+      );
     }
     // Refresh durable native evidence before replacing a paid workload. A failed cost read/write
     // holds the update retryably and must leave the provider untouched.
@@ -853,6 +940,19 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       input.externalName,
       "delete"
     );
+    if (
+      record.retentionPolicy === "retain" ||
+      record.appliedDatabaseCellBinding?.length
+    ) {
+      this.log.warn(
+        { cogniKey: input.cogniKey, receiptId: record.receiptId },
+        "akash_tx_retained_storage_delete_refused"
+      );
+      throw new AkashTxError(
+        "invalid_request",
+        "retained storage requires audited retirement; ordinary delete is refused"
+      );
+    }
     await this.observeCost(record, input.externalName).catch(
       (error: unknown) => {
         this.log.warn(
@@ -899,6 +999,120 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       { cogniKey: input.cogniKey, externalName: input.externalName },
       "akash_tx_released"
     );
+  }
+
+  /** Initial admission stays immutable; app releases preserve its consumer/pool boundary. */
+  private async requireQualifiedCellRelease(input: {
+    cogniKey: string;
+    environment: string;
+    nodeId?: string;
+    workload: string;
+    requestedShas: readonly string[];
+    spec?: ProvisionSpec;
+  }): Promise<void> {
+    if (input.environment !== "production") return;
+    let records: readonly AkashTxAllocationRecord[];
+    try {
+      records = await this.ledger.listAllocated({
+        ...(input.nodeId ? { nodeId: input.nodeId } : {}),
+        environment: input.environment,
+        limit: 100,
+      });
+    } catch {
+      throw new AkashTxError(
+        "ledger_unavailable",
+        "qualified cell release metadata unavailable"
+      );
+    }
+    if (records.length >= 100)
+      throw new AkashTxError(
+        "identity_conflict",
+        "qualified cell release metadata exceeds bounded scan"
+      );
+    const cells = records.flatMap((record) =>
+      (record.appliedDatabaseCellBinding ?? []).filter(
+        (receipt) =>
+          receipt.binding.phase === "applied" &&
+          (input.nodeId
+            ? receipt.binding.nodeId === input.nodeId
+            : receipt.binding.nodeSlug === input.workload) &&
+          receipt.binding.environment === input.environment &&
+          // The persistent cell itself remains subject to its stricter retained SDL guard.
+          record.cogniKey !== input.cogniKey
+      )
+    );
+    if (cells.length === 0) return;
+    const cell = cells[0];
+    if (
+      cells.length !== 1 ||
+      !cell ||
+      cell.binding.nodeSlug !== input.workload ||
+      input.requestedShas.length === 0 ||
+      input.requestedShas.some((sha) => !/^[0-9a-f]{40}$/.test(sha)) ||
+      new Set(input.requestedShas).size !== 1
+    )
+      throw new AkashTxError(
+        "identity_conflict",
+        "app release lacks one unambiguous owned applied cell and source SHA"
+      );
+    const pools = cell.registration?.runtimePoolLimits;
+    // Older/factory admissions without an explicit audited runtime policy keep
+    // their exact-build restriction. A historical cutover SHA is not a permanent
+    // application freeze once the manual admission supplies enforceable bounds.
+    if (!pools) {
+      if (input.requestedShas.some((sha) => sha !== cell.targetBuildSha))
+        throw new AkashTxError(
+          "identity_conflict",
+          "app release differs from qualified cell target without audited runtime bounds"
+        );
+      return;
+    }
+    if (
+      pools.replicaCount !== 1 ||
+      [pools.app, pools.service, pools.read].some(
+        (limit) => !Number.isSafeInteger(limit) || limit <= 0
+      )
+    )
+      throw new AkashTxError(
+        "identity_conflict",
+        "applied cell runtime bounds invalid"
+      );
+    if (input.spec) {
+      const consumers = input.spec.services.filter(
+        (service) =>
+          service.env?.DATABASE_URL !== undefined ||
+          service.env?.DATABASE_SERVICE_URL !== undefined
+      );
+      const consumer = consumers[0];
+      const env = consumer?.env;
+      // provider-http resolves the owned references before this private wire call.
+      // Compare the actual credentials with their immutable audited digests.
+      const digest = (value: string | undefined) =>
+        value === undefined
+          ? undefined
+          : createHash("sha256").update(value).digest("hex");
+      const ca = env?.DATABASE_SSL_CA_CERT?.replaceAll("\\n", "\n");
+      const tlsMatches =
+        cell.registration?.tlsTrustKind === "system"
+          ? usesSystemTrust(ca)
+          : ca !== undefined && digest(ca) === cell.registration?.tlsCaSha256;
+      if (
+        consumers.length !== 1 ||
+        !env ||
+        digest(env.DATABASE_URL) !== cell.registration?.appDsnSha256 ||
+        digest(env.DATABASE_SERVICE_URL) !==
+          cell.registration?.serviceDsnSha256 ||
+        !tlsMatches ||
+        env.COGNI_REPO_SHA !== input.requestedShas[0] ||
+        env.DB_POOL_MAX !== String(pools.app) ||
+        env.DB_SERVICE_POOL_MAX !== String(pools.service) ||
+        env.DB_READ_POOL_MAX !== String(pools.read)
+      )
+        throw new AkashTxError(
+          "identity_conflict",
+          "app release changes its admitted database consumer or pool bounds"
+        );
+    }
   }
 
   /**
@@ -1439,6 +1653,9 @@ export class AkashTxActuator implements AkashTxActuatorPort {
         workload: input.spec.name,
         environment: input.environment,
         identity: input.identity,
+        ...(retainsStorage(input.spec)
+          ? { retentionPolicy: "retain" as const }
+          : {}),
       });
     } catch (error) {
       throw this.ledgerUnavailable(error, input.cogniKey, "claim");
@@ -1449,6 +1666,7 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     cogniKey: string;
     environment: string;
     identity: AkashTxWorkloadIdentity;
+    retentionPolicy?: "retain";
   }): Promise<
     Awaited<ReturnType<AkashTxAllocationLedgerPort["bindIdentity"]>>
   > {
@@ -1457,6 +1675,9 @@ export class AkashTxActuator implements AkashTxActuatorPort {
         cogniKey: input.cogniKey,
         environment: input.environment,
         identity: input.identity,
+        ...(input.retentionPolicy
+          ? { retentionPolicy: input.retentionPolicy }
+          : {}),
       });
     } catch (error) {
       throw this.ledgerUnavailable(error, input.cogniKey, "bindIdentity");
@@ -1636,4 +1857,12 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     );
     return new AkashTxError(code, "allocation ledger unavailable");
   }
+}
+
+/** Persistent volumes cannot opt out of retention by omitting a caller flag. */
+function retainsStorage(spec: ProvisionSpec): boolean {
+  return (
+    spec.retentionPolicy === "retain" ||
+    spec.services.some((service) => Boolean(service.volumes?.length))
+  );
 }

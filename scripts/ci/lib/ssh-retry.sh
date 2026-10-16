@@ -20,8 +20,11 @@ cogni_ssh_transport_retry() {
   if [ ! -t 0 ]; then cat >"$_stdin"; fi
   _rc=255
   for _attempt in 1 2 3; do
-    "$@" <"$_stdin" 2>"$_err"
-    _rc=$?
+    if "$@" <"$_stdin" 2>"$_err"; then
+      _rc=0
+    else
+      _rc=$?
+    fi
     if [ "$_rc" -ne 0 ] && grep -qiE 'kex_exchange_identification|connection (reset|closed|refused|timed out)|broken pipe|banner exchange' "$_err"; then
       cat "$_err" >&2
       echo "[ssh-retry] transport failure (attempt ${_attempt}/3) — retrying" >&2
@@ -70,7 +73,7 @@ cogni_openbao_kubernetes_login_retry() {
     # Classify the first failure once so a later error cannot widen a bounded
     # permission-denied recheck into the longer transient-server retry class.
     if [ "$_max_attempts" -eq 0 ]; then
-      if grep -qiE 'context deadline exceeded|i/o timeout|TLS handshake timeout|connection (refused|reset)|Code: (429|500|502|503|504)' "$_err"; then
+      if grep -qiE 'context deadline exceeded|Internal error occurred: Timeout occurred|i/o timeout|TLS handshake timeout|connection (refused|reset)|Code: (429|500|502|503|504)' "$_err"; then
         _reason="server_transient"
         _max_attempts=3
       elif grep -qiE 'Code: 403|permission denied' "$_err"; then
@@ -81,7 +84,7 @@ cogni_openbao_kubernetes_login_retry() {
         rm -f "$_stdin" "$_out" "$_err"
         return "$_rc"
       fi
-    elif ! grep -qiE 'context deadline exceeded|i/o timeout|TLS handshake timeout|connection (refused|reset)|Code: (429|500|502|503|504)|Code: 403|permission denied' "$_err"; then
+    elif ! grep -qiE 'context deadline exceeded|Internal error occurred: Timeout occurred|i/o timeout|TLS handshake timeout|connection (refused|reset)|Code: (429|500|502|503|504)|Code: 403|permission denied' "$_err"; then
       cat "$_err" >&2
       rm -f "$_stdin" "$_out" "$_err"
       return "$_rc"

@@ -67,8 +67,8 @@ The simplification target is one artifact contract and one promotion primitive. 
 
 11. **LANE_AND_CONTROL_ENV_ARE_DIFFERENT_QUESTIONS**: "env" names two
     independent things, and every consumer must state which one it means.
-    **Path and name follow the LANE. Identity and substrate follow the CONTROL
-    env.** Resolve the control env with `control_env_for` (`scripts/ci/lib/appset-paths.sh`)
+    **Workload identity and Postgres residency follow the LANE. Reconciliation,
+    payment and secret custody follow the CONTROL env.** Resolve the control env with `control_env_for` (`scripts/ci/lib/appset-paths.sh`)
     or `controlEnvFor` (`nodes/operator/app/src/features/compute/node-deployment-provider.ts`)
     — never by reading the env variable directly. See `## Lane vs control env` below.
 
@@ -82,12 +82,24 @@ still do for every k3s node. They diverge the moment a node runs a
 all, so its desired state has to be reconciled by _some_ cluster, and that
 cluster is production's.
 
-| question                               | name            | decides                                                                                                                      |
-| -------------------------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| What is this workload?                 | **lane**        | public URL, vault path prefix, XR namespace, deploy branch, idempotence key, DB name suffix, **migration-receipt namespace** |
-| Who reconciles, pays and custodies it? | **control env** | AppSet directory, vault host + writer role, actuator namespace, substrate host, Postgres host, owner-inherited keys          |
+| question                               | name            | decides                                                                                                                                                  |
+| -------------------------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| What is this workload?                 | **lane**        | public URL, vault path prefix, XR namespace, deploy branch, idempotence key, Postgres environment and database identity, **migration-receipt namespace** |
+| Who reconciles, pays and custodies it? | **control env** | AppSet directory, vault host + writer role, actuator namespace, control-plane substrate host, owner-inherited keys                                       |
 
-> **Path and name follow the LANE. Identity and substrate follow the CONTROL env.**
+> **Workload identity and Postgres residency follow the LANE. Reconciliation,
+> payment and secret custody follow the CONTROL env.**
+
+Shared-tier Postgres placement is resolved separately by `lane_db_vm_env` /
+`lane_db_host` in `scripts/ci/lib/lane-db-residency.sh`: candidate-a, preview and
+production each use their own environment's instance, with no foreign-residency
+exception. Database names alone do not isolate a shared production server.
+`lane_db_assert_agreement` checks the stored runtime app/service and migration
+DSNs against the resolved host and database; missing or mismatched values fail
+closed. Secret custody and migration execution authority do not select the
+database host. Reviewed dedicated-cell placement/cutover follows the
+[database contract](databases.md#database-placement-and-budgets); this rule
+does not override that lifecycle or assert Doltgres/Temporal isolation.
 
 The durable _why_ — the eleven live-discovered conflations, the destructive
 one, and the open `bug.5208` question about `cogni-test-org` throwaways — lives
@@ -120,6 +132,7 @@ candidate-a flight the production vault is rejected.
 | follows     | value                                                                                                    |
 | ----------- | -------------------------------------------------------------------------------------------------------- |
 | lane        | `poly-test.cognidao.org` · `cogni/candidate-a/poly` · ns `cogni-candidate-a` · `deploy/candidate-a-poly` |
+| Postgres    | candidate-a instance via `lane_db_host poly candidate-a` · database `cogni_poly`                         |
 | control env | `appsets/production/…` · production OpenBao + `production-writer` · `cogni.vm.cognidao.org`              |
 
 The AppSet filename keeps the **lane** (`candidate-a-poly-applicationset.yaml`)
@@ -159,10 +172,13 @@ it was asked for. The question was wrong. A Job named `migrate-<slug>-<digest12>
 in the ACTUATOR's namespace answers _"has this node's bundle been migrated by
 whoever is paying?"_ — while the only useful question is _"has THIS DATABASE been
 migrated?"_. One node at one digest with two lanes has two databases
-(`cogni_poly` and `cogni_poly_candidate_a`, same Postgres since the lane suffix)
+(`cogni_poly` and the historical `cogni_poly_candidate_a` on the same server)
 and produced ONE Job name, so the first lane's receipt answered for the second.
 poly's candidate-a lease then served an empty schema until its boot deadline
 closed it.
+
+Environment-owned Postgres now separates their servers; receipt identity still
+has to distinguish the lanes.
 
 > **A receipt proves a fact about a resource, so it must live where that resource
 > is addressed.** For anything a lane owns, that is the LANE — even when the
@@ -459,7 +475,7 @@ Inline node CI exists because this repo historically carried several node apps a
 
 The node has **its own `.github/workflows/` and runs its own CI** — _and_ it is **`nodes/<slug>` only** from the operator. Both are true; they are two views of one object, not a contradiction:
 
-- **Node-repo view (the node-dev's clone).** A submodule node is a _full standalone repo_ with the node **at its root**: `app/`, `graphs/`, `k8s/`, `packages/`, plus its **own** `.github/workflows/pr-build.yml`, biome/tsconfig/Dockerfile, and the `setup-main-branch.sh` gate. The node-dev clones _only_ this repo, runs the full merge gate there, and **builds + pushes its own image** to GHCR (`FORK_FREEDOM`). This sovereignty is the entire reason the submodule model exists. For the product/package shape of that root-level node repo, see [Node Backend-as-a-Service Architecture](./node-baas-architecture.md).
+- **Node-repo view (the node-dev's clone).** A submodule node is a _full standalone repo_ with the node **at its root**: `app/`, `graphs/`, `k8s/`, `packages/`, plus its **own** `.github/workflows/pr-build.yml`, biome/tsconfig/Dockerfile, and the `setup-main-branch.sh` gate. The node-dev clones _only_ this repo, runs the full merge gate there, and **builds + pushes its own image** to GHCR (`FORK_FREEDOM`). This sovereignty is the entire reason the submodule model exists. For the product/package shape of that root-level node repo, see the [Node BaaS product model](https://cognidao.org/knowledge/node-baas-substrate-model).
 - **Operator view (the monorepo).** The operator sees a `nodes/<slug>` **gitlink — a pointer**, not content. Even after `git submodule update --init nodes/<slug>`, the node's root `.github/workflows/` lands at `nodes/<slug>/.github/workflows/`, which **GitHub never executes** (only _repo-root_ `.github/workflows/` run). So the operator monorepo **never runs the node's workflows and never builds the node** — its job is exactly the table above: pointer-validate + provision + flight + promote the node's _pre-built_ image.
 
 **Corollary that breaks today's pin-PR (P0).** Because the node builds itself, the operator's `detect-affected.sh` must **exclude the gitlink from build targets** — a `build (<slug>)` leg on the parent is always wrong. The operator consumes the artifact by **digest** resolved from catalog `image_repository` + requested `sourceSha`, never by rebuilding source.
@@ -682,16 +698,15 @@ This standard does not split `.dependency-cruiser.cjs` per node. That's a separa
 
 ### Workflow Entrypoints
 
-| File                              | Type | Secrets                   | Trigger                              | Concern                                                                                                                                                                                                      |
-| --------------------------------- | ---- | ------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `ci.yaml`                         | CI   | No                        | PR; push main                        | Typecheck, lint, unit, component, docs, architecture, scope                                                                                                                                                  |
-| `stack-test.yml`                  | CI   | No                        | workflow_dispatch                    | Per-node full-stack vitest                                                                                                                                                                                   |
-| `pr-build.yml`                    | CI   | GHCR write                | pull_request; merge_group; push main | In-repo artifact build → `<image>:sha-<sourceSha>` (SOURCE_SHA_IS_DEPLOY_IDENTITY). `push:main` self-builds every merge (incl. admin/`/vcs/merge` squash); `merge_group` produces the `manifest` queue check |
-| `candidate-flight.yml`            | CD   | GHCR read; deploy         | workflow_dispatch                    | Candidate-a target substrate assertion + digest flight from `image_repository:sha-<sourceSha>`                                                                                                               |
-| `candidate-flight-infra.yml`      | CD   | SSH/secrets               | workflow_dispatch                    | Candidate-a VM compose substrate only                                                                                                                                                                        |
-| `flight-preview.yml`              | CD   | GHCR read                 | push main; workflow_dispatch         | Preview dispatch by digest: resolves the merge's `sha-<mainSha>` images and dispatches `promote-and-deploy(preview)`. NO re-tag step — promote consumes the same `sha-<mainSha>` digest                      |
-| `promote-and-deploy.yml`          | CD   | SSH/secrets; deploy       | workflow_dispatch                    | Preview/production digest promotion, infra reconcile, verify, e2e                                                                                                                                            |
-| `promote-preview-digest-seed.yml` | CD   | GHCR read; contents write | workflow_run                         | Maintains preview digest seed pins on `main` after dispatched preview flights                                                                                                                                |
+| File                         | Type | Secrets             | Trigger                              | Concern                                                                                                                                                                                                      |
+| ---------------------------- | ---- | ------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ci.yaml`                    | CI   | No                  | PR; push main                        | Typecheck, lint, unit, component, docs, architecture, scope                                                                                                                                                  |
+| `stack-test.yml`             | CI   | No                  | workflow_dispatch                    | Per-node full-stack vitest                                                                                                                                                                                   |
+| `pr-build.yml`               | CI   | GHCR write          | pull_request; merge_group; push main | In-repo artifact build → `<image>:sha-<sourceSha>` (SOURCE_SHA_IS_DEPLOY_IDENTITY). `push:main` self-builds every merge (incl. admin/`/vcs/merge` squash); `merge_group` produces the `manifest` queue check |
+| `candidate-flight.yml`       | CD   | GHCR read; deploy   | workflow_dispatch                    | Candidate-a target substrate assertion + digest flight from `image_repository:sha-<sourceSha>`                                                                                                               |
+| `candidate-flight-infra.yml` | CD   | SSH/secrets         | workflow_dispatch                    | Candidate-a VM compose substrate only                                                                                                                                                                        |
+| `flight-preview.yml`         | CD   | GHCR read           | push main; workflow_dispatch         | Preview dispatch by digest: resolves the merge's `sha-<mainSha>` images and dispatches `promote-and-deploy(preview)`. NO re-tag step — promote consumes the same `sha-<mainSha>` digest                      |
+| `promote-and-deploy.yml`     | CD   | SSH/secrets; deploy | workflow_dispatch                    | Preview/production digest promotion, infra reconcile, verify, e2e                                                                                                                                            |
 
 ### Local Gates
 

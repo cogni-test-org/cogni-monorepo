@@ -160,16 +160,34 @@ export default function () {
 
 Load detailed guidance based on context:
 
-| Topic               | Reference                             | Load When                               |
-| ------------------- | ------------------------------------- | --------------------------------------- |
-| Logging             | `references/structured-logging.md`    | Pino, JSON logging                      |
-| Metrics             | `references/prometheus-metrics.md`    | Counter, Histogram, Gauge               |
-| Tracing             | `references/opentelemetry.md`         | OpenTelemetry, spans                    |
-| Alerting            | `references/alerting-rules.md`        | Prometheus alerts                       |
-| Dashboards          | `references/dashboards.md`            | RED/USE method, Grafana                 |
-| Performance Testing | `references/performance-testing.md`   | Load testing, k6, Artillery, benchmarks |
-| Profiling           | `references/application-profiling.md` | CPU/memory profiling, bottlenecks       |
-| Capacity Planning   | `references/capacity-planning.md`     | Scaling, forecasting, budgets           |
+| Topic                 | Reference                                                                | Load When                                                |
+| --------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------- |
+| Logging               | `references/structured-logging.md`                                       | Pino, JSON logging                                       |
+| Metrics               | `references/prometheus-metrics.md`                                       | Counter, Histogram, Gauge                                |
+| Tracing               | `references/opentelemetry.md`                                            | OpenTelemetry, spans                                     |
+| Alerting              | `references/alerting-rules.md`                                           | Prometheus alerts                                        |
+| Dashboards            | `references/dashboards.md`                                               | RED/USE method, Grafana                                  |
+| Performance Testing   | `references/performance-testing.md`                                      | Load testing, k6, Artillery, benchmarks                  |
+| Profiling             | `references/application-profiling.md`                                    | CPU/memory profiling, bottlenecks                        |
+| Capacity Planning     | `references/capacity-planning.md`                                        | Scaling, forecasting, budgets                            |
+| Cogni Fleet Diagnosis | [hub guide](https://cognidao.org/knowledge/fleet-health-diagnosis-guide) | Red fleet status, node 52x, shared-substrate attribution |
+
+## Fleet availability and deployment identity
+
+Continuous Serve probes measure availability: TLS, HTTP 200, a healthy response,
+and the configured deadline. Never pin a release SHA in their body assertions,
+labels, or required inputs: normal flights and promotions must not require a
+separate monitoring apply to remain available.
+
+Check actual build identity through `/version` and `/readyz` diagnostics. Keep
+exact expected-versus-actual SHA verification in flight, promotion, and candidate
+validation gates. A wrong build fails deployment verification; it is not, by
+itself, evidence of an availability outage. Incident-scoped recovery proofs retain
+their exact build, native database, and incident identity assertions.
+
+When HTTP 200 produces `probe_success=0`, inspect `probe_failed_due_to_regex` and
+the configured assertions before attributing an outage to a database or host.
+Follow the existing [fleet diagnosis guide](https://cognidao.org/knowledge/fleet-health-diagnosis-guide).
 
 ## Constraints
 
