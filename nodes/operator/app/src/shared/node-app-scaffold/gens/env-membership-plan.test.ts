@@ -639,21 +639,11 @@ describe("planEnvAddShape (ADD_DERIVES_PLACEMENT, story.5039)", () => {
     });
   });
 
-  it("production defaults to the production fleet control env", () => {
+  it("production's control env is production itself", () => {
     expect(
       planEnvAddShape(externallyBuiltCatalog(["candidate-a"]), "production")
         .controlEnv
     ).toBe("production");
-  });
-
-  it("threads an isolated fleet control env into the production Akash lane", () => {
-    expect(
-      planEnvAddShape(
-        externallyBuiltCatalog(["candidate-a"]),
-        "production",
-        "candidate-a"
-      ).controlEnv
-    ).toBe("candidate-a");
   });
 
   it("threads the FLEET CONTROL ENV into an akash non-production lane's control env (isolated fleet, bug.5235)", () => {

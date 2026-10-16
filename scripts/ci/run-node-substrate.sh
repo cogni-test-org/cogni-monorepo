@@ -36,7 +36,6 @@ TARGET_NODE="${2:?usage: run-node-substrate.sh <env> <node>}"
 
 # Script paths overridable for tests (mirrors the *_SSH_BIN seam in the callees).
 MATERIALIZE_BIN="${RUN_NODE_SUBSTRATE_MATERIALIZE_BIN:-$SCRIPT_DIR/secret-materialize.sh}"
-FLIGHT_PROBE_BIN="${RUN_NODE_SUBSTRATE_FLIGHT_PROBE_BIN:-$SCRIPT_DIR/flight-probe-credentials.sh}"
 RECONCILE_BIN="${RUN_NODE_SUBSTRATE_RECONCILE_BIN:-$SCRIPT_DIR/reconcile-node-substrate.sh}"
 ASSERT_BIN="${RUN_NODE_SUBSTRATE_ASSERT_BIN:-$SCRIPT_DIR/assert-target-substrate.sh}"
 DEPLOYMENT_PROVIDER="${DEPLOYMENT_PROVIDER:-k3s}"
@@ -101,6 +100,7 @@ export CATALOG_DIR
 # shellcheck source=scripts/ci/lib/appset-paths.sh
 . "$SCRIPT_DIR/lib/appset-paths.sh"
 CONTROL_ENV="$(control_env_for "$DEPLOY_ENVIRONMENT" "$TARGET_NODE")"
+RELIABILITY_CONTROLLER="$(reliability_controller_for_env "$DEPLOY_ENVIRONMENT")" || exit 1
 
 # The bare zone every lane's public host hangs off (`cognidao.org`), used only to build
 # ANOTHER lane's domain when this env custodies it. Derived by stripping this env's own
@@ -141,10 +141,6 @@ lane_degraded() {
 
 if [ "$CONTROL_ENV" = "$DEPLOY_ENVIRONMENT" ]; then
   bash "$MATERIALIZE_BIN" "$DEPLOY_ENVIRONMENT" "$TARGET_NODE"
-  if [ "$DEPLOY_ENVIRONMENT" = "${FLEET_CONTROL_ENV:-production}" ]; then
-    SECRETS_CONTROL_ENV="$DEPLOY_ENVIRONMENT" \
-      bash "$FLIGHT_PROBE_BIN" materialize "$DEPLOY_ENVIRONMENT" "$TARGET_NODE"
-  fi
   # Then every OTHER lane of this node that THIS cluster reconciles. Catalog-derived, so a
   # lane added by a catalog edit is materialized with no code change, and a node with no
   # such lane (every k3s row, every production-only node) enumerates nothing.
@@ -167,41 +163,42 @@ if [ "$CONTROL_ENV" = "$DEPLOY_ENVIRONMENT" ]; then
       continue
     }
     echo "[run-node-substrate] ${DEPLOY_ENVIRONMENT} reconciles ${lane}/${TARGET_NODE} — materializing that lane's secrets into THIS vault (bug.5206), domain ${lane_domain}"
-    set +e
     SECRETS_CONTROL_ENV="$DEPLOY_ENVIRONMENT" DOMAIN="$lane_domain" \
-      bash "$MATERIALIZE_BIN" "$lane" "$TARGET_NODE"
-    materialize_rc=$?
-    set -e
-    if [ "$materialize_rc" -ne 0 ]; then
-      lane_degraded "$lane" materialize "$materialize_rc"
-      continue
-    fi
-    if [ "$DEPLOY_ENVIRONMENT" = "${FLEET_CONTROL_ENV:-production}" ]; then
-      SECRETS_CONTROL_ENV="$DEPLOY_ENVIRONMENT" \
-        bash "$FLIGHT_PROBE_BIN" materialize "$lane" "$TARGET_NODE" \
-        || lane_degraded "$lane" flight-probe-materialize $?
-    fi
+      bash "$MATERIALIZE_BIN" "$lane" "$TARGET_NODE" \
+      || lane_degraded "$lane" materialize $?
   done
 else
-  # A FOREIGN-CUSTODIED LANE HAS NO SUBSTRATE ON ITS OWN VM, so its own flight reconciles
-  # NOTHING here (bug.5206). Everything reconcile would provision — the vault bank, the
-  # database, the roles, the Temporal namespace — belongs to the CONTROL cluster and is
-  # provisioned by THAT cluster's substrate run, which is the only run holding the identities
-  # to do it. Running it here anyway produced exactly one outcome: a mint of
-  # `production-db-reader` against the LANE's OpenBao, where that role does not exist —
-  # `invalid role name "production-db-reader"`, and the flight dies.
-  #
-  # The alternative (resolve the reader from the VM's env instead) would "work" by
-  # provisioning a SECOND copy of the lane's database on the lane's own VM — a ghost nothing
-  # dials, since the DSN the workload receives is composed against the control VM. Reconciling
-  # nothing is not a gap here; it is the correct amount of work.
-  echo "::notice::${TARGET_NODE}'s ${DEPLOY_ENVIRONMENT} lane is reconciled by '${CONTROL_ENV}' — its ENTIRE substrate (vault bank, database, roles, Temporal namespace) lives in that cluster and is provisioned by ${CONTROL_ENV}'s own substrate run. Nothing to reconcile on this VM."
-  echo "[run-node-substrate] ${DEPLOY_ENVIRONMENT}/${TARGET_NODE}: substrate is ${CONTROL_ENV}'s — nothing to do here"
+  # Run under the catalog-selected custodian's GitHub environment/SSH identity.
+  # It owns this lane's secrets; only Postgres provisioning is delegated to the
+  # lane's own VM. A nonproduction custodian may never provision production.
+  [ "$DEPLOY_ENVIRONMENT" != production ] || {
+    echo "::error::nonproduction control may not provision a production lane" >&2
+    exit 1
+  }
+  lane_domain=""
+  case "$DEPLOY_ENVIRONMENT" in
+    preview) lane_domain="preview.$DOMAIN_ROOT" ;;
+    candidate-a) lane_domain="test.$DOMAIN_ROOT" ;;
+  esac
+  [ -n "$lane_domain" ] || { echo "::error::cannot derive lane domain" >&2; exit 1; }
+  SECRETS_CONTROL_ENV="$CONTROL_ENV" DOMAIN="$lane_domain" \
+    bash "$MATERIALIZE_BIN" "$DEPLOY_ENVIRONMENT" "$TARGET_NODE"
+  DEPLOYMENT_PROVIDER="$DEPLOYMENT_PROVIDER" DOMAIN="$lane_domain" \
+    bash "$RECONCILE_BIN" "$DEPLOY_ENVIRONMENT" "$TARGET_NODE"
+  TARGET="$TARGET_NODE" DEPLOYMENT_PROVIDER="$DEPLOYMENT_PROVIDER" DOMAIN="$lane_domain" \
+    bash "$ASSERT_BIN" "$DEPLOY_ENVIRONMENT" "$TARGET_NODE"
+  echo "[run-node-substrate] ${DEPLOY_ENVIRONMENT}/${TARGET_NODE}: lane-local Postgres and control-custodied substrate verified"
   exit 0
 fi
 
 DEPLOYMENT_PROVIDER="$DEPLOYMENT_PROVIDER" \
   bash "$RECONCILE_BIN" "$DEPLOY_ENVIRONMENT" "$TARGET_NODE"
+
+# The owner matrix leg alone seals measured private bindings through the same writer.
+# Other node legs never read/modify/write the shared actuator array.
+if [ "$TARGET_NODE" = "$RELIABILITY_CONTROLLER" ] && [ "$CONTROL_ENV" = "$DEPLOY_ENVIRONMENT" ]; then
+  SECRET_MATERIALIZE_PHASE=db-ready bash "$MATERIALIZE_BIN" "$DEPLOY_ENVIRONMENT" "$TARGET_NODE"
+fi
 
 # ...then the SUBSTRATE of every lane this cluster custodies. Materializing the lane's secrets
 # without provisioning its database produces a lease that boots with a valid DSN pointing at a

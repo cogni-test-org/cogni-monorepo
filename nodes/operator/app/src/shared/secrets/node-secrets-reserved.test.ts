@@ -33,10 +33,17 @@ describe("node-secrets reserved-key guard (gate 2)", () => {
     // secret-materialize.sh's key_is_agent_generated set.
     expect(isNodeOwnedSecretKey("CONNECTIONS_ENCRYPTION_KEY")).toBe(false);
     expect(isNodeOwnedSecretKey("INTERNAL_OPS_TOKEN")).toBe(false);
-    expect(isNodeOwnedSecretKey("FLIGHT_PROBE_API_KEY")).toBe(false);
     expect(isNodeOwnedSecretKey("METRICS_TOKEN")).toBe(false);
     expect(isNodeOwnedSecretKey("GH_WEBHOOK_SECRET")).toBe(false);
     expect(isNodeOwnedSecretKey("POLY_WALLET_AEAD_KEY_HEX")).toBe(false);
+  });
+
+  it.each([
+    "DATABASE_RECOVERY_PROBE_PASSWORD",
+    "DATABASE_RECOVERY_PROBE_URL",
+    "DATABASE_RECOVERY_PROBE_URLS_JSON",
+  ])("refuses substrate-owned probe material %s", (key) => {
+    expect(isNodeOwnedSecretKey(key)).toBe(false);
   });
 
   it("the reserved set is a denylist (small + fixed), not a per-node allowlist", () => {

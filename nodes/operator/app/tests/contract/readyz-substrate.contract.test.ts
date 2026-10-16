@@ -3,9 +3,9 @@
 
 /**
  * Module: `@tests/contract/readyz-substrate.contract`
- * Purpose: Prove the shallow/deep readiness contract for async substrate dependencies.
- * Scope: Exercises the /readyz route with isolated Temporal, scheduler-worker, and knowledge-store probes. Does not perform network or database IO.
- * Invariants: Default readiness stays healthy while emitting critical dependency events; `?deep=1` returns 503 for any missing dependency, knowledge plane included (bug.5386).
+ * Purpose: Prove the local-only shallow readiness and explicit deep substrate contract.
+ * Scope: Exercises the /readyz route with isolated RPC, Temporal, scheduler-worker, knowledge-store, and database probes. Does not perform real network or database IO.
+ * Invariants: Default readiness performs zero remote IO; `?deep=1` returns 503 for any missing dependency, knowledge plane included (bug.5386).
  * Side-effects: none
  * Links: src/app/(infra)/readyz/route.ts, Cogni-DAO/cogni#1860
  * @internal
@@ -27,16 +27,20 @@ const mocks = vi.hoisted(() => ({
   setBuildInfo: vi.fn(),
   verifySystemTenant: vi.fn(),
   warn: vi.fn(),
+  getContainer: vi.fn(),
+  localRecovery: vi.fn(),
 }));
 
 vi.mock("@/bootstrap/container", () => ({
-  getContainer: () => ({
-    evmOnchainClient: {},
-    knowledgeStorePort: { domainExists: async () => false },
-    paymentRailsActive: false,
-    scheduleControl: {},
-    serviceAccountService: {},
-  }),
+  resolveLocalReliabilityControl: () => mocks.localRecovery(),
+  getContainer: () =>
+    mocks.getContainer() ?? {
+      evmOnchainClient: {},
+      knowledgeStorePort: { domainExists: async () => false },
+      paymentRailsActive: false,
+      scheduleControl: {},
+      serviceAccountService: {},
+    },
 }));
 
 vi.mock("@/bootstrap/healthchecks", () => ({
@@ -130,30 +134,100 @@ describe("GET /readyz async substrate contract", () => {
     mocks.verifySystemTenant.mockResolvedValue(undefined);
   });
 
-  it("checks RPC before payment activation while keeping a transient failure non-draining", async () => {
-    mocks.checkEvmRpcConnectivity.mockResolvedValue({
-      ok: false,
-      source: "live",
-      errorMessage: "upstream 429",
+  it("serves scoped recovery through the cold private seam while runtime DB construction is fenced", async () => {
+    const sha = "a".repeat(40);
+    const evidence = {
+      status: "healthy",
+      buildSha: sha,
+      databaseSystemIdentifier: "123456",
+      incidentId: "reliability.v1:incident",
+      proofClass: "recovery",
+    };
+    const read = vi.fn().mockResolvedValue(evidence);
+    mocks.getContainer.mockImplementation(() => {
+      throw new Error("runtime role NOLOGIN");
     });
+    mocks.localRecovery.mockReturnValue({
+      nodeId: "12345678-1234-4234-8234-123456789abc",
+      slug: "operator",
+      buildSha: sha,
+      recoveryReader: { read },
+    });
+    mocks.serverEnv.mockReturnValue({
+      APP_BUILD_SHA: sha,
+      DEPLOY_ENVIRONMENT: "candidate-a",
+    });
+    const response = await GET(request("/readyz?proof=recovery"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(evidence);
+    expect(read).toHaveBeenCalledWith(
+      expect.objectContaining({ expectedBuildSha: sha, proofClass: "recovery" })
+    );
+    expect(mocks.getContainer).not.toHaveBeenCalled();
+    expect(mocks.verifySystemTenant).not.toHaveBeenCalled();
+    mocks.getContainer.mockReset();
+  });
+
+  it("resolves a remote cell through the private sealed target without runtime DB access or caller SHA", async () => {
+    const evidence = {
+      status: "healthy",
+      buildSha: "b".repeat(40),
+      databaseSystemIdentifier: "123456",
+      incidentId: "reliability.v1:cell",
+      proofClass: "recovery",
+    };
+    const readBoundTarget = vi.fn().mockResolvedValue(evidence);
+    const read = vi.fn();
+    mocks.getContainer.mockImplementation(() => {
+      throw new Error("runtime role NOLOGIN");
+    });
+    mocks.localRecovery.mockReturnValue({
+      slug: "operator",
+      buildSha: "a".repeat(40),
+      recoveryReader: { read, readBoundTarget },
+    });
+    mocks.serverEnv.mockReturnValue({ DEPLOY_ENVIRONMENT: "candidate-a" });
+    const response = await GET(
+      request("/readyz?proof=recovery&node_slug=fixture")
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(evidence);
+    expect(readBoundTarget).toHaveBeenCalledWith({
+      nodeSlug: "fixture",
+      environment: "candidate-a",
+      proofClass: "recovery",
+    });
+    expect(read).not.toHaveBeenCalled();
+    expect(mocks.getContainer).not.toHaveBeenCalled();
+    expect(mocks.verifySystemTenant).not.toHaveBeenCalled();
+    mocks.getContainer.mockReset();
+  });
+
+  it("rejects unavailable scoped recovery instead of falling back to shallow readiness", async () => {
+    mocks.localRecovery.mockReturnValue({ buildSha: "a".repeat(40) });
+    const response = await GET(request("/readyz?proof=recovery"));
+    expect(response.status).toBe(503);
+    expect(mocks.getContainer).not.toHaveBeenCalled();
+    expect(mocks.verifySystemTenant).not.toHaveBeenCalled();
+  });
+
+  it("keeps the kubelet probe local-only even when every remote probe would stall", async () => {
+    const never = new Promise<never>(() => undefined);
+    mocks.checkEvmRpcConnectivity.mockReturnValue(never);
+    mocks.assertTemporalConnectivity.mockReturnValue(never);
+    mocks.assertSchedulerWorkerConnectivity.mockReturnValue(never);
+    mocks.assertKnowledgeStoreConnectivity.mockReturnValue(never);
+    mocks.verifySystemTenant.mockReturnValue(never);
 
     const response = await GET(request());
 
     expect(response.status).toBe(200);
     expect(mocks.assertEvmRpcConfig).toHaveBeenCalledOnce();
-    expect(mocks.checkEvmRpcConnectivity).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ APP_ENV: "production" }),
-      { forceLive: false }
-    );
-    expect(mocks.warn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: "substrate.evm_rpc.unreachable",
-        severity: "degraded",
-        dependency: "evm-rpc",
-      }),
-      expect.stringContaining("returning ready")
-    );
+    expect(mocks.checkEvmRpcConnectivity).not.toHaveBeenCalled();
+    expect(mocks.assertTemporalConnectivity).not.toHaveBeenCalled();
+    expect(mocks.assertSchedulerWorkerConnectivity).not.toHaveBeenCalled();
+    expect(mocks.assertKnowledgeStoreConnectivity).not.toHaveBeenCalled();
+    expect(mocks.verifySystemTenant).not.toHaveBeenCalled();
   });
 
   it("returns 503 when the mandatory RPC secret is missing", async () => {
@@ -214,7 +288,7 @@ describe("GET /readyz async substrate contract", () => {
     );
   });
 
-  it("keeps shallow readiness healthy and critically observes both missing dependencies", async () => {
+  it("does not consult missing async dependencies from shallow readiness", async () => {
     mocks.assertTemporalConnectivity.mockRejectedValue(
       new InfraConnectivityError("Temporal is unavailable")
     );
@@ -229,26 +303,10 @@ describe("GET /readyz async substrate contract", () => {
       status: "healthy",
       buildSha: "readyz-contract-sha",
     });
-    expect(mocks.verifySystemTenant).toHaveBeenCalledOnce();
-    expect(mocks.error).toHaveBeenCalledTimes(2);
-    expect(mocks.error).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: "substrate.temporal.unreachable",
-        severity: "critical",
-        reason: "INFRA_UNREACHABLE",
-        dependency: "temporal",
-      }),
-      expect.stringContaining("MISSION-CRITICAL substrate down")
-    );
-    expect(mocks.error).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: "substrate.scheduler_worker.unreachable",
-        severity: "critical",
-        reason: "INFRA_UNREACHABLE",
-        dependency: "scheduler-worker",
-      }),
-      expect.stringContaining("MISSION-CRITICAL substrate down")
-    );
+    expect(mocks.assertTemporalConnectivity).not.toHaveBeenCalled();
+    expect(mocks.assertSchedulerWorkerConnectivity).not.toHaveBeenCalled();
+    expect(mocks.verifySystemTenant).not.toHaveBeenCalled();
+    expect(mocks.error).not.toHaveBeenCalled();
   });
 
   it("returns 503 from the deep probe when Temporal is unavailable", async () => {
@@ -284,7 +342,7 @@ describe("GET /readyz async substrate contract", () => {
     expect(mocks.assertTemporalConnectivity).toHaveBeenCalledOnce();
     expect(mocks.verifySystemTenant).not.toHaveBeenCalled();
   });
-  it("keeps shallow readiness healthy but critically observes a wedged knowledge plane (bug.5386)", async () => {
+  it("does not consult a wedged knowledge plane from shallow readiness (bug.5386)", async () => {
     mocks.assertKnowledgeStoreConnectivity.mockRejectedValue(
       new InfraConnectivityError(
         "Knowledge store connectivity check failed: knowledge store did not answer within 3000ms (pool exhausted or wedged)"
@@ -293,19 +351,9 @@ describe("GET /readyz async substrate contract", () => {
 
     const response = await GET(request());
 
-    // Non-fatal by design: a knowledge-plane blip must not drain the fleet.
-    // What must NOT happen is silence — before this probe, candidate-a logged
-    // only "request received" and /readyz answered 200 with nothing to alert on.
     expect(response.status).toBe(200);
-    expect(mocks.error).toHaveBeenCalledWith(
-      expect.objectContaining({
-        event: "substrate.knowledge_store.unreachable",
-        severity: "critical",
-        reason: "INFRA_UNREACHABLE",
-        dependency: "knowledge-store",
-      }),
-      expect.stringContaining("MISSION-CRITICAL substrate down")
-    );
+    expect(mocks.assertKnowledgeStoreConnectivity).not.toHaveBeenCalled();
+    expect(mocks.error).not.toHaveBeenCalled();
   });
 
   it("returns 503 from the deep probe when the knowledge plane is wedged (bug.5386)", async () => {
@@ -327,7 +375,7 @@ describe("GET /readyz async substrate contract", () => {
   });
 
   it("probes the container's knowledge store port", async () => {
-    await GET(request());
+    await GET(request("/readyz?deep=1"));
 
     expect(mocks.assertKnowledgeStoreConnectivity).toHaveBeenCalledWith(
       expect.objectContaining({ domainExists: expect.any(Function) })

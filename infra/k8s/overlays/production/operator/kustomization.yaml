@@ -7,14 +7,53 @@ namespace: cogni-production
 
 resources:
   - ../../../base/node-app
+  - ../../../base/openfga-external
+  # story.5016 step 9, production (mirror of #2212 on candidate-a): the legacy
+  # compute-workload-controller is structurally removed so exactly ONE writer — the
+  # Crossplane transaction actuator below — can reach an Akash wallet from this env.
+  # Its old-account leases are closed (all 12 retired 2026-09-15) and its Console key
+  # is dead; the pod was pure reconcile-churn + memory on a full box.
+  - external-secret.yaml
+  - ../../../base/operator-migration-external-secret
+  - ./secrets-writer-sa.yaml
+  - ./compute-workload-platform-application.yaml
+  # story.5016 production cutover — the private Akash transaction actuator Crossplane calls.
+  # #2234 shipped the two ExternalSecrets deliberately WITHOUT this Deployment because a
+  # projected Secret source whose key is absent makes kubelet refuse the mount (FailedMount,
+  # Argo app Degraded, invisible to Loki — bug.5142). That ordering constraint is satisfied:
+  # the production credential is written and verified at cogni/production/akash-tx-actuator,
+  # so the Deployment can land and mount it.
   - ../../../base/akash-tx-actuator
   - ./akash-tx-actuator-external-secret.yaml
   - ./akash-tx-actuator-auth-external-secret.yaml
+  # bug.5240 — the keyless lease-log pump rides beside the actuator BECAUSE custody lives
+  # here: this cluster's actuator ledger receipts EVERY env's Akash lane (bug.5206/task.5132),
+  # so this one pump tails candidate-a + preview + production leases (UNFILTERED_ENUMERATION;
+  # each stream labeled from its receipt's own environment). bug.5142 mount ordering is
+  # satisfied IN the promote run that delivers this: node-substrate materialize seeds
+  # LOKI_LEASE_PUSH_* (CI-derived bootstrap, #2393) before the mount, and kubelet retries
+  # converge any race.
+  - ../../../base/lease-log-pump
+  # task.5247 — private read-only database status observation.
+  - ../../../base/database-reliability-actuator
+  - ./database-reliability-actuator-external-secret.yaml
 
 namePrefix: operator-
 
+# Runs AFTER the built-in namePrefix transformer and restores the actuator Service's
+# name to the bare `akash-tx-actuator` the Crossplane Composition dials. See
+# ../../../base/akash-tx-actuator-service-name for why the prefix is what gives.
 transformers:
   - ../../../base/akash-tx-actuator-service-name
+
+replacements:
+  - source:
+      kind: Application
+      name: compute-workload-platform
+      fieldPath: spec.destination.namespace
+    targets:
+      - select: { kind: Application, name: compute-workload-platform }
+        fieldPaths: [metadata.namespace]
 
 images:
   - name: ghcr.io/cogni-dao/cogni-template
@@ -22,6 +61,75 @@ images:
     newTag: "prod-placeholder-operator"
 
 patches:
+  - target:
+      kind: ExternalSecret
+      name: migration-secrets
+    patch: |
+      - op: replace
+        path: /spec/data/0/remoteRef/key
+        value: production/operator-database-migration
+  - target:
+      kind: Deployment
+      name: database-reliability-actuator
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: database-reliability-actuator
+      spec:
+        template:
+          spec:
+            containers:
+              - name: actuator
+                env:
+                  - name: DEPLOY_ENVIRONMENT
+                    value: production
+                  - name: FORK_DOMAIN_ROOT
+                    value: cognidao.org
+  - target:
+      kind: Deployment
+      name: node-app
+    patch: |
+      - op: replace
+        path: /spec/template/spec/initContainers/0/env/0/valueFrom/secretKeyRef/name
+        value: operator-migration-secrets
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: DATABASE_RELIABILITY_ACTUATOR_URL
+          value: http://operator-database-reliability-actuator:8080
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: DATABASE_RELIABILITY_STATUS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: operator-env-secrets
+              key: DATABASE_RELIABILITY_STATUS_TOKEN
+              optional: true
+  # bug.5240 — same BY-NAME env rule as the actuator patch below.
+  - target:
+      kind: Deployment
+      name: lease-log-pump
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: lease-log-pump
+      spec:
+        template:
+          spec:
+            containers:
+              - name: pump
+                env:
+                  - name: DEPLOY_ENVIRONMENT
+                    value: production
+  # story.5016 Gate 0b: env values are set BY NAME via strategic merge (env lists
+  # merge on `name`), never by positional JSON-pointer index. A positional
+  # `/env/N/value` patch silently repoints when the base list shifts — that exact
+  # failure (d69e5c29) blanked AKASH_ALLOWED_PROVIDERS fleet-wide. Since story.5050 a
+  # blanked value no longer closes every auction (empty == "no pin"), but a patch that
+  # silently repoints ANY of these values is still a fleet-wide incident.
   - target:
       kind: Deployment
       name: akash-tx-actuator
@@ -41,9 +149,109 @@ patches:
                       fieldRef: { fieldPath: metadata.namespace }
                   - name: DEPLOY_ENVIRONMENT
                     value: production
+                  # OPTIONAL PIN — NOT THE AUTHORIZATION BOUNDARY (story.5050). While
+                  # NON-EMPTY this is still a hard narrowing, and it still governs EVERY
+                  # cogni-dao node in EVERY environment (NS3 routes all real nodes to this
+                  # production writer), so candidate-a and preview placements are pinned here
+                  # too, not by their own overlays. What CHANGED: emptying this value no
+                  # longer refuses every bid — it means "no pin, screen on policy alone".
+                  # Set BY NAME via strategic merge, never a positional `/env/N/value` patch
+                  # (d69e5c29 blanked this list fleet-wide that way).
+                  #
+                  # THE LIST BELOW IS KEPT BUT IS KNOWN STALE. Measured against the live
+                  # registry 2026-09-30: 1848 providers registered, 30 online+audited+leasing,
+                  # 28 also custom-domain-capable, and only 6 of these 11 addresses qualify.
+                  # FIVE SLOTS ARE DEAD — overclock NL, Froggy RO and DSTM CH publish
+                  # `featEndpointCustomDomain=false`; ithub UA and RHITE FI are offline. That
+                  # rot, not the Akash market, is what held the poly node to one vendor across
+                  # ten dry auctions. Emptying this value is now the SAFE way to widen the
+                  # pool to all 28 qualifying providers; it is left populated here so that
+                  # unpinning production is a deliberate, separately-reviewed one-line change.
+                  #
+                  # zencloud (BE, Antwerp, AS5432 Proximus) hosts every production slot today.
+                  #
+                  # THE PERMITTED POOL (story.5050). A single-provider region is a single point of
+                  # failure, which is not theory: requiring [PT] against ONE allowlisted PT
+                  # provider produced `refused: not_allowlisted=5, required_country=1` and closed
+                  # the deployment — the filter worked perfectly and nothing could win, because
+                  # the one eligible provider simply did not bid that round. The cell is a SET;
+                  # the allowlist has to be one too. The quality screen, price-outlier exclusion,
+                  # and derived strike blacklist are the safety boundary; this coarse allowlist
+                  # must not second-guess them by carrying only providers that happened to look
+                  # attractive during one capacity snapshot. The ten non-BE providers below sit
+                  # in Polymarket-PERMITTED jurisdictions and are Overclock-audited (verified on
+                  # the SDL anchor, not just Console's isAudited flag):
+                  # (state as re-measured 2026-09-30 — DEAD slots can no longer win a bid):
+                  #   akash1hgulk6… digital frontier  PT Evora   AS5626
+                  #   akash1aaul837… digital frontier BG Sofia
+                  #   akash19tp6w64… DSTM             CH Zurich       DEAD no custom-domain
+                  #   akash1z9nr23c… digital frontier FI Helsinki
+                  #   akash1svfr9xa… overclock        NL Amsterdam    DEAD no custom-domain
+                  #   akash1s3hq36… Froggy Servers   RO Cluj-Napoca  DEAD no custom-domain
+                  #   akash1cvcfyad… proxyua          UA
+                  #   akash1rja3y2c… Pronto-AI        UA
+                  #   akash1v0f04wr… ithub            UA Kyiv         DEAD offline
+                  #   akash127x6cuk… RHITE            FI Helsinki     DEAD offline
+                  #   akash15pkdke… h100/val         NL Amsterdam (story.5050)
+                  # That last one is why this list moved again. Console advertises it as GB,
+                  # but the provider DECLARES `country=NL, city=AMS, datacenter=eu-west-ams-1,
+                  # hosting-provider=Overclock` on chain. Only the GeoIP of its ingress says
+                  # GB, at 51.5072,-0.1276 — central London, the default coordinate a
+                  # registrant gets when nothing better is known. The screener reads the
+                  # DECLARED field and falls back to GeoIP, logging
+                  # `akash_provider_country_source_disagreement` when they differ. No
+                  # per-owner correction table — that would rot exactly like this list does.
+                  #
+                  # WHY THIS LIST IS THE REAL CAP — MEASURED, not inferred (story.5050).
+                  # Posted poly's EXACT spec (cpu 2 / 2048Mi / 4096Mi, signedBy overclock,
+                  # accept poly.cognidao.org, both nginx and poly's own private image) to the
+                  # open market from a throwaway wallet. Ten bids in ten seconds, twice. Three
+                  # of them sit INSIDE poly's country set and OUTSIDE this list:
+                  #
+                  #   alphavps  BG   8.00
+                  #   oni       PT  28.00
+                  #   hetzner   FI  16.00
+                  #
+                  # Meanwhile poly's own gen-16 auction drew 8 bids and refused every one:
+                  # `quality=1, not_allowlisted=3, required_country=4`. Every refusal was
+                  # CORRECT — the screener is not broken. The pool was simply never allowed to
+                  # contain a provider that could win. Eleven consecutive dry auctions and
+                  # four days of country-set tuning were aimed at the minor filter; THIS is
+                  # the major one, and `not_allowlisted` is evaluated FIRST (first-match-wins
+                  # in `rejectionFor`), so those bids were never even country-evaluated.
+                  #
+                  # Five of the entries above are already dead: overclock NL, Froggy RO and
+                  # DSTM CH declare featEndpointCustomDomain=FALSE (every node has a
+                  # publicHost, so they can only win a lease and 404 — that was bug.5325, a
+                  # declared capability we never read), and ithub UA + RHITE FI are offline.
+                  # Every gate that actually matters fires independently of this list:
+                  # on-chain audit, the node-catalog country requirement, quality,
+                  # price-outlier and strike blacklisting. Keep it only as an optional pin;
+                  # policy must not be a hand-maintained enumeration.
+                  # DSTM's larger CH box is deliberately ABSENT: it reports 0 active leases, and
+                  # the screener's quality filter requires activeLeases>0 as proof of registry
+                  # egress, so allowlisting it would only add a bid that is refused anyway.
+                  #
+                  # digital frontier (PT, Evora, AS5626 Onitelecom) is added for story.5050:
+                  # Belgium is a Polymarket API-restricted jurisdiction, so a node with a
+                  # geo-fenced outbound dependency cannot satisfy its own product contract from
+                  # the BE provider (bug.5270 — 200/200 prod CLOB orders refused 403).
+                  #
+                  # WIDENING THIS LIST MOVES NOTHING BY ITSELF. Placement binds only on a fresh
+                  # mint, so every existing lease is untouched; and which of these two a given
+                  # node MAY use is now the node's own catalog cell
+                  # (`required_placement_countries.<env>`), which FILTERS bids fail-closed.
                   - name: AKASH_ALLOWED_PROVIDERS
-                    value: akash16yr3wxt97ae045a06kr3ycde9srcgpg8syjxxm
+                    value: akash16yr3wxt97ae045a06kr3ycde9srcgpg8syjxxm,akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk,akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z,akash19tp6w64zvdvdh26pv5lyf4f40llnqthgfy0t48,akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x,akash1svfr9xarfkcxwdnx32nvl8cs9rfruu4nd56c4f,akash1s3hq36mpas4nmkqasn7fgwhs9968cgl3u5esnw,akash1cvcfyadrm6gcghzspyhacw924c90lwnjkhcglm,akash1rja3y2ctj3tzmesvh0zfhzzx95rfjw405hwt8d,akash1v0f04wr3tkh9uf43q9eqfd0whpfeu8qevlq99h,akash127x6cuk44ul3azferg8wy9fju686kcf6x2dhz7,akash15pkdkewzarpsx42t98vzf45h42hlq6ra8w96hr
                   - name: AKASH_ACTUATOR_ACCOUNT_ID
+                    # PUBLIC, non-secret Akash account address of the operator sponsor wallet.
+                    # Asserted at boot by assertActuatorWalletAccount() against Console
+                    # /v1/wallets, so the actuator refuses to start if its credential resolves
+                    # to any other account. Unlike candidate-a (which kept the original shared
+                    # account), production spends from its own DEDICATED funded account —
+                    # ONE_WALLET_ONE_ACTIVE_WRITER is per environment, and this pin is the
+                    # non-secret half of that proof (the credential lives only at
+                    # cogni/production/akash-tx-actuator, never in the operator bucket).
                     value: "akash10auj6u6wr7aqjawuxurgue9w7wfnca50t8cr4l"
   # Node-specific ConfigMap values.
   # DNS names must match prefixed Service names (namePrefix applies to all resources).
@@ -54,6 +262,11 @@ patches:
       - op: replace
         path: /data/NODE_NAME
         value: "operator"
+      # Deploy-env name the secrets route stamps onto the OpenBao path
+      # (cogni/<env>/<node>/<KEY>). Distinct from APP_ENV (a build flag).
+      - op: add
+        path: /data/DEPLOY_ENVIRONMENT
+        value: "production"
       - op: replace
         path: /data/TEMPORAL_NAMESPACE
         value: "cogni-production"
@@ -69,9 +282,49 @@ patches:
       - op: add
         path: /data/NEXTAUTH_URL
         value: "https://cognidao.org"
-      # Public, non-secret account identity. Keep the test-parent production overlay internally
-      # complete even though candidate-a is this PR's proof lane: the shared env-manager and
-      # invariant suite derive lease-generation evidence from each funded environment's own pin.
+      - op: add
+        path: /data/NODE_MINT_OWNER
+        value: "cogni-dao"
+      - op: add
+        path: /data/NODE_TEMPLATE_OWNER
+        value: "cogni-dao"
+      - op: add
+        path: /data/NODE_SUBMODULE_PARENT_OWNER
+        value: "cogni-dao"
+      - op: add
+        path: /data/NODE_SUBMODULE_PARENT_REPO
+        value: "cogni"
+      # Explicit canonical runtime catalog/deploy-state source. Keep this
+      # separate from the repository that receives formation pin PRs.
+      - op: add
+        path: /data/NODE_REGISTRY_CATALOG_OWNER
+        value: "cogni-dao"
+      - op: add
+        path: /data/NODE_REGISTRY_CATALOG_REPO
+        value: "cogni"
+      - op: add
+        path: /data/DOLTHUB_OWNER
+        value: "cogni-dao"
+      # Non-prod mirror org: prod publish ALSO creates <this>/<slug> so a fresh
+      # node's candidate-a/preview mirror target exists (bug.5002). The prod PAT is
+      # cross-org (creates in cogni-dao AND cogni-test-nodes); non-prod holds no PAT
+      # (bug.5003), so this bootstrap can only run here on prod.
+      - op: add
+        path: /data/DOLTHUB_NONPROD_OWNER
+        value: "cogni-test-nodes"
+      - op: add
+        path: /data/OPENFGA_API_URL
+        value: "http://operator-openfga-external:8080"
+      # Node self-serve secret writes — operator's OpenBao writer role (SA +
+      # projected token wired on the Deployment below). OPENBAO_ADDR defaults to
+      # the in-cluster ClusterIP, so only the role name is set here.
+      - op: add
+        path: /data/OPENBAO_NODE_SECRETS_WRITER_ROLE
+        value: "production-node-secrets-writer"
+      # App-side READ pin (story.5039 lease views + task.5132 env-verb generation
+      # evidence): createLeaseReadCapability returns undefined without it, so the
+      # app's read-only lease/receipt views stay unwired. Same PUBLIC value the
+      # akash-tx-actuator Deployment pins above — an on-chain address, NOT a secret.
       - op: add
         path: /data/AKASH_ACTUATOR_ACCOUNT_ID
         value: "akash10auj6u6wr7aqjawuxurgue9w7wfnca50t8cr4l"
@@ -96,13 +349,34 @@ patches:
     patch: |
       - op: replace
         path: /spec/template/spec/containers/0/envFrom/1/secretRef/name
-        value: "operator-node-app-secrets"
+        value: "operator-env-secrets"
       - op: replace
         path: /spec/template/spec/initContainers/0/envFrom/1/secretRef/name
-        value: "operator-node-app-secrets"
-      - op: replace
-        path: /spec/template/spec/initContainers/0/envFrom/1/secretRef/name
-        value: "operator-node-app-secrets"
+        value: "operator-env-secrets"
+      # design.node-self-serve-secrets §1.B: the operator pod's OWN OpenBao
+      # identity. serviceAccountName resolves to operator-secrets-writer
+      # (namePrefix), bound by the production-node-secrets-writer k8s-auth role.
+      # Projected token carries the cogni-openbao audience (default audience is
+      # bound to no role — silent-auth trap). SSA (#1642) keeps this drift-free.
+      - op: add
+        path: /spec/template/spec/serviceAccountName
+        value: secrets-writer
+      - op: add
+        path: /spec/template/spec/volumes
+        value:
+          - name: openbao-token
+            projected:
+              sources:
+                - serviceAccountToken:
+                    path: token
+                    audience: cogni-openbao
+                    expirationSeconds: 3600
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts
+        value:
+          - name: openbao-token
+            mountPath: /var/run/secrets/openbao
+            readOnly: true
       - op: add
         path: /spec/selector/matchLabels/app.kubernetes.io~1instance
         value: "operator"
@@ -132,7 +406,7 @@ patches:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: operator-node-app-secrets
+                  name: operator-env-secrets
                   key: DOLTGRES_URL
           resources:
             requests:
@@ -170,6 +444,16 @@ patches:
       kind: Service
       metadata:
         name: litellm-external
+      spec:
+        type: ExternalName
+        externalName: cogni.vm.cognidao.org
+        clusterIP: null
+  - target: { kind: Service, name: openfga-external }
+    patch: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: openfga-external
       spec:
         type: ExternalName
         externalName: cogni.vm.cognidao.org

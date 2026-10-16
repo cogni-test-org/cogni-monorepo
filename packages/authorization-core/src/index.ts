@@ -19,7 +19,8 @@ export type AuthzAction =
   | "node.flight"
   | "node.manage_secrets"
   | "node.promote_production"
-  | "node.manage_envs";
+  | "node.manage_envs"
+  | "node.administer";
 
 export const AUTHZ_ACTIONS = [
   "tool.execute",
@@ -30,6 +31,7 @@ export const AUTHZ_ACTIONS = [
   "node.manage_secrets",
   "node.promote_production",
   "node.manage_envs",
+  "node.administer",
 ] as const satisfies readonly AuthzAction[];
 
 export type AuthzDecisionCode =
@@ -79,6 +81,14 @@ export interface AuthorizationPort {
   check(params: AuthzCheckParams): Promise<AuthzDecision>;
   writeRelation(tuple: AuthzRelationTuple): Promise<AuthzWriteDecision>;
   deleteRelation(tuple: AuthzRelationTuple): Promise<AuthzWriteDecision>;
+  /**
+   * Lists the stored relation tuples a subject holds (the directly-assigned
+   * ROLE grants, e.g. `developer`/`production_promoter`, not computed
+   * capabilities). Read plane — fail-closed-WITH-DISTINCTION: an infra failure
+   * returns `authz_list_unavailable` (never a silent empty list that would read
+   * as "no grants"). `user` is a resource string (`user:<id>`).
+   */
+  listRelations(user: string): Promise<AuthzListDecision>;
 }
 
 export interface AuthzRelationTuple {
@@ -95,6 +105,18 @@ export type AuthzWriteDecision =
   | {
       readonly decision: "failure";
       readonly code: "authz_write_unavailable";
+      readonly reason?: string;
+    };
+
+export type AuthzListDecision =
+  | {
+      readonly decision: "success";
+      readonly code: "authz_list_success";
+      readonly tuples: readonly AuthzRelationTuple[];
+    }
+  | {
+      readonly decision: "failure";
+      readonly code: "authz_list_unavailable";
       readonly reason?: string;
     };
 
@@ -136,6 +158,12 @@ export function relationForAuthzAction(action: AuthzAction): string {
       return "can_promote_production";
     case "node.manage_envs":
       return "can_manage_envs";
+    case "node.administer":
+      // Node-admin (hub-admin) scope — the directly-assignable `admin` relation in the
+      // OpenFGA model, deliberately above env_manager. Gates repo-governance verbs that
+      // flip GitHub Actions permissions (reconcile-actions). No model change: `admin`
+      // already exists on `type node` and is held by the node owner.
+      return "admin";
   }
 }
 
@@ -143,6 +171,9 @@ export {
   OpenFgaAuthorizationAdapter,
   type OpenFgaAuthorizationAdapterConfig,
   type OpenFgaCheckClient,
+  type OpenFgaReadClient,
+  type OpenFgaReadRequest,
+  type OpenFgaReadResponse,
   type OpenFgaStoreClient,
   type OpenFgaWriteClient,
 } from "./adapters/openfga-authorization.adapter";

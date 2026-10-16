@@ -90,6 +90,15 @@ appsets_kustomization_rel_path() {
 # Callers pass the control env they already resolved, so this stays a pure formatting rule
 # with one definition. Empty for every row that exists today (control == lane), so nothing
 # migrates; a foreign-custodied lane is new by construction and is born correct.
+#
+# WHAT ITS DB CALLERS NOW PASS (bug.5299): not `control_env_for` but `lane_db_vm_env <node>
+# <lane>` (scripts/ci/lib/lane-db-residency.sh) — the one cell that answers "whose Postgres
+# instance holds this lane's database", of which the control env was only ever a proxy. The
+# two agree for every pinned pair, which today is every misresident pair, so the names are
+# unchanged. This function is KEPT and must not be deleted: re-pinning a lane is how a
+# residency cutover is rolled back, and the rollback needs the suffix to still exist.
+# `lane_db_residency_status` deliberately still passes the control env — it is asking the
+# PROXY question on purpose, as the interlock that keeps the pin ledger honest.
 lane_db_suffix() {
   local lane="$1" control="$2"
   [ -n "$lane" ] && [ "$control" != "$lane" ] || return 0
@@ -103,4 +112,16 @@ lanes_reconciled_by() {
     [ "$(control_env_for "$env" "$node")" = "$want" ] || continue
     printf '%s\n' "$env"
   done
+}
+
+# Unique catalog authority for reliability private-service ownership in one environment.
+# Never infer an operator node name; renamed forks retain the same declaration.
+reliability_controller_for_env() {
+  local env="$1" controllers
+  controllers="$(yq -N "select(.type == \"node\" and .reliability.controller == true and (.envs | contains([\"${env}\"]))) | .name" "${CATALOG_DIR}"/*.yaml)" || return 1
+  [[ "$controllers" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || {
+    echo '[ERROR] reliability requires exactly one catalog controller in this environment' >&2
+    return 1
+  }
+  printf '%s' "$controllers"
 }

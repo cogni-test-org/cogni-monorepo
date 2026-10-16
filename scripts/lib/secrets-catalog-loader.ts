@@ -86,10 +86,6 @@ const GenerateSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("base64"), bytes: z.number().int().positive() }),
   z.object({ kind: z.literal("hex"), bytes: z.number().int().positive() }),
   z.object({
-    kind: z.literal("flight-probe-key-ring"),
-    bytes: z.number().int().min(32),
-  }),
-  z.object({
     kind: z.literal("sk-cogni"),
     randHexBytes: z.number().int().positive(),
   }),
@@ -128,7 +124,7 @@ export type SyncTarget = z.infer<typeof SyncTargetSchema>;
 /**
  * Non-node PLATFORM SERVICES that own their own OpenBao bucket + ExternalSecret.
  *
- * A "node" is a bundle of services (node-baas-architecture.md), and Invariant 1 makes
+ * A "node" is a bundle of services (https://cognidao.org/knowledge/node-baas-substrate-model), and Invariant 1 makes
  * `<service>` the catalog name in `cogni/<env>/<service>/<KEY>` — so a service whose blast
  * radius must NOT be the owning node's gets its own `<service>` rather than borrowing the
  * node's. That is the whole point: the operator app consumes the ENTIRE `cogni/<env>/operator`
@@ -141,6 +137,11 @@ export type SyncTarget = z.infer<typeof SyncTargetSchema>;
  * - `akash-tx-actuator`: the private Akash transaction actuator (task.5102). It holds the
  *   operator sponsor wallet's Console credential and the bearer token that unlocks it; an
  *   operator-app compromise must not reach either (story.5016 secret-boundary amendments).
+ * - `database-reliability-actuator`: a private control process whose dedicated OpenBao
+ *   bucket contains the generated, least-privilege Postgres control DSN and status-read
+ *   bearer (tasks 5246/5247). The public operator receives only the latter.
+ * - `database-reliability-readmitter`: a separate human-command process whose bucket
+ *   contains the readmit-only Postgres DSN and narrow command bearer.
  *
  * These are NOT nodes: they receive no node DNS, no node DB, and no NODE_BASELINE_KEYS
  * fan-out. `_node_gets_key` already drops a `service:`-pinned key from every node whose name
@@ -148,7 +149,28 @@ export type SyncTarget = z.infer<typeof SyncTargetSchema>;
  */
 export const PLATFORM_SERVICES: ReadonlySet<string> = new Set([
   "akash-tx-actuator",
+  "database-reliability-actuator",
+  "database-reliability-readmitter",
 ]);
+
+/** setup-secrets must never mirror private platform-service values to GitHub. */
+export function isSetupSecretsManaged(
+  name: string,
+  routing: Readonly<Record<string, SecretRouting>>
+): boolean {
+  const route = routing[name];
+  // Private node-scoped DB components are composed by the sole OpenBao writer,
+  // including dynamic per-cell banks. They are not GitHub setup inputs.
+  if (
+    route?.tier === "A1" &&
+    route.appliesTo === "database" &&
+    route.consumedBy?.includes("compose") &&
+    !route.consumedBy.includes("pod")
+  )
+    return false;
+  const service = route?.service;
+  return service === undefined || !PLATFORM_SERVICES.has(service);
+}
 
 const CatalogEntrySchema = z
   .object({
@@ -176,8 +198,9 @@ const CatalogEntrySchema = z
     required: z.boolean(),
     category: z.string(),
     // ORIGIN of the value: agent = we generate it (`generate:` required);
-    // human = vendor-minted, a human supplies it once (un-generatable by us).
-    source: z.enum(["agent", "human"]),
+    // human = vendor-minted; derived = canonical materializer composes owned inputs.
+    // Derived structured custody is never a random credential or human prompt.
+    source: z.enum(["agent", "human", "derived"]),
     // Orthogonal axis — does the value ALSO live in an external system that we
     // must keep in lockstep? A generated value can still need mirroring outward
     // (e.g. the GitHub App webhook secret: source: agent + syncTo: the App).
@@ -188,14 +211,11 @@ const CatalogEntrySchema = z
     url: z.string().url().optional(),
     perEnv: z.boolean().optional(),
     repoLevel: z.boolean().optional(),
-    // Generated only by a dedicated runtime materializer. setup-secrets must
-    // never stage it in GitHub Environment Secrets as a parallel authority.
-    materializeOnly: z.boolean().optional(),
     generate: GenerateSchema.optional(),
     transform: TransformSchema.optional(),
   })
-  .refine((e) => e.source !== "agent" || e.generate !== undefined, {
-    message: "source: agent requires generate field",
+  .refine((e) => e.source === "human" || e.generate !== undefined, {
+    message: "source: agent or derived requires generate field",
   })
   .refine((e) => !(e.service !== undefined && e.appliesTo !== undefined), {
     message:
@@ -217,14 +237,13 @@ export interface Secret {
   required: boolean;
   category: string;
   description: string;
-  source: "agent" | "human";
+  source: "agent" | "human" | "derived";
   syncTo?: SyncTarget;
   url?: string;
   steps: string[];
   generate?: () => string;
   perEnv?: boolean;
   repoLevel?: boolean;
-  materializeOnly?: boolean;
   transform?: (value: string) => string;
 }
 
@@ -420,8 +439,6 @@ function catalogEntryToSecret(entry: CatalogEntry): Secret {
   if (entry.syncTo !== undefined) secret.syncTo = entry.syncTo;
   if (entry.perEnv !== undefined) secret.perEnv = entry.perEnv;
   if (entry.repoLevel !== undefined) secret.repoLevel = entry.repoLevel;
-  if (entry.materializeOnly !== undefined)
-    secret.materializeOnly = entry.materializeOnly;
   if (entry.generate !== undefined) {
     secret.generate = generatorFor(entry.generate);
   }
@@ -437,8 +454,6 @@ function generatorFor(g: z.infer<typeof GenerateSchema>): () => string {
       return () => rand64(g.bytes);
     case "hex":
       return () => randHex(g.bytes);
-    case "flight-probe-key-ring":
-      return () => JSON.stringify({ active: rand64(g.bytes), previous: null });
     case "sk-cogni":
       return () => `sk-cogni-${randHex(g.randHexBytes)}`;
     case "static":

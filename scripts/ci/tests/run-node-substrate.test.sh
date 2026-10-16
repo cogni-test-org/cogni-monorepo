@@ -28,8 +28,9 @@ CATALOG_FIXTURE="$TMPROOT/catalog"
 mkdir -p "$CATALOG_FIXTURE"
 export COGNI_CATALOG_ROOT="$CATALOG_FIXTURE"
 for n in node-template operator toks4 k3snode; do
-  printf 'name: %s\nenvs: [candidate-a, preview, production]\n' "$n" > "$CATALOG_FIXTURE/$n.yaml"
+  printf 'name: %s\ntype: node\nenvs: [candidate-a, preview, production]\n' "$n" > "$CATALOG_FIXTURE/$n.yaml"
 done
+printf 'reliability: { controller: true }\n' >> "$CATALOG_FIXTURE/operator.yaml"
 # toks4 is akash in PRODUCTION ONLY — control env == env in every lane it holds, which is
 # every existing fleet row. Case 5 must stay byte-identical to its pre-bug.5206 expectation.
 printf 'name: toks4\nenvs: [production]\ndeployment_provider:\n  production: akash\n' > "$CATALOG_FIXTURE/toks4.yaml"
@@ -63,16 +64,6 @@ EOF
   chmod +x "$1"
 }
 
-# Most existing cases predate the orthogonal control-vault credential phase and
-# assert the materialize/reconcile ordering only. Keep that phase inert there;
-# Case 7b below proves its exact control-lane calls separately.
-cat > "$TMPROOT/flight-noop.sh" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
-chmod +x "$TMPROOT/flight-noop.sh"
-export RUN_NODE_SUBSTRATE_FLIGHT_PROBE_BIN="$TMPROOT/flight-noop.sh"
-
 # ── Case 1: happy path — materialize then reconcile, same args, in order ──────
 mk_stub "$TMPROOT/mat.sh" materialize 0
 mk_stub "$TMPROOT/rec.sh" reconcile 0
@@ -86,6 +77,32 @@ want="materialize candidate-a node-template|reconcile candidate-a node-template"
 [ "$got" = "$want" ] || { echo "order/args mismatch:
   got:  $got
   want: $want" >&2; exit 1; }
+
+# Cold owner flight: precreate -> read-only reconcile -> same writer seals the native receipt.
+cat > "$TMPROOT/mat-owner.sh" <<EOF
+#!/usr/bin/env bash
+echo "materialize-\${SECRET_MATERIALIZE_PHASE:-pre-reconcile} \$1 \$2" >> "$ORDER"
+EOF
+chmod +x "$TMPROOT/mat-owner.sh"
+: > "$ORDER"
+RUN_NODE_SUBSTRATE_MATERIALIZE_BIN="$TMPROOT/mat-owner.sh" \
+RUN_NODE_SUBSTRATE_RECONCILE_BIN="$TMPROOT/rec.sh" \
+  bash "$RUNNER" candidate-a operator >/dev/null
+[ "$(paste -sd'|' - < "$ORDER")" = "materialize-pre-reconcile candidate-a operator|reconcile candidate-a operator|materialize-db-ready candidate-a operator" ] \
+  || { echo "cold owner seal phase did not follow DB reconcile" >&2; exit 1; }
+
+# Renamed controller keeps ownership entirely in catalog; duplicate/missing owner fails.
+sed 's/name: operator/name: neutral-controller/' "$CATALOG_FIXTURE/operator.yaml" > "$CATALOG_FIXTURE/neutral-controller.yaml"
+sed -i.bak '/reliability:/d' "$CATALOG_FIXTURE/operator.yaml"
+rm "$CATALOG_FIXTURE/operator.yaml.bak"
+: > "$ORDER"
+RUN_NODE_SUBSTRATE_MATERIALIZE_BIN="$TMPROOT/mat-owner.sh" \
+RUN_NODE_SUBSTRATE_RECONCILE_BIN="$TMPROOT/rec.sh" \
+  bash "$RUNNER" candidate-a neutral-controller >/dev/null
+[ "$(paste -sd'|' - < "$ORDER")" = "materialize-pre-reconcile candidate-a neutral-controller|reconcile candidate-a neutral-controller|materialize-db-ready candidate-a neutral-controller" ] || exit 1
+printf 'reliability: { controller: true }\n' >> "$CATALOG_FIXTURE/operator.yaml"
+if RUN_NODE_SUBSTRATE_MATERIALIZE_BIN="$TMPROOT/mat-owner.sh" RUN_NODE_SUBSTRATE_RECONCILE_BIN="$TMPROOT/rec.sh" bash "$RUNNER" candidate-a operator >/dev/null 2>&1; then echo 'duplicate controller accepted' >&2; exit 1; fi
+rm "$CATALOG_FIXTURE/neutral-controller.yaml"
 
 # ── Case 2: materialize fails → reconcile must NOT run; runner exits non-zero ──
 mk_stub "$TMPROOT/mat.sh" materialize 7
@@ -155,29 +172,41 @@ want="materialize production toks4|reconcile production toks4 provider=akash|ass
   got:  $got
   want: $want" >&2; exit 1; }
 
-# ── Case 6: SECRETS FOLLOW THE RECONCILING CLUSTER, DB SUBSTRATE FOLLOWS THE ENV.
-#    bug.5206. An akash node's non-production lane is reconciled by the production cluster,
-#    so its secrets belong in THAT vault. The flight running against the lane's OWN VM must
-#    decline the materialize + secret-bank assert it cannot legitimately make — and must
-#    STILL reconcile, because the workload dials this env's substrate host. ─────────────
-mk_stub "$TMPROOT/mat.sh" materialize 0
+# ── Case 6: the existing job selects the custodian's VM/key, while its target
+# lane keeps its own public domain and Postgres residency. No empty green path.
+cat > "$TMPROOT/mat.sh" <<EOF
+#!/usr/bin/env bash
+echo "materialize \$1 \$2 control=\${SECRETS_CONTROL_ENV:-unset} domain=\${DOMAIN:-unset}" >> "$ORDER"
+EOF
+chmod +x "$TMPROOT/mat.sh"
 mk_stub "$TMPROOT/rec.sh" reconcile 0
 mk_stub "$TMPROOT/assert.sh" assert 0
 : > "$ORDER"
-DEPLOYMENT_PROVIDER=akash COGNI_CATALOG_ROOT="$CATALOG_FIXTURE" \
+DEPLOYMENT_PROVIDER=akash COGNI_CATALOG_ROOT="$CATALOG_FIXTURE" DOMAIN=cognidao.org \
 RUN_NODE_SUBSTRATE_MATERIALIZE_BIN="$TMPROOT/mat.sh" \
 RUN_NODE_SUBSTRATE_RECONCILE_BIN="$TMPROOT/rec.sh" \
 RUN_NODE_SUBSTRATE_ASSERT_BIN="$TMPROOT/assert.sh" \
   bash "$RUNNER" candidate-a polyfix >/dev/null
-# A foreign-custodied lane has NO substrate on its own VM: the vault bank, the database, the
-# roles and the Temporal namespace all belong to the control cluster and are provisioned by
-# THAT cluster's run. Reconciling here mints `<control>-db-reader` against the LANE's OpenBao,
-# where it does not exist, and kills the flight. Doing nothing is the correct amount of work.
 got="$(paste -sd'|' - < "$ORDER")"
-want=""
-[ "$got" = "$want" ] || { echo "a foreign-custodied lane's own flight must touch NOTHING on its own VM:
+want="materialize candidate-a polyfix control=production domain=test.cognidao.org|reconcile candidate-a polyfix|assert candidate-a polyfix"
+[ "$got" = "$want" ] || { echo "a custodian-authorized foreign-lane job must materialize, reconcile and assert:
   got:  $got
-  want: <nothing>" >&2; exit 1; }
+  want: $want" >&2; exit 1; }
+
+# The foreign target remains fatal, unlike a degraded sibling in a production replay.
+mk_stub "$TMPROOT/mat.sh" materialize 7
+: > "$ORDER"
+if DEPLOYMENT_PROVIDER=akash DOMAIN=cognidao.org \
+   RUN_NODE_SUBSTRATE_MATERIALIZE_BIN="$TMPROOT/mat.sh" \
+   RUN_NODE_SUBSTRATE_RECONCILE_BIN="$TMPROOT/rec.sh" \
+   RUN_NODE_SUBSTRATE_ASSERT_BIN="$TMPROOT/assert.sh" \
+     bash "$RUNNER" candidate-a polyfix >/dev/null 2>&1; then
+  echo 'foreign target materialize failure must fail the runner' >&2; exit 1
+fi
+if grep -qE '^(reconcile|assert)' "$ORDER"; then
+  echo 'foreign materialize failure reached a later phase' >&2; exit 1
+fi
+mk_stub "$TMPROOT/mat.sh" materialize 0
 
 # ── Case 7: the control env writes its OWN secrets AND every lane it reconciles. ─────
 : > "$ORDER"
@@ -194,22 +223,6 @@ want="materialize production polyfix|materialize candidate-a polyfix|materialize
 [ "$got" = "$want" ] || { echo "the reconciling cluster must hold every lane it reconciles:
   got:  $got
   want: $want" >&2; exit 1; }
-
-# ── Case 7b: only the fleet-control run materializes operator-owned flight
-# credentials, once for its own lane and once for each foreign-custodied lane.
-mk_stub "$TMPROOT/flight.sh" flight-probe 0
-: > "$ORDER"
-DEPLOYMENT_PROVIDER=akash COGNI_CATALOG_ROOT="$CATALOG_FIXTURE" \
-RUN_NODE_SUBSTRATE_MATERIALIZE_BIN="$TMPROOT/mat.sh" \
-RUN_NODE_SUBSTRATE_FLIGHT_PROBE_BIN="$TMPROOT/flight.sh" \
-RUN_NODE_SUBSTRATE_RECONCILE_BIN="$TMPROOT/rec.sh" \
-RUN_NODE_SUBSTRATE_ASSERT_BIN="$TMPROOT/assert.sh" \
-  bash "$RUNNER" production polyfix >/dev/null
-got="$(grep '^flight-probe' "$ORDER" | paste -sd'|' -)"
-want_flight="flight-probe materialize production|flight-probe materialize candidate-a|flight-probe materialize preview"
-[ "$got" = "$want_flight" ] || { echo "fleet-control credential lanes mismatch:
-  got:  $got
-  want: $want_flight" >&2; exit 1; }
 
 # The real materializer/reconciler invoke cogni_ssh_transport_retry, whose stdin buffering used
 # to drain the heredoc that also carried the lane loop. A child that consumes stdin must not make
