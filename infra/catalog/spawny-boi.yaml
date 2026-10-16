@@ -7,7 +7,7 @@ image_tag_suffix: "-spawny-boi"
 migrator_tag_suffix: "-spawny-boi-migrate"
 source_repo: https://github.com/cogni-test-org/spawny-boi.git
 image_repository: ghcr.io/cogni-test-org/spawny-boi
-source_sha: bef8ba3f93efdd106da8d102a1cdf4f889c338df
+source_sha: 662d748423b9698ed77adb41f93103a2c79b2fa6
 candidate_a_branch: deploy/candidate-a-spawny-boi
 preview_branch: deploy/preview-spawny-boi
 production_branch: deploy/production-spawny-boi
@@ -15,6 +15,10 @@ production_branch: deploy/production-spawny-boi
 # candidate-a proof slot and canonical production; PREVIEW_IS_ABSENT_AT_BIRTH. Closing the
 # candidate after the proof is the ordinary env verb ({env:candidate-a, present:false}).
 envs: [candidate-a, preview, production]
+database:
+  candidate-a: { tier: shared, budget_profile: shared-default-v1 }
+  preview: { tier: shared, budget_profile: shared-default-v1 }
+  production: { tier: shared, budget_profile: shared-default-v1 }
 # story.5025 — BORN_ON_AKASH. Placement is stated at birth, never inherited from the k3s
 # fallback that exists for rows minted before decentralized compute did.
 deployment_provider:
@@ -35,8 +39,8 @@ compute_api:
   preview: crossplane
   production: crossplane
 lease_generation:
-  candidate-a: 4
-  preview: 3
+  candidate-a: 5
+  preview: 4
   production: 0
 # story.5025 — birth authority is PRODUCTION, the only environment that receives Git
 # webhooks (ACTIVITY_FOLLOWS_INGEST, bug.5079). Born here it is immutable for life: a
