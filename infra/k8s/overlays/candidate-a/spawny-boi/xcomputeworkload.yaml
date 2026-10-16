@@ -11,13 +11,13 @@ spec:
   nodeId: d520f82e-486a-40f1-9e4f-c8ef7a016e9a
   environment: candidate-a
   bundle:
-    ref: ghcr.io/cogni-test-org/spawny-boi@sha256:c7929936eb0cc051fbf6605218fa332aa55d364376c1ba0ab2de0f3bec8186e4
+    ref: ghcr.io/cogni-test-org/spawny-boi@sha256:6683035a284d290afbfdd1cd272fa0ba23cfad53891c75e9ac0b5d860bcf9e84
     source:
       repository: cogni-test-org/spawny-boi
       sha: b257a088ec1ca8ad663450bcf64551a1176d7f65
     artifacts:
       - name: app
-        image: ghcr.io/cogni-test-org/spawny-boi@sha256:c4e9e39e89b610cf44abcd1e844e10e85303e45548bb98e8733bfd8c7e3e4891
+        image: ghcr.io/cogni-test-org/spawny-boi@sha256:11f38a331d9f8e713a35e34f7dce723761bc888004fffba6ccd897fc10e7e0a3
   workload:
     name: spawny-boi
     publicHost: spawny-boi-test.cogni-testing.org
@@ -64,7 +64,7 @@ spec:
   bootPolicy:
     onDeadline: Close
     onGiveUp: Hold
-  leaseGeneration: 6
+  leaseGeneration: 7
   actuatorNamespace: cogni-candidate-a
   dns:
     provider: cloudflare
