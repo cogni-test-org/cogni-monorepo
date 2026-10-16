@@ -64,7 +64,7 @@ spec:
   bootPolicy:
     onDeadline: Close
     onGiveUp: Hold
-  leaseGeneration: 7
+  leaseGeneration: 8
   actuatorNamespace: cogni-candidate-a
   dns:
     provider: cloudflare
