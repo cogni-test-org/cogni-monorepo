@@ -223,13 +223,14 @@ mkdir -p "$HAPPY_TREE/infra/catalog" \
 cp infra/catalog/node-template.yaml "$HAPPY_TREE/infra/catalog/node-template.yaml"
 cp infra/k8s/overlays/candidate-a/node-template/*.yaml \
   "$HAPPY_TREE/infra/k8s/overlays/candidate-a/node-template/"
-# Appset path derived through the lib — this fixture is a k3s pair (no deployment_provider
-# cell for candidate-a), so control env == env; spelling the dir by hand is the env-keyed
-# form the appset-path-consumers invariant forbids (bug.5204).
+# Derive both the AppSet path and its directory from the copied catalog. Candidate
+# compute custody may be production even while this fixture exercises k3s probes;
+# spelling the directory by hand breaks when normal env membership is enabled.
 # shellcheck source=scripts/ci/lib/appset-paths.sh
 CATALOG_DIR="$HAPPY_TREE/infra/catalog" . "$REPO_ROOT/scripts/ci/lib/appset-paths.sh"
-bash scripts/ci/render-node-appset.sh candidate-a node-template \
-  > "$HAPPY_TREE/$(CATALOG_DIR="$HAPPY_TREE/infra/catalog" appset_rel_path candidate-a node-template)"
+happy_appset="$HAPPY_TREE/$(CATALOG_DIR="$HAPPY_TREE/infra/catalog" appset_rel_path candidate-a node-template)"
+mkdir -p "$(dirname "$happy_appset")"
+bash scripts/ci/render-node-appset.sh candidate-a node-template > "$happy_appset"
 
 BASE_ENV=(
   TARGET=node-template
@@ -282,7 +283,7 @@ yq -i '.deployment_provider."candidate-a" = "akash"' "$MISRESIDENT_TREE/infra/ca
 # Placement moves the control env, so it also moves the AppSet directory (bug.5204). Park a
 # copy at the relocated path so the EARLIER appset-existence check cannot absorb this case —
 # the residency gate is what must produce the verdict.
-misresident_appset="$MISRESIDENT_TREE/$(CATALOG_DIR="$MISRESIDENT_TREE/infra/catalog" appset_rel_path candidate-a node-template)"
+misresident_appset="$MISRESIDENT_TREE/$(FLEET_CONTROL_ENV=production CATALOG_DIR="$MISRESIDENT_TREE/infra/catalog" appset_rel_path candidate-a node-template)"
 mkdir -p "$(dirname "$misresident_appset")"
 cp "$HAPPY_TREE/$(CATALOG_DIR="$HAPPY_TREE/infra/catalog" appset_rel_path candidate-a node-template)" \
   "$misresident_appset"
@@ -292,7 +293,8 @@ cp scripts/ci/assert-target-substrate.sh "$MISRESIDENT_SCRIPT/"
 cp scripts/ci/lib/*.sh "$MISRESIDENT_SCRIPT/lib/"
 printf '\nLANE_DB_RESIDENCY_PINNED=("node-template/candidate-a")\n' \
   >> "$MISRESIDENT_SCRIPT/lib/lane-db-residency.sh"
-if env "${BASE_ENV[@]}" APP_SOURCE_DIR="$MISRESIDENT_TREE" \
+# This historical pin models production custody, independently of the runner fleet.
+if env "${BASE_ENV[@]}" FLEET_CONTROL_ENV=production APP_SOURCE_DIR="$MISRESIDENT_TREE" \
   COGNI_CATALOG_ROOT="$MISRESIDENT_TREE/infra/catalog" \
   bash "$MISRESIDENT_SCRIPT/assert-target-substrate.sh" >"$TMPROOT/misresident.out" 2>&1; then
   echo "expected an explicitly foreign PG lane to fail the substrate preflight" >&2
@@ -566,6 +568,8 @@ EXTERNAL_ALLOWLIST="$TMPROOT/compute-egress-allowlist"
 # whole-line `grep -Fx` shipped and failed closed on every real host.
 printf '%s\n' '80.200.246.35/32:5432,5435,6379,4000,7233' > "$EXTERNAL_ALLOWLIST"
 EXTERNAL_ENV=(
+  # This birth scenario explicitly exercises the historical production custodian.
+  FLEET_CONTROL_ENV=production
   TARGET=toks4
   DEPLOYMENT_PROVIDER=akash
   DEPLOY_ENVIRONMENT=candidate-a

@@ -42,7 +42,7 @@ patches:
         value: "redis://spawny-boi-redis-external:6379"
       - op: add
         path: /data/NEXTAUTH_URL
-        value: "https://spawny-boi.cognidao.org"
+        value: "https://spawny-boi.cogni-testing.org"
   - target:
       kind: Service
       name: node-app

@@ -42,7 +42,7 @@ patches:
         value: "redis://toks2-redis-external:6379"
       - op: add
         path: /data/NEXTAUTH_URL
-        value: "https://toks2.cognidao.org"
+        value: "https://toks2.cogni-testing.org"
   - target:
       kind: Service
       name: node-app
