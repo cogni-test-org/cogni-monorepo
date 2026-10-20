@@ -45,7 +45,7 @@ transformers:
   - ../../../base/akash-tx-actuator-service-name
 images:
   - name: ghcr.io/cogni-dao/cogni-template
-    newName: ghcr.io/cogni-test-org/cogni-template
+    newName: ghcr.io/cogni-dao/cogni-template
     digest: "sha256:fe2c8cf4e7d4a45b004186806214f0f9ddf813dca0314fc5b7df4481d96aa1e3"
 replacements:
   - source:
