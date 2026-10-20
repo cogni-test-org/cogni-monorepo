@@ -20,13 +20,13 @@
 #   the operator deploy route re-validates BOTH files against a Zod strictObject before it
 #   will move the deploy ref (422 candidate_control_plane_self_object_invalid otherwise).
 #
-# Why this isolated test fleet tracks its protected main:
-#   Candidate flights execute from cogni-test-org/cogni-monorepo, so the self-managing copy
-#   must preserve that repository and ref after adopting the seed. Pointing back to the
-#   canonical deploy ref makes Argo immediately overwrite the test-owned root.
+# Why the TEST root tracks its own reviewed deploy ref:
+#   The operator selects an exact reviewed TEST PR head on deploy/candidate-a-control-plane.
+#   Seed that ref before merging this handoff; Argo then adopts the already-valid TEST source.
+#   Repository custody remains cogni-test-org/cogni-monorepo, never the canonical repository.
 #
 # directory.recurse: false — own only the manifests directly in control-plane/candidate-a/,
-#   never descend. repoURL is the LITERAL upstream: the bootstrap apply path does NO envsubst,
+#   never descend. repoURL is the LITERAL TEST parent: the bootstrap apply path does NO envsubst,
 #   so this cannot use ${FORK_REPO}.
 #
 # Scope: this root owns ONLY the app-of-apps under control-plane/candidate-a/ (plus itself).
@@ -47,7 +47,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
-    targetRevision: main
+    targetRevision: deploy/candidate-a-control-plane
     path: infra/k8s/argocd/control-plane/candidate-a
     directory:
       recurse: false

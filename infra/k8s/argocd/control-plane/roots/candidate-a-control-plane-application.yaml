@@ -32,10 +32,10 @@
 #   means it owns ONLY candidate-a's app-of-apps. provision applies ONLY the matching
 #   cogni-${DEPLOY_ENV}-control-plane seed.
 #
-# Why this isolated test fleet tracks its protected main:
-#   Candidate flights execute from cogni-test-org/cogni-monorepo, so the seed and adopted
-#   self-managing copy must keep one stable repository and ref. Pointing back to the canonical
-#   deploy ref reintroduces a second writer that immediately undoes the isolated seed.
+# Why the TEST root tracks its own reviewed deploy ref:
+#   The operator selects an exact reviewed TEST PR head on deploy/candidate-a-control-plane.
+#   Seed that ref before merging this handoff; Argo then adopts the already-valid TEST source.
+#   Repository custody remains cogni-test-org/cogni-monorepo, never the canonical repository.
 #
 # Scope: this root owns ONLY the app-of-apps under control-plane/candidate-a/ (plus itself). It
 #   NEVER manages Argo's own install (install.yaml / ksops / repo-server + cm patches) — those
@@ -45,7 +45,7 @@
 #   cannot do that substitution, so they remain apply-once until that templating is solved.
 #
 # directory.recurse: false — apply only the manifests directly in control-plane/candidate-a/,
-#   never descend. repoURL is the LITERAL upstream (the bootstrap apply path does NO envsubst).
+#   never descend. repoURL is the LITERAL TEST parent (the bootstrap apply path does NO envsubst).
 #
 # KEEP THE OBJECT BELOW IDENTICAL TO THE SELF-MANAGING COPY. Drift makes Argo fight its own
 # seed. tests/ci-invariants/candidate-control-plane-self-management.spec.ts pins the
@@ -62,7 +62,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
-    targetRevision: main
+    targetRevision: deploy/candidate-a-control-plane
     path: infra/k8s/argocd/control-plane/candidate-a
     directory:
       recurse: false

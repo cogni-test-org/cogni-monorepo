@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
+# SPDX-FileCopyrightText: 2026 Cogni-DAO
+# TEST-owned opt-in preview Application. Its deploy tree was seeded empty before activation.
+# This owner is separate from ordinary node AppSets and tracks only requested preview state.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cogni-candidate-a-previews
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
+    targetRevision: deploy/candidate-a-previews
+    path: infra/k8s/preview-deployments/candidate-a
+    directory:
+      recurse: true
+      exclude: "**/kustomization.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cogni-candidate-a
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: true
+    syncOptions:
+      - ServerSideApply=true
+      - SkipDryRunOnMissingResource=true
