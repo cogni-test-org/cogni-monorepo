@@ -7,8 +7,8 @@ resources:
   - ../../../base/scheduler-worker
 images:
   - name: ghcr.io/cogni-dao/cogni-template
-    newName: ghcr.io/cogni-dao/cogni-template
-    digest: "sha256:f781d5327ecb38ed627287b69e41628f019d0545346d55f80dabe64e64584dbc"
+    newName: ghcr.io/cogni-test-org/cogni-template
+    digest: "sha256:3a9fd0669fbe77a5254e7ac5a94442919a1c468cfda3e62a3e813cfc153e20d4"
 patches:
   - target:
       kind: ConfigMap
@@ -19,10 +19,10 @@ patches:
         value: "cogni-candidate-a"
       - op: replace
         path: /data/IMAGE_DIGEST
-        value: "sha256:f781d5327ecb38ed627287b69e41628f019d0545346d55f80dabe64e64584dbc"
+        value: "sha256:3a9fd0669fbe77a5254e7ac5a94442919a1c468cfda3e62a3e813cfc153e20d4"
       - op: add
         path: /data/GIT_SHA
-        value: "73110db9465155a632506b3122fa1304124c587f"
+        value: "ec9bfe20f6b43ab5e06631f8311937b5bb294b39"
   # bug.0295: VM discovery via DNS (cogni-candidate-a.vm.cognidao.org).
   # Convert base headless Services → ExternalName; delete EndpointSlices.
   - target: {kind: Service, name: temporal}
