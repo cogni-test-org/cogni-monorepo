@@ -28,13 +28,12 @@ candidate_a_branch: deploy/candidate-a-operator
 preview_branch: deploy/preview-operator
 production_branch: deploy/production-operator
 # task.5017 — per-env node-set (deploy ⊆ provisioned). Must include candidate-a (candidate-flightable); preview/production are opt-in once proven.
-# TEST owns one stable operator/control environment; preview app leases use that control plane.
-envs: [candidate-a]
+envs: [candidate-a, preview, production]
 database:
   candidate-a: { tier: shared, budget_profile: operator-control-v1 }
   preview: { tier: shared, budget_profile: operator-control-v1 }
   production: { tier: shared, budget_profile: operator-control-v1 }
-activity_env: candidate-a
+activity_env: production
 owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
 path_prefix: nodes/operator/
 # task.5078 — operator serves the bare base domain (https://${DOMAIN}); every
