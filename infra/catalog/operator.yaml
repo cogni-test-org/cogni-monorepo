@@ -28,7 +28,8 @@ candidate_a_branch: deploy/candidate-a-operator
 preview_branch: deploy/preview-operator
 production_branch: deploy/production-operator
 # task.5017 — per-env node-set (deploy ⊆ provisioned). Must include candidate-a (candidate-flightable); preview/production are opt-in once proven.
-envs: [candidate-a, preview, production]
+# TEST owns one stable operator/control environment; preview app leases use that control plane.
+envs: [candidate-a]
 database:
   candidate-a: { tier: shared, budget_profile: operator-control-v1 }
   preview: { tier: shared, budget_profile: operator-control-v1 }

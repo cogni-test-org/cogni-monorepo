@@ -42,7 +42,7 @@ patches:
         value: "redis://ghcr-redis-external:6379"
       - op: add
         path: /data/NEXTAUTH_URL
-        value: "https://ghcr-preview.cognidao.org"
+        value: "https://ghcr-preview.cogni-testing.org"
   - target:
       kind: Service
       name: node-app
