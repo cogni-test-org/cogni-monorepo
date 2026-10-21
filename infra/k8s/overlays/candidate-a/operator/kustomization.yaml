@@ -45,8 +45,8 @@ transformers:
   - ../../../base/akash-tx-actuator-service-name
 images:
   - name: ghcr.io/cogni-dao/cogni-template
-    newName: ghcr.io/cogni-test-org/cogni-template
-    digest: "sha256:da8fbbf46c74ca6d37d62cdd1b10a60514150fbe89442f214e1fe12340e3007f"
+    newName: ghcr.io/cogni-dao/cogni-template
+    digest: "sha256:add0540136f697acc27d76cc0cac48a82e75209ed7b9478eae1fb71b6a23dde3"
 replacements:
   - source:
       kind: Application
@@ -319,10 +319,6 @@ patches:
       kind: Deployment
       name: node-app
     patch: |
-      # One-time legacy writer cutover; restore RollingUpdate after all operator lanes prove v2.
-      - op: replace
-        path: /spec/strategy
-        value: {type: Recreate}
       - op: add
         path: /spec/template/spec/initContainers/-
         value:
@@ -331,7 +327,7 @@ patches:
           command:
             - /bin/sh
             - -c
-            - exec node --input-type=module -e 'import { migrateOperatorAfterNativeDrain } from "/app/nodes/operator/app/migrate-doltgres.mjs"; await migrateOperatorAfterNativeDrain("/app/nodes/operator/app/doltgres-migrations")'
+            - exec node /app/nodes/$(NODE_NAME)/app/migrate-doltgres.mjs /app/nodes/$(NODE_NAME)/app/doltgres-migrations
           envFrom:
             - configMapRef:
                 name: operator-node-app-config
@@ -445,23 +441,6 @@ patches:
       kind: EndpointSlice
       metadata:
         name: doltgres-external-1
-  # Trusted TEST pilot: opt-in public preview config; credentials retain existing custody.
-  - target:
-      kind: ConfigMap
-      name: node-app-config
-    patch: |
-      - op: add
-        path: /data/PREVIEW_FLIGHTS_ENABLED
-        value: "true"
-      - op: add
-        path: /data/PREVIEW_READY_STATE_GENERATIONS
-        value: '{"0":"5616bc5c-5c0f-4cbf-ae01-82c376897448","1":"894d3a9d-465d-48a8-92fd-47373d8e53fe"}'
-      - op: add
-        path: /data/PREVIEW_DNS_ZONE_ID
-        value: "23220356c352c5831c6af57887b11a27"
-      - op: add
-        path: /data/PREVIEW_SUBSTRATE_HOST
-        value: "cogni-candidate-a.vm.cognidao.org"
   - target:
       kind: Deployment
       name: database-reliability-actuator
