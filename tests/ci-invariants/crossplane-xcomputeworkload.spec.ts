@@ -24,7 +24,8 @@
  *   - NARROWEST_ACTIVATION: exactly one managed type is activated, and it is namespaced.
  *   - DNS_TYPE_FOLLOWS_TARGET: hostnames publish as CNAME; IPv4-only ingress publishes as A.
  *   - CREATE_AMBIGUITY_RECOVERY_REQUIRES_IDEMPOTENCE_PROOF: DNS adopts by name; a paid lease
- *     releases the guard only with exact-key, active-resource, external-handle and revision proof.
+ *     releases the guard only with a pending timestamp and exact-key, active-resource,
+ *     external-handle OBSERVE proof, including revisions that previously served.
  *   - OVERLAP_BEFORE_CLOSE: a lease close is IRREVERSIBLE and its idempotence key is refused
  *     forever once settled, so the outgoing lease is held open until the incoming one is proven
  *     serving and DNS has flipped. Never more than two lease children for one (node, env).
@@ -160,6 +161,9 @@ describe("XComputeWorkload composite API (task.5096)", () => {
       "bundle",
       "dns",
       "environment",
+      // story.5093 — operator-placed isolated-service lease. Optional and immutable; absent on
+      // every existing XR, so the primary one-workload-per-node gate is unchanged.
+      "instance",
       "leaseEpoch",
       "leaseGeneration",
       "migration",
@@ -167,6 +171,9 @@ describe("XComputeWorkload composite API (task.5096)", () => {
       // story.5050 — node-owned HARD placement requirement. Optional and immutable, so no
       // existing XR changes and a new requirement can only bind on a fresh mint.
       "placement",
+      "previewDeploymentId",
+      "previewResetGeneration",
+      "previewStateSlot",
       "runtime",
       "workload",
     ]);
@@ -363,9 +370,41 @@ describe("XComputeWorkload Composition (task.5096)", () => {
     // The legacy CRD's top-level `metadata.name == spec.nodeId` rule has no home in an XRD
     // (only spec/status may be described), so the render refuses instead. Failing the render
     // creates NO managed resource, which is why the fallback is safe: nothing is spent.
-    expect(template).toContain("{{- if ne $name $spec.nodeId }}");
+    expect(template).toContain("{{- if ne $name $expectedName }}");
+    expect(template).toContain("{{- $expectedName := $spec.nodeId }}");
     expect(template).toContain("{{- fail (printf");
     expect(template).toContain('{{- if ne (printf "cogni-%s" $env) $ns }}');
+  });
+
+  it("names an isolated-service lease <nodeId>-<instance> and keeps the node identity (story.5093)", () => {
+    // ISOLATED_SERVICE_IS_ITS_OWN_LEASE: the only accepted second name for a node's workload is
+    // derived from the immutable spec.instance, so the idempotence key family is distinct while
+    // the receipt identity below still reads spec.nodeId.
+    expect(template).toContain('{{- $instance := dig "instance" "" $spec }}');
+    expect(template).toContain(
+      '{{- if ne $instance "" }}{{ $expectedName = printf "%s-%s" $spec.nodeId $instance }}{{ end }}'
+    );
+    expect(template).toContain(
+      '{{- $identity := dict "nodeId" $spec.nodeId "compositeUid" $compositeUid "compositeGeneration" $generation }}'
+    );
+    // The instance's public service proves its exact SHA on /version; it gets the SHA only.
+    expect(template).toContain(
+      '{{- if and (ne $instance "") (eq $svc.visibility "public") }}'
+    );
+    const instance = (
+      (xrd.spec as YamlObject).versions as YamlObject[]
+    )[0] as YamlObject;
+    const specSchema = (
+      ((instance.schema as YamlObject).openAPIV3Schema as YamlObject)
+        .properties as YamlObject
+    ).spec as YamlObject;
+    expect((specSchema.properties as YamlObject).instance).toMatchObject({
+      type: "string",
+      pattern: "^[a-z][a-z0-9-]{0,19}$",
+    });
+    expect(JSON.stringify(specSchema["x-kubernetes-validations"])).toContain(
+      "has(self.instance) == has(oldSelf.instance)"
+    );
   });
 
   it("sends the actuator its exact strict-contract wire shape", () => {
@@ -1210,11 +1249,9 @@ describe("XComputeWorkload paid create-ambiguity recovery (bug.5464)", () => {
     expect(templateCode).toContain(
       '$leaseReceiptProven := and (ge $leaseReceiptStatus 200) (lt $leaseReceiptStatus 300) $leaseReceiptObserved $leaseReceiptFound (eq $leaseReceiptState "active") (ne $leaseReceiptExternalName "") (eq $responseKey $currentKey)'
     );
+    expect(templateCode).not.toContain("$leaseRevisionPending");
     expect(templateCode).toContain(
-      "$leaseRevisionPending := ne $prevSha $desiredSha"
-    );
-    expect(templateCode).toContain(
-      '$recoverLeaseCreateAmbiguity := and $leaseCreateAmbiguous (ne $leaseCreatePending "") $leaseReceiptProven $leaseRevisionPending'
+      '$recoverLeaseCreateAmbiguity := and $leaseCreateAmbiguous (ne $leaseCreatePending "") $leaseReceiptProven'
     );
     expect(templateCode).toContain(
       "$unsafeLeaseCreateAmbiguity := and $leaseCreateAmbiguous (not $recoverLeaseCreateAmbiguity)"
@@ -1227,6 +1264,7 @@ describe("XComputeWorkload paid create-ambiguity recovery (bug.5464)", () => {
     type Proof = {
       ambiguous: boolean;
       pending: string;
+      currentStatus: number;
       currentObserved: boolean;
       cachedStatus: number;
       cachedObserved: boolean;
@@ -1238,12 +1276,10 @@ describe("XComputeWorkload paid create-ambiguity recovery (bug.5464)", () => {
       externalName: string;
       responseKey: string;
       currentKey: string;
-      previousSha: string;
-      desiredSha: string;
     };
     const safe = (p: Proof) => {
       const useCache = !p.currentObserved;
-      const receiptStatus = useCache ? p.cachedStatus : 200;
+      const receiptStatus = useCache ? p.cachedStatus : p.currentStatus;
       const observed = useCache ? p.cachedObserved : p.currentObserved;
       const found = useCache ? p.cachedFound : p.found;
       const active = useCache ? p.cachedActive : p.active;
@@ -1257,13 +1293,13 @@ describe("XComputeWorkload paid create-ambiguity recovery (bug.5464)", () => {
         found &&
         active &&
         externalName !== "" &&
-        p.responseKey === p.currentKey &&
-        p.previousSha !== p.desiredSha
+        p.responseKey === p.currentKey
       );
     };
     const valid: Proof = {
       ambiguous: true,
       pending: "2026-10-14T07:05:33Z",
+      currentStatus: 200,
       currentObserved: true,
       cachedStatus: 200,
       cachedObserved: true,
@@ -1275,18 +1311,18 @@ describe("XComputeWorkload paid create-ambiguity recovery (bug.5464)", () => {
       externalName: "1791427850757",
       responseKey: "xcw:cogni-production:red:0",
       currentKey: "xcw:cogni-production:red:0",
-      previousSha: "old",
-      desiredSha: "new",
     };
     expect(safe(valid)).toBe(true);
     for (const unsafe of [
       { ambiguous: false },
       { pending: "" },
+      { currentStatus: 199 },
+      { currentStatus: 300 },
+      { currentStatus: 503 },
       { found: false },
       { active: false },
       { externalName: "" },
       { responseKey: "different-key" },
-      { previousSha: "new" },
     ]) {
       expect(safe({ ...valid, ...unsafe })).toBe(false);
     }
@@ -1296,6 +1332,7 @@ describe("XComputeWorkload paid create-ambiguity recovery (bug.5464)", () => {
     expect(
       safe({
         ...valid,
+        currentStatus: 503,
         currentObserved: false,
         found: false,
         active: false,
@@ -1312,6 +1349,7 @@ describe("XComputeWorkload paid create-ambiguity recovery (bug.5464)", () => {
       expect(
         safe({
           ...valid,
+          currentStatus: 503,
           currentObserved: false,
           found: false,
           active: false,
@@ -1320,6 +1358,36 @@ describe("XComputeWorkload paid create-ambiguity recovery (bug.5464)", () => {
         })
       ).toBe(false);
     }
+
+    // A current OBSERVE that says gone/closed is contrary evidence, not permission
+    // to fall back to the otherwise valid cached allocation.
+    expect(safe({ ...valid, found: false })).toBe(false);
+    expect(safe({ ...valid, active: false })).toBe(false);
+    // A CREATE/UPDATE echo may carry a handle, but without found it cannot prove
+    // an allocation on its own. Only an independently valid OBSERVE cache can.
+    expect(
+      safe({ ...valid, currentObserved: false, cachedObserved: false })
+    ).toBe(false);
+  });
+
+  it("does not use served revision history to block an otherwise proven allocation", () => {
+    // Source-level regression: Beacon had already observed its desired SHA when
+    // a later response lost serving. The allocation/key remained the same; that
+    // SHA latch must not prevent provider-http from observing it again.
+    const recoveryDeclaration = templateCode.match(
+      /\$recoverLeaseCreateAmbiguity :=[^\n]+/
+    )?.[0];
+    expect(recoveryDeclaration).toBe(
+      '$recoverLeaseCreateAmbiguity := and $leaseCreateAmbiguous (ne $leaseCreatePending "") $leaseReceiptProven }}'
+    );
+    expect(leaseBlock).toContain(
+      "crossplane.io/external-create-succeeded: {{ $leaseCreatePending | quote }}"
+    );
+    // Acknowledging the create receipt does not fabricate a successful probe.
+    expect(leaseBlock).toContain("{{- if and $active $serving }}");
+    expect(templateCode).toContain(
+      '{{- $serving := dig "serving" false $resp }}'
+    );
   });
 });
 
