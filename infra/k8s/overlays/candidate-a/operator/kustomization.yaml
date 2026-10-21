@@ -445,6 +445,23 @@ patches:
       kind: EndpointSlice
       metadata:
         name: doltgres-external-1
+  # Trusted TEST pilot: opt-in public preview config; credentials retain existing custody.
+  - target:
+      kind: ConfigMap
+      name: node-app-config
+    patch: |
+      - op: add
+        path: /data/PREVIEW_FLIGHTS_ENABLED
+        value: "true"
+      - op: add
+        path: /data/PREVIEW_READY_STATE_GENERATIONS
+        value: '{"0":"5616bc5c-5c0f-4cbf-ae01-82c376897448","1":"894d3a9d-465d-48a8-92fd-47373d8e53fe"}'
+      - op: add
+        path: /data/PREVIEW_DNS_ZONE_ID
+        value: "23220356c352c5831c6af57887b11a27"
+      - op: add
+        path: /data/PREVIEW_SUBSTRATE_HOST
+        value: "cogni-candidate-a.vm.cognidao.org"
   - target:
       kind: Deployment
       name: database-reliability-actuator
@@ -463,3 +480,7 @@ patches:
                     value: candidate-a
                   - name: FORK_DOMAIN_ROOT
                     value: cognidao.org
+  - target:
+      kind: Deployment
+      name: node-app
+    path: .prepare-init-compatibility.json
