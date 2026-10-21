@@ -13,6 +13,8 @@
 #   3. idempotency — re-running produces byte-identical rules;
 #   4. fail-closed — an empty render yields NO compute ACCEPTs while the public
 #      DROP remains, and catalog removal converges on the next run.
+#   5. reboot persistence (story.5084) — the hardener installs a current copy of
+#      itself plus an enabled docker-bound boot replay unit, idempotently.
 # Usage: bash scripts/ci/tests/render-compute-egress-allowlist.test.sh
 
 set -euo pipefail
@@ -48,6 +50,7 @@ compute_egress_cidrs:
     comment: second provider block (fixture)
 EOF
 
+# Explicit entry scope excludes the custodian; lane custody must not widen it.
 cat > "$CATALOG/toksb.yaml" <<'EOF'
 name: toksb
 type: node
@@ -57,6 +60,7 @@ deployment_provider:
 compute_egress_cidrs:
   - cidr: 203.0.113.7/32
     comment: preview-only provider (fixture)
+    envs: [preview]
 EOF
 
 # Duplicate CIDR from a second candidate-a row — must render exactly once.
@@ -84,9 +88,18 @@ compute_egress_cidrs:
     comment: k3s-placed row must open no provider hole (fixture)
 EOF
 
+cat > "$CATALOG/defaultk3s.yaml" <<'EOF'
+name: defaultk3s
+type: node
+envs: [candidate-a]
+compute_egress_cidrs:
+  - cidr: 192.0.2.78/32
+    comment: placement-defaulted k3s must open no provider hole
+EOF
+
 # bug.5191 — the same row in TWO envs with different placement. K3S_IS_DEFAULT:
 # candidate-a has no override, so it is k3s and contributes nothing there; preview
-# is akash and contributes. One row, one CIDR, opposite outcomes per env.
+# is akash and contributes. Explicit entry scope keeps its foreign custodian excluded.
 cat > "$CATALOG/tokssplit.yaml" <<'EOF'
 name: tokssplit
 type: node
@@ -96,6 +109,7 @@ deployment_provider:
 compute_egress_cidrs:
   - cidr: 192.0.2.99/32
     comment: provider NAT for the preview placement only (fixture)
+    envs: [preview]
 EOF
 
 # Rows without the field / without envs must contribute nothing.
@@ -143,6 +157,9 @@ ok "catalog comments carried into rendered file"
 grep -q '192.0.2.77' "$OUT_A" \
   && fail "explicitly k3s-placed row (toksk3s) leaked its CIDR into candidate-a"
 ok "explicitly k3s-placed row contributes no CIDR to the env it deploys to"
+grep -q '192.0.2.78' "$OUT_A" \
+  && fail "unscoped default-k3s row leaked its CIDR into candidate-a"
+ok "absent placement alone excludes an unscoped candidate provider grant"
 
 grep -q '192.0.2.99' "$OUT_A" \
   && fail "placement-defaulted (k3s) row (tokssplit) leaked its CIDR into candidate-a"
@@ -179,6 +196,59 @@ ok "env with no external compute renders an allow-free (fail-closed) file"
 bash "$RENDERER" candidate-a > "$TMPROOT/candidate-a.second"
 diff -u "$OUT_A" "$TMPROOT/candidate-a.second" || fail "renderer is not deterministic"
 ok "renderer is deterministic/idempotent"
+
+# TEST fleet topology: spawny has no persistent candidate app, but candidate-a
+# custodies its preview/production lanes and owns the shared preview substrate.
+CUSTODY_CATALOG="$TMPROOT/test-custody-catalog"
+mkdir -p "$CUSTODY_CATALOG"
+cat > "$CUSTODY_CATALOG/operator.yaml" <<'EOF'
+name: operator
+type: node
+envs: [candidate-a]
+deployment_provider: { candidate-a: k3s }
+EOF
+cat > "$CUSTODY_CATALOG/spawny-boi.yaml" <<'EOF'
+name: spawny-boi
+type: node
+envs: [preview, production]
+deployment_provider: { preview: akash, production: akash }
+compute_egress_cidrs:
+  - cidr: 80.200.246.35/32
+    comment: shared zencloud + digitalfrontier NAT (TEST catalog)
+  - cidr: 198.51.100.61/32
+    comment: explicit preview-only Temporal grant must not reach custodian
+    envs: [preview]
+    ports: [7233]
+  - cidr: 198.51.100.62/32
+    comment: unscoped database-only provider grant retains its ports
+    ports: [5432, 5435]
+EOF
+COGNI_CATALOG_ROOT="$CUSTODY_CATALOG" bash "$RENDERER" candidate-a > "$TMPROOT/custody-self.list"
+grep -v '^#' "$TMPROOT/custody-self.list" > "$TMPROOT/custody-self.rules"
+printf '%s\n' "80.200.246.35/32:$PORTS" '198.51.100.62/32:5432,5435' > "$TMPROOT/custody-self.expected"
+diff -u "$TMPROOT/custody-self.expected" "$TMPROOT/custody-self.rules" \
+  || fail "self-lane reconcile pruned custodied grants or broadened scoped env/ports"
+[ "$(yq -N '.envs | contains(["candidate-a"])' "$CUSTODY_CATALOG/spawny-boi.yaml")" = false ] \
+  || fail "custody regression must not introduce a persistent candidate app"
+COGNI_CATALOG_ROOT="$CUSTODY_CATALOG" bash "$RENDERER" preview candidate-a > "$TMPROOT/custody-foreign.list"
+diff -u "$TMPROOT/custody-self.list" "$TMPROOT/custody-foreign.list" \
+  || fail "ordinary operator reconcile differs from foreign-lane reconcile on the same VM"
+COGNI_CATALOG_ROOT="$CUSTODY_CATALOG" bash "$RENDERER" candidate-a > "$TMPROOT/custody-again.list"
+diff -u "$TMPROOT/custody-self.list" "$TMPROOT/custody-again.list" || fail "custody union is not deterministic"
+FLEET_CONTROL_ENV=production COGNI_CATALOG_ROOT="$CUSTODY_CATALOG" \
+  bash "$RENDERER" candidate-a > "$TMPROOT/not-custodian.list"
+grep -qv '^#' "$TMPROOT/not-custodian.list" && fail "candidate gained grants for a foreign custodian's lanes"
+ok "ordinary TEST operator reconcile retains only its custodied provider grants, without candidate membership or scope widening"
+cp "$CUSTODY_CATALOG/spawny-boi.yaml" "$TMPROOT/custody-valid.yaml"
+for invalid_entry in '.compute_egress_cidrs[0].ports = [8080]' '.compute_egress_cidrs[0].envs = []'; do
+  cp "$TMPROOT/custody-valid.yaml" "$CUSTODY_CATALOG/spawny-boi.yaml"
+  yq -i "$invalid_entry" "$CUSTODY_CATALOG/spawny-boi.yaml"
+  if COGNI_CATALOG_ROOT="$CUSTODY_CATALOG" bash "$RENDERER" candidate-a > /dev/null 2>&1; then
+    fail "inferred custodied lane accepted invalid entry policy: $invalid_entry"
+  fi
+done
+cp "$TMPROOT/custody-valid.yaml" "$CUSTODY_CATALOG/spawny-boi.yaml"
+ok "inferred custody fails closed on invalid entry env and port scopes"
 
 cat > "$CATALOG/broken.yaml" <<'EOF'
 name: broken
@@ -395,14 +465,78 @@ echo "8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.10 uid 0"
 EOF
 chmod +x "$FAKEBIN/ip"
 
-for tool in apt-get netfilter-persistent flock; do
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKEBIN/$tool"
-  chmod +x "$FAKEBIN/$tool"
-done
+printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKEBIN/flock"
+chmod +x "$FAKEBIN/flock"
+
+export PERSISTENCE_STATE="$TMPROOT/persistence.state"
+export PERSISTENCE_PLUGIN="$TMPROOT/usr/share/netfilter-persistent/plugins.d/15-ip4tables"
+export APT_CALLS="$TMPROOT/apt.calls" PERSISTENCE_CALLS="$TMPROOT/persistence.calls"
+mkdir -p "$(dirname "$PERSISTENCE_PLUGIN")"
+printf 'installed\n' > "$PERSISTENCE_STATE"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$PERSISTENCE_PLUGIN"
+chmod +x "$PERSISTENCE_PLUGIN"
+export FAKE_APT_MODE=locked
+: > "$APT_CALLS"; : > "$PERSISTENCE_CALLS"
+cat > "$FAKEBIN/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  '-W -f=${Status} iptables-persistent')
+    case "$(cat "$PERSISTENCE_STATE")" in
+      installed) printf 'install ok installed' ;;
+      held) printf 'hold ok installed' ;;
+      broken) printf 'install reinstreq installed' ;;
+      *) exit 1 ;;
+    esac ;;
+  '-L iptables-persistent') printf '%s\n' "$PERSISTENCE_PLUGIN" ;;
+  *) exit 9 ;;
+esac
+EOF
+cat > "$FAKEBIN/apt-get" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$APT_CALLS"
+[ "$*" = '-o DPkg::Lock::Timeout=60 install -y iptables-persistent' ] || exit 9
+[ "$DEBIAN_FRONTEND" = noninteractive ] || exit 9
+case "$FAKE_APT_MODE" in
+  locked) echo 'fixture: unattended-upgrades holds frontend lock' >&2; exit 100 ;;
+  incomplete) exit 0 ;;
+  install)
+    printf 'installed\n' > "$PERSISTENCE_STATE"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$PERSISTENCE_PLUGIN"
+    chmod +x "$PERSISTENCE_PLUGIN" ;;
+  *) exit 9 ;;
+esac
+EOF
+cat > "$FAKEBIN/netfilter-persistent" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$*" = save ] || exit 9
+printf 'save\n' >> "$PERSISTENCE_CALLS"
+EOF
+chmod +x "$FAKEBIN/dpkg-query" "$FAKEBIN/apt-get" "$FAKEBIN/netfilter-persistent"
 
 export ALLOWLIST_FILE="$TMPROOT/etc/compute-egress-allowlist"
 export STAGED_ALLOWLIST="$TMPROOT/staged-allowlist"
 export HARDEN_LOCK_FILE="$TMPROOT/harden.lock"
+export HARDEN_BOOT_SCRIPT="$TMPROOT/usr/local/sbin/cogni-harden-docker-public-ports.sh"
+export HARDEN_BOOT_UNIT="$TMPROOT/etc/systemd/system/cogni-harden-docker-public-ports.service"
+export SYSTEMCTL_CALLS="$TMPROOT/systemctl.calls" SYSTEMCTL_ENABLED="$TMPROOT/systemctl.enabled"
+: > "$SYSTEMCTL_CALLS"
+cat > "$FAKEBIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$SYSTEMCTL_CALLS"
+case "$*" in
+  daemon-reload) ;;
+  'reenable --quiet cogni-harden-docker-public-ports.service'|'enable --quiet cogni-harden-docker-public-ports.service')
+    : > "$SYSTEMCTL_ENABLED" ;;
+  'is-enabled --quiet cogni-harden-docker-public-ports.service')
+    [ -f "$SYSTEMCTL_ENABLED" ] ;;
+  *) exit 9 ;;
+esac
+EOF
+chmod +x "$FAKEBIN/systemctl"
 
 run_harden() {
   PATH="$FAKEBIN:$PATH" bash "$HARDEN" > "$TMPROOT/harden.log" 2>&1 \
@@ -440,6 +574,32 @@ run_harden
 PATH="$FAKEBIN:$PATH" iptables -S DOCKER-USER > "$TMPROOT/rules.2"
 diff -u "$RULES_1" "$TMPROOT/rules.2" || fail "re-run must produce identical rules"
 ok "harden re-run is idempotent (byte-identical rules)"
+
+# Reboot persistence (story.5084): the hardener installs a current copy of
+# itself plus a docker-bound oneshot unit, enabled but never started inline.
+cmp -s "$HARDEN" "$HARDEN_BOOT_SCRIPT" || fail "boot replay script is not the current hardener"
+for directive in 'Requires=docker.service' 'After=docker.service network-online.target' \
+  'PartOf=docker.service' 'Type=oneshot' 'PrivateTmp=yes' \
+  "ExecStart=/bin/bash $HARDEN_BOOT_SCRIPT" 'WantedBy=multi-user.target docker.service'; do
+  grep -Fxq -- "$directive" "$HARDEN_BOOT_UNIT" || fail "boot replay unit missing: $directive"
+done
+[ "$(grep -c '^daemon-reload$' "$SYSTEMCTL_CALLS")" = 1 ] \
+  || { cat "$SYSTEMCTL_CALLS" >&2; fail "unit must be written and reloaded exactly once across runs"; }
+grep -Fxq 'reenable --quiet cogni-harden-docker-public-ports.service' "$SYSTEMCTL_CALLS" \
+  || fail "boot replay unit was not enabled"
+if grep -Eq '^(start|restart)( |$)|--now' "$SYSTEMCTL_CALLS"; then
+  fail "hardener must never start its own unit (writer-lock re-entry)"
+fi
+ok "hardener installs and enables its docker-bound boot replay unit idempotently"
+
+# The boot replay runs the installed copy with only the installed allowlist.
+PATH="$FAKEBIN:$PATH" STAGED_ALLOWLIST="$TMPROOT/absent-under-private-tmp" \
+  bash "$HARDEN_BOOT_SCRIPT" > "$TMPROOT/harden.boot.log" 2>&1 \
+  || { cat "$TMPROOT/harden.boot.log" >&2; fail "boot replay exited nonzero"; }
+PATH="$FAKEBIN:$PATH" iptables -S DOCKER-USER > "$TMPROOT/rules.boot"
+diff -u "$RULES_1" "$TMPROOT/rules.boot" || fail "boot replay must restore the same rules"
+[ "$(grep -c '^daemon-reload$' "$SYSTEMCTL_CALLS")" = 1 ] || fail "boot replay rewrote its own unit"
+ok "boot replay restores identical rules without rewriting its unit"
 
 # Catalog removal: stage the (empty) production render over the same VM state.
 cp "$OUT_PROD" "$STAGED_ALLOWLIST"
@@ -611,6 +771,20 @@ for invalid_scope in '[]' '"preview"' null '["unknown"]' '["preview","unknown"]'
 done
 ok "renderer fails closed for scalar/null/empty/unknown scopes outside schema CI"
 
+cp "$TMPROOT/custody-foreign.list" "$STAGED_ALLOWLIST"
+run_harden
+PATH="$FAKEBIN:$PATH" iptables -S DOCKER-USER > "$TMPROOT/custody-installed-before"
+cp "$TMPROOT/custody-self.list" "$STAGED_ALLOWLIST"
+run_harden
+PATH="$FAKEBIN:$PATH" iptables -S DOCKER-USER > "$TMPROOT/custody-installed-after"
+diff -u "$TMPROOT/custody-installed-before" "$TMPROOT/custody-installed-after" \
+  || fail "ordinary operator hardening pruned the foreign preview's existing provider grants"
+for port in 5432 5435; do
+  grep -q -- "-s 80.200.246.35/32 -p tcp -m conntrack --ctdir ORIGINAL --ctorigdstport $port .*compute-egress-allow.* ACCEPT" "$TMPROOT/custody-installed-after" \
+    || fail "ordinary operator hardening lost preview database port $port"
+done
+ok "ordinary operator hardening preserves the installed preview provider database grants"
+
 # A long live chain exceeds the pipe buffer. Finding the first managed rule must
 # still drain iptables' output, or pipefail turns SIGPIPE into exit 141.
 printf '%s\n' '-m comment --comment cogni-harden-internal-ports:old -j ACCEPT' > "$IPT_STATE"
@@ -620,5 +794,76 @@ run_harden
 grep -q 'cogni-harden-internal-ports:old' "$IPT_STATE" && fail "large-chain reconciliation retained stale managed rules"
 grep -q 'cogni-harden-internal-ports:drop-public' "$IPT_STATE" || fail "large-chain reconciliation lost public DROP"
 ok "large-chain reconciliation drains iptables output and preserves unmanaged fences"
+
+# The healthy dependency must never touch apt, even while its frontend is locked.
+[ ! -s "$APT_CALLS" ] || fail "healthy installed persistence invoked apt"
+[ -s "$PERSISTENCE_CALLS" ] || fail "healthy path skipped persistence save"
+grep -q 'persistence_dependency=healthy apt=skipped' "$TMPROOT/harden.log" || fail "healthy skip branch not observable"
+ok "healthy package, persistence command and executable package-owned plugin skip apt entirely"
+
+printf 'held\n' > "$PERSISTENCE_STATE"
+run_harden
+[ ! -s "$APT_CALLS" ] || fail "healthy held package invoked apt"
+grep -q 'persistence_dependency=healthy apt=skipped' "$TMPROOT/harden.log" || fail "held healthy path not observed"
+ok "healthy held persistence stays on its installed version without any apt operation"
+
+printf 'broken\n' > "$PERSISTENCE_STATE"
+FAKE_APT_MODE=incomplete; export FAKE_APT_MODE
+: > "$PERSISTENCE_CALLS"
+if PATH="$FAKEBIN:$PATH" bash "$HARDEN" > "$TMPROOT/broken-package.log" 2>&1; then
+  fail "reinstreq package was treated as healthy"
+fi
+[ ! -s "$PERSISTENCE_CALLS" ] || fail "broken package claimed persistence save"
+grep -q 'reason=install_postcheck_failed' "$TMPROOT/broken-package.log" || fail "broken package failed for wrong reason"
+ok "an installed package requiring reinstallation cannot pass the healthy predicate"
+
+printf 'missing\n' > "$PERSISTENCE_STATE"
+rm "$PERSISTENCE_PLUGIN"
+FAKE_APT_MODE=install; export FAKE_APT_MODE
+: > "$APT_CALLS"; : > "$PERSISTENCE_CALLS"
+run_harden
+[ "$(wc -l < "$APT_CALLS" | tr -d ' ')" = 1 ] || fail "missing persistence must install once"
+[ "$(cat "$PERSISTENCE_CALLS")" = save ] || fail "installed persistence not saved"
+grep -q 'persistence_dependency=healthy apt=installed' "$TMPROOT/harden.log" || fail "verified install branch not observable"
+ok "missing dependency installs with a finite native lock wait, verifies and saves"
+
+# A nominally installed package with a non-executable/missing plugin is unhealthy.
+# A successful apt no-op does not prove that a broken installation was repaired.
+chmod -x "$PERSISTENCE_PLUGIN"
+FAKE_APT_MODE=incomplete; export FAKE_APT_MODE
+: > "$APT_CALLS"; : > "$PERSISTENCE_CALLS"
+if PATH="$FAKEBIN:$PATH" bash "$HARDEN" > "$TMPROOT/broken-persistence.log" 2>&1; then
+  fail "broken persistence accepted a successful apt no-op"
+fi
+[ "$(wc -l < "$APT_CALLS" | tr -d ' ')" = 1 ] || fail "broken plugin bypassed dependency install"
+[ ! -s "$PERSISTENCE_CALLS" ] || fail "broken persistence claimed save"
+grep -q 'reason=install_postcheck_failed' "$TMPROOT/broken-persistence.log" || fail "postcheck failure not observable"
+grep -q 'cogni-harden-internal-ports:drop-public' "$IPT_STATE" || fail "postcheck failure lost public DROP"
+ok "broken installed persistence fails closed after install/postcheck"
+
+rm "$PERSISTENCE_PLUGIN"
+mkdir "$PERSISTENCE_PLUGIN"
+: > "$PERSISTENCE_CALLS"
+if PATH="$FAKEBIN:$PATH" bash "$HARDEN" > "$TMPROOT/directory-plugin.log" 2>&1; then
+  fail "an executable directory was accepted as the persistence plugin"
+fi
+[ ! -s "$PERSISTENCE_CALLS" ] || fail "directory plugin claimed save"
+grep -q 'reason=install_postcheck_failed' "$TMPROOT/directory-plugin.log" || fail "directory plugin failed for wrong reason"
+rmdir "$PERSISTENCE_PLUGIN"
+ok "an executable directory cannot masquerade as the IPv4 persistence plugin"
+
+printf 'missing\n' > "$PERSISTENCE_STATE"
+FAKE_APT_MODE=locked; export FAKE_APT_MODE
+: > "$APT_CALLS"; : > "$PERSISTENCE_CALLS"
+status=0
+PATH="$FAKEBIN:$PATH" bash "$HARDEN" > "$TMPROOT/locked-persistence.log" 2>&1 || status=$?
+[ "$status" = 100 ] || fail "native apt lock failure not propagated"
+[ "$(wc -l < "$APT_CALLS" | tr -d ' ')" = 1 ] || fail "apt lock failure retried"
+grep -Fxq -- '-o DPkg::Lock::Timeout=60 install -y iptables-persistent' "$APT_CALLS" || fail "apt lock wait not bounded"
+[ ! -s "$PERSISTENCE_CALLS" ] || fail "lock failure claimed persistence save"
+grep -q 'reason=install_failed native_rc=100' "$TMPROOT/locked-persistence.log" || fail "native failure not observable"
+if grep -q '\[harden\] done' "$TMPROOT/locked-persistence.log"; then fail "lock failure claimed hardener completion"; fi
+grep -q 'cogni-harden-internal-ports:drop-public' "$IPT_STATE" || fail "lock failure lost public DROP"
+ok "missing dependency propagates apt lock failure without retry or false completion"
 
 echo "PASS: all $PASS assertions"

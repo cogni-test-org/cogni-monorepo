@@ -4,8 +4,12 @@
 /**
  * Module: `@app/_facades/work/items.server`
  * Purpose: Server-side facade for work item read/write operations across the markdown + Doltgres surfaces.
- * Scope: Maps port results to contract DTOs. Routes Doltgres-allocated IDs (5000+) to the Doltgres port from `getContainer()`; legacy markdown IDs to the markdown port.
- * Invariants: PORT_VIA_CONTAINER (no direct adapter imports), CONTRACTS_ARE_TRUTH, ID_RANGE_RESERVED.
+ * Scope: Maps content results to DTOs; does not own adapters or PostgreSQL coordination. Dolt IDs start at 5000; lower IDs use markdown.
+ * Invariants: PORT_VIA_CONTAINER (no direct adapter imports), CONTRACTS_ARE_TRUTH, ID_RANGE_RESERVED,
+ *   P0P1_IS_NODE_ADMIN (task.5286): a create or patch that sets priority 0 or 1 requires
+ *   `node.administer` on this node, checked BEFORE the store write (deny →
+ *   WorkItemAuthorizationError/403, outage → WorkItemAuthzUnavailableError/503). Priority 2+ and
+ *   every other field are unchanged.
  * Side-effects: IO (filesystem read via port; database read/write via Doltgres port)
  * Links: contracts/work.items.{list,get,create,patch}.v1.contract, work/items/task.0423.doltgres-work-items-source-of-truth.md
  * @internal
@@ -22,6 +26,11 @@ import type { WorkItem, WorkItemId } from "@cogni/work-items";
 import { toWorkItemId } from "@cogni/work-items";
 
 import { getContainer } from "@/bootstrap/container";
+import {
+  checkNodeAdmin,
+  isPrivilegedPriority,
+} from "@/bootstrap/node-admin-gate";
+import { getNodeId } from "@/shared/config/repoSpec.server";
 
 /**
  * Thrown when the opaque pagination cursor cannot be decoded — translated
@@ -64,16 +73,111 @@ export class WorkItemAuthorizationError extends Error {
   }
 }
 
+/** Permanent retirement: cancel the durable item instead of reusing its identity. */
+export class WorkItemDeletionRetiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkItemDeletionRetiredError";
+  }
+}
+
+/** A current mutation may have committed; preserve lookup evidence and forbid automatic replay. */
+export class WorkItemWriteOutcomeUnknownError extends Error {
+  readonly code = "work_item_write_outcome_unknown";
+  readonly retryable = false;
+  constructor(
+    readonly operationId: string,
+    readonly branch: string,
+    readonly commitHash?: string,
+    readonly itemId?: string
+  ) {
+    super(
+      "Work-item write outcome is unknown; inspect the operation branch and main before retrying."
+    );
+    this.name = "WorkItemWriteOutcomeUnknownError";
+  }
+  get receipt() {
+    return {
+      code: this.code,
+      retryable: false as const,
+      lookup: {
+        operationId: this.operationId,
+        branch: this.branch,
+        commitHash: this.commitHash ?? null,
+        itemId: this.itemId ?? null,
+      },
+    };
+  }
+}
+
+/**
+ * Thrown when the authorization service could not decide (OpenFGA unconfigured,
+ * unreachable, or erroring). FAIL CLOSED but DISTINCT from a denial: the route
+ * answers 503 `authz_unavailable`, never 403.
+ */
+export class WorkItemAuthzUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkItemAuthzUnavailableError";
+  }
+}
+
+/**
+ * P0P1_IS_NODE_ADMIN: refuse a priority-0/1 write unless the caller holds
+ * `node.administer`. A no-op for any other priority (including absent).
+ */
+async function assertPriorityAuthority(
+  priority: number | null | undefined,
+  userId: string
+): Promise<void> {
+  if (!isPrivilegedPriority(priority)) return;
+  const gate = await checkNodeAdmin(getContainer().authorization, {
+    userId,
+    nodeId: getNodeId(),
+  });
+  if (gate.ok) return;
+  if (gate.errorCode === "authz_unavailable") {
+    throw new WorkItemAuthzUnavailableError(
+      `priority ${priority} authorization unavailable: ${gate.reason}`
+    );
+  }
+  throw new WorkItemAuthorizationError(
+    `priority ${priority} requires node admin`
+  );
+}
+
 /**
  * Thrown when the store was momentarily unavailable (query timeout, destroyed
  * connection, contended Dolt operation branch). RETRYABLE: the identical
  * request typically succeeds on the next attempt — the route answers 503 with
  * a retry hint, never an opaque 500.
  */
+
 export class WorkItemsBusyError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "WorkItemsBusyError";
+  }
+}
+
+/**
+ * Thrown when a patch's `expectedRevision` no longer matches the row. RETRY
+ * AFTER RE-READ: nothing was written; the route answers 409 `revision_conflict`
+ * with the row's current revision.
+ */
+export class WorkItemRevisionConflictError extends Error {
+  readonly expectedRevision: number;
+  readonly currentRevision: number;
+
+  constructor(
+    message: string,
+    expectedRevision: number,
+    currentRevision: number
+  ) {
+    super(message);
+    this.name = "WorkItemRevisionConflictError";
+    this.expectedRevision = expectedRevision;
+    this.currentRevision = currentRevision;
   }
 }
 
@@ -92,11 +196,49 @@ function mapStoreError(e: unknown): unknown {
   if (name === "DoltgresNotConfiguredError") {
     return new WorkItemsBackendNotReadyError(message);
   }
+  if (name === "WorkItemWriteOutcomeUnknownError") {
+    const receipt = e as {
+      operationId?: unknown;
+      branch?: unknown;
+      commitHash?: unknown;
+      itemId?: unknown;
+    };
+    if (
+      typeof receipt.operationId === "string" &&
+      typeof receipt.branch === "string"
+    )
+      return new WorkItemWriteOutcomeUnknownError(
+        receipt.operationId,
+        receipt.branch,
+        typeof receipt.commitHash === "string" ? receipt.commitHash : undefined,
+        typeof receipt.itemId === "string" ? receipt.itemId : undefined
+      );
+    return e;
+  }
+  if (name === "WorkItemDeletionRetiredError") {
+    return new WorkItemDeletionRetiredError(message);
+  }
   if (name === "WorkItemAuthorizationError") {
     return new WorkItemAuthorizationError(message);
   }
   if (name === "WorkItemsBusyError") {
     return new WorkItemsBusyError(message);
+  }
+  if (name === "WorkItemRevisionConflictError") {
+    const { expectedRevision, currentRevision } = e as {
+      expectedRevision?: unknown;
+      currentRevision?: unknown;
+    };
+    if (
+      typeof expectedRevision === "number" &&
+      typeof currentRevision === "number"
+    ) {
+      return new WorkItemRevisionConflictError(
+        message,
+        expectedRevision,
+        currentRevision
+      );
+    }
   }
   return e;
 }
@@ -239,6 +381,7 @@ export async function createWorkItem(
   input: ContractCreateInput,
   sessionUser: { id: string; displayName: string | null }
 ): Promise<WorkItemDto> {
+  await assertPriorityAuthority(input.priority, sessionUser.id);
   const container = getContainer();
   try {
     const created = await container.doltgresWorkItems.create(
@@ -275,11 +418,15 @@ export async function patchWorkItem(
   input: ContractPatchInput,
   sessionUser: { id: string; displayName: string | null }
 ): Promise<WorkItemDto> {
+  await assertPriorityAuthority(input.set.priority, sessionUser.id);
   const container = getContainer();
   try {
     const patched = await container.doltgresWorkItems.patch(
       {
         id: toWorkItemId(input.id),
+        ...(input.expectedRevision !== undefined && {
+          expectedRevision: input.expectedRevision,
+        }),
         set: dropUndefined(input.set),
       },
       authorTagFromSession(sessionUser)

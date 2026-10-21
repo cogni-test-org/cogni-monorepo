@@ -16,8 +16,17 @@
  * @public
  */
 
+import {
+  DoltBranchMutationUncertainError,
+  runDoltBranchMutation,
+} from "@cogni-dao/doltgres-admission";
 import type { Sql } from "postgres";
 import { initializeConfidence } from "../../domain/confidence-policy.js";
+import {
+  type ActiveGoal,
+  GOAL_ENTRY_TYPE,
+  selectActiveGoals,
+} from "../../domain/dao-goals.js";
 import { stripDangerousControlChars } from "../../domain/sanitize.js";
 import type {
   Citation,
@@ -31,16 +40,29 @@ import type {
 import {
   HYPOTHESIS_TARGETED_EDGES,
   isWorkItemEndpointId,
+  requiresEvaluateAt,
 } from "../../domain/schemas.js";
 import {
+  assertKnowledgeReplay,
+  KnowledgeWriteConflictError,
+} from "../../domain/write-replay.js";
+import {
+  type CitationLinkPage,
   CitationTargetNotFoundError,
   CitationTypeMismatchError,
   type Domain,
   DomainAlreadyRegisteredError,
   HypothesisMissingEvaluateAtError,
   type KnowledgeStorePort,
+  KnowledgeWriteOutcomeUnknownError,
+  KnowledgeWriteScopeRequiredError,
+  type KnowledgeWriteSession,
   type NewDomain,
 } from "../../port/knowledge-store.port.js";
+import type {
+  DoltBranchSessionRunner,
+  DoltWriteConnection,
+} from "./session-admission.js";
 import {
   assertDomainRegistered,
   escapeRef,
@@ -173,8 +195,8 @@ function expectedEntryTypeForEdge(type: CitationType): string | null {
  * DOMAIN_FK_ENFORCED_AT_WRITE pattern from task.5038.
  */
 function assertHypothesisEvaluateAt(entry: NewKnowledge): void {
-  if (entry.entryType === "hypothesis" && !entry.evaluateAt) {
-    throw new HypothesisMissingEvaluateAtError(entry.id);
+  if (requiresEvaluateAt(entry.entryType) && !entry.evaluateAt) {
+    throw new HypothesisMissingEvaluateAtError(entry.id, entry.entryType);
   }
 }
 
@@ -188,6 +210,8 @@ export interface DoltgresAdapterConfig {
    * Must be created with `fetch_types: false` for non-superuser roles.
    */
   sql: Sql;
+  /** Existing shared branch admission; ordinary reads never use it. */
+  writerSession?: DoltBranchSessionRunner;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,10 +219,68 @@ export interface DoltgresAdapterConfig {
 // ---------------------------------------------------------------------------
 
 export class DoltgresKnowledgeStoreAdapter implements KnowledgeStorePort {
-  private readonly sql: Sql;
+  private sql: Sql | DoltWriteConnection;
+  private readonly readSql: Sql;
+  private readonly writerSession: DoltBranchSessionRunner | undefined;
+  private scopeOpen = false;
 
   constructor(config: DoltgresAdapterConfig) {
     this.sql = config.sql;
+    this.readSql = config.sql;
+    this.writerSession = config.writerSession;
+    this.writerSession?.assertIndependentReadClient(config.sql);
+  }
+
+  private assertWriteScope(): void {
+    if (!this.scopeOpen) throw new KnowledgeWriteScopeRequiredError();
+  }
+
+  async withWrite<T>(
+    input: { operationId: string; message: string },
+    run: (write: KnowledgeWriteSession) => Promise<T>
+  ): Promise<T> {
+    if (this.scopeOpen || !this.writerSession)
+      throw new KnowledgeWriteScopeRequiredError();
+    const writer = this.writerSession;
+    try {
+      return await writer.run(
+        "knowledge.logical_write",
+        async (conn, guard, owner) => {
+          const result = await runDoltBranchMutation(conn, {
+            ...input,
+            guard,
+            onReconcile: owner.registerReconciliation,
+            onCommitted: owner.committed,
+            onSessionUncertain: (error) => writer.retire(conn, error),
+            run: async (scopedConnection) => {
+              const scoped = new DoltgresKnowledgeStoreAdapter({
+                sql: this.readSql,
+              });
+              scoped.sql = {
+                unsafe: async (query: string) =>
+                  await scopedConnection.unsafe(query),
+              };
+              scoped.scopeOpen = true;
+              try {
+                return await run(scoped);
+              } finally {
+                scoped.scopeOpen = false;
+              }
+            },
+          });
+          return result.value;
+        },
+        input
+      );
+    } catch (error) {
+      if (error instanceof DoltBranchMutationUncertainError)
+        throw new KnowledgeWriteOutcomeUnknownError(
+          error.operationId,
+          error.branch,
+          error.commitHash
+        );
+      throw error;
+    }
   }
 
   // --- Read ---
@@ -291,6 +373,31 @@ export class DoltgresKnowledgeStoreAdapter implements KnowledgeStorePort {
     return matched;
   }
 
+  async listActiveGoals(): Promise<ActiveGoal[]> {
+    // Direct read of the main-plane `knowledge` table — contribution branches
+    // are separate Dolt branches and never appear here. The id-prefix and
+    // status checks run in `selectActiveGoals` (app layer) rather than SQL, the
+    // same Doltgres-safe idiom as `searchKnowledge`; the shelf is tiny.
+    const rows = await this.sql.unsafe(
+      `SELECT id, entry_type, status, title, content, evaluate_at FROM knowledge WHERE entry_type = ${escapeValue(GOAL_ENTRY_TYPE)}`
+    );
+    return selectActiveGoals(
+      rows.map((r) => {
+        const row = r as Record<string, unknown>;
+        return {
+          id: row.id as string,
+          entryType: row.entry_type as string,
+          status: (row.status as string | null) ?? null,
+          title: row.title as string,
+          content: row.content as string,
+          evaluateAt: row.evaluate_at
+            ? new Date(row.evaluate_at as string)
+            : null,
+        };
+      })
+    );
+  }
+
   async listDomains(): Promise<string[]> {
     const rows = await this.sql.unsafe(
       "SELECT DISTINCT domain FROM knowledge ORDER BY domain"
@@ -329,75 +436,69 @@ export class DoltgresKnowledgeStoreAdapter implements KnowledgeStorePort {
   }
 
   async registerDomain(input: NewDomain): Promise<Domain> {
-    try {
-      await this.sql.unsafe(
-        `INSERT INTO domains (id, name, description) VALUES (${escapeValue(input.id)}, ${escapeValue(input.name)}, ${escapeValue(input.description ?? null)})`
-      );
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg.toLowerCase().includes("duplicate")) {
-        throw new DomainAlreadyRegisteredError(input.id);
+    return this.withWrite(
+      {
+        operationId: `domain.register:${input.id}`,
+        message: `register domain ${input.id}`,
+      },
+      async (write) => {
+        const scoped = write as DoltgresKnowledgeStoreAdapter;
+        if (await write.domainExists(input.id))
+          throw new DomainAlreadyRegisteredError(input.id);
+        await scoped.sql.unsafe(
+          `INSERT INTO domains (id, name, description) VALUES (${escapeValue(input.id)}, ${escapeValue(input.name)}, ${escapeValue(input.description ?? null)})`
+        );
+        const rows = await scoped.sql.unsafe(
+          `SELECT d.id, d.name, d.description, d.confidence_pct, d.created_at, COUNT(k.id) AS entry_count FROM domains d LEFT JOIN knowledge k ON k.domain = d.id WHERE d.id = ${escapeValue(input.id)} GROUP BY d.id, d.name, d.description, d.confidence_pct, d.created_at LIMIT 1`
+        );
+        if (rows.length === 0) {
+          throw new Error(`domain ${input.id} not found after register`);
+        }
+        const row = rows[0] as Record<string, unknown>;
+        const created = row.created_at;
+        return {
+          id: row.id as string,
+          name: row.name as string,
+          description: (row.description as string) ?? null,
+          confidencePct: Number(row.confidence_pct ?? 40),
+          entryCount: Number(row.entry_count ?? 0),
+          createdAt:
+            created instanceof Date
+              ? created.toISOString()
+              : String(created ?? ""),
+        };
       }
-      throw e;
-    }
-    await this.sql.unsafe(
-      `SELECT dolt_commit('-Am', ${escapeValue(`register domain ${input.id}`)})`
     );
-    const rows = await this.sql.unsafe(
-      `SELECT d.id, d.name, d.description, d.confidence_pct, d.created_at, COUNT(k.id) AS entry_count FROM domains d LEFT JOIN knowledge k ON k.domain = d.id WHERE d.id = ${escapeValue(input.id)} GROUP BY d.id, d.name, d.description, d.confidence_pct, d.created_at LIMIT 1`
-    );
-    if (rows.length === 0) {
-      throw new Error(`domain ${input.id} not found after register`);
-    }
-    const row = rows[0] as Record<string, unknown>;
-    const created = row.created_at;
-    return {
-      id: row.id as string,
-      name: row.name as string,
-      description: (row.description as string) ?? null,
-      confidencePct: Number(row.confidence_pct ?? 40),
-      entryCount: Number(row.entry_count ?? 0),
-      createdAt:
-        created instanceof Date ? created.toISOString() : String(created ?? ""),
-    };
   }
 
   // --- Write ---
 
   async upsertKnowledge(entry: NewKnowledge): Promise<Knowledge> {
+    this.assertWriteScope();
     await assertDomainRegistered(this.sql, entry.domain);
     assertHypothesisEvaluateAt(entry);
     const insert = insertColumnsSql(knowledgeInsertColumns(entry));
 
-    // Doltgres does not support EXCLUDED or ON CONFLICT DO UPDATE reliably.
-    // Use insert-or-update: try INSERT, on duplicate key fall back to UPDATE.
-    try {
-      const rows = await this.sql.unsafe(
-        `INSERT INTO knowledge (${insert.names}) VALUES (${insert.values}) RETURNING *`
-      );
-      return rowToKnowledge(rows[0] as Record<string, unknown>);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!msg.includes("duplicate") && !msg.includes("Duplicate")) throw e;
-    }
-    // Row exists — update it
-    const setClauses = updateSetSql(knowledgeUpdateColumns(entry));
-    if (setClauses.length === 0) {
-      const existing = await this.getKnowledge(entry.id);
-      if (!existing) throw new Error(`Knowledge ${entry.id} not found`);
+    const existing = await this.getKnowledge(entry.id);
+    if (existing) {
+      assertKnowledgeReplay(existing, entry);
       return existing;
     }
     const rows = await this.sql.unsafe(
-      `UPDATE knowledge SET ${setClauses} WHERE id = ${escapeValue(entry.id)} RETURNING *`
+      `INSERT INTO knowledge (${insert.names}) VALUES (${insert.values}) RETURNING *`
     );
-    if (rows.length === 0)
-      throw new Error(`Knowledge ${entry.id} not found after upsert`);
     return rowToKnowledge(rows[0] as Record<string, unknown>);
   }
 
   async addKnowledge(entry: NewKnowledge): Promise<Knowledge> {
+    this.assertWriteScope();
     await assertDomainRegistered(this.sql, entry.domain);
     assertHypothesisEvaluateAt(entry);
+    const existing = await this.getKnowledge(entry.id);
+    if (existing) {
+      assertKnowledgeReplay(existing, entry);
+      return existing;
+    }
     const insert = insertColumnsSql(knowledgeInsertColumns(entry));
 
     const rows = await this.sql.unsafe(
@@ -410,6 +511,7 @@ export class DoltgresKnowledgeStoreAdapter implements KnowledgeStorePort {
     id: string,
     update: Partial<NewKnowledge>
   ): Promise<Knowledge> {
+    this.assertWriteScope();
     if (update.domain !== undefined) {
       await assertDomainRegistered(this.sql, update.domain);
     }
@@ -429,6 +531,7 @@ export class DoltgresKnowledgeStoreAdapter implements KnowledgeStorePort {
   }
 
   async deleteKnowledge(id: string): Promise<void> {
+    this.assertWriteScope();
     await this.sql.unsafe(
       `DELETE FROM knowledge WHERE id = ${escapeValue(id)}`
     );
@@ -451,6 +554,7 @@ export class DoltgresKnowledgeStoreAdapter implements KnowledgeStorePort {
   // --- Edges (knowledge-syntropy: hypothesis loop) ---
 
   async addCitation(edge: NewCitation): Promise<Citation> {
+    this.assertWriteScope();
     const citingIsWork = isWorkItemEndpointId(edge.citingId);
     const citedIsWork = isWorkItemEndpointId(edge.citedId);
     const workEndpointCount = (citingIsWork ? 1 : 0) + (citedIsWork ? 1 : 0);
@@ -509,22 +613,19 @@ export class DoltgresKnowledgeStoreAdapter implements KnowledgeStorePort {
     const id =
       edge.id ?? citationId(edge.citingId, edge.citedId, edge.citationType);
 
-    // Idempotent on the unique (citing_id, cited_id, citation_type) index.
-    try {
-      const rows = await this.sql.unsafe(
-        `INSERT INTO citations (id, citing_id, cited_id, citation_type, context) VALUES (${escapeValue(id)}, ${escapeValue(edge.citingId)}, ${escapeValue(edge.citedId)}, ${escapeValue(edge.citationType)}, ${escapeValue(edge.context ?? null)}) RETURNING *`
-      );
-      return rowToCitation(rows[0] as Record<string, unknown>);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!msg.toLowerCase().includes("duplicate")) throw e;
-      // Already exists — return the canonical row.
-      const rows = await this.sql.unsafe(
-        `SELECT * FROM citations WHERE citing_id = ${escapeValue(edge.citingId)} AND cited_id = ${escapeValue(edge.citedId)} AND citation_type = ${escapeValue(edge.citationType)} LIMIT 1`
-      );
-      if (rows.length === 0) throw e;
-      return rowToCitation(rows[0] as Record<string, unknown>);
+    const existing = await this.sql.unsafe(
+      `SELECT * FROM citations WHERE citing_id = ${escapeValue(edge.citingId)} AND cited_id = ${escapeValue(edge.citedId)} AND citation_type = ${escapeValue(edge.citationType)} LIMIT 1`
+    );
+    if (existing.length) {
+      const canonical = rowToCitation(existing[0] as Record<string, unknown>);
+      if (canonical.context !== (edge.context ?? null))
+        throw new KnowledgeWriteConflictError(edge.citingId);
+      return canonical;
     }
+    const rows = await this.sql.unsafe(
+      `INSERT INTO citations (id, citing_id, cited_id, citation_type, context) VALUES (${escapeValue(id)}, ${escapeValue(edge.citingId)}, ${escapeValue(edge.citedId)}, ${escapeValue(edge.citationType)}, ${escapeValue(edge.context ?? null)}) RETURNING *`
+    );
+    return rowToCitation(rows[0] as Record<string, unknown>);
   }
 
   async listCitationsByCitingId(citingId: string): Promise<Citation[]> {
@@ -541,6 +642,52 @@ export class DoltgresKnowledgeStoreAdapter implements KnowledgeStorePort {
     return rows.map((r) => rowToCitation(r as Record<string, unknown>));
   }
 
+  async listCitationLinks(
+    endpointId: string,
+    after?: string
+  ): Promise<CitationLinkPage> {
+    const endpoint = escapeValue(endpointId);
+    const cursor = after ? `AND id > ${escapeValue(after)}` : "";
+    // Bound each indexed adjacency read before joining endpoint metadata.
+    // One sentinel detects another page without counting the whole graph.
+    const rows = await this.sql.unsafe(`
+      WITH candidates AS (
+        (SELECT id, citing_id, cited_id, citation_type, context
+         FROM citations WHERE citing_id = ${endpoint} ${cursor}
+         ORDER BY id LIMIT 6)
+        UNION ALL
+        (SELECT id, citing_id, cited_id, citation_type, context
+         FROM citations WHERE cited_id = ${endpoint}
+           AND citing_id <> ${endpoint} ${cursor}
+         ORDER BY id LIMIT 6)
+      ), page AS (
+        SELECT id, citing_id, cited_id, citation_type, context
+        FROM candidates ORDER BY id LIMIT 6
+      )
+      SELECT p.id, p.citing_id, p.cited_id, p.citation_type, p.context,
+        COALESCE(sk.title, sw.title) AS source_title,
+        COALESCE(tk.title, tw.title) AS target_title
+      FROM page p
+      LEFT JOIN knowledge sk ON sk.id = p.citing_id
+      LEFT JOIN knowledge tk ON tk.id = p.cited_id
+      LEFT JOIN work_items sw ON sw.id = p.citing_id
+      LEFT JOIN work_items tw ON tw.id = p.cited_id
+      ORDER BY p.id`);
+    const links = rows.slice(0, 5).map((r) => ({
+      id: r.id as string,
+      citingId: r.citing_id as string,
+      citedId: r.cited_id as string,
+      citationType: r.citation_type as CitationType,
+      context: (r.context as string | null) ?? null,
+      sourceTitle: (r.source_title as string | null) ?? null,
+      targetTitle: (r.target_title as string | null) ?? null,
+    }));
+    return {
+      links,
+      nextCursor: rows.length > 5 ? (links.at(-1)?.id ?? null) : null,
+    };
+  }
+
   async listAllCitations(): Promise<Citation[]> {
     const rows = await this.sql.unsafe(
       "SELECT * FROM citations ORDER BY created_at"
@@ -550,15 +697,8 @@ export class DoltgresKnowledgeStoreAdapter implements KnowledgeStorePort {
 
   // --- Doltgres versioning ---
 
-  async commit(message: string): Promise<string> {
-    const result = await this.sql.unsafe(
-      `SELECT dolt_commit('-Am', ${escapeValue(message)})`
-    );
-    // dolt_commit returns { dolt_commit: ['<hash>'] }
-    const raw = result[0] as Record<string, unknown>;
-    const commitField = raw.dolt_commit;
-    if (Array.isArray(commitField)) return commitField[0] as string;
-    return String(commitField);
+  async commit(_message: string): Promise<string> {
+    throw new KnowledgeWriteScopeRequiredError();
   }
 
   async log(limit?: number): Promise<DoltCommit[]> {
