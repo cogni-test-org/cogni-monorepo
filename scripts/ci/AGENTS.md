@@ -35,7 +35,6 @@ CI/CD automation scripts and configuration documentation for multiple pipeline s
 - **Fast-path classifier env:** `EVENT_NAME`, `REPOSITORY`, `PR_NUMBER_PR`, `PR_HEAD_SHA_PR`, `MQ_HEAD_REF`, `MQ_BASE_SHA`, `MQ_HEAD_SHA`; `FAST_PATH_{PR,COMMIT,FILES}_JSON`, `FAST_PATH_{BASE,HEAD}_CATALOG`, and `FAST_PATH_APPSET_PATHS_LIB` are hermetic test seams only
 - **Files considered API:** `scripts/*.sh`, `workflow-check.mjs`, `infra/openfga/rbac-model.json`
 
-
 - `assert-k3s-dns-substrate.sh` fences optional TEST DNS before deploy-branch publication using direct writer/provider/zone facts; `CONTROL_DOMAIN` preserves the operator host, and `K3S_DNS_PREFLIGHT_RECEIPT` stores public routing metadata only. Existing workload absence/unready is reported; foreign/unresolved writer fails.
 
 ## Responsibilities
