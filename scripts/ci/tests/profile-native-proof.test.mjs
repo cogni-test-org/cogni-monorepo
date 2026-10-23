@@ -11,7 +11,7 @@
  * @internal
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -51,6 +51,98 @@ test("allowlist is applied before serialization, excludes exec and full attribut
   ])
     assert.equal(safeEvent(event(action)), null);
   assert.equal(safeEvent({ ...event("start"), Actor: { ID: "SECRET" } }), null);
+});
+test("image pull names, tags and digests use a separate narrow reference allowlist", () => {
+  for (const id of [
+    "alpine",
+    "alpine:latest",
+    "ghcr.io/cogni-test-org/image:v1",
+    `registry.local:5000/team/image@sha256:${"a".repeat(64)}`,
+  ]) {
+    const selected = safeEvent({
+      ...event("pull"),
+      Type: "image",
+      Actor: { ID: id, Attributes: { name: id, env: "SECRET" } },
+    });
+    assert.equal(selected?.id, id);
+    assert.equal(selected?.image, id);
+    assert.equal(selected?.project, "");
+    assert.ok(!JSON.stringify(selected).includes("SECRET"));
+  }
+  for (const id of [
+    "https://registry/image",
+    "user:password@registry/image",
+    "image?token=SECRET",
+    "image\nSECRET",
+    "image@sha256:bad",
+    "../image",
+  ]) {
+    assert.equal(
+      safeEvent({ ...event("pull"), Type: "image", Actor: { ID: id } }),
+      null
+    );
+  }
+  assert.equal(
+    safeEvent({ ...event("start"), Actor: { ID: "alpine:latest" } }),
+    null
+  );
+});
+
+test("valid event floods retain a bounded mandatory summary at count and byte limits", async () => {
+  for (const mode of ["count", "bytes"]) {
+    const dir = mkdtempSync(path.join(tmpdir(), "native-profile-"));
+    const socketPath = path.join(dir, "docker.sock");
+    const output = path.join(dir, "events.ndjson");
+    const stopped = path.join(dir, "observer-stopped");
+    const sample = event("start");
+    sample.Actor.Attributes =
+      mode === "count"
+        ? {}
+        : {
+            image: "a".repeat(256),
+            "com.docker.compose.project": "b".repeat(256),
+          };
+    const server = http.createServer((_req, res) => {
+      res.on("error", () => {});
+      res.on("close", () => writeFileSync(stopped, "joined"));
+      res.writeHead(200);
+      res.flushHeaders();
+      res.write(`${JSON.stringify(sample)}\n`.repeat(6000));
+    });
+    await new Promise((resolve) => server.listen(socketPath, resolve));
+    try {
+      assert.equal(
+        await profileNative({
+          socketPath,
+          output,
+          command: process.execPath,
+          args: [
+            "-e",
+            "const fs=require('node:fs');const end=Date.now()+2000;const timer=setInterval(()=>{if(fs.existsSync(process.argv[1])||Date.now()>end){clearInterval(timer);process.exit(7)}},5)",
+            stopped,
+          ],
+        }),
+        7
+      );
+      const text = readFileSync(output, "utf8");
+      const rows = text.trim().split("\n").map(JSON.parse);
+      assert.ok(Buffer.byteLength(text) <= 1048576);
+      assert.ok(rows.length <= 5000);
+      assert.deepEqual(
+        rows.at(-1),
+        { action: "profiling-inconclusive", nativeExit: 7 },
+        `${mode}: ${rows.length} rows ${Buffer.byteLength(text)} bytes`
+      );
+      assert.ok(
+        rows.filter((row) => row.action === "start").length >
+          (mode === "count" ? 4900 : 1000)
+      );
+      if (mode === "bytes") assert.ok(rows.length < 4900);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
 });
 test("observer ready precedes native, joins and preserves native failure exactly", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "native-profile-"));

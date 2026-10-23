@@ -32,6 +32,14 @@ const reference = (value) =>
   typeof value === "string" && /^[a-zA-Z0-9_./@:-]{1,256}$/.test(value)
     ? value
     : "";
+const imageReference = (value) =>
+  typeof value === "string" &&
+  value.length <= 256 &&
+  /^(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]{1,5})?\/)*(?:[a-z0-9]+(?:[._-][a-z0-9]+)*)(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@sha256:[a-f0-9]{64})?$/.test(
+    value
+  )
+    ? value
+    : "";
 
 export function safeEvent(event) {
   if (event.Type !== "container" && event.Type !== "image") return null;
@@ -39,9 +47,19 @@ export function safeEvent(event) {
     return null;
   if (event.Type === "image" && event.Action !== "pull") return null;
   const id = event.Actor?.ID ?? event.id;
+  if (!Number.isFinite(event.timeNano) || event.timeNano < 0) return null;
+  if (event.Type === "image") {
+    if (!imageReference(id)) return null;
+    return {
+      action: event.Action,
+      timeNano: String(event.timeNano),
+      id,
+      image: imageReference(event.Actor?.Attributes?.name),
+      project: "",
+    };
+  }
   if (typeof id !== "string" || !/^(sha256:)?[a-f0-9]{12,64}$/.test(id))
     return null;
-  if (!Number.isFinite(event.timeNano) || event.timeNano < 0) return null;
   return {
     action: event.Action,
     timeNano: String(event.timeNano),
@@ -54,6 +72,8 @@ export function safeEvent(event) {
 export async function profileNative({ socketPath, output, command, args }) {
   const maxBytes = 1_048_576;
   const maxRecords = 5_000;
+  // Reserve one record and enough bytes for the mandatory joined/exit summary.
+  const summaryBytes = 256;
   let bytes = 0,
     records = 0,
     inconclusive = false,
@@ -64,11 +84,15 @@ export async function profileNative({ socketPath, output, command, args }) {
   writeFileSync(output, "", { mode: 0o600 });
   const record = (value) => {
     const line = `${JSON.stringify(value)}\n`;
-    if (++records > maxRecords || bytes + Buffer.byteLength(line) > maxBytes) {
+    if (
+      records >= maxRecords - 1 ||
+      bytes + Buffer.byteLength(line) > maxBytes - summaryBytes
+    ) {
       inconclusive = true;
       return false;
     }
     bytes += Buffer.byteLength(line);
+    records++;
     appendFileSync(output, line);
     return true;
   };
@@ -133,14 +157,14 @@ export async function profileNative({ socketPath, output, command, args }) {
     response.setEncoding("utf8");
     response.on("data", (chunk) => {
       buffer += chunk;
-      if (Buffer.byteLength(buffer) > 65_536) {
-        abandon();
-        return;
-      }
       while (buffer.includes("\n")) {
         const end = buffer.indexOf("\n");
         const line = buffer.slice(0, end);
         buffer = buffer.slice(end + 1);
+        if (Buffer.byteLength(line) > 65_536) {
+          abandon();
+          return;
+        }
         if (!line) continue;
         try {
           const selected = safeEvent(JSON.parse(line));
@@ -153,6 +177,7 @@ export async function profileNative({ socketPath, output, command, args }) {
           return;
         }
       }
+      if (Buffer.byteLength(buffer) > 65_536) abandon();
     });
     phase("observer-ready");
     readyResolve(true);
@@ -206,10 +231,13 @@ export async function profileNative({ socketPath, output, command, args }) {
     for (const [name, handler] of Object.entries(handlers))
       process.off(name, handler);
     // No raw Docker event is ever serialized. Summary remains bounded as well.
-    record({
-      action: inconclusive ? "profiling-inconclusive" : "observer-joined",
-      nativeExit: exit,
-    });
+    appendFileSync(
+      output,
+      `${JSON.stringify({
+        action: inconclusive ? "profiling-inconclusive" : "observer-joined",
+        nativeExit: exit,
+      })}\n`
+    );
   }
 }
 
