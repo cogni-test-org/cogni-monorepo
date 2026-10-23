@@ -4083,6 +4083,9 @@ describe("GitHubRepoWriter.dispatchNodeRefCandidateFlight", () => {
           },
         },
       ],
+      "GET /repos/{owner}/{repo}/compare/{basehead}": () => ({
+        status: "ahead",
+      }),
       "GET /repos/{owner}/{repo}/git/ref/{ref}": () =>
         Promise.reject(statusError(404, "Not Found")),
       "POST /repos/{owner}/{repo}/git/refs": () => ({}),
