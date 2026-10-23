@@ -1,0 +1,5 @@
+{
+  "experiment": "task5314-seven-copy-build-sha-cache-mechanism",
+  "purpose": "Dockerignored ordinary-commit marker measures new BUILD_SHA metadata behavior; no product input change.",
+  "sequence": 0
+}
