@@ -33,6 +33,14 @@ import {
 } from "testcontainers";
 import { describe, expect, it } from "vitest";
 import yaml from "yaml";
+import {
+  attemptCleanup,
+  createPhaseObserver,
+  expectedFrozenTree,
+  frozenSourceIdentity,
+  verifyExperimentReceipt,
+  verifyPulledImage,
+} from "../../../scripts/ci/native-preparation-experiment.mjs";
 
 const repo = path.resolve(__dirname, "../../..");
 const { services } = yaml.parse(
@@ -61,6 +69,20 @@ if (!process.env.CI)
   );
 describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
   it("replaces the old true-policy gateway once and preserves native databases", async () => {
+    // TEST-only matched experiment: preserve declared-tag assertion below, then
+    // use the SAME source-bound immutable receipt in both baseline/candidate.
+    const imageControl = verifyExperimentReceipt(
+      JSON.parse(
+        readFileSync(
+          path.join(__dirname, "preparation-image-receipt.json"),
+          "utf8"
+        )
+      ),
+      process.env.GITHUB_REPOSITORY,
+      process.platform
+    );
+    expect(frozenSourceIdentity(repo)).toBe(expectedFrozenTree);
+    const phase = createPhaseObserver();
     const docker = new Docker({ timeout: 10_000 });
     await docker.ping();
     const project = `cogni-litellm-${randomUUID().slice(0, 8)}`;
@@ -68,7 +90,12 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
     const directory = mkdtempSync(path.join(tmpdir(), `${project}-`));
     const composeFile = path.join(directory, "compose.yaml");
     const configFile = path.join(directory, "litellm.yaml");
-    const network = await new Network().start();
+    const network = await phase
+      .run("network-start", () => new Network().start())
+      .catch((error: unknown) => {
+        rmSync(directory, { recursive: true, force: true });
+        throw error;
+      });
     const owned: StartedTestContainer[] = [];
     let watchdog: StartedTestContainer | undefined;
     type Fault = {
@@ -165,21 +192,26 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
           stdio: ["ignore", "pipe", "pipe"],
         }
       );
+    let primaryFailed = false;
     try {
-      const postgres = await new PostgreSqlContainer(services.postgres.image)
-        .withDatabase("litellm")
-        .withUsername("litellm")
-        .withPassword(randomUUID())
-        .withNetwork(network)
-        .withNetworkAliases("owned-pg")
-        .start();
+      const postgres = await phase.run("postgres-start", () =>
+        new PostgreSqlContainer(services.postgres.image)
+          .withDatabase("litellm")
+          .withUsername("litellm")
+          .withPassword(randomUUID())
+          .withNetwork(network)
+          .withNetworkAliases("owned-pg")
+          .start()
+      );
       owned.push(postgres);
-      const dolt = await new GenericContainer(services.doltgres.image)
-        .withEnvironment({ DOLTGRES_PASSWORD: randomUUID() })
-        .withNetwork(network)
-        .withWaitStrategy(Wait.forLogMessage(/server (started|listening)/i))
-        .withStartupTimeout(120_000)
-        .start();
+      const dolt = await phase.run("dolt-start", () =>
+        new GenericContainer(services.doltgres.image)
+          .withEnvironment({ DOLTGRES_PASSWORD: randomUUID() })
+          .withNetwork(network)
+          .withWaitStrategy(Wait.forLogMessage(/server (started|listening)/i))
+          .withStartupTimeout(120_000)
+          .start()
+      );
       owned.push(dolt);
       const databaseState = async () =>
         Promise.all(
@@ -205,17 +237,21 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
         /^Database system identifier:\s+(\d+)$/m
       )?.[1];
       expect(systemId).toMatch(/^\d+$/);
-      const gatewayImage = execFileSync(
-        "bash",
-        [
-          "-c",
-          'source "$1"; infra_image_tag litellm',
-          "owned-image-resolution",
-          path.join(repo, "scripts/ci/lib/image-tags.sh"),
-        ],
-        { cwd: repo, encoding: "utf8" }
-      ).trim();
-      expect(gatewayImage).toMatch(/:litellm-[a-f0-9]+$/);
+      const declaredGatewayImage = phase.sync("gateway-resolution", () =>
+        execFileSync(
+          "bash",
+          [
+            "-c",
+            'source "$1"; infra_image_tag litellm',
+            "owned-image-resolution",
+            path.join(repo, "scripts/ci/lib/image-tags.sh"),
+          ],
+          { cwd: repo, encoding: "utf8" }
+        ).trim()
+      );
+      expect(declaredGatewayImage).toMatch(/:litellm-[a-f0-9]+$/);
+      expect(declaredGatewayImage).toBe(imageControl.declared);
+      const gatewayImage = imageControl.image;
       expect(services.litellm.labels).toContain("autoheal=false");
       expect(services.litellm.restart).toBe("unless-stopped");
       writeFileSync(
@@ -260,7 +296,25 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
       // Keep credentials and every input except reviewed policy identical across convergence.
       const declaration = desired(true);
       writeFileSync(composeFile, yaml.stringify(declaration));
-      compose("up", "-d", "--no-deps", "litellm");
+      phase.sync("gateway-first-up", () =>
+        compose("up", "-d", "--no-deps", "litellm")
+      );
+      const pulledImageId = await phase.run(
+        "gateway-image-identity",
+        async () => {
+          const image = await docker.getImage(gatewayImage).inspect();
+          verifyPulledImage(image);
+          console.info(
+            JSON.stringify({
+              proof: "native-preparation-image",
+              image: gatewayImage,
+              os: image.Os,
+              architecture: image.Architecture,
+            })
+          );
+          return image.Id;
+        }
+      );
       const oldId = compose("ps", "-q", "litellm").trim();
       const old = docker.getContainer(oldId);
       await until(
@@ -269,6 +323,7 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
         240_000
       );
       const oldInspection = await old.inspect();
+      expect(oldInspection.Image).toBe(pulledImageId);
       const oldStart = oldInspection.State.StartedAt;
       const exactHealthcheck = oldInspection.Config.Healthcheck;
       watchdog = await new GenericContainer(services.autoheal.image)
@@ -337,6 +392,7 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
       expect(repairedId).not.toBe(oldId);
       const repaired = docker.getContainer(repairedId);
       const after = await repaired.inspect();
+      expect(after.Image).toBe(pulledImageId);
       expect(after.Config.Healthcheck).toEqual(exactHealthcheck);
       expect(after.Config.Labels.autoheal).toBe("false");
       expect(after.HostConfig.RestartPolicy?.Name).toBe("unless-stopped");
@@ -405,22 +461,65 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
           postgresSystemIdentifier: systemId,
         })
       );
+    } catch (error) {
+      primaryFailed = true;
+      throw error;
     } finally {
-      if (watchdog) await watchdog.stop();
-      try {
-        try {
-          for (const fault of [...faults]) await restoreHttp(fault);
-        } finally {
-          // Container removal also disposes an old faulted namespace after restart.
-          if (existsSync(composeFile)) compose("down", "--remove-orphans");
-        }
-      } finally {
-        await Promise.allSettled(
-          owned.reverse().map((container) => container.stop())
-        );
-        await network.stop();
-        rmSync(directory, { recursive: true, force: true });
-      }
+      await attemptCleanup(
+        [
+          [
+            "cleanup-watchdog",
+            () =>
+              phase.run("cleanup-watchdog", async () => {
+                if (watchdog) await watchdog.stop();
+              }),
+          ],
+          [
+            "cleanup-faults",
+            () =>
+              phase.run("cleanup-faults", () =>
+                attemptCleanup(
+                  [...faults].map((fault) => [
+                    "cleanup-faults",
+                    () => restoreHttp(fault),
+                  ]),
+                  false
+                )
+              ),
+          ],
+          [
+            "cleanup-compose",
+            () =>
+              phase.run("cleanup-compose", async () => {
+                if (existsSync(composeFile))
+                  compose("down", "--remove-orphans");
+              }),
+          ],
+          [
+            "cleanup-databases",
+            () =>
+              phase.run("cleanup-databases", async () => {
+                const stopped = await Promise.allSettled(
+                  owned.reverse().map((container) => container.stop())
+                );
+                if (stopped.some((result) => result.status === "rejected"))
+                  throw new Error("owned database cleanup failed");
+              }),
+          ],
+          [
+            "cleanup-network",
+            () => phase.run("cleanup-network", () => network.stop()),
+          ],
+          [
+            "cleanup-directory",
+            () =>
+              phase.run("cleanup-directory", async () => {
+                rmSync(directory, { recursive: true, force: true });
+              }),
+          ],
+        ],
+        primaryFailed
+      );
     }
   }, 720_000);
 });
