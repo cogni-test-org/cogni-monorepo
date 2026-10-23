@@ -1,0 +1,63 @@
+{
+  "apiVersion": "http.m.crossplane.io/v1alpha2",
+  "kind": "Request",
+  "metadata": {
+    "name": "workload-dns",
+    "namespace": "cogni-candidate-a",
+    "annotations": {
+      "cogni.io/dns-owner": "cogni:cogni-test-org/cogni-monorepo:b927a9dd-6132-4fc9-a51e-e3cee2568e3c:candidate-a",
+      "argocd.argoproj.io/sync-wave": "1"
+    }
+  },
+  "spec": {
+    "providerConfigRef": {
+      "kind": "ClusterProviderConfig",
+      "name": "cogni-http"
+    },
+    "forProvider": {
+      "waitTimeout": "30s",
+      "headers": {
+        "Content-Type": ["application/json"],
+        "Authorization": [
+          "Bearer {{ operator-env-secrets:cogni-candidate-a:CLOUDFLARE_API_TOKEN }}"
+        ]
+      },
+      "payload": {
+        "baseUrl": "https://api.cloudflare.com/client/v4/zones/00000000000000000000000000000000/dns_records",
+        "body": "{\"type\":\"CNAME\",\"name\":\"node-template-test.cogni-testing.org\",\"content\":\"cogni-candidate-a.vm.cognidao.org\",\"ttl\":1,\"proxied\":true,\"comment\":\"cogni:cogni-test-org/cogni-monorepo:b927a9dd-6132-4fc9-a51e-e3cee2568e3c:candidate-a\"}"
+      },
+      "mappings": [
+        {
+          "action": "OBSERVE",
+          "method": "GET",
+          "url": "(.payload.baseUrl + \"?name=\" + .payload.body.name + \"&per_page=100\")"
+        },
+        {
+          "action": "CREATE",
+          "method": "POST",
+          "url": ".payload.baseUrl",
+          "body": ".payload.body"
+        },
+        {
+          "action": "UPDATE",
+          "method": "PUT",
+          "url": "if (.response.statusCode == 200 and .response.body.success == true and (.response.body.result | type) == \"array\" and .response.body.result_info.total_count == (.response.body.result | length)) and ((.response.body.result | length) == 1 and .response.body.result[0].name == .payload.body.name and (.response.body.result[0].type == \"A\" or .response.body.result[0].type == \"AAAA\" or .response.body.result[0].type == \"CNAME\") and .response.body.result[0].comment == .payload.body.comment and (.response.body.result[0].id | type) == \"string\" and (.response.body.result[0].id | test(\"^[a-f0-9]{32}$\"))) then (.payload.baseUrl + \"/\" + .response.body.result[0].id) else error(\"dns_ownership_conflict\") end",
+          "body": ".payload.body"
+        },
+        {
+          "action": "REMOVE",
+          "method": "DELETE",
+          "url": "if (.response.statusCode == 200 and .response.body.success == true and (.response.body.result | type) == \"array\" and .response.body.result_info.total_count == (.response.body.result | length)) and ((.response.body.result | length) == 1 and .response.body.result[0].name == .payload.body.name and (.response.body.result[0].type == \"A\" or .response.body.result[0].type == \"AAAA\" or .response.body.result[0].type == \"CNAME\") and .response.body.result[0].comment == .payload.body.comment and (.response.body.result[0].id | type) == \"string\" and (.response.body.result[0].id | test(\"^[a-f0-9]{32}$\"))) then (.payload.baseUrl + \"/\" + .response.body.result[0].id) else error(\"dns_ownership_conflict\") end"
+        }
+      ],
+      "isRemovedCheck": {
+        "type": "CUSTOM",
+        "logic": "if (.response.statusCode == 200 and .response.body.success == true and (.response.body.result | type) == \"array\" and .response.body.result_info.total_count == (.response.body.result | length)) | not then error(\"dns_observation_invalid\") elif (.response.body.result | length) == 0 then true elif ((.response.body.result | length) == 1 and .response.body.result[0].name == .payload.body.name and (.response.body.result[0].type == \"A\" or .response.body.result[0].type == \"AAAA\" or .response.body.result[0].type == \"CNAME\") and .response.body.result[0].comment == .payload.body.comment and (.response.body.result[0].id | type) == \"string\" and (.response.body.result[0].id | test(\"^[a-f0-9]{32}$\"))) then false else error(\"dns_ownership_conflict\") end"
+      },
+      "expectedResponseCheck": {
+        "type": "CUSTOM",
+        "logic": "(.response.statusCode == 200 and .response.body.success == true and (.response.body.result | type) == \"array\" and .response.body.result_info.total_count == (.response.body.result | length)) and ((.response.body.result | length) == 1 and .response.body.result[0].name == .payload.body.name and (.response.body.result[0].type == \"A\" or .response.body.result[0].type == \"AAAA\" or .response.body.result[0].type == \"CNAME\") and .response.body.result[0].comment == .payload.body.comment and (.response.body.result[0].id | type) == \"string\" and (.response.body.result[0].id | test(\"^[a-f0-9]{32}$\"))) and (.response.body.result[0].type == .payload.body.type and .response.body.result[0].content == .payload.body.content and .response.body.result[0].proxied == true)"
+      }
+    }
+  }
+}

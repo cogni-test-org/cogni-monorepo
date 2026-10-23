@@ -26,3 +26,9 @@ deployment_provider:
 activity_env: candidate-a
 owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
 node_id: b927a9dd-6132-4fc9-a51e-e3cee2568e3c
+k3s_dns:
+  candidate-a:
+    mode: crossplane-http
+    zoneId: "00000000000000000000000000000000"
+    target: cogni-candidate-a.vm.cognidao.org
+    workloadDomain: cogni-testing.org
