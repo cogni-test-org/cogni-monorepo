@@ -115,6 +115,7 @@
     "scheduler:build": "pnpm --filter @cogni/scheduler-worker-service build",
     "scheduler:dev": "dotenv -e .env.local -- pnpm --filter @cogni/scheduler-worker-service dev",
     "scheduler:docker:build": "docker build -f services/scheduler-worker/Dockerfile -t cogni-scheduler-worker-local .",
+    "sandbox:docker:build": "docker build -t cogni-sandbox-runtime:latest services/sandbox-runtime/",
     "packages:build": "pnpm -r --filter \"./packages/**\" --filter \"./nodes/operator/packages/**\" --filter \"./nodes/operator/graphs/**\" build && tsc -b packages/*/tsconfig.json packages/langgraph-graphs/tsconfig.build.json nodes/operator/packages/*/tsconfig.json && pnpm packages:validate",
     "packages:build:clean": "rm -rf packages/*/dist packages/*/*.tsbuildinfo nodes/operator/packages/*/dist nodes/operator/packages/*/*.tsbuildinfo nodes/operator/graphs/dist && pnpm packages:build",
     "packages:validate": "tsx --tsconfig tsconfig.scripts.json scripts/validate-package-declarations.ts",
@@ -167,7 +168,8 @@
     "validate:chain": "tsx --no-cache --tsconfig tsconfig.scripts.json scripts/validate-chain-config.ts",
     "governance:schedules:sync": "pnpm dotenv -e .env.local -- sh -lc 'curl -fsS -X POST http://localhost:3000/api/internal/ops/governance/schedules/sync -H \"Authorization: Bearer ${INTERNAL_OPS_TOKEN:?INTERNAL_OPS_TOKEN is required}\"'",
     "knip": "dotenv -e .env.local -- knip --include files,exports,dependencies",
-    "prepare": "husky"
+    "prepare": "husky",
+    "bug5521:unused-probe": "node -e \"process.exit(0)\""
   },
   "engines": {
     "node": "22.x"
