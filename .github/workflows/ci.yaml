@@ -634,7 +634,16 @@ jobs:
           password: ${{ github.token }}
 
       - name: Native fault acceptance (unchanged declared controls)
-        run: pnpm exec vitest run --config scripts/vitest/vitest.native.config.mts
+        run: node scripts/ci/profile-native-proof.mjs --config scripts/vitest/vitest.native.config.mts
+
+      - name: Upload bounded TEST-only native lifecycle profile
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-profile-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/native-profile.ndjson
+          retention-days: 1
+          if-no-files-found: warn
 
       - name: CI Telemetry
         if: always()
