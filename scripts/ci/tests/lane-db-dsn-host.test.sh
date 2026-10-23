@@ -471,9 +471,12 @@ echo "  ok  scope guards hold"
   fixture="$TMPROOT/db-provision"
   mkdir -p "$fixture/infra/catalog"
   cp "$REPO_ROOT/infra/database-budget-profiles.yaml" "$fixture/infra/"
-  for node in operator red poly; do
-    cp "$REPO_ROOT/infra/catalog/$node.yaml" "$fixture/infra/catalog/"
-  done
+  cp "$REPO_ROOT/infra/catalog/operator.yaml" "$fixture/infra/catalog/"
+  yq -i '.envs = ["candidate-a", "preview", "production"]' "$fixture/infra/catalog/operator.yaml"
+  # This caller fixture owns its shared/dedicated and env-membership inputs;
+  # canonical red/poly need not exist in the sovereign fleet under test.
+  printf '%s\n' '{"name":"red","type":"node","envs":["candidate-a","production"],"database":{"candidate-a":{"tier":"shared","budget_profile":"shared-default-v1"},"production":{"tier":"shared","budget_profile":"shared-default-v1"}}}' > "$fixture/infra/catalog/red.yaml"
+  printf '%s\n' '{"name":"poly","type":"node","envs":["candidate-a"],"database":{"candidate-a":{"tier":"dedicated","budget_profile":"dedicated-high-throughput-v1"}}}' > "$fixture/infra/catalog/poly.yaml"
   for function_name in render_shared_db_provision_config read_node_db_secret provision_shared_node_databases; do
     function_source="$(awk -v name="$function_name" '
       $0 == name "() {" { capture=1 }
@@ -488,6 +491,10 @@ echo "  ok  scope guards hold"
   log_info() { :; }
   log_warn() { printf '%s\n' "$*" >> "$fixture/skips"; }
   REPO_ROOT="$fixture"
+  # The real caller's target_in_env reads image-tags' source-time cache. Bind
+  # that cache to this SAME owned tree, including red's absent preview lane.
+  export COGNI_CATALOG_ROOT="$fixture/infra/catalog"
+  . "$real_repo/scripts/ci/lib/image-tags.sh"
   NODE_TARGETS=(operator red poly)
   DEPLOY_ENVIRONMENT=candidate-a
   NODE_DB_PROVISION_CONFIG="$(render_shared_db_provision_config)"

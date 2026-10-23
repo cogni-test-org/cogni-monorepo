@@ -48,6 +48,124 @@ class AuditControls(unittest.TestCase):
                 self.assertEqual(receipt['engineVersion'], observed['Version'])
                 self.assertEqual(receipt['enginePlatform'], {'os': observed['Os'], 'architecture': observed['Arch']})
 
+    def test_classic_load_preserves_every_proven_input_and_max_metadata(self):
+        command = ['docker', 'buildx', 'build', '--platform', 'linux/amd64', '--provenance=mode=max', '--build-arg', 'BUILD_SHA='+'a'*40, '--file', '/owned/old.Dockerfile', '--target', 'runner', '--build-context', 'builder=oci-layout:///owned/builder@sha256:'+'b'*64, '--tag', 'copy-audit:old', '--output', 'type=oci,tar=false,dest=/owned/old-oci', '--metadata-file', '/owned/max-metadata.json', '/owned/context']
+        loaded = audit.classic_load_command(command)
+        self.assertNotIn('--load', command)
+        self.assertIn('--provenance=mode=max', command)
+        self.assertNotIn('--provenance=mode=max', loaded)
+        self.assertIn('--provenance=false', loaded)
+        self.assertNotIn('--metadata-file', loaded)
+        self.assertNotIn('/owned/max-metadata.json', loaded)
+        self.assertNotIn('--output', loaded)
+        stripped = command.copy()
+        for option in ['--output', '--metadata-file']:
+            index = stripped.index(option)
+            del stripped[index:index+2]
+        stripped[stripped.index('--provenance=mode=max')] = '--provenance=false'
+        self.assertEqual(loaded, stripped[:-1]+['--load', stripped[-1]])
+        for changed in [command+['--load'], [x.replace('type=oci,', 'type=docker,') for x in command], [x.replace('--provenance=mode=max', '--provenance=false') for x in command]]:
+            with self.assertRaises(ValueError):
+                audit.classic_load_command(changed)
+
+    def test_owned_buildx_errors_are_bounded_public_and_redacted(self):
+        public = 'ERROR: docker exporter does not currently support exporting manifest lists'
+        data = (public+'\nERROR: https://user:password@host.invalid/path token=secret-value ghp_abc123 Authorization: Bearer private-token\n'+
+                'ERROR: Config={"Env":["SECRET=private"]}\n'+
+                '{"predicate":{"private":"not serialized"}}\n'+
+                'ERROR: API_KEY=arbitrary-private-value\nordinary build output SECRET=private\n').encode()
+        receipt = audit.public_buildx_diagnostic(data)
+        self.assertIn(public.removeprefix('ERROR: '), receipt['publicError'])
+        for secret in ['user:password', 'secret-value', 'ghp_abc123', 'private-token', 'SECRET=private', 'predicate', 'Config', 'arbitrary-private-value']:
+            self.assertNotIn(secret, json.dumps(receipt))
+        self.assertLessEqual(len(audit.public_buildx_diagnostic((public+'\n').encode()*1000)['publicError'].encode()), 4096)
+        sentinel = 'PRIVATE-SENTINEL-DO-NOT-LOG'
+        for error in [
+            'ERROR: '+sentinel,
+            'ERROR: failed to solve: '+sentinel,
+            'ERROR: API_KEY: '+sentinel,
+            'failed to solve: '+sentinel,
+            'ERROR: token='+sentinel,
+            'ERROR: https://user:'+sentinel+'@host.invalid/path',
+            'ERROR: Bearer eyJfixture.fixture.signature '+sentinel,
+            public+' '+sentinel,
+            public+'\nERROR: Config='+sentinel,
+        ]:
+            observed = audit.public_buildx_diagnostic(error.encode())
+            self.assertNotIn(sentinel, json.dumps(observed))
+            self.assertGreater(observed['unknownLines'], 0)
+        with tempfile.TemporaryDirectory() as directory:
+            owned = Path(directory)
+            shim = owned / 'docker'
+            shim.write_text('#!/bin/sh\necho "'+public+'" >&2\nexit 7\n')
+            shim.chmod(0o755)
+            commands = audit.OwnedCommands(owned)
+            previous_path = os.environ['PATH']
+            os.environ['PATH'] = str(owned)+os.pathsep+previous_path
+            try:
+                with self.assertRaises(ValueError):
+                    commands.run(['docker', 'buildx', 'build', '/owned/context'])
+            finally:
+                os.environ['PATH'] = previous_path
+            self.assertEqual(commands.receipts[-1]['failureOutput']['publicError'], public.removeprefix('ERROR: '))
+            self.assertEqual(commands.receipts[-1]['exit'], 7)
+
+    def test_unit_actual_event_base_preserves_root_and_off_pr_full_proof(self):
+        root = MODULE.parents[2]
+        workflow = (root / '.github/workflows/ci.yaml').read_text()
+        match = re.search(r'      - name: Unit \+ contract tests\n.*?        run: \|\n(.*?)(?=\n      (?:#|-))', workflow, re.S)
+        self.assertIsNotNone(match)
+        command = textwrap.dedent(match.group(1))
+        with tempfile.TemporaryDirectory() as directory:
+            owned = Path(directory)
+            def git(*args):
+                return subprocess.check_output(['git', '-C', str(owned), *args], text=True, stderr=subprocess.DEVNULL).strip()
+            git('init', '-q');git('config', 'user.name', 'Owned fixture');git('config', 'user.email', 'fixture@example.invalid')
+            (owned / 'data').write_text('ancient main')
+            git('add', '.');git('commit', '-qm', 'ancientmain');git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+            (owned / 'data').write_text('protected current baseline')
+            git('add', '.');git('commit', '-qm', 'actualbase');base = git('rev-parse', 'HEAD')
+            (owned / 'changed').write_text('actual PR delta')
+            git('add', '.');git('commit', '-qm', 'actualPR')
+            (owned / 'scripts/ci').mkdir(parents=True)
+            (owned / 'scripts/ci/run-unit-tests.sh').write_bytes((root / 'scripts/ci/run-unit-tests.sh').read_bytes())
+            tools = owned / 'bin';tools.mkdir();record = owned / 'calls'
+            shim = tools / 'pnpm'
+            shim.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$OWNED_UNIT_CALLS"\ncase "$*" in *--config*) exit "${OWNED_APP_RESULT:-0}";; esac\n')
+            shim.chmod(0o755)
+            environment = {**os.environ, 'PATH': str(tools)+os.pathsep+os.environ['PATH'], 'CI_NATIVE_SPLIT':'true', 'UNIT_PR_BASE_SHA':base, 'OWNED_UNIT_CALLS':str(record)}
+            def execute(event='pull_request', **overrides):
+                record.write_text('')
+                result = subprocess.run(['bash', '-euo', 'pipefail', '-c', command], cwd=owned, env={**environment, 'CI_EVENT':event, **overrides}, capture_output=True, text=True, timeout=10)
+                return result, record.read_text().splitlines()
+            result, calls = execute()
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(calls[0], "exec vitest run --exclude tests/ci-invariants/native/**")
+            self.assertIn('--changed '+base, calls[1])
+            self.assertNotIn('origin/main', calls[1])
+            for event in ['push', 'merge_group']:
+                result, calls = execute(event, UNIT_PR_BASE_SHA='')
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(len(calls), 2)
+                self.assertIn('--exclude tests/ci-invariants/native/**', calls[0])
+                self.assertNotIn('--changed', calls[1])
+            for bad in ['', 'unknown;echo bypass', 'f'*40]:
+                result, calls = execute(UNIT_PR_BASE_SHA=bad)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
+            result, calls = execute(OWNED_APP_RESULT='19')
+            self.assertEqual(result.returncode, 19)
+            self.assertEqual(len(calls), 2)
+            git('checkout', '--orphan', 'unrelated')
+            git('commit', '--allow-empty', '-qm', 'unrelated')
+            # The actual former PR base exists but is not an ancestor here.
+            result, calls = execute(UNIT_PR_BASE_SHA=base)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(calls, [])
+            result, calls = execute('push', OWNED_APP_RESULT='19')
+            self.assertEqual(result.returncode, 19)
+            self.assertEqual(len(calls), 2)
+
     def test_actual_migration_event_binding_preserves_real_immutable_negative(self):
         root = MODULE.parents[2]
         workflow = (root / '.github/workflows/ci.yaml').read_text()

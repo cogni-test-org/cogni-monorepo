@@ -546,9 +546,17 @@ jobs:
       - name: Unit + contract tests
         env:
           CI_EVENT: ${{ github.event_name }}
-          TURBO_SCM_BASE: origin/main
+          UNIT_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           CI_NATIVE_SPLIT: "true"
-        run: bash scripts/ci/run-unit-tests.sh
+        run: |
+          set -euo pipefail
+          if [ "$CI_EVENT" = pull_request ]; then
+            [[ "$UNIT_PR_BASE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo '::error::invalid unit PR event base'; exit 1; }
+            git cat-file -e "$UNIT_PR_BASE_SHA^{commit}" || exit 1
+            git merge-base --is-ancestor "$UNIT_PR_BASE_SHA" HEAD || exit 1
+            export TURBO_SCM_BASE="$UNIT_PR_BASE_SHA"
+          fi
+          bash scripts/ci/run-unit-tests.sh
 
       - name: CI Telemetry
         if: always()

@@ -24,7 +24,8 @@ import tempfile
 import time
 
 BASE = 'b4049ffab2cd6a04f3db48d1563bbc2edf37ed63'
-FAILED_Q = 'e1ea3cfe26bd23c803ddae4b5c73fc4fd3906871'
+FAILED_Q = '2baa660856d07fc51d2a2c2af58c52d3ec266b6f'
+SECOND_FAILED_Q = 'e1ea3cfe26bd23c803ddae4b5c73fc4fd3906871'
 FIRST_FAILED_Q = '4e4388390011b1a69b6b187203daea103886d8cf'
 RECIPE = 'nodes/operator/app/Dockerfile'
 MAX_BYTES = 4 * 1024**3
@@ -425,6 +426,61 @@ def oci(layout, scan=False, receipt=None):
     return root['digest'], manifest['config']['digest'], config, selected
 
 
+def classic_load_command(oci_command):
+    """Load the SAME proven source using a classic-store-compatible exporter.
+
+    Buildx0.38 build/opt.go rejects --load+attests on overlay2. Provenance is
+    mandatory on the separate OCI export; the loaded config ID must equal its
+    selected config before any use. Never overwrite max-provenance metadata.
+    """
+    require(oci_command[:3] == ['docker', 'buildx', 'build'], 'unknown load command')
+    require(oci_command.count('--provenance=mode=max') == 1 and '--load' not in oci_command and '--push' not in oci_command, 'max OCI proof command required')
+    require(oci_command.count('--output') == oci_command.count('--metadata-file') == 1, 'ambiguous OCI output/metadata')
+    result, index = [], 0
+    while index < len(oci_command):
+        arg = oci_command[index]
+        if arg in ['--output', '--metadata-file']:
+            require(index+1 < len(oci_command), 'missing OCI option value')
+            if arg == '--output':
+                require(oci_command[index+1].startswith('type=oci,tar=false,dest='), 'non-OCI proof output')
+            index += 2
+            continue
+        result.append('--provenance=false' if arg == '--provenance=mode=max' else arg)
+        index += 1
+    return result[:-1]+['--load', result[-1]]
+
+
+def public_buildx_diagnostic(data):
+    """Exact pinned-source public CLI classifications; unknown output is hashed.
+
+    An ERROR prefix does not establish that its arbitrary tail is public. Never
+    echo unclassified stderr/build/Env/config/provenance text, even when short.
+    Source: Buildxv0.38.0 build/opt.go, commands/build.go, util/buildflags/export.go.
+    """
+    messages = {
+        'docker exporter does not currently support exporting manifest lists': 'classic-store-attestation-incompatible',
+        'docker exporter does not support exporting manifest lists, use the oci exporter instead': 'classic-store-attestation-output-incompatible',
+        'multiple outputs currently unsupported by the current BuildKit daemon, please upgrade to version v0.13+ or use a single output': 'multiple-exporters-unsupported',
+        'multiple outputs configured to write to stdout': 'ambiguous-stdout-exporters',
+        'type is required for output': 'missing-exporter-type',
+        'local and tar exporters are incompatible with image ID file': 'image-id-exporter-incompatible',
+    }
+    known = {prefix+message: (code, message) for message, code in messages.items()
+             for prefix in ['ERROR: ', 'ERROR: failed to solve: ', 'error: ', 'failed to solve: ']}
+    admitted, matched = {}, 0
+    for raw in data.decode('utf-8', errors='replace').splitlines():
+        line = re.sub(r'\x1b\[[0-9;]*m', '', raw).strip()
+        if line in known:
+            code, message = known[line]
+            admitted[code] = message  # fixed source constant, never the raw tail
+            matched += 1
+    text = '\n'.join(admitted.values())
+    require(len(text.encode()) <= 4096, 'public CLI classification limit')
+    return {'outputSha256': hashlib.sha256(data).hexdigest(), 'outputBytes': len(data),
+            'publicError': text, 'classifications': list(admitted),
+            'unknownLines': len(data.splitlines())-matched}
+
+
 class OwnedCommands:
     def __init__(self, directory):
         self.directory = directory
@@ -456,7 +512,10 @@ class OwnedCommands:
                 except ProcessLookupError:
                     pass
                 child.wait()
-                self.receipts.append({"phase": self.phase, "action": " ".join(args[:2]), "seconds": round(time.monotonic()-started, 3), "bytes": path.stat().st_size, "exit": child.returncode})
+                record = {"phase": self.phase, "action": " ".join(args[:2]), "seconds": round(time.monotonic()-started, 3), "bytes": path.stat().st_size, "exit": child.returncode}
+                if child.returncode != 0 and args[:3] == ['docker', 'buildx', 'build'] and output is None:
+                    record['failureOutput'] = public_buildx_diagnostic(path.read_bytes())
+                self.receipts.append(record)
         if not allow_failure:
             require(child.returncode == 0, 'owned command failed (output not serialized)')
         data = b'' if output else path.read_bytes()
@@ -484,8 +543,9 @@ def qualify():
     source = Path.cwd()
     require(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == opts.source_sha, 'checkout/source mismatch')
     require(subprocess.check_output(['git', 'rev-parse', 'HEAD^'], text=True).strip() == FAILED_Q, 'qualification repair parent mismatch')
-    require(subprocess.check_output(['git', 'rev-parse', 'HEAD^^'], text=True).strip() == FIRST_FAILED_Q, 'qualification first failed ancestor mismatch')
-    require(subprocess.check_output(['git', 'rev-parse', 'HEAD^^^'], text=True).strip() == BASE, 'qualification protected ancestor mismatch')
+    require(subprocess.check_output(['git', 'rev-parse', 'HEAD^^'], text=True).strip() == SECOND_FAILED_Q, 'qualification second failed ancestor mismatch')
+    require(subprocess.check_output(['git', 'rev-parse', 'HEAD^^^'], text=True).strip() == FIRST_FAILED_Q, 'qualification first failed ancestor mismatch')
+    require(subprocess.check_output(['git', 'rev-parse', 'HEAD^^^^'], text=True).strip() == BASE, 'qualification protected ancestor mismatch')
     old, new = base_recipe(source), (source / RECIPE).read_text()
     assert_recipe(old, new)
     owned = Path(tempfile.mkdtemp(prefix='copy-audit-', dir=os.environ['RUNNER_TEMP']))
@@ -553,13 +613,21 @@ def qualify():
             tag = f'copy-audit-{os.environ["GITHUB_RUN_ID"]}-{os.environ["GITHUB_RUN_ATTEMPT"]}:{label}'
             images.append(tag)
             layout, meta = owned / (label+'-oci'), owned / (label+'-metadata.json')
-            commands.run(common+['--file', str(recipe), '--target', 'runner', '--build-context', f'builder=oci-layout://{builder_layout}@{builder_digest}', '--tag', tag, '--output', f'type=oci,tar=false,dest={layout}', '--load', '--metadata-file', str(meta), str(context)])
+            proof_command = common+['--file', str(recipe), '--target', 'runner', '--build-context', f'builder=oci-layout://{builder_layout}@{builder_digest}', '--tag', tag, '--output', f'type=oci,tar=false,dest={layout}', '--metadata-file', str(meta), str(context)]
+            commands.phase = 'runner-'+label+'-oci'
+            commands.run(proof_command)
             m = json.loads(meta.read_bytes())
             provenance = m.get('buildx.build.provenance', {})
             materials = provenance.get('materials', [])
             record = {'layout': label, 'builderMaterial': selected_oci_material(materials, builder_digest, builder_manifest)}
             summary.setdefault('auditImages', []).append(record)
             _, config_digest, config, _ = oci(layout, scan=True, receipt=record)
+            commands.phase = 'runner-'+label+'-load'
+            # Classic Docker cannot load the attestation index. Reuse identical
+            # proven inputs/cache, with only exporter/attestation output changed.
+            # A different config ID or layer/platform is RED before export/smoke.
+            commands.run(classic_load_command(proof_command))
+            record['loadPolicy'] = 'same source/context/recipe/builder/SHA; classic load only; OCI max provenance remains authoritative'
             image = _json(commands, ['docker', 'image', 'inspect', tag])[0]
             assert_loaded_identity(image, config_digest, config)
             assert_no_volumes(image)
