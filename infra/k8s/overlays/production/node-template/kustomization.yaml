@@ -43,7 +43,7 @@ patches:
         value: "redis://node-template-redis-external:6379"
       - op: add
         path: /data/NEXTAUTH_URL
-        value: "https://node-template.cognidao.org"
+        value: "https://node-template.cogni-testing.org"
   - target:
       kind: Service
       name: node-app
@@ -67,6 +67,9 @@ patches:
       - op: replace
         path: /spec/template/spec/initContainers/0/envFrom/1/secretRef/name
         value: "node-template-env-secrets"
+      - op: replace
+        path: /spec/template/spec/initContainers/0/env/0/valueFrom/secretKeyRef/name
+        value: "node-template-migration-secrets"
       - op: replace
         path: /spec/template/spec/initContainers/0/command/2
         value: exec node /app/app/migrate.mjs /app/app/migrations
