@@ -634,11 +634,6 @@ jobs:
       - name: Native fault acceptance (unchanged declared controls)
         run: pnpm exec vitest run --config scripts/vitest/vitest.native.config.mts
 
-      - name: TEST-only native terminal failure probe (task.5314)
-        run: |
-          echo '::error::Intentional TEST-only native terminal failure after unchanged acceptance'
-          exit 71
-
       - name: CI Telemetry
         if: always()
         uses: ./.github/actions/loki-ci-telemetry
