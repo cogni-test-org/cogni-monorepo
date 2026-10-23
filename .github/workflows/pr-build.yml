@@ -357,6 +357,7 @@ jobs:
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
         with:
+          fetch-depth: 2 # TEST Q pins its exact protected fixture parent.
           repository: ${{ needs.resolve.outputs.checkout_repo }}
           ref: ${{ needs.resolve.outputs.checkout_ref }}
 
@@ -400,6 +401,15 @@ jobs:
           SHOULD_PUSH: ${{ needs.resolve.outputs.should_push }}
           OUTPUT_FILE: ${{ runner.temp }}/build-fragment-${{ matrix.target }}.json
         run: bash scripts/ci/build-and-push-images.sh
+
+      # TEST-only diagnostic event; its full audit/queue/cleanup costs are retained.
+      - name: Qualify exact seven-COPY equivalence
+        if: github.event_name == 'pull_request' && github.repository == 'cogni-test-org/cogni-monorepo' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'test/task5314-copy-equivalence-qualification' && github.base_ref == 'test/task5314-current-source-base-83d5-f9dc' && matrix.target == 'operator'
+        env:
+          AUDIT_SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+        run: |
+          python3 scripts/ci/tests/operator-copy-qualification.test.py
+          python3 scripts/ci/qualify-operator-copy-layout.py --source-sha "$AUDIT_SOURCE_SHA"
 
       - name: Upload build fragment
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
