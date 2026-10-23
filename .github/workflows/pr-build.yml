@@ -334,6 +334,8 @@ jobs:
           CHANGED_PATHS_FILE: ${{ steps.pr-files.outputs.changed_paths_file }}
           FAST_PATH_ELIGIBLE: ${{ needs.env_manager_fast_path.outputs.eligible }}
         run: |
+          echo '::error::TEST_PROBE_DETECT_FAILURE: deliberate detector failure must block manifest'
+          exit 1
           if [ "$FAST_PATH_ELIGIBLE" = true ]; then
             echo 'has_targets=false' >> "$GITHUB_OUTPUT"
             echo 'targets_json=[]' >> "$GITHUB_OUTPUT"

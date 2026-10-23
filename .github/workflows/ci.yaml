@@ -631,8 +631,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Native fault acceptance (unchanged declared controls)
-        run: pnpm exec vitest run --config scripts/vitest/vitest.native.config.mts
+      - name: Native fault acceptance (deliberate TEST failure probe)
+        run: |
+          echo '::error::TEST_PROBE_NATIVE_FAILURE: deliberate child failure must block unit'
+          exit 1
+          pnpm exec vitest run --config scripts/vitest/vitest.native.config.mts
 
       - name: CI Telemetry
         if: always()
