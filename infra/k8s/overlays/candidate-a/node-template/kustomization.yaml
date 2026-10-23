@@ -6,6 +6,7 @@ kind: Kustomization
 namespace: cogni-candidate-a
 
 resources:
+  - k3s-dns-request.json
   - ../../../base/node-app
 
 namePrefix: node-template-
@@ -202,3 +203,12 @@ patches:
       kind: EndpointSlice
       metadata:
         name: doltgres-external-1
+  # BEGIN generated k3s DNS origin
+  - target:
+      kind: ConfigMap
+      name: node-app-config
+    patch: |
+      - op: replace
+        path: /data/NEXTAUTH_URL
+        value: "https://node-template-test.cogni-testing.org"
+  # END generated k3s DNS origin
