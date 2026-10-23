@@ -24,6 +24,7 @@ import tempfile
 import time
 
 BASE = 'b4049ffab2cd6a04f3db48d1563bbc2edf37ed63'
+FAILED_Q = '4e4388390011b1a69b6b187203daea103886d8cf'
 RECIPE = 'nodes/operator/app/Dockerfile'
 MAX_BYTES = 4 * 1024**3
 MAX_MEMBERS = 500_000
@@ -34,6 +35,18 @@ DIGEST = re.compile(r'sha256:[a-f0-9]{64}\Z')
 def require(ok, message):
     if not ok:
         raise ValueError(message)
+
+
+def record_engine_identity(summary, engine):
+    # Observe first so an unsupported hosted runner remains diagnosable after
+    # cleanup. Only public engine identity fields enter the persistent receipt.
+    summary['engineVersion'] = engine.get('Version')
+    summary['enginePlatform'] = {'os': engine.get('Os'), 'architecture': engine.get('Arch')}
+    # Actual PR Build runner, independently reviewed at Moby v28.0.4:
+    # daemon/export.go -> pkg/archive/archive.go. Export omits arbitrary xattrs;
+    # the separate raw-OCI ALL-attribute absence check remains mandatory.
+    require(engine.get('Version') == '28.0.4', 'unreviewed export-engine version')
+    require(engine.get('Os') == 'linux' and engine.get('Arch') == 'amd64', 'unreviewed export-engine platform')
 
 
 def verify_digest(data, digest):
@@ -423,7 +436,8 @@ def qualify():
     require(pr['head']['sha'] == opts.source_sha and pr['base']['sha'] == BASE, 'exact event source/base mismatch')
     source = Path.cwd()
     require(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == opts.source_sha, 'checkout/source mismatch')
-    require(subprocess.check_output(['git', 'rev-parse', 'HEAD^'], text=True).strip() == BASE, 'qualification parent mismatch')
+    require(subprocess.check_output(['git', 'rev-parse', 'HEAD^'], text=True).strip() == FAILED_Q, 'qualification repair parent mismatch')
+    require(subprocess.check_output(['git', 'rev-parse', 'HEAD^^'], text=True).strip() == BASE, 'qualification protected ancestor mismatch')
     old, new = base_recipe(source), (source / RECIPE).read_text()
     assert_recipe(old, new)
     owned = Path(tempfile.mkdtemp(prefix='copy-audit-', dir=os.environ['RUNNER_TEMP']))
@@ -437,11 +451,11 @@ def qualify():
     previous = {s: signal.signal(s, interrupted) for s in [signal.SIGINT, signal.SIGTERM]}
     try:
         engine = _json(commands, ['docker', 'version', '--format', '{{json .Server}}'])
-        require(engine['Version'] == '29.4.2', 'unreviewed export-engine version')
+        record_engine_identity(summary, engine)
         info = _json(commands, ['docker', 'info', '--format', '{{json .}}'])
+        summary['storageDriver'] = info.get('Driver')
+        require(info.get('Driver') == 'overlay2', 'unreviewed export-engine storage driver')
         require(not any('rootless' in x or 'userns' in x for x in info.get('SecurityOptions', [])), 'unreviewed daemon remapping')
-        summary['engineVersion'] = engine['Version']
-        summary['storageDriver'] = info['Driver']
         archive = owned / 'context.tar'
         commands.run(['git', 'archive', '--format=tar', opts.source_sha], output=archive)
         context = owned / 'context'

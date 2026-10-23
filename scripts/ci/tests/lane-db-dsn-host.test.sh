@@ -255,6 +255,17 @@ compose_base_ref() {
 )
 echo '[current] all catalog lanes compose lane-local app/service/migration DSNs; Doltgres unchanged'
 
+. "$SCRIPT_DIR/fixtures/historical-lane-catalog.sh"
+seed_historical_lane_catalog "$TMPROOT/historical-catalog"
+# Historical cases enumerate their complete owned roster independently.
+PAIRS=()
+for catalog_file in "$CATALOG_DIR"/*.yaml; do
+  [ "$(yq -N '.type // ""' "$catalog_file")" = node ] || continue
+  while read -r lane; do
+    [ -n "$lane" ] && PAIRS+=("$(basename "$catalog_file" .yaml)/$lane")
+  done < <(yq -r '.envs[]?' "$catalog_file")
+done
+
 # Historical pins are an EXPLICIT rollback fixture, not the committed contract.
 # Old inertness baselines apply only to the historical four or local-custody rows;
 # a future foreign-compute birth is covered above and never inherits these pins.

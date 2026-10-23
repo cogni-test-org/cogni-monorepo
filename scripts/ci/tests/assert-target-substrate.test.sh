@@ -279,6 +279,9 @@ done
 MISRESIDENT_TREE="$TMPROOT/misresident-src"
 mkdir -p "$MISRESIDENT_TREE"
 cp -R "$HAPPY_TREE/." "$MISRESIDENT_TREE/"
+# This historical pin deliberately models production-custodied compute, not the TEST fleet control default.
+misresident_control_env="${FLEET_CONTROL_ENV-}"
+export FLEET_CONTROL_ENV=production
 yq -i '.deployment_provider."candidate-a" = "akash"' "$MISRESIDENT_TREE/infra/catalog/node-template.yaml"
 # Placement moves the control env, so it also moves the AppSet directory (bug.5204). Park a
 # copy at the relocated path so the EARLIER appset-existence check cannot absorb this case —
@@ -306,6 +309,8 @@ if grep -q "Postgres database exists: cogni_node_template" "$TMPROOT/misresident
   echo "expected no husk verdict once the lane is known to be misresident" >&2
   exit 1
 fi
+
+if [ -n "$misresident_control_env" ]; then export FLEET_CONTROL_ENV="$misresident_control_env"; else unset FLEET_CONTROL_ENV; fi
 
 env "${BASE_ENV[@]}" CHECK_DNS=true \
   CLOUDFLARE_API_TOKEN=test-token CLOUDFLARE_ZONE_ID=zone123 FORK_DOMAIN_ROOT=cognidao.org \

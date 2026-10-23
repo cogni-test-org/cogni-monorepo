@@ -357,7 +357,7 @@ jobs:
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
         with:
-          fetch-depth: 2 # TEST Q pins its exact protected fixture parent.
+          fetch-depth: 3 # TEST Q repair pins failed4e parent and protectedb404 grandparent.
           repository: ${{ needs.resolve.outputs.checkout_repo }}
           ref: ${{ needs.resolve.outputs.checkout_ref }}
 

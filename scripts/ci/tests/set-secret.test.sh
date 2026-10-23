@@ -136,10 +136,19 @@ case "$1/$2" in
 esac
 BAO
 chmod +x "$TMPROOT/fakebin/bao"
+# Dynamic components use an owned poly catalog and the real typed validator;
+# committed sovereign roster membership is not this private CAS test's input.
+COMPONENT_ROOT="$TMPROOT/component-source"
+mkdir -p "$COMPONENT_ROOT/infra/catalog"
+printf '%s\n' '{"name":"poly","type":"node","node_id":"4b06359a-a859-4399-888e-a8c7a6696f7e"}' > "$COMPONENT_ROOT/infra/catalog/poly.yaml"
+ln -s "$REPO_ROOT/scripts" "$COMPONENT_ROOT/scripts"
+ln -s "$REPO_ROOT/node_modules" "$COMPONENT_ROOT/node_modules"
+ln -s "$REPO_ROOT/tsconfig.json" "$COMPONENT_ROOT/tsconfig.json"
+ln -s "$REPO_ROOT/package.json" "$COMPONENT_ROOT/package.json"
 component_case() {
   local name="$1" mode="$2" version="$3" body="$4" expected="$5" env_name="$6" service="$7" key="$8" rc=0 output
   : > "$TMPROOT/component.log"; rm -f "$TMPROOT/component-value"
-  output="$(printf '%s' "$body" | env -u SET_SECRET_BAO PATH="$TMPROOT/fakebin:$PATH" BAO_ADDR=http://fixture.invalid BAO_TOKEN=fixture-only FAKE_MODE="$mode" FAKE_BAO_LOG="$TMPROOT/component.log" FAKE_BAO_VALUE="$TMPROOT/component-value" SET_SECRET_EXPECTED_VERSION="$version" REPO_ROOT="$REPO_ROOT" bash "$TARGET" "$env_name" "$service" "$key" 2>&1)" || rc=$?
+  output="$(printf '%s' "$body" | env -u SET_SECRET_BAO PATH="$TMPROOT/fakebin:$PATH" BAO_ADDR=http://fixture.invalid BAO_TOKEN=fixture-only FAKE_MODE="$mode" FAKE_BAO_LOG="$TMPROOT/component.log" FAKE_BAO_VALUE="$TMPROOT/component-value" SET_SECRET_EXPECTED_VERSION="$version" REPO_ROOT="$COMPONENT_ROOT" bash "$TARGET" "$env_name" "$service" "$key" 2>&1)" || rc=$?
   if { [[ "$expected" == pass && "$rc" == 0 ]] || [[ "$expected" == fail && "$rc" != 0 ]]; } && ! grep -q 'kv put' "$TMPROOT/component.log"; then
     printf 'OK  %s\n' "$name"; pass=$((pass+1))
   elif [[ "$expected" == create && "$rc" == 0 ]] && grep -q '^kv put -cas=0 ' "$TMPROOT/component.log"; then

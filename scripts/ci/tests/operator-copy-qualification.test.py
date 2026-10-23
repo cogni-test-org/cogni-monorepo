@@ -6,6 +6,10 @@ import hashlib
 import tempfile
 import time
 import sys
+import subprocess
+import re
+import textwrap
+import os
 from pathlib import Path
 import tarfile
 import unittest
@@ -30,6 +34,93 @@ def archive(rows):
 
 
 class AuditControls(unittest.TestCase):
+    def test_exact_reviewed_engine_and_unknown_version_receipt(self):
+        known = {'Version': '28.0.4', 'Os': 'linux', 'Arch': 'amd64'}
+        receipt = {}
+        audit.record_engine_identity(receipt, known)
+        self.assertEqual(receipt['engineVersion'], '28.0.4')
+        for changed in [{'Version': '29.4.2'}, {'Os': 'windows'}, {'Arch': 'arm64'}]:
+            with self.subTest(changed=changed):
+                observed = {**known, **changed}
+                receipt = {}
+                with self.assertRaises(ValueError):
+                    audit.record_engine_identity(receipt, observed)
+                self.assertEqual(receipt['engineVersion'], observed['Version'])
+                self.assertEqual(receipt['enginePlatform'], {'os': observed['Os'], 'architecture': observed['Arch']})
+
+    def test_actual_migration_event_binding_preserves_real_immutable_negative(self):
+        root = MODULE.parents[2]
+        workflow = (root / '.github/workflows/ci.yaml').read_text()
+        match = re.search(r'      - name: Database migration guards\n.*?        run: \|\n(.*?)(?=\n      (?:#|-))', workflow, re.S)
+        self.assertIsNotNone(match)
+        command = textwrap.dedent(match.group(1))
+        with tempfile.TemporaryDirectory() as directory:
+            owned = Path(directory)
+            def git(*args):
+                return subprocess.check_output(['git', '-C', str(owned), *args], text=True, stderr=subprocess.DEVNULL).strip()
+            git('init', '-q')
+            git('config', 'user.name', 'Owned CI fixture')
+            git('config', 'user.email', 'fixture@example.invalid')
+            migration = owned / 'infra/compose/runtime/postgres-init/control-migrations/0000_owned.sql'
+            migration.parent.mkdir(parents=True)
+            migration.write_text('SELECT 1;\n')
+            old = owned / 'nodes/canary/app/src/adapters/server/db/migrations/0000_old.sql'
+            old.parent.mkdir(parents=True)
+            old.write_text('SELECT 2;\n')
+            (old.parent / 'README.md').write_text('surviving node input')
+            git('add', '.')
+            git('commit', '-qm', 'owned historical main')
+            git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+            old.unlink()
+            git('add', '.')
+            git('commit', '-qm', 'owned protected fixture baseline')
+            base = git('rev-parse', 'HEAD')
+            (owned / 'changed.txt').write_text('ordinary nonmigration delta')
+            git('add', '.')
+            git('commit', '-qm', 'owned PR')
+            tools = owned / 'bin'
+            tools.mkdir()
+            shim = tools / 'pnpm'
+            shim.write_text('#!/bin/sh\n[ "$1" = db:check ] || exit 91\nexec node "$OWNED_MIGRATION_GUARD"\n')
+            shim.chmod(0o755)
+            environment = {**os.environ, 'PATH': str(tools)+os.pathsep+os.environ['PATH'], 'OWNED_MIGRATION_GUARD': str(root / 'scripts/db/check-migrations-immutable.mjs'), 'MIGRATION_PR_BASE_SHA': base, 'MIGRATION_MQ_BASE_SHA': base}
+            def execute(event='pull_request', **overrides):
+                return subprocess.run(['bash', '-euo', 'pipefail', '-c', command], cwd=owned, env={**environment, 'GITHUB_EVENT_NAME': event, **overrides}, capture_output=True, text=True, timeout=10)
+            # The wrong origin/main reports historical deletions; the actual PR
+            # and MQ event bases admit exactly this unchanged migration tree.
+            wrong = subprocess.run(['node', environment['OWNED_MIGRATION_GUARD']], cwd=owned, env={**environment, 'MIGRATIONS_BASE_REF': 'origin/main'}, capture_output=True, timeout=10)
+            self.assertNotEqual(wrong.returncode, 0)
+            self.assertEqual(execute().returncode, 0)
+            self.assertEqual(execute('merge_group').returncode, 0)
+            self.assertNotEqual(execute(MIGRATION_PR_BASE_SHA='untrusted;echo bypass').returncode, 0)
+            self.assertNotEqual(execute(MIGRATION_PR_BASE_SHA='f'*40).returncode, 0)
+            migration.write_text('SELECT 999;\n')
+            rejected = execute()
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('Migrations are append-only', rejected.stderr)
+
+    def test_loaded_test_image_config_rejects_foreign_runtime_or_producer(self):
+        helper = (MODULE.parent / 'qualify-test-doltgres-image.mjs').as_uri()
+        program = r"""
+import assert from 'node:assert/strict';
+import {verifyLoadedFixture} from 'HELPER_URI';
+const layer = 'sha256:'+'1'.repeat(64);
+const base = {Id:'sha256:'+'2'.repeat(64),Os:'linux',Architecture:'amd64',RootFS:{Type:'layers',Layers:[layer]},Config:{Env:['PUBLIC=value'],Cmd:['doltgres'],Labels:{upstream:'preserved'}}};
+const mirror = structuredClone(base);
+mirror.Id = 'sha256:'+'3'.repeat(64);
+mirror.RootFS.Layers.push('sha256:'+'4'.repeat(64));
+mirror.Config.Labels = {...base.Config.Labels,'org.opencontainers.image.source':'https://github.com/cogni-test-org/cogni-monorepo','org.opencontainers.image.revision':'d0678db88ded712e60c2ffa472bc9be1fff45900','org.opencontainers.image.created':'2026-10-23T08:22:26Z'};
+const receipt = verifyLoadedFixture(base,mirror);
+assert(!JSON.stringify(receipt).includes('PUBLIC=value'));
+// Only absent/empty platform fields are equivalent; preserve every nonempty value.
+const empty=structuredClone(mirror);empty.Variant='';empty.OsVersion='';
+verifyLoadedFixture(base,empty);
+for (const alter of [x=>x.Config.Env=['ALTERED=value'],x=>x.Config.Unknown='new',x=>x.Config.Labels['org.opencontainers.image.revision']='f'.repeat(40),x=>x.RootFS.Layers[0]='sha256:'+'5'.repeat(64),x=>x.Architecture='arm64',x=>x.Variant='v3',x=>x.OsVersion='10.0.1',x=>x.Variant=null,x=>x.OsVersion=3]) {
+ const bad=structuredClone(mirror);alter(bad);assert.throws(()=>verifyLoadedFixture(base,bad));
+}
+""".replace('HELPER_URI', helper)
+        subprocess.run(['node', '--input-type=module', '-e', program], check=True, capture_output=True, timeout=10)
+
     def test_actual_seven_copy_move_is_only_change(self):
         root = MODULE.parents[2]
         old = audit.base_recipe(root)

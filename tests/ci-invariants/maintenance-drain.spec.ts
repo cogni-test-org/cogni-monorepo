@@ -11,7 +11,7 @@
  * @public
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -134,6 +134,17 @@ with tempfile.TemporaryDirectory() as d:
 
   it("executes the actual snapshot with owned engine identity and private native failures", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "maintenance-snapshot-"));
+    const fixtureSource = path.join(dir, "source");
+    mkdirSync(path.join(fixtureSource, "infra/catalog"), { recursive: true });
+    writeFileSync(
+      path.join(fixtureSource, "infra/catalog/node-template.yaml"),
+      JSON.stringify({
+        node_id: "11111111-1111-4111-8111-111111111111",
+        source_sha: "a".repeat(40),
+        envs: ["candidate-a"],
+        deployment_provider: { "candidate-a": "akash" },
+      })
+    );
     const images = {
       postgres: "postgres:15",
       doltgres: "dolthub/doltgresql:0.57.3",
@@ -209,7 +220,7 @@ else:
               GITHUB_REPOSITORY: "cogni-dao/cogni",
               NODE: "node-template",
               CONTROL_ENV: "production",
-              APP_SOURCE_ROOT: root,
+              APP_SOURCE_ROOT: fixtureSource,
               CI_SOURCE_ROOT: root,
             },
           }
