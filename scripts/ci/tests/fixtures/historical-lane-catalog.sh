@@ -11,9 +11,6 @@ seed_historical_lane_catalog() {
     printf '{"name":"%s","type":"node","envs":["candidate-a","preview","production"],"deployment_provider":{"candidate-a":"akash","preview":"akash","production":"akash"}}\n' "$node" > "$destination/$node.yaml"
   done
   export CATALOG_DIR="$destination" COGNI_CATALOG_ROOT="$destination" FLEET_CONTROL_ENV=production
-  # The real image helper snapshots membership at source time. Reload it against
-  # this owned tree so newly synthesized targets cannot inherit a stale cache.
-  if [ -n "${_image_tags_lib_dir:-}" ]; then
-    . "$_image_tags_lib_dir/image-tags.sh"
-  fi
+  # Callers must reload image-tags at TOP LEVEL: its declare arrays would be
+  # function-local here and disappear before historical identity assertions.
 }

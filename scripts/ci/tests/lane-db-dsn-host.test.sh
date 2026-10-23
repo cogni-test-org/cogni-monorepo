@@ -257,6 +257,8 @@ echo '[current] all catalog lanes compose lane-local app/service/migration DSNs;
 
 . "$SCRIPT_DIR/fixtures/historical-lane-catalog.sh"
 seed_historical_lane_catalog "$TMPROOT/historical-catalog"
+# Reload at top level so image-tags declare arrays retain owned membership.
+. "$REPO_ROOT/scripts/ci/lib/image-tags.sh"
 # Historical cases enumerate their complete owned roster independently.
 PAIRS=()
 for catalog_file in "$CATALOG_DIR"/*.yaml; do

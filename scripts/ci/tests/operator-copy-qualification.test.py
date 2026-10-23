@@ -198,6 +198,62 @@ for (const alter of [x=>x.Config.Env=['ALTERED=value'],x=>x.Config.Unknown='new'
             with self.assertRaises(ValueError):
                 audit.oci(root, scan=True)
 
+    def test_buildkit_0331_modern_and_legacy_attestation_members(self):
+        # Representative commitAttestationsManifest output, pinned BuildKit0.33.1:
+        # modern OCI empty config + artifactType/subject; legacy unknown image config.
+        def execute(modern=True, change=None, receipt=None):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                blobs = root / 'blobs/sha256'
+                blobs.mkdir(parents=True)
+                def store(data, media):
+                    digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+                    (blobs / digest.split(':')[1]).write_bytes(data)
+                    return {'digest': digest, 'size': len(data), 'mediaType': media}
+                media = 'application/vnd.oci.image.manifest.v1+json'
+                layer = store(archive([('app/helper', b'data', {})]), 'application/vnd.oci.image.layer.v1.tar')
+                config = {'architecture': 'amd64', 'os': 'linux', 'rootfs': {'type': 'layers', 'diff_ids': [layer['digest']]}}
+                cfg = store(json.dumps(config).encode(), 'application/vnd.oci.image.config.v1+json')
+                runnable = store(json.dumps({'schemaVersion': 2, 'mediaType': media, 'config': cfg, 'layers': [layer]}).encode(), media)
+                att_config = store(b'{}' if modern else json.dumps({'os': 'unknown', 'architecture': 'unknown'}).encode(), 'application/vnd.oci.empty.v1+json' if modern else 'application/vnd.oci.image.config.v1+json')
+                att = {'schemaVersion': 2, 'mediaType': media, 'config': att_config, 'layers': [store(b'{"predicateType":"https://slsa.dev/provenance/v0.2"}', 'application/vnd.in-toto+json')]}
+                descriptor = {'platform': {'os': 'unknown', 'architecture': 'unknown'}, 'annotations': {'vnd.docker.reference.type': 'attestation-manifest', 'vnd.docker.reference.digest': runnable['digest']}}
+                if modern:
+                    att.update(artifactType='application/vnd.docker.attestation.manifest.v1+json', subject=dict(runnable))
+                if change:
+                    change(att, descriptor, store)
+                descriptor.update(store(json.dumps(att).encode(), media))
+                index = store(json.dumps({'schemaVersion': 2, 'manifests': [runnable, descriptor]}).encode(), 'application/vnd.oci.image.index.v1+json')
+                (root / 'index.json').write_text(json.dumps({'schemaVersion': 2, 'manifests': [index]}))
+                return audit.oci(root, scan=True, receipt=receipt)
+        for modern in [True, False]:
+            receipt = {}
+            execute(modern, receipt=receipt)
+            self.assertEqual(len(receipt['observedManifests']), 2)
+            self.assertIn('selectedManifestDigest', receipt)
+            self.assertNotIn('predicateType', json.dumps(receipt))
+        for change in [
+            lambda a, d, st: a.pop('subject'),
+            lambda a, d, st: a['subject'].update(digest='sha256:'+'f'*64),
+            lambda a, d, st: a['subject'].update(size=a['subject']['size']+1),
+            lambda a, d, st: a['subject'].update(mediaType='application/unknown'),
+            lambda a, d, st: a.update(artifactType='application/unknown'),
+            lambda a, d, st: a.update(config=st(b'{"unexpected":1}', 'application/vnd.oci.empty.v1+json')),
+            lambda a, d, st: a['config'].update(digest='sha256:'+'f'*64),
+            lambda a, d, st: a['config'].update(mediaType='application/vnd.oci.image.config.v1+json'),
+            lambda a, d, st: d['annotations'].update({'vnd.docker.reference.digest':'sha256:'+'f'*64}),
+            lambda a, d, st: d['platform'].update(architecture='amd64'),
+            lambda a, d, st: a['layers'][0].update(mediaType='application/unknown'),
+        ]:
+            receipt = {}
+            with self.subTest(change=change), self.assertRaises((ValueError, KeyError)):
+                execute(change=change, receipt=receipt)
+            # Even rejected descriptors are observable after owned temp cleanup.
+            self.assertEqual(len(receipt['observedManifests']), 2)
+            self.assertIn('config', receipt['observedManifests'][1])
+        with self.assertRaises(ValueError):
+            execute(False, lambda a, d, st: a.update(config=st(b'{}', 'application/vnd.oci.image.config.v1+json')))
+
     def test_owned_timeout_kills_and_joins_child(self):
         with tempfile.TemporaryDirectory() as directory:
             commands = audit.OwnedCommands(Path(directory))

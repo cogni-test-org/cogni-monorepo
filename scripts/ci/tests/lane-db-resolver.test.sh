@@ -79,6 +79,8 @@ done
 echo '[current] every committed lane is resident; historical rollback coverage follows'
 . "$SCRIPT_DIR/fixtures/historical-lane-catalog.sh"
 seed_historical_lane_catalog "$TMPROOT/historical-catalog"
+# Reload at top level so image-tags declare arrays retain owned membership.
+. "$REPO_ROOT/scripts/ci/lib/image-tags.sh"
 # Historical cases enumerate their complete owned roster independently.
 PAIRS=()
 for catalog_file in "$CATALOG_DIR"/*.yaml; do

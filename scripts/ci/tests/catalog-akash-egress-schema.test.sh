@@ -14,7 +14,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 # Own a schema-valid Akash input rather than requiring the sovereign roster
 # to contain canonical red. All mutations below still exercise the real schema.
-yq '.name = "egress-fixture" | .envs = ["production"] | .deployment_provider = {"production":"akash"} | .compute_egress_cidrs = [{"cidr":"192.0.2.1/32","comment":"owned fixture"}]' \
+yq '.name = "egress-fixture" | .envs = ["production"] | .activity_env = "production" | .deployment_provider = {"production":"akash"} | .compute_egress_cidrs = [{"cidr":"192.0.2.1/32","comment":"owned fixture"}]' \
   "$REPO_ROOT/infra/catalog/node-template.yaml" > "$tmpdir/source.yaml"
 check-jsonschema --schemafile "$REPO_ROOT/infra/catalog/_schema.json" "$tmpdir/source.yaml" >/dev/null
 

@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
-// SPDX-FileCopyrightText: 2026 Cogni-DAO
-/** TEST-only fixed image fixture. No credential, registry policy, or runtime writer.
- * Canonical producer39724315855 and TEST producer39924083615 use identical
- * Dockerfile/patch and log binary8ecc5f8a…; only OCI producer labels differ.
- * The loaded TEST config and base layers must match the reviewed FROM+COPY
- * recipe before any of this job's tests consume the TEST-owned image.
+// SPDX-FileCopyrightText: 2025 Cogni-DAO
+/**
+ * Module: `@scripts/ci/qualify-test-doltgres-image`
+ * Purpose: Qualify the existing TEST-owned same-binary Doltgres mirror before consumption.
+ * Scope: Fixed TEST repository CI and immutable reviewed images; does not change registry policy or runtime.
+ * Invariants: Exact source, platform, base layers, binary recipe and config; canonical pin unchanged.
+ * Side-effects: IO, process.env
+ * Links: scripts/ci/tests/operator-copy-qualification.test.py, task.5314
+ * @internal
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";

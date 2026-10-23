@@ -855,7 +855,7 @@ FOREIGN_NODE=poly-guard-fixture
 # Owned synthetic foreign source: a sovereign TEST roster need not contain poly.
 # Keep complete existing row fields from its node-template shape, but make this
 # explicit fake workload production-custodied in both nonproduction lanes.
-yq '.name = "poly" | .envs = ["candidate-a", "preview", "production"] | .deployment_provider = {"candidate-a":"akash", "preview":"akash", "production":"akash"}' \
+yq '.name = "poly" | .envs = ["candidate-a", "preview", "production"] | .database."candidate-a" = {"tier":"dedicated","budget_profile":"dedicated-high-throughput-v1"} | .deployment_provider = {"candidate-a":"akash", "preview":"akash", "production":"akash"}' \
   "$FOREIGN_CATALOG/node-template.yaml" > "$FOREIGN_CATALOG/poly.yaml"
 cp "$FOREIGN_CATALOG/poly.yaml" "$FOREIGN_CATALOG/$FOREIGN_NODE.yaml"
 yq -i ".name = \"$FOREIGN_NODE\"" "$FOREIGN_CATALOG/$FOREIGN_NODE.yaml"

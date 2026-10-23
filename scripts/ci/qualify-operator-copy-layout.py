@@ -24,7 +24,8 @@ import tempfile
 import time
 
 BASE = 'b4049ffab2cd6a04f3db48d1563bbc2edf37ed63'
-FAILED_Q = '4e4388390011b1a69b6b187203daea103886d8cf'
+FAILED_Q = 'e1ea3cfe26bd23c803ddae4b5c73fc4fd3906871'
+FIRST_FAILED_Q = '4e4388390011b1a69b6b187203daea103886d8cf'
 RECIPE = 'nodes/operator/app/Dockerfile'
 MAX_BYTES = 4 * 1024**3
 MAX_MEMBERS = 500_000
@@ -334,7 +335,18 @@ def oci(layout, scan=False, receipt=None):
         require('sha256:' + h.hexdigest() == digest, 'OCI blob digest')
         return path
     root = index['manifests'][0]
-    candidates = []
+    candidates, attestations = [], []
+    image_media = 'application/vnd.oci.image.manifest.v1+json'
+    config_media = 'application/vnd.oci.image.config.v1+json'
+    def public(value):
+        return value if isinstance(value, str) and len(value) <= 160 and re.fullmatch(r'[A-Za-z0-9./+_:-]+', value) else {'hash': fingerprint(value)}
+    def identity(desc):
+        # Descriptor fields are public content identities; never serialize config,
+        # arbitrary annotations, payload statements, Env or user-provided strings.
+        return {key: public(desc[key]) if key != 'size' else desc[key] if isinstance(desc[key], int) else {'hash': fingerprint(desc[key])} for key in ['digest', 'size', 'mediaType'] if key in desc}
+    if receipt is not None:
+        receipt['rootDescriptor'] = identity(root)
+        receipt['observedManifests'] = []
     def walk(desc, depth=0):
         require(depth <= 2, 'nested OCI index limit')
         value = json.loads(blob(desc).read_bytes())
@@ -344,17 +356,52 @@ def oci(layout, scan=False, receipt=None):
                 walk(child, depth+1)
             return
         require('config' in value and 'layers' in value, 'unknown OCI object')
-        cfg = json.loads(blob(value['config']).read_bytes())
+        require(len(value['layers']) <= 128, 'OCI layer membership limit')
+        observed = {'descriptor': identity(desc), 'config': identity(value['config']),
+                    'subject': identity(value['subject']) if isinstance(value.get('subject'), dict) else None,
+                    'artifactType': public(value.get('artifactType')),
+                    'referenceType': public(desc.get('annotations', {}).get('vnd.docker.reference.type')),
+                    'referenceDigest': public(desc.get('annotations', {}).get('vnd.docker.reference.digest')),
+                    'platform': {k: public(desc.get('platform', {}).get(k)) for k in ['os', 'architecture', 'variant']},
+                    'layers': [identity(layer) for layer in value['layers']]}
+        if receipt is not None:
+            receipt['observedManifests'].append(observed)
+        require(desc.get('mediaType') == image_media and value.get('mediaType', image_media) == image_media, 'unknown OCI manifest media')
+        cfg_bytes = blob(value['config']).read_bytes()
+        cfg = json.loads(cfg_bytes)
+        observed['configBodyHash'] = hashlib.sha256(cfg_bytes).hexdigest()
+        observed['emptyConfig'] = cfg == {}
         for layer in value['layers']:
             blob(layer)
         if desc.get('annotations', {}).get('vnd.docker.reference.type') == 'attestation-manifest':
-            require(cfg.get('architecture') == 'unknown' and cfg.get('os') == 'unknown', 'invalid attestation descriptor')
+            # BuildKitv0.33.1 commitAttestationsManifest uses DescriptorEmptyJSON
+            # for OCI artifacts, and unknown/unknown image config for legacy mode.
+            # Keep both exact forms; bind subject/reference after selecting the
+            # single runnable member. Unknown objects never become candidates.
+            platform = desc.get('platform', {})
+            require(platform.get('os') == 'unknown' and platform.get('architecture') == 'unknown', 'invalid attestation platform')
+            require(0 < len(value['layers']) <= 8 and all(x.get('mediaType') == 'application/vnd.in-toto+json' for x in value['layers']), 'invalid attestation layers')
+            if value.get('artifactType') == 'application/vnd.docker.attestation.manifest.v1+json':
+                require(value['config'].get('mediaType') == 'application/vnd.oci.empty.v1+json' and cfg_bytes == b'{}' and value['config']['size'] == 2, 'invalid OCI artifact config')
+                require(isinstance(value.get('subject'), dict), 'OCI artifact subject missing')
+                attestations.append((desc, value['subject']))
+            else:
+                require('artifactType' not in value and 'subject' not in value, 'unknown attestation artifact type')
+                require(value['config'].get('mediaType') == config_media and cfg.get('architecture') == 'unknown' and cfg.get('os') == 'unknown', 'invalid legacy attestation config')
+                attestations.append((desc, None))
             return
         require(cfg.get('os') == 'linux' and cfg.get('architecture') == 'amd64', 'unreviewed OCI platform member')
         candidates.append((desc['digest'], value, cfg))
     walk(root)
     require(len(candidates) == 1, 'ambiguous OCI platform result')
     selected, manifest, config = candidates[0]
+    require(manifest['config'].get('mediaType') == config_media, 'invalid runnable config media')
+    selected_descriptor = {'digest': selected, 'size': (layout / 'blobs' / 'sha256' / selected.split(':')[1]).stat().st_size, 'mediaType': image_media}
+    require(len(attestations) <= 1, 'ambiguous attestation member')
+    for descriptor, subject in attestations:
+        require(descriptor.get('annotations', {}).get('vnd.docker.reference.digest') == selected, 'attestation reference mismatch')
+        if subject is not None:
+            require({k: subject.get(k) for k in selected_descriptor} == selected_descriptor, 'attestation subject identity mismatch')
     require(config['os'] == 'linux' and config['architecture'] == 'amd64', 'OCI platform')
     require(len(manifest['layers']) == len(config['rootfs']['diff_ids']), 'layer/diffID count')
     for layer, diffid in zip(manifest['layers'], config['rootfs']['diff_ids']):
@@ -437,7 +484,8 @@ def qualify():
     source = Path.cwd()
     require(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == opts.source_sha, 'checkout/source mismatch')
     require(subprocess.check_output(['git', 'rev-parse', 'HEAD^'], text=True).strip() == FAILED_Q, 'qualification repair parent mismatch')
-    require(subprocess.check_output(['git', 'rev-parse', 'HEAD^^'], text=True).strip() == BASE, 'qualification protected ancestor mismatch')
+    require(subprocess.check_output(['git', 'rev-parse', 'HEAD^^'], text=True).strip() == FIRST_FAILED_Q, 'qualification first failed ancestor mismatch')
+    require(subprocess.check_output(['git', 'rev-parse', 'HEAD^^^'], text=True).strip() == BASE, 'qualification protected ancestor mismatch')
     old, new = base_recipe(source), (source / RECIPE).read_text()
     assert_recipe(old, new)
     owned = Path(tempfile.mkdtemp(prefix='copy-audit-', dir=os.environ['RUNNER_TEMP']))
@@ -510,8 +558,8 @@ def qualify():
             provenance = m.get('buildx.build.provenance', {})
             materials = provenance.get('materials', [])
             record = {'layout': label, 'builderMaterial': selected_oci_material(materials, builder_digest, builder_manifest)}
-            _, config_digest, config, _ = oci(layout, scan=True, receipt=record)
             summary.setdefault('auditImages', []).append(record)
+            _, config_digest, config, _ = oci(layout, scan=True, receipt=record)
             image = _json(commands, ['docker', 'image', 'inspect', tag])[0]
             assert_loaded_identity(image, config_digest, config)
             assert_no_volumes(image)

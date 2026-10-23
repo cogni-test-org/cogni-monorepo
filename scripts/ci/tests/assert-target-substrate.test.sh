@@ -572,6 +572,7 @@ EXTERNAL_ALLOWLIST="$TMPROOT/compute-egress-allowlist"
 # whole-line `grep -Fx` shipped and failed closed on every real host.
 printf '%s\n' '80.200.246.35/32:5432,5435,6379,4000,7233' > "$EXTERNAL_ALLOWLIST"
 EXTERNAL_ENV=(
+  FLEET_CONTROL_ENV=production
   TARGET=toks4
   DEPLOYMENT_PROVIDER=akash
   DEPLOY_ENVIRONMENT=candidate-a

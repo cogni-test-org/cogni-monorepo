@@ -144,6 +144,9 @@ printf '%s\n' '{"name":"poly","type":"node","node_id":"4b06359a-a859-4399-888e-a
 ln -s "$REPO_ROOT/scripts" "$COMPONENT_ROOT/scripts"
 ln -s "$REPO_ROOT/node_modules" "$COMPONENT_ROOT/node_modules"
 ln -s "$REPO_ROOT/tsconfig.json" "$COMPONENT_ROOT/tsconfig.json"
+ln -s "$REPO_ROOT/tsconfig.base.json" "$COMPONENT_ROOT/tsconfig.base.json"
+ln -s "$REPO_ROOT/nodes" "$COMPONENT_ROOT/nodes"
+ln -s "$REPO_ROOT/packages" "$COMPONENT_ROOT/packages"
 ln -s "$REPO_ROOT/package.json" "$COMPONENT_ROOT/package.json"
 component_case() {
   local name="$1" mode="$2" version="$3" body="$4" expected="$5" env_name="$6" service="$7" key="$8" rc=0 output
