@@ -4,7 +4,7 @@
 /**
  * Module: `@scripts/ci/tests/profile-native-proof`
  * Purpose: Prove sanitized observation, bounded streams, and native exit preservation.
- * Scope: Owned local HTTP socket and child processes only; no Docker.
+ * Scope: Owned local HTTP socket and child processes. Does not access Docker.
  * Invariants: No exec or raw attribute serialization; observer joined before return.
  * Side-effects: IO (temporary owned socket/trace and awaited child processes).
  * Links: task.5314

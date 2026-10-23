@@ -4,7 +4,7 @@
 /**
  * Module: `@scripts/ci/profile-native-proof`
  * Purpose: Observe lifecycle phases around the unchanged native acceptance command in TEST.
- * Scope: Read-only disposable runner Docker events; no exec events or Docker mutation.
+ * Scope: Read-only disposable runner Docker events. Does not observe exec or mutate Docker.
  * Invariants: Filter before serialization; bounded output; preserve native exit; join observer.
  * Side-effects: IO (bounded sanitized trace and awaited native child process).
  * Links: task.5314, operator-ci-proof-lanes Checkpoint0
