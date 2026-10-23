@@ -19,6 +19,9 @@
 #
 # Run: bash scripts/ci/tests/reconcile-scheduler-worker-routing.test.sh
 set -euo pipefail
+# Canonical APP_SRC and watched TEST routes below are explicitly owned fixture data.
+# Ambient workload DOMAIN must not rewrite the canonical selected-pair expectation.
+export DOMAIN=cognidao.org
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"

@@ -128,6 +128,26 @@ COPY --from=builder --chown=nextjs:nodejs /tmp/codex-native/@openai/ ./node_modu
 # Next.js standalone does process.chdir(__dirname) → CWD becomes /app/nodes/operator/app at runtime.
 COPY --from=builder --chown=nextjs:nodejs /app/config/mcp.servers.json ./nodes/operator/app/config/mcp.servers.json
 
+# Migrate runner — bundled into runtime image so Deployment initContainers can
+# invoke `node migrate.mjs` directly. task.0370 step 1.
+COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/src/adapters/server/db/migrations /app/nodes/operator/app/migrations
+COPY --from=builder --chown=nextjs:nodejs /app/scripts/db/migrate.mjs /app/nodes/operator/app/migrate.mjs
+# Doltgres migrate runner — task.0423: applies @cogni/operator-doltgres-schema
+# migrations against `knowledge_operator`, then stamps a dolt_commit so DDL
+# lands in dolt_log.
+COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/src/adapters/server/db/doltgres-migrations /app/nodes/operator/app/doltgres-migrations
+# Doltgres migrator + verifier — shared scripts (parity with the Postgres
+# migrate.mjs COPY above). Verifier is sibling-imported by migrate-doltgres.mjs
+# and runs the post-migrate schema check before any tracking-row stamping,
+# closing the silent-skip gap from drizzle-orm's folderMillis-only "applied?"
+# check.
+# The standalone CLI imports the exact released helper index outside Next's trace.
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@cogni-dao/doltgres-admission/dist /app/node_modules/@cogni-dao/doltgres-admission/dist
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@cogni-dao/doltgres-admission/package.json /app/node_modules/@cogni-dao/doltgres-admission/package.json
+COPY --from=builder --chown=nextjs:nodejs /app/scripts/db/migrate-doltgres.mjs /app/nodes/operator/app/migrate-doltgres.mjs
+COPY --from=builder --chown=nextjs:nodejs /app/scripts/db/verify-doltgres-schema.mjs /app/nodes/operator/app/verify-doltgres-schema.mjs
+
+
 # Build SHA plumbing: CI passes --build-arg BUILD_SHA=${GITHUB_SHA}; app reads APP_BUILD_SHA at runtime.
 # Placed last so cache invalidation from a new commit only rebuilds the trailing metadata layer,
 # not the expensive upstream COPY + pnpm-add-codex layers.
@@ -154,24 +174,6 @@ RUN if [ -n "$BUILD_SHA" ]; then \
 
 USER nextjs
 
-# Migrate runner — bundled into runtime image so Deployment initContainers can
-# invoke `node migrate.mjs` directly. task.0370 step 1.
-COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/src/adapters/server/db/migrations /app/nodes/operator/app/migrations
-COPY --from=builder --chown=nextjs:nodejs /app/scripts/db/migrate.mjs /app/nodes/operator/app/migrate.mjs
-# Doltgres migrate runner — task.0423: applies @cogni/operator-doltgres-schema
-# migrations against `knowledge_operator`, then stamps a dolt_commit so DDL
-# lands in dolt_log.
-COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/src/adapters/server/db/doltgres-migrations /app/nodes/operator/app/doltgres-migrations
-# Doltgres migrator + verifier — shared scripts (parity with the Postgres
-# migrate.mjs COPY above). Verifier is sibling-imported by migrate-doltgres.mjs
-# and runs the post-migrate schema check before any tracking-row stamping,
-# closing the silent-skip gap from drizzle-orm's folderMillis-only "applied?"
-# check.
-# The standalone CLI imports the exact released helper index outside Next's trace.
-COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@cogni-dao/doltgres-admission/dist /app/node_modules/@cogni-dao/doltgres-admission/dist
-COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@cogni-dao/doltgres-admission/package.json /app/node_modules/@cogni-dao/doltgres-admission/package.json
-COPY --from=builder --chown=nextjs:nodejs /app/scripts/db/migrate-doltgres.mjs /app/nodes/operator/app/migrate-doltgres.mjs
-COPY --from=builder --chown=nextjs:nodejs /app/scripts/db/verify-doltgres-schema.mjs /app/nodes/operator/app/verify-doltgres-schema.mjs
 
 EXPOSE 3000
 

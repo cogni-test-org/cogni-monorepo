@@ -58,7 +58,15 @@ const config = {
   parentOwner: input.parentOwner,
   parentRepo: input.parentRepo,
 };
-const canonical = readFileSync(path.join(ROOT, FILE), "utf8");
+// Transaction/rollback inputs are owned, independent of a sovereign fleet's
+// generated roster or whether its production worker delegates any aliases.
+const canonical = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-worker-config
+data:
+  TEMPORAL_CUSTODIED_NODE_ENDPOINTS: '{"cogni-candidate-a":"poly=https://poly-test.cognidao.org,4b06359a-a859-4399-888e-a8c7a6696f7e=https://poly-test.cognidao.org,toks5=https://toks5-test.cognidao.org,f66b260b-4633-41e2-8711-b7c1b8449cc1=https://toks5-test.cognidao.org,node-template=https://node-template-test.cognidao.org,b927a9dd-6132-4fc9-a51e-e3cee2568e3c=https://node-template-test.cognidao.org","cogni-preview":"preserve-exact"}'
+`;
 const all = readWorkerPatch(canonical).selected ?? "";
 const old = all
   .split(",")

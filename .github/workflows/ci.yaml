@@ -124,7 +124,7 @@ jobs:
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
         with:
-          fetch-depth: 0 # Migration immutability compares against origin/main.
+          fetch-depth: 0 # Migration immutability needs the authoritative event base.
 
       - name: Enforce env-manager classifier result
         env:
@@ -196,7 +196,24 @@ jobs:
       #   2. strict-monotonic `when` in _journal.json (silent-skip variant)
       #   3. drizzle-kit's own snapshot-chain check
       - name: Database migration guards
-        run: pnpm db:check
+        env:
+          MIGRATION_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MIGRATION_MQ_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          unset MIGRATIONS_BASE_REF
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) migration_base_sha="$MIGRATION_PR_BASE_SHA" ;;
+            merge_group) migration_base_sha="$MIGRATION_MQ_BASE_SHA" ;;
+            push) migration_base_sha="" ;;
+            *) echo '::error::unsupported migration guard event'; exit 1 ;;
+          esac
+          if [ "$GITHUB_EVENT_NAME" != push ]; then
+            [[ "$migration_base_sha" =~ ^[a-f0-9]{40}$ ]] || { echo '::error::invalid migration event base'; exit 1; }
+            git cat-file -e "$migration_base_sha^{commit}" || exit 1
+            git merge-base --is-ancestor "$migration_base_sha" HEAD || exit 1
+            export MIGRATIONS_BASE_REF="$migration_base_sha"
+          fi
+          pnpm db:check
 
       # bug.0344 — structural guardrail on image-updater scope. Positive
       # allowlist: only ApplicationSets named in ALLOWLIST inside the
@@ -529,9 +546,17 @@ jobs:
       - name: Unit + contract tests
         env:
           CI_EVENT: ${{ github.event_name }}
-          TURBO_SCM_BASE: origin/main
+          UNIT_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           CI_NATIVE_SPLIT: "true"
-        run: bash scripts/ci/run-unit-tests.sh
+        run: |
+          set -euo pipefail
+          if [ "$CI_EVENT" = pull_request ]; then
+            [[ "$UNIT_PR_BASE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo '::error::invalid unit PR event base'; exit 1; }
+            git cat-file -e "$UNIT_PR_BASE_SHA^{commit}" || exit 1
+            git merge-base --is-ancestor "$UNIT_PR_BASE_SHA" HEAD || exit 1
+            export TURBO_SCM_BASE="$UNIT_PR_BASE_SHA"
+          fi
+          bash scripts/ci/run-unit-tests.sh
 
       - name: CI Telemetry
         if: always()
@@ -632,6 +657,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+
+      - name: Qualify fixed TEST Doltgres fixture before use
+        run: node scripts/ci/qualify-test-doltgres-image.mjs
 
       - name: Native fault acceptance (unchanged declared controls)
         run: pnpm exec vitest run --config scripts/vitest/vitest.native.config.mts
@@ -738,6 +766,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      - name: Qualify fixed TEST Doltgres fixture before use
+        run: node scripts/ci/qualify-test-doltgres-image.mjs
+
       - name: Component tests (testcontainers)
         run: pnpm test:component
 
@@ -805,6 +836,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+
+      - name: Qualify fixed TEST Doltgres fixture before use
+        run: node scripts/ci/qualify-test-doltgres-image.mjs
 
       # Doltgres-migrator regression: boots the pinned published catalog image in its
       # own container (separate from the Postgres globalSetup the rest of
