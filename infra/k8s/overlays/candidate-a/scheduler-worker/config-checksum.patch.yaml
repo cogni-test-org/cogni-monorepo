@@ -7,4 +7,4 @@ spec:
   template:
     metadata:
       annotations:
-        cogni.dev/scheduler-config-sha256: "0000a9483578855981fdb45b5aa8d3825b9b03d55f3491731b1a4fb5d5b37f55"
+        cogni.dev/scheduler-config-sha256: "b90a5c3f7f84d4a0aa4cd7648a718ebdcedaaa3d21b8917ce78654a24f70a00e"
