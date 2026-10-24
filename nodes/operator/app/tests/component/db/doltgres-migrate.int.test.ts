@@ -56,9 +56,11 @@ const DG_USER = "postgres";
 const DG_PASSWORD = "doltgres";
 const DG_DB = "knowledge_operator";
 const OTHER_DB = "knowledge_attribution_other";
-// PR Build39724315855 / manifest artifact12403190038; compile once, test the published bytes.
+// TEST fixture: existing producer39924083615, identical canonical39724315855
+// recipe/runtime base and binary8ecc; verify-test fixture step checks loaded config.
+// Canonical source pin remains f892; this exact TEST-only mapping is not a version upgrade.
 const DG_IMAGE =
-  "ghcr.io/cogni-dao/cogni-template@sha256:f892b365ad6fc6c683da839260f20c4015615c105176a3c21c015ca90d2b70a3";
+  "ghcr.io/cogni-test-org/cogni-template@sha256:96889c2c105f6bc3dba63d06374662e2e32c661d36498dbc9188dd59016071f8";
 const EXPECTED_BINARY_SHA256 =
   "8ecc5f8a764fe5a70ca3cac76452dc17377bc446136891478c7ee19a5a9eb2b9";
 const require = createRequire(import.meta.url);

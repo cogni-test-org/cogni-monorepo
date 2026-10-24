@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-export const trustedNativeBranch = "main";
+export const trustedNativeBranch = "test/task5314-native-current-6884";
 
 const sha = (value) =>
   typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
@@ -491,8 +491,7 @@ export function validateNativeWitness({
 }) {
   try {
     requireThat(
-      repository === "cogni-dao/cogni" ||
-        repository === "cogni-test-org/cogni-monorepo",
+      repository === "cogni-test-org/cogni-monorepo",
       "unsupported-witness-repository"
     );
     requireThat(
@@ -599,9 +598,7 @@ export async function lookupNativeWitness({
   fetchImpl = fetch,
 }) {
   if (
-    !["cogni-dao/cogni", "cogni-test-org/cogni-monorepo"].includes(
-      repository
-    ) ||
+    !["cogni-test-org/cogni-monorepo"].includes(repository) ||
     !sha(base) ||
     !token
   )
@@ -897,9 +894,7 @@ export async function awaitNativeImageProducer({
     new Promise((resolve) => setTimeout(resolve, milliseconds)),
 }) {
   if (
-    !["cogni-dao/cogni", "cogni-test-org/cogni-monorepo"].includes(
-      repository
-    ) ||
+    !["cogni-test-org/cogni-monorepo"].includes(repository) ||
     !sha(sourceSha) ||
     !["pull_request", "push", "merge_group"].includes(event) ||
     !token
@@ -1150,7 +1145,7 @@ export function nativeExecutionImage(
 async function prepareNativeImages() {
   const repository = process.env.GITHUB_REPOSITORY;
   requireThat(
-    ["cogni-dao/cogni", "cogni-test-org/cogni-monorepo"].includes(repository),
+    ["cogni-test-org/cogni-monorepo"].includes(repository),
     "unsupported-native-image-repository"
   );
   const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
@@ -1260,9 +1255,7 @@ export async function nativeEligibility({
     requireThat(
       baseRef === trustedNativeBranch &&
         policy.repository === repository &&
-        ["cogni-dao/cogni", "cogni-test-org/cogni-monorepo"].includes(
-          repository
-        ) &&
+        ["cogni-test-org/cogni-monorepo"].includes(repository) &&
         sha(base) &&
         sha(head) &&
         sha(tested),

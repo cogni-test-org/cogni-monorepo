@@ -11,5 +11,10 @@ kind: Kustomization
 namespace: argocd
 
 resources:
-  - preview-operator-applicationset.yaml
-  - preview-scheduler-worker-applicationset.yaml
+  - preview-anotha-applicationset.yaml
+  - preview-brother-applicationset.yaml
+  - preview-ghcr-applicationset.yaml
+  - preview-node-template-applicationset.yaml
+  - preview-test-cog-applicationset.yaml
+  - preview-toks2-applicationset.yaml
+  - preview-yo-applicationset.yaml

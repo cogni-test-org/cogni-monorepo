@@ -31,7 +31,7 @@ activity_ledger:
       attribution_pipeline: cogni-v0.0
       # source_refs is a selection-time, fail-open repo allowlist (SSOT for the
       # repos whose merged PRs earn attribution). Empty/missing → no filtering.
-      source_refs: ["cogni-dao/cogni"]
+      source_refs: ["cogni-test-org/cogni-monorepo"]
       # source_refs: ["cogni-test-org/test-cog"]   # candidate-a test value — swap back for candidate-a attribution testing
       excluded_logins: ["Cogni-1729"]
 
@@ -122,6 +122,7 @@ gates:
   - type: review-limits
     id: review_limits
     with:
+      max_changed_files: 50
       max_total_diff_kb: 1500
 
   # Ensure */*/AGENTS.md files are updated when code changes

@@ -28,7 +28,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [main]
+    branches: [test/task5314-native-current-6884]
   # Operator-dispatched TRUSTED build of an approved PR head — the same resolve →
   # detect → build → manifest jobs, just sourced from head_repo@head_sha. This is
   # the only way a fork contributor's PR (whose `pull_request` run has a read-only

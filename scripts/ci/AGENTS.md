@@ -45,6 +45,8 @@ CI/CD automation scripts and configuration documentation for multiple pipeline s
 - Bank calls distinguish target LANE from explicit CONTROL-owner intent even when operator has both roles. Missing target values never fall back to an owner; inheritance is declared by catalog `inheritFrom`.
 - Every runner and direct reconcile resolves the actual catalog provider and refuses an explicit mismatch before materialization.
 
+- TEST fixture qualifier: `qualify-test-doltgres-image.mjs` is restricted to the fixed `cogni-test-org/cogni-monorepo` surrogate ref `test/task5314-native-current-6884`. Its PR caller binds `FIXTURE_EVENT_BASE_SHA` to the GitHub event base and fetches that commit before qualification; the helper verifies the event base is an ancestor of the checkout. Push admission accepts only that exact ref and event/checkout SHA. This fixture never changes canonical image custody or permits deployment.
+
 ## Responsibilities
 
 - This directory **does**: Provide CI-agnostic deployment automation with artifact capture and documentation

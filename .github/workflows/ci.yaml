@@ -4,7 +4,7 @@ on:
   pull_request:
   merge_group: # Required so GitHub Merge Queue re-runs gates on the rebased queue candidate (task.0391)
   push:
-    branches: [canary, staging, main]
+    branches: [test/task5314-native-current-6884]
 
 permissions:
   contents: read
@@ -204,10 +204,13 @@ jobs:
           case "$GITHUB_EVENT_NAME" in
             pull_request) migration_base_sha="$MIGRATION_PR_BASE_SHA" ;;
             merge_group) migration_base_sha="$MIGRATION_MQ_BASE_SHA" ;;
-            push) migration_base_sha="" ;;
+            push)
+              [ "$GITHUB_REPOSITORY" = cogni-test-org/cogni-monorepo ] && [ "$GITHUB_REF" = refs/heads/test/task5314-native-current-6884 ] || exit 1
+              migration_base_sha="$GITHUB_SHA"
+              ;;
             *) echo '::error::unsupported migration guard event'; exit 1 ;;
           esac
-          if [ "$GITHUB_EVENT_NAME" != push ]; then
+          if [ -n "$migration_base_sha" ]; then
             [[ "$migration_base_sha" =~ ^[a-f0-9]{40}$ ]] || { echo '::error::invalid migration event base'; exit 1; }
             git cat-file -e "$migration_base_sha^{commit}" || exit 1
             git merge-base --is-ancestor "$migration_base_sha" HEAD || exit 1
@@ -294,6 +297,9 @@ jobs:
       - id: domains
         uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
         with:
+          # TEST surrogate projects the canonical main-push baseline role;
+          # ordinary PR file discovery remains GitHub's actual PR delta.
+          base: ${{ github.event_name == 'push' && github.repository == 'cogni-test-org/cogni-monorepo' && github.ref == 'refs/heads/test/task5314-native-current-6884' && github.sha || github.event.pull_request.base.sha || github.event.repository.default_branch }}
           list-files: json # exposes <filter>_files so we can inspect which paths matched
           # Required so the operator filter's `**` + `!nodes/<X>/**` negations
           # actually subtract. Default `some` quantifier OR's the rules, so
@@ -495,13 +501,13 @@ jobs:
             git fetch --no-tags "https://github.com/$EVENT_HEAD_REPO.git" "$EVENT_HEAD_SHA" || echo '::warning::head fetch failed; full native proof'
           fi
           compatible=false
-          if [ "$CI_EVENT" = pull_request ] && [ "$EVENT_BASE_REF" = main ]; then
+          if [ "$CI_EVENT" = pull_request ] && [ "$EVENT_BASE_REF" = test/task5314-native-current-6884 ]; then
             compatible=true
             for file in ci-proof-plan.mjs native-proof.mjs native-proof-policy.json; do
               if ! git show "$EVENT_BASE_SHA:scripts/ci/$file" > "$trusted_dir/$file" 2>/dev/null; then compatible=false; fi
             done
           fi
-          if [ "$CI_EVENT" = pull_request ] && [ "$EVENT_BASE_REF" = main ] && "$compatible"; then
+          if [ "$CI_EVENT" = pull_request ] && [ "$EVENT_BASE_REF" = test/task5314-native-current-6884 ] && "$compatible"; then
             # Every executable import and policy byte comes from reviewed BASE.
             # PR checkout code never decides its own exemption.
             node "$trusted_dir/ci-proof-plan.mjs" plan
@@ -685,6 +691,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      - name: Qualify the fixed TEST-owned Doltgres mirror before use
+        env:
+          FIXTURE_EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            [[ "$FIXTURE_EVENT_BASE_SHA" =~ ^[a-f0-9]{40}$ ]] || exit 1
+            git fetch --no-tags origin "$FIXTURE_EVENT_BASE_SHA"
+          fi
+          node scripts/ci/qualify-test-doltgres-image.mjs
+
       - name: Prepare exact immutable native images
         env:
           NATIVE_IMAGE_BINDINGS_FILE: ${{ runner.temp }}/native-image-bindings.json
@@ -771,6 +788,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          fetch-depth: 2
 
       - name: Enforce env-manager classifier result
         env:
@@ -816,6 +835,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      - name: Qualify the fixed TEST-owned Doltgres mirror before use
+        env:
+          FIXTURE_EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            [[ "$FIXTURE_EVENT_BASE_SHA" =~ ^[a-f0-9]{40}$ ]] || exit 1
+            git fetch --no-tags origin "$FIXTURE_EVENT_BASE_SHA"
+          fi
+          node scripts/ci/qualify-test-doltgres-image.mjs
+
       - name: Component tests (testcontainers)
         # The identically guarded migrator lane owns these three suites and the
         # terminal component gate requires it. Ordinary/local discovery stays full.
@@ -852,6 +882,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          fetch-depth: 2
 
       - name: Enforce env-manager classifier result
         env:
@@ -885,6 +917,17 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+
+      - name: Qualify the fixed TEST-owned Doltgres mirror before use
+        env:
+          FIXTURE_EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            [[ "$FIXTURE_EVENT_BASE_SHA" =~ ^[a-f0-9]{40}$ ]] || exit 1
+            git fetch --no-tags origin "$FIXTURE_EVENT_BASE_SHA"
+          fi
+          node scripts/ci/qualify-test-doltgres-image.mjs
 
       # Doltgres-migrator regression: boots the pinned published catalog image in its
       # own container (separate from the Postgres globalSetup the rest of

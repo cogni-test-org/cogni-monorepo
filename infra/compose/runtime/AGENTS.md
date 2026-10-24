@@ -6,7 +6,7 @@
 
 - **Owners:** @derekg1729
 - **Status:** draft
-- **Last reviewed:** 2026-10-22
+- **Last reviewed:** 2026-10-24
 
 ## Purpose
 
@@ -113,6 +113,8 @@ docker compose --project-name cogni-runtime logs -f app
 - Verify in Alloy UI (http://127.0.0.1:12345) and Grafana Cloud
 
 **Doltgres (knowledge plane):**
+
+- TEST CI fixture only (`subtask.5021`): this disposable baseline maps the Doltgres service to `ghcr.io/cogni-test-org/cogni-template@sha256:96889c2c105f6bc3dba63d06374662e2e32c661d36498dbc9188dd59016071f8`. The unchanged canonical pin documented below is not upgraded; the fixture must pass its exact platform/config/base-layer gate and binary assertions before CI consumption. This tree must never be deployed.
 
 - `doltgres`: Postgres-wire-compatible Dolt server, host port 5435→5432, volume `doltgres_data`. Public-NIC traffic on 5435 is dropped by `DOCKER-USER` chain (see `infra/provision/cherry/harden-docker-public-ports.sh`); k3s pods on `10.42.0.0/16` reach it via the EndpointSlice node IP. Image pinned to `ghcr.io/cogni-dao/cogni-template@sha256:f892b365ad6fc6c683da839260f20c4015615c105176a3c21c015ca90d2b70a3` (qualified upstream0.57.3 binary with session attribution and cold-TEXT lifetime fixes, PR2881; existing GHCR pull custody required) (bug.5076 — `:latest` rolled an auth-file format change; 0.56.3 additionally fresh-inits broken with no connectable default DB, fixed in 0.57.3, verified 2026-08-04). Entrypoint is wrapped by `doltgres-init/install-creds.sh` — when `DOLT_CREDS_JWK` + `DOLT_CREDS_KEYID` are set, installs the keypair at `/root/.dolt/creds/<keyid>.jwk` and merges `user.creds` into `config_global.json` before exec'ing the upstream entrypoint; no-op when unset.
 - `doltgres-provision` (profile: bootstrap): creates roles + per-node `knowledge_<node>` databases via `doltgres-init/provision.sh`; never commits application working sets. Schema and its first commit belong to drizzle-kit (k8s PreSync Job), not this script

@@ -209,11 +209,11 @@ function witness() {
     { length: 6 },
     (_, index) => `owned native control ${index}`
   );
-  const repository = "cogni-dao/cogni";
+  const repository = "cogni-test-org/cogni-monorepo";
   const run = {
     repository: { full_name: repository },
     event: "push",
-    head_branch: "main",
+    head_branch: "test/task5314-native-current-6884",
     head_sha: base,
     status: "completed",
     conclusion: "success",
@@ -261,7 +261,7 @@ function witness() {
     repository,
     sourceSha: base,
     event: "push",
-    ref: "refs/heads/main",
+    ref: "refs/heads/test/task5314-native-current-6884",
     runId: run.id,
     runAttempt: run.run_attempt,
     workflowBlob,
@@ -408,7 +408,7 @@ test("bounded main witness lookup never forwards credentials or falls back to an
       .every(
         ({ url, options }) =>
           url.startsWith(
-            "https://api.github.com/repos/cogni-dao/cogni/actions/"
+            "https://api.github.com/repos/cogni-test-org/cogni-monorepo/actions/"
           ) && options.headers.Authorization === "Bearer owned-fixture-token"
       )
   );
@@ -452,8 +452,8 @@ test("bounded main witness lookup never forwards credentials or falls back to an
 
 function imageProducerFixture() {
   const sourceSha = "a".repeat(40);
-  const repository = "cogni-dao/cogni";
-  const image = "ghcr.io/cogni-dao/cogni-template";
+  const repository = "cogni-test-org/cogni-monorepo";
+  const image = "ghcr.io/cogni-test-org/cogni-template";
   const value = {
     repository,
     sourceSha,
@@ -593,7 +593,8 @@ test("native uses only the exact successful target fragment and producing attemp
       v.fragment.targets[0].tag = `${image}:litellm-old`;
     },
     (v) => {
-      v.expectedTag = "ghcrXio/cogni-dao/cogni-template:litellm-123abc";
+      v.expectedTag =
+        "ghcrXio/cogni-test-org/cogni-monorepo-template:litellm-123abc";
       v.fragment.targets[0].tag = v.expectedTag;
     },
   ])
@@ -1063,7 +1064,7 @@ test("native eligibility integrates exact B/H/tested membership and never self-c
       base,
       head,
       tested: head,
-      baseRef: "main",
+      baseRef: "test/task5314-native-current-6884",
       policy,
       cwd,
       token: "owned-token",

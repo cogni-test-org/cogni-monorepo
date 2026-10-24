@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "repository": "cogni-dao/cogni",
-  "scope": "Reviewed Git impact only. Main and merge queue execute full native; unknown membership, cohort, witness or producer identity executes full. No ambient hermeticity claim.",
+  "repository": "cogni-test-org/cogni-monorepo",
+  "scope": "TEST-only fixed protected-nonmain surrogate; actual push receipt is never literal canonical-main proof. Unknown/old policy or unqualified producer remains FULL. Runtime HOLD5495.",
   "toolContract": {
     "nativeNodeVersion": "22.22.0",
     "nativePnpmVersion": "9.12.2"
@@ -11,7 +11,7 @@
       "path": ".cogni/repo-spec.yaml",
       "mode": "100644",
       "kind": "blob",
-      "oid": "61a1788340bb8cb745c9f42b8950de834920ca89"
+      "oid": "d2e2618557dd0f9dee1ec3f9f965bd889103ac3c"
     },
     {
       "path": ".dockerignore",
@@ -53,13 +53,19 @@
       "path": ".github/workflows/ci.yaml",
       "mode": "100644",
       "kind": "blob",
-      "oid": "cc6436e01aea8a4a7b055884ef6195efbc5cce95"
+      "oid": "d5eaaf903c45bd5198a3ceb7cba53c9924d2ba8e"
     },
     {
       "path": ".github/workflows/pr-build.yml",
       "mode": "100644",
       "kind": "blob",
-      "oid": "27d46ef5bf66bb033712da9b778eff629b387622"
+      "oid": "f31a0c25de984065d24b3fa42ef0a22dc4764fd4"
+    },
+    {
+      "path": ".gitmodules",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "9a948323ffd9296f7bdaa8ad0d90663b1a77c9de"
     },
     {
       "path": ".husky/commit-msg",
@@ -92,10 +98,16 @@
       "oid": "0ef31ce13c643095654220b067d98d2791aedfcb"
     },
     {
-      "path": "infra/catalog/beacon.yaml",
+      "path": "infra/catalog/anotha.yaml",
       "mode": "100644",
       "kind": "blob",
-      "oid": "675ea6cf21077f1460e34ef4ac54705b1166b7f9"
+      "oid": "de3af0695220648828b5dcf01ce471f2b36c30c1"
+    },
+    {
+      "path": "infra/catalog/brother.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ccc7bf04ddfeb966f06cce6bccc316498293ec46"
     },
     {
       "path": "infra/catalog/doltgres.yaml",
@@ -104,10 +116,10 @@
       "oid": "4c1a475686691243af1c58b502cdb5e840b76826"
     },
     {
-      "path": "infra/catalog/levelup.yaml",
+      "path": "infra/catalog/ghcr.yaml",
       "mode": "100644",
       "kind": "blob",
-      "oid": "495ae8ccee971d291b0de736b9222c1012545bb1"
+      "oid": "ddeed78c48722ffaad96485f6fcd22fa1a7f6250"
     },
     {
       "path": "infra/catalog/litellm.yaml",
@@ -119,7 +131,7 @@
       "path": "infra/catalog/node-template.yaml",
       "mode": "100644",
       "kind": "blob",
-      "oid": "33fa9426571a742f1fc973e57ade4b7303d9723a"
+      "oid": "300369020f374b15bdf2f2aa3b7bb790c6b1d893"
     },
     {
       "path": "infra/catalog/openfga.yaml",
@@ -131,31 +143,37 @@
       "path": "infra/catalog/operator.yaml",
       "mode": "100644",
       "kind": "blob",
-      "oid": "be90aa516192348296e4664722a1e3d42e9cbe36"
-    },
-    {
-      "path": "infra/catalog/poly.yaml",
-      "mode": "100644",
-      "kind": "blob",
-      "oid": "66092a834701472a342eb2dd8be9d36aa2a608c6"
-    },
-    {
-      "path": "infra/catalog/red.yaml",
-      "mode": "100644",
-      "kind": "blob",
-      "oid": "f47fbd116b492be4833e385ecb86ab24e94cddaa"
+      "oid": "8e1504635c1df420ce6a20c92d052ca4d338d72b"
     },
     {
       "path": "infra/catalog/scheduler-worker.yaml",
       "mode": "100644",
       "kind": "blob",
-      "oid": "de8aa1bf0627906c052f7d105ea18f6277ca0ecf"
+      "oid": "bfec7e33d38d7729bc6e72fb18d74d8a859d735b"
     },
     {
-      "path": "infra/catalog/toks5.yaml",
+      "path": "infra/catalog/spawny-boi.yaml",
       "mode": "100644",
       "kind": "blob",
-      "oid": "83fb54d4b4e7db176ff820d47790e20f93e41fa6"
+      "oid": "defcaa7869ec3ca2f60b8b3d97b7bd08fc2c8282"
+    },
+    {
+      "path": "infra/catalog/test-cog.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ff49558ea8330e19f71c06fbea6b0d3cd502003d"
+    },
+    {
+      "path": "infra/catalog/toks2.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "277d08ffaea76d958e770c5d14f817113656723d"
+    },
+    {
+      "path": "infra/catalog/yo.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "5eec852149f480887314c4514db01d8438c27f3d"
     },
     {
       "path": "infra/compose/runtime/configs/alloy-config.metrics.alloy",
@@ -167,13 +185,25 @@
       "path": "infra/compose/runtime/docker-compose.yml",
       "mode": "100644",
       "kind": "blob",
-      "oid": "989daa484d397624fddee17db2edc0bb743ef15d"
+      "oid": "5d15cac92506a8d8efad544c2bccfcb59b82a9d2"
     },
     {
       "path": "infra/compose/runtime/doltgres-init/provision.sh",
       "mode": "100755",
       "kind": "blob",
       "oid": "d0e435d235d6e35ca99b76f08dcb3d34337462e7"
+    },
+    {
+      "path": "infra/images/doltgres/Dockerfile",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "347153f47dc2aed8107252e36add351bc9b70c37"
+    },
+    {
+      "path": "infra/images/doltgres/session-attribution.patch",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "0c8f12569536df60addb9c18078f2b6016fdc202"
     },
     {
       "path": "infra/images/litellm/AGENTS.md",
@@ -755,13 +785,19 @@
       "path": "scripts/ci/native-proof.mjs",
       "mode": "100644",
       "kind": "blob",
-      "oid": "b610229f2559f654ca6628ec63a93095b081e8b1"
+      "oid": "4d2e6b4d407a448dd9d7ca20ab5667f80c312b59"
     },
     {
       "path": "scripts/ci/next-free-node-port.sh",
       "mode": "100755",
       "kind": "blob",
       "oid": "bd077e08c44b578a64c07bf172b2f2f9ad58c998"
+    },
+    {
+      "path": "scripts/ci/qualify-test-doltgres-image.mjs",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "d3721b1f168076d8114e74d6c9ea7fa1bc143342"
     },
     {
       "path": "scripts/ci/tests/runtime-secret-authority.test.sh",
@@ -877,14 +913,18 @@
     ".env.local",
     ".env.test",
     ".env.test.local",
-    ".gitmodules",
     ".npmrc",
     ".pnpmfile.cjs",
     "config/jsconfig.json",
     "config/package.json",
     "config/tsconfig.json",
+    "infra/catalog/beacon.yaml",
     "infra/catalog/jsconfig.json",
+    "infra/catalog/levelup.yaml",
     "infra/catalog/package.json",
+    "infra/catalog/poly.yaml",
+    "infra/catalog/red.yaml",
+    "infra/catalog/toks5.yaml",
     "infra/catalog/tsconfig.json",
     "infra/images/doltgres/.cogni/repo-spec.yaml",
     "infra/images/litellm/.cogni/repo-spec.yaml",
@@ -1009,8 +1049,8 @@
     },
     {
       "target": "litellm",
-      "declared": "ghcr.io/cogni-dao/cogni-template:litellm-46f38f4447c2",
-      "image": "ghcr.io/cogni-dao/cogni-template@sha256:77257b6851341b1751c111315a3e6e5b137bdaf7aa75c0acf7b2c21eff9076f9",
+      "declared": "ghcr.io/cogni-test-org/cogni-template:litellm-46f38f4447c2",
+      "image": "ghcr.io/cogni-test-org/cogni-template@sha256:aaf189799c9d22211fa668dcbaca6a456706735135cf8911ce552a36ac61adf8",
       "platform": "linux/amd64"
     }
   ],
@@ -1057,165 +1097,14 @@
     "integrityClosureDigest": "759432f734d6f3059a6ce1f78e618abad7043cf8c35e5c8837fabb4fc5961510"
   },
   "litellmProducer": {
-    "members": [
-      {
-        "path": ".dockerignore",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "e019ed87eff07e6757f522a93df0bb0e46bdb729"
-      },
-      {
-        "path": ".github/workflows/pr-build.yml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "27d46ef5bf66bb033712da9b778eff629b387622"
-      },
-      {
-        "path": "infra/catalog/_schema.json",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "0ef31ce13c643095654220b067d98d2791aedfcb"
-      },
-      {
-        "path": "infra/catalog/beacon.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "675ea6cf21077f1460e34ef4ac54705b1166b7f9"
-      },
-      {
-        "path": "infra/catalog/doltgres.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "4c1a475686691243af1c58b502cdb5e840b76826"
-      },
-      {
-        "path": "infra/catalog/levelup.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "495ae8ccee971d291b0de736b9222c1012545bb1"
-      },
-      {
-        "path": "infra/catalog/litellm.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "b1cdcb58ed7c51f00ad25e505fa07b0765850e1b"
-      },
-      {
-        "path": "infra/catalog/node-template.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "33fa9426571a742f1fc973e57ade4b7303d9723a"
-      },
-      {
-        "path": "infra/catalog/openfga.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "1c1eafcf4112806efdb9434b77c1fabf144f8f2a"
-      },
-      {
-        "path": "infra/catalog/operator.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "be90aa516192348296e4664722a1e3d42e9cbe36"
-      },
-      {
-        "path": "infra/catalog/poly.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "66092a834701472a342eb2dd8be9d36aa2a608c6"
-      },
-      {
-        "path": "infra/catalog/red.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "f47fbd116b492be4833e385ecb86ab24e94cddaa"
-      },
-      {
-        "path": "infra/catalog/scheduler-worker.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "de8aa1bf0627906c052f7d105ea18f6277ca0ecf"
-      },
-      {
-        "path": "infra/catalog/toks5.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "83fb54d4b4e7db176ff820d47790e20f93e41fa6"
-      },
-      {
-        "path": "infra/images/litellm/AGENTS.md",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "520dc16075cf72b57f38cf2d797860c3c70d0104"
-      },
-      {
-        "path": "infra/images/litellm/Dockerfile",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "c598bec66906b1dd6b51a8a304b4b2453b361103"
-      },
-      {
-        "path": "infra/images/litellm/cogni_callbacks.py",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "bc0980a2f79c95fbd7f83786f3f8364db9a0b4f2"
-      },
-      {
-        "path": "nodes/operator/.cogni/repo-spec.yaml",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "97b84b266428f169c3574e84b6de7804444b1554"
-      },
-      {
-        "path": "scripts/ci/build-and-push-images.sh",
-        "mode": "100755",
-        "kind": "blob",
-        "oid": "939d920c51db6ce140b604a3f3d2971f4161c5fa"
-      },
-      {
-        "path": "scripts/ci/detect-affected.sh",
-        "mode": "100755",
-        "kind": "blob",
-        "oid": "c4c770a8fc8abc0aa3bc518dfbb865388be994f3"
-      },
-      {
-        "path": "scripts/ci/lib/image-tags.sh",
-        "mode": "100644",
-        "kind": "blob",
-        "oid": "ae7f9c6d142a9faf37ea161c3cb4cf94c56e1aa0"
-      },
-      {
-        "path": "scripts/ci/merge-build-fragments.sh",
-        "mode": "100755",
-        "kind": "blob",
-        "oid": "c7b18a6dbef51d19223d4afeb0680573b416748e"
-      },
-      {
-        "path": "scripts/ci/write-build-manifest.sh",
-        "mode": "100755",
-        "kind": "blob",
-        "oid": "02da0177a038bdad230d33b850281890e21fb4d1"
-      }
-    ],
-    "absentSentinels": [
-      "infra/images/doltgres/.cogni/repo-spec.yaml",
-      "infra/images/litellm/.cogni/repo-spec.yaml",
-      "infra/images/litellm/.dockerignore",
-      "infra/images/openfga/.cogni/repo-spec.yaml",
-      "nodes/beacon/.cogni/repo-spec.yaml",
-      "nodes/levelup/.cogni/repo-spec.yaml",
-      "nodes/node-template/.cogni/repo-spec.yaml",
-      "nodes/poly/.cogni/repo-spec.yaml",
-      "nodes/red/.cogni/repo-spec.yaml",
-      "nodes/toks5/.cogni/repo-spec.yaml",
-      "services/scheduler-worker/.cogni/repo-spec.yaml"
-    ],
+    "members": [],
+    "absentSentinels": [],
     "provenance": {
-      "sourceSha": "51980fcdd12da154d77c85bec7dba5e2a356e132",
-      "runId": 39938805919,
-      "artifactId": 12494284759,
-      "platform": "linux/amd64",
-      "bootstrap": "Old reviewed canonical pin; new metadata producer is intentionally incompatible. Exact-head producer and full native proof precede a separately reviewed canonical pin refresh."
+      "admitted": false,
+      "scope": "No reviewed current TEST producer pin exists. Empty compatibility membership intentionally forces exact-head fresh fragment and FULL native. Historical TEST6f03 immutable image is schema metadata only, never an admitted fallback.",
+      "historicalSourceSha": "6f03d37d63c8b3cee619a3a024eaa3d8f6d7562b",
+      "historicalRunId": 39938747904,
+      "requiredNextGate": "Own-repository invocation exporter digest + actual six controls, then reviewed pin-only refresh and full named push before any witness/omission."
     }
   },
   "producerImplementation": {
@@ -1231,7 +1120,7 @@
         "path": ".github/workflows/pr-build.yml",
         "mode": "100644",
         "kind": "blob",
-        "oid": "27d46ef5bf66bb033712da9b778eff629b387622"
+        "oid": "f31a0c25de984065d24b3fa42ef0a22dc4764fd4"
       },
       {
         "path": "infra/catalog/litellm.yaml",
@@ -1288,5 +1177,13 @@
         "oid": "02da0177a038bdad230d33b850281890e21fb4d1"
       }
     ]
+  },
+  "testProjection": {
+    "canonicalSource": "688237fb30745e2aa286c7ed4edce6fd1602331a",
+    "fixtureSource": "502f79a1707bb450e9b22354912adb8e85efa99a",
+    "fixedTrustedBranch": "test/task5314-native-current-6884",
+    "canonicalCertificateCopied": false,
+    "eligibilityBeforeFreshPinAndWitness": 0,
+    "runtimeMutationAuthorized": false
   }
 }
