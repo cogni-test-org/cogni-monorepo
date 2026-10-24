@@ -208,29 +208,56 @@ export function nativeSafeChanges({ base, tested, cwd = process.cwd() }) {
       paths.length > 0 && paths.length <= 500,
       "unknown-change-membership"
     );
-    const prefixes = [
-      "nodes/operator/app/",
-      "services/scheduler-worker/",
-      "docs/",
-      ".agents/skills/",
-      ".claude/skills/",
-      "work/",
-      "infra/k8s/",
-    ];
+    const sourceExtensions = new Set([
+      "ts",
+      "tsx",
+      "js",
+      "jsx",
+      "mjs",
+      "cjs",
+      "json",
+    ]);
+    const appExtensions = new Set([
+      ...sourceExtensions,
+      "css",
+      "scss",
+      "svg",
+      "png",
+      "jpg",
+      "jpeg",
+      "gif",
+      "webp",
+      "ico",
+      "woff",
+      "woff2",
+      "ttf",
+      "otf",
+      "txt",
+    ]);
     for (const path of paths) {
       requireThat(validPath(path), "unsupported-changed-path");
+      const old = before.get(path),
+        next = after.get(path);
       requireThat(
-        [before.get(path), after.get(path)]
-          .filter(Boolean)
-          .every(
-            (v) => v.kind === "blob" && ["100644", "100755"].includes(v.mode)
-          ),
+        (!old || !next || old.mode === next.mode) &&
+          [old, next]
+            .filter(Boolean)
+            .every((v) => v.kind === "blob" && v.mode === "100644"),
         "unsupported-changed-mode"
       );
+      const extension = path.slice(path.lastIndexOf(".") + 1);
+      const app = ["nodes/operator/app/", "services/scheduler-worker/"].some(
+        (prefix) => path.startsWith(prefix)
+      );
+      const packageSource = /^packages\/[^/]+\/(?:src|tests?)\//.test(path);
+      const k8s =
+        path.startsWith("infra/k8s/") &&
+        ["yaml", "yml", "json"].includes(extension);
       requireThat(
-        prefixes.some((prefix) => path.startsWith(prefix)) ||
-          /^packages\/[^/]+\/(?:src|tests?)\//.test(path) ||
-          path.endsWith(".md"),
+        extension === "md" ||
+          (app && appExtensions.has(extension)) ||
+          (packageSource && sourceExtensions.has(extension)) ||
+          k8s,
         "unknown-native-impact-class"
       );
     }
@@ -1405,21 +1432,10 @@ function recordNativeResult() {
     );
     return;
   }
-  const nodeObserved = process.versions.node;
-  const pnpmObserved = execFileSync("pnpm", ["--version"], {
-    encoding: "utf8",
-    timeout: 5_000,
-    maxBuffer: 1024,
-  }).trim();
-  if (
-    nodeObserved !== policy.toolContract.nativeNodeVersion ||
-    pnpmObserved !== policy.toolContract.nativePnpmVersion
-  ) {
-    console.log(
-      "NATIVE_PROOF_UNAVAILABLE full controls passed; install tools differ"
-    );
-    return;
-  }
+  // readNativeCohort has already checked these against the actual executing
+  // Node and pnpm --version. Optional receipt generation never probes again.
+  const nodeObserved = cohort.cohort.nativeNodeVersion;
+  const pnpmObserved = cohort.cohort.nativePnpmVersion;
   const receipt = {
     version: 1,
     repository: process.env.GITHUB_REPOSITORY,

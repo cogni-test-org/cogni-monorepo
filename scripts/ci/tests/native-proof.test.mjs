@@ -36,6 +36,7 @@ import {
   nativeEligibility,
   nativeExecutionImage,
   nativeResultControls,
+  nativeSafeChanges,
   readNativeCohort,
   validateNativeImageProducer,
   validateNativeWitness,
@@ -1329,4 +1330,44 @@ test("a valid FULL machine result remains successful without cohort metadata and
     } finally {
       rmSync(temp, { recursive: true, force: true });
     }
+  }));
+
+test("affected native classes reject unknown extensions and every executable-mode change", () =>
+  fixture(({ cwd, put, commit, base }) => {
+    put("nodes/operator/app/src/owned.ts", "owned app source\n");
+    let current = commit();
+    assert.equal(nativeSafeChanges({ base, tested: current, cwd }).safe, true);
+    const old = current;
+    chmodSync(join(cwd, "nodes/operator/app/src/owned.ts"), 0o755);
+    current = commit();
+    assert.equal(
+      nativeSafeChanges({ base: old, tested: current, cwd }).safe,
+      false
+    );
+    chmodSync(join(cwd, "nodes/operator/app/src/owned.ts"), 0o644);
+    const restored = commit();
+    put("nodes/operator/app/src/unreviewed.xyz", "unknown extension\n");
+    current = commit();
+    assert.equal(
+      nativeSafeChanges({ base: restored, tested: current, cwd }).safe,
+      false
+    );
+    rmSync(join(cwd, "nodes/operator/app/src/unreviewed.xyz"));
+    const clean = commit();
+    put("nodes/operator/app/src/executable.ts", "new executable source\n");
+    chmodSync(join(cwd, "nodes/operator/app/src/executable.ts"), 0o755);
+    current = commit();
+    assert.equal(
+      nativeSafeChanges({ base: clean, tested: current, cwd }).safe,
+      false
+    );
+    rmSync(join(cwd, "nodes/operator/app/src/executable.ts"));
+    const ordinary = commit();
+    put("infra/k8s/owned/config.yaml", "owned: manifest\n");
+    put("docs/owned.md", "owned doc\n");
+    current = commit();
+    assert.equal(
+      nativeSafeChanges({ base: ordinary, tested: current, cwd }).safe,
+      true
+    );
   }));

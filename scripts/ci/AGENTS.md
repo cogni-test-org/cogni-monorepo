@@ -6,7 +6,7 @@
 
 - **Owners:** @derekg1729
 - **Status:** draft
-- **Last reviewed:** 2026-10-22
+- **Last reviewed:** 2026-10-24
 
 ## Purpose
 
@@ -35,6 +35,9 @@ CI/CD automation scripts and configuration documentation for multiple pipeline s
 - **Worker selection guard:** `lib/worker-routing-preservation.py` is called only by `reconcile_shared_platform_manifests` for production worker image copies; it preserves deploy `HEAD` candidate selection exactly and validates retained aliases against one pinned main authority, without additions or equality requirements.
 - **Scheduler routing env:** `SWR_RECONCILE_FLIGHT_TARGETS_JSON` is the normal decide-selected slug array; only renderer-validated active candidate slug/UUID pairs may replace watched destinations.
 - **Fast-path classifier env:** `EVENT_NAME`, `REPOSITORY`, `PR_NUMBER_PR`, `PR_HEAD_SHA_PR`, `MQ_HEAD_REF`, `MQ_BASE_SHA`, `MQ_HEAD_SHA`; `FAST_PATH_{PR,COMMIT,FILES}_JSON`, `FAST_PATH_{BASE,HEAD}_CATALOG`, and `FAST_PATH_APPSET_PATHS_LIB` are hermetic test seams only
+- **Native proof CLI:** `ci-proof-plan.mjs plan|verify-unit|verify-component|verify-manifest`; selection loads the planner, `native-proof.mjs`, and `native-proof-policy.json` only from exact event BASE. Unknown/old policy or missing compatible proof executes full native; main/MQ remain full.
+- **Native execution CLI:** `native-proof.mjs prepare-images|record-result` uses `NATIVE_IMAGE_BINDINGS_FILE` and `NATIVE_RESULT_FILE` under `RUNNER_TEMP`, authoritative GitHub event/run identities, and read-only `GITHUB_TOKEN`. Images must be immutable; invalid controls/images fail, optional witness metadata cannot fail a valid full proof.
+- **Split/selection inputs:** `CI_NATIVE_SPLIT=true` is owned only by the required split graph; local discovery remains full. `CI_EVENT`, `EVENT_{BASE,HEAD,TESTED}_SHA`, `EVENT_BASE_REF`, `EVENT_{BASE,HEAD}_REPO`, and `POLICY_SHA` bind the plan; terminal `*_RESULT`, identity/digest and witness outputs must agree.
 - **Files considered API:** `scripts/*.sh`, `workflow-check.mjs`, `infra/openfga/rbac-model.json`
 
 - `lib/maintenance-fence.py check <deploy-tree>` is the read-only node-generic marker/audited-source-floor guard; no grant, claim, preserve or maintenance write command.
