@@ -4,7 +4,7 @@
 /**
  * Module: `@scripts/ci/tests/native-proof`
  * Purpose: Falsify finite input drift and forged trusted-main execution evidence.
- * Scope: Owned Git repositories and public metadata fixtures; no network or Docker.
+ * Scope: Owned Git repositories and public metadata fixtures; does not access network or Docker.
  * Invariants: Base-only dependency drift and every incomplete witness fail closed.
  * Side-effects: IO (owned temporary repositories removed after each test).
  * Links: scripts/ci/native-proof.mjs, task.5314
@@ -20,17 +20,20 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import {
   awaitNativeImageProducer,
   compareNativeInputs,
+  compareNativeProducerExecution,
   lookupNativeWitness,
+  nativeEligibility,
   nativeExecutionImage,
   nativeResultControls,
   readNativeCohort,
@@ -735,7 +738,10 @@ test("current actual runner/image/tool facts must match the witnessed cohort", (
   for (const patch of [
     { nativeNodeVersion: "22" },
     { observedNodeVersion: "22.21.0" },
-    { command: (...args) => args[0] === "pnpm" ? "9.13.0" : JSON.stringify(version) },
+    {
+      command: (...args) =>
+        args[0] === "pnpm" ? "9.13.0" : JSON.stringify(version),
+    },
     { nativePnpmVersion: "latest" },
     { env: { ...env, ImageVersion: "" } },
     { env: { ...env, RUNNER_OS: "macOS" } },
@@ -874,39 +880,70 @@ test("exact target preparation is bounded and never waits for sibling matrix leg
   assert.equal(missing.valid, false);
 });
 
-
 test("machine native proof requires all six real controls, original files, and no skipped status", () => {
   const names = Array.from({ length: 6 }, (_, i) => `Owned suite control ${i}`);
-  const files = Object.fromEntries(names.map((name, i) => [name, `tests/native-${i}.spec.ts`]));
+  const files = Object.fromEntries(
+    names.map((name, i) => [name, `tests/native-${i}.spec.ts`])
+  );
   const report = {
-    success: true, numFailedTests: 0, numPendingTests: 0, numTodoTests: 0,
-    numTotalTests: 6, numPassedTests: 6,
+    success: true,
+    numFailedTests: 0,
+    numPendingTests: 0,
+    numTodoTests: 0,
+    numTotalTests: 6,
+    numPassedTests: 6,
     testResults: names.map((name) => ({
-      name: `${process.cwd()}/${files[name]}`, status: "passed",
+      name: `${process.cwd()}/${files[name]}`,
+      status: "passed",
       assertionResults: [{ fullName: name, status: "passed" }],
     })),
   };
   assert.equal(nativeResultControls(report, names, files).length, 6);
   for (const change of [
-    (v) => { v.success = false; },
-    (v) => { v.numPendingTests = 1; },
-    (v) => { v.numTodoTests = 1; },
-    (v) => { v.numFailedTests = 1; },
-    (v) => { v.numPassedTests = 5; },
-    (v) => { v.testResults.pop(); },
-    (v) => { v.testResults[0].assertionResults[0].status = "skipped"; },
-    (v) => { v.testResults[0].assertionResults[0].status = "pending"; },
-    (v) => { v.testResults[0].name = `${process.cwd()}/tests/copied.spec.ts`; },
-    (v) => { v.testResults[0].assertionResults[0].fullName = names[1]; },
+    (v) => {
+      v.success = false;
+    },
+    (v) => {
+      v.numPendingTests = 1;
+    },
+    (v) => {
+      v.numTodoTests = 1;
+    },
+    (v) => {
+      v.numFailedTests = 1;
+    },
+    (v) => {
+      v.numPassedTests = 5;
+    },
+    (v) => {
+      v.testResults.pop();
+    },
+    (v) => {
+      v.testResults[0].assertionResults[0].status = "skipped";
+    },
+    (v) => {
+      v.testResults[0].assertionResults[0].status = "pending";
+    },
+    (v) => {
+      v.testResults[0].name = `${process.cwd()}/tests/copied.spec.ts`;
+    },
+    (v) => {
+      v.testResults[0].assertionResults[0].fullName = names[1];
+    },
   ]) {
-    const value = structuredClone(report); change(value);
+    const value = structuredClone(report);
+    change(value);
     assert.throws(() => nativeResultControls(value, names, files));
   }
   // Future discovered native cases still execute and must pass, but a receipt
   // with additional cases cannot match the old exact six-control witness.
   const extra = structuredClone(report);
-  extra.numTotalTests = 7; extra.numPassedTests = 7;
-  extra.testResults[0].assertionResults.push({fullName: "Owned future native control", status: "passed"});
+  extra.numTotalTests = 7;
+  extra.numPassedTests = 7;
+  extra.testResults[0].assertionResults.push({
+    fullName: "Owned future native control",
+    status: "passed",
+  });
   assert.equal(nativeResultControls(extra, names, files).length, 7);
 });
 
@@ -914,24 +951,382 @@ test("mutable declared images require a unique exact immutable execution binding
   const directory = mkdtempSync(join(tmpdir(), "native-image-bindings-"));
   const path = join(directory, "bindings.json");
   const pinned = `docker.io/library/postgres@sha256:${"a".repeat(64)}`;
-  const value = { version: 1, images: [{declared: "postgres:15", image: pinned, platform: "linux/amd64"}] };
+  const value = {
+    version: 1,
+    images: [
+      { declared: "postgres:15", image: pinned, platform: "linux/amd64" },
+    ],
+  };
   const put = (v) => writeFileSync(path, JSON.stringify(v));
   try {
     put(value);
     assert.equal(nativeExecutionImage("postgres:15", path), pinned);
-    assert.equal(nativeExecutionImage("${POSTGRES_IMAGE:-postgres:15}", path), pinned);
+    assert.equal(
+      nativeExecutionImage("${POSTGRES_IMAGE:-postgres:15}", path),
+      pinned
+    );
     assert.equal(nativeExecutionImage(pinned, path), pinned);
     for (const change of [
-      (v) => { v.version = 0; },
-      (v) => { v.images = []; },
-      (v) => { v.images[0].image = "postgres:latest"; },
-      (v) => { v.images[0].platform = "linux/arm64"; },
-      (v) => { v.images.push(v.images[0]); },
-      (v) => { v.images[0].declared = "postgres:16"; },
+      (v) => {
+        v.version = 0;
+      },
+      (v) => {
+        v.images = [];
+      },
+      (v) => {
+        v.images[0].image = "postgres:latest";
+      },
+      (v) => {
+        v.images[0].platform = "linux/arm64";
+      },
+      (v) => {
+        v.images.push(v.images[0]);
+      },
+      (v) => {
+        v.images[0].declared = "postgres:16";
+      },
     ]) {
-      const v = structuredClone(value); change(v); put(v);
+      const v = structuredClone(value);
+      change(v);
+      put(v);
       assert.throws(() => nativeExecutionImage("postgres:15", path));
     }
-    assert.throws(() => nativeExecutionImage("postgres:15", join(directory, "absent")));
-  } finally { rmSync(directory, {recursive: true, force: true}); }
+    assert.throws(() =>
+      nativeExecutionImage("postgres:15", join(directory, "absent"))
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
+
+test("native eligibility integrates exact B/H/tested membership and never self-certifies a missing witness", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "native-eligibility-"));
+  const git = (...args) =>
+    execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  const put = (path, text) => {
+    mkdirSync(dirname(join(cwd, path)), { recursive: true });
+    writeFileSync(join(cwd, path), text);
+  };
+  const commit = () => {
+    git("add", ".");
+    git("-c", "core.hooksPath=/dev/null", "commit", "-qm", "owned input");
+    return git("rev-parse", "HEAD");
+  };
+  try {
+    git("init", "-q");
+    git("config", "user.name", "Owned fixture");
+    git("config", "user.email", "owned@example.invalid");
+    put("package.json", "{}\n");
+    put(".github/workflows/ci.yaml", "owned workflow\n");
+    put("scripts/helper.mjs", "owned helper\n");
+    put("docs/owned.md", "owned base\n");
+    const seed = commit();
+    const members = [
+      "package.json",
+      ".github/workflows/ci.yaml",
+      "scripts/helper.mjs",
+    ]
+      .sort()
+      .map((path) => {
+        const [mode, kind, oid] = git("ls-tree", seed, "--", path).split(/\s+/);
+        return { path, mode, kind, oid };
+      });
+    const example = witness();
+    const policy = {
+      version: 1,
+      repository: example.repository,
+      members,
+      absentSentinels: ["tests/tsconfig.json"],
+      images: example.expectedImages,
+      tests: example.expectedTests,
+      toolContract: {
+        nativeNodeVersion: "22.22.0",
+        nativePnpmVersion: "9.12.2",
+      },
+      litellmProducer: {
+        members: [members.find((v) => v.path === "scripts/helper.mjs")],
+        absentSentinels: ["infra/images/litellm/.dockerignore"],
+      },
+    };
+    put("scripts/ci/native-proof-policy.json", JSON.stringify(policy));
+    const base = commit();
+    put("docs/owned.md", "owned app-only candidate\n");
+    const head = commit();
+    let lookups = 0;
+    const args = {
+      repository: example.repository,
+      base,
+      head,
+      tested: head,
+      baseRef: "main",
+      policy,
+      cwd,
+      token: "owned-token",
+      cohortReader: () => ({ compatible: true, cohort: example.currentCohort }),
+      witnessLookup: async (bindings) => {
+        lookups++;
+        const run = { ...example.run, head_sha: base };
+        const receipt = {
+          ...example.receipt,
+          sourceSha: base,
+          fingerprint: bindings.fingerprint,
+          policyDigest: bindings.policyDigest,
+          workflowBlob: bindings.workflowBlob,
+        };
+        return validateNativeWitness({
+          ...bindings,
+          run,
+          job: example.job,
+          receipt,
+        });
+      },
+    };
+    assert.equal((await nativeEligibility(args)).eligible, true);
+    assert.equal(lookups, 1);
+    for (const patch of [
+      { baseRef: "other" },
+      { repository: "foreign/repo" },
+      { cohortReader: () => ({ compatible: false }) },
+      { witnessLookup: async () => ({ valid: false }) },
+      {
+        witnessLookup: async () => {
+          throw new Error("owned API403/timeout");
+        },
+      },
+      { policy: { ...policy, version: 0 } },
+    ])
+      assert.equal(
+        (await nativeEligibility({ ...args, ...patch })).eligible,
+        false
+      );
+    put("scripts/helper.mjs", "changed only at candidate\n");
+    const changed = commit();
+    assert.equal(
+      (await nativeEligibility({ ...args, head: changed, tested: changed }))
+        .eligible,
+      false
+    );
+    put("scripts/helper.mjs", "owned helper\n");
+    put("tests/tsconfig.json", "{}\n");
+    const nearer = commit();
+    assert.equal(
+      (await nativeEligibility({ ...args, head: nearer, tested: nearer }))
+        .eligible,
+      false
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runtime migration copies precede the SHA-varying marker with literal paths and ownership", () => {
+  const source = readFileSync("nodes/operator/app/Dockerfile", "utf8");
+  const marker = source.indexOf("ARG BUILD_SHA\n");
+  assert.ok(marker > 0);
+  assert.ok(!/^COPY /m.test(source.slice(marker)));
+  const assets = [
+    [
+      "/app/nodes/operator/app/src/adapters/server/db/migrations",
+      "/app/nodes/operator/app/migrations",
+    ],
+    ["/app/scripts/db/migrate.mjs", "/app/nodes/operator/app/migrate.mjs"],
+    [
+      "/app/nodes/operator/app/src/adapters/server/db/doltgres-migrations",
+      "/app/nodes/operator/app/doltgres-migrations",
+    ],
+    [
+      "/app/node_modules/@cogni-dao/doltgres-admission/dist",
+      "/app/node_modules/@cogni-dao/doltgres-admission/dist",
+    ],
+    [
+      "/app/node_modules/@cogni-dao/doltgres-admission/package.json",
+      "/app/node_modules/@cogni-dao/doltgres-admission/package.json",
+    ],
+    [
+      "/app/scripts/db/migrate-doltgres.mjs",
+      "/app/nodes/operator/app/migrate-doltgres.mjs",
+    ],
+    [
+      "/app/scripts/db/verify-doltgres-schema.mjs",
+      "/app/nodes/operator/app/verify-doltgres-schema.mjs",
+    ],
+  ];
+  let previous = -1;
+  for (const [from, to] of assets) {
+    const literal = `COPY --from=builder --chown=nextjs:nodejs ${from} ${to}\n`;
+    const at = source.indexOf(literal);
+    assert.ok(at > previous && at < marker, literal);
+    previous = at;
+  }
+  assert.match(source.slice(marker), /printf '%s' "\$BUILD_SHA"/);
+  assert.match(source.slice(marker), /USER nextjs/);
+});
+
+test("fresh image admission binds reviewed producer code while tolerating unrelated app drift", () =>
+  fixture(({ cwd, git, put, commit, base: seed }) => {
+    const path = "scripts/native-helper.sh";
+    const [mode, kind, oid] = git("ls-tree", seed, "--", path).split(/\s+/);
+    const producerPolicy = {
+      producerImplementation: { members: [{ path, mode, kind, oid }] },
+      litellmProducer: {
+        members: [{ path, mode, kind, oid }],
+        absentSentinels: ["infra/images/litellm/.dockerignore"],
+      },
+    };
+    put("docs/owned.md", "unrelated merged docs\n");
+    const docs = commit();
+    assert.equal(
+      compareNativeProducerExecution({
+        head: seed,
+        tested: docs,
+        policy: producerPolicy,
+        cwd,
+      }).compatible,
+      true
+    );
+    put("scripts/native-helper.sh", "old tag-derived producer\n");
+    const reverted = commit();
+    assert.equal(
+      compareNativeProducerExecution({
+        head: reverted,
+        tested: reverted,
+        policy: producerPolicy,
+        cwd,
+      }).compatible,
+      false
+    );
+    put(path, "owned\n");
+    put("infra/images/litellm/Dockerfile", "owned new native context\n");
+    const context = commit();
+    assert.equal(
+      compareNativeProducerExecution({
+        head: docs,
+        tested: context,
+        policy: producerPolicy,
+        cwd,
+      }).compatible,
+      false
+    );
+    assert.equal(
+      compareNativeProducerExecution({
+        head: context,
+        tested: context,
+        policy: producerPolicy,
+        cwd,
+      }).compatible,
+      true
+    );
+    put("infra/catalog/new.yaml", "owned new catalog input\n");
+    const catalog = commit();
+    assert.equal(
+      compareNativeProducerExecution({
+        head: context,
+        tested: catalog,
+        policy: producerPolicy,
+        cwd,
+      }).compatible,
+      false
+    );
+    assert.equal(
+      compareNativeProducerExecution({
+        head: catalog,
+        tested: catalog,
+        policy: producerPolicy,
+        cwd,
+      }).compatible,
+      true
+    );
+    assert.equal(
+      compareNativeProducerExecution({
+        head: catalog,
+        tested: catalog,
+        policy: {},
+        cwd,
+      }).compatible,
+      false
+    );
+  }));
+
+test("a valid FULL machine result remains successful without cohort metadata and emits no witness", () =>
+  fixture(({ cwd, git, put, commit }) => {
+    const names = Array.from(
+      { length: 6 },
+      (_, i) => `Owned original native ${i}`
+    );
+    const testFiles = Object.fromEntries(
+      names.map((n, i) => [n, `tests/control-${i}.ts`])
+    );
+    const seed = git("rev-parse", "HEAD");
+    const members = git("ls-tree", "-rz", "--full-tree", seed)
+      .split("\0")
+      .filter(Boolean)
+      .map((line) => {
+        const [left, path] = line.split("\t");
+        const [mode, kind, oid] = left.split(" ");
+        return { path, mode, kind, oid };
+      });
+    const policy = {
+      version: 1,
+      members,
+      absentSentinels: [],
+      tests: names,
+      testFiles,
+      images: [],
+      toolContract: {
+        nativeNodeVersion: "22.22.0",
+        nativePnpmVersion: "9.12.2",
+      },
+    };
+    put("scripts/ci/native-proof-policy.json", JSON.stringify(policy));
+    commit();
+    const report = {
+      success: true,
+      numFailedTests: 0,
+      numPendingTests: 0,
+      numTodoTests: 0,
+      numTotalTests: 6,
+      numPassedTests: 6,
+      testResults: names.map((name) => ({
+        name: `${realpathSync(cwd)}/${testFiles[name]}`,
+        status: "passed",
+        assertionResults: [{ fullName: name, status: "passed" }],
+      })),
+    };
+    const temp = mkdtempSync(join(tmpdir(), "native-full-result-"));
+    try {
+      writeFileSync(join(temp, "result.json"), JSON.stringify(report));
+      writeFileSync(
+        join(temp, "images.json"),
+        JSON.stringify({ version: 1, images: [] })
+      );
+      const command = () =>
+        execFileSync(
+          process.execPath,
+          [resolve("scripts/ci/native-proof.mjs"), "record-result"],
+          {
+            cwd,
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              GITHUB_ACTIONS: "false",
+              RUNNER_TEMP: temp,
+              NATIVE_RESULT_FILE: join(temp, "result.json"),
+              NATIVE_IMAGE_BINDINGS_FILE: join(temp, "images.json"),
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          }
+        );
+      const output = command();
+      assert.match(output, /NATIVE_PROOF_UNAVAILABLE/);
+      assert.ok(!output.includes("NATIVE_PROOF_RECEIPT"));
+      report.numPendingTests = 1;
+      writeFileSync(join(temp, "result.json"), JSON.stringify(report));
+      assert.throws(command);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  }));

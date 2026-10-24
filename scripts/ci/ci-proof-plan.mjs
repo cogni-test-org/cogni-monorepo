@@ -4,7 +4,7 @@
 /**
  * Module: `@scripts/ci/ci-proof-plan`
  * Purpose: Select only unchanged reviewed native proof with exact trusted-base execution evidence.
- * Scope: Git objects and bounded read-only native witness metadata; no deployment authority.
+ * Scope: Git objects and bounded read-only native witness metadata; does not deploy or mutate infrastructure.
  * Invariants: UNKNOWN_MEANS_FULL; TRUSTED_EXEMPTION_POLICY; REQUIRED_PROOF_FAILS_CLOSED.
  * Side-effects: IO (Git reads, bounded witness reads, audited GitHub output/summary files).
  * API: plan|verify-unit|verify-component|verify-manifest; standalone stdlib module for exact event-base loading.

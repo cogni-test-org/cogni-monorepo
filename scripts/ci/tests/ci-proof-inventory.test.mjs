@@ -265,32 +265,75 @@ test("actual heavy job conditions stop on cancellation and enforce classifier fa
   }
 });
 
-
 test("actual native job expression omits only successful v2 decisions and cancels promptly", () => {
   const expression = workflow("ci.yaml").native.if;
-  const run = (plan, cancelled = false, classifier = {result: "success", outputs: {eligible: "false"}}) =>
-    Function("cancelled", "needs", `return (${expression.replace(/^\$\{\{\s*|\s*\}\}$/g, "")});`)(
-      () => cancelled, {env_manager_fast_path: classifier, proof_plan: plan}
-    );
+  const run = (
+    plan,
+    cancelled = false,
+    classifier = { result: "success", outputs: { eligible: "false" } }
+  ) =>
+    Function(
+      "cancelled",
+      "needs",
+      `return (${expression.replace(/^\$\{\{\s*|\s*\}\}$/g, "")});`
+    )(() => cancelled, { env_manager_fast_path: classifier, proof_plan: plan });
   for (const plan of [
-    {result: "success", outputs: {plan_version: "1", native_required: "false"}},
-    {result: "failure", outputs: {plan_version: "2", native_required: "false"}},
-    {result: "cancelled", outputs: {plan_version: "2", native_required: "false"}},
-    {result: "skipped", outputs: {}},
-    {result: "success", outputs: {}},
-    {result: "success", outputs: {plan_version: "2", native_required: "true"}},
-    {result: "success", outputs: {plan_version: "2", native_required: "unknown"}},
+    {
+      result: "success",
+      outputs: { plan_version: "1", native_required: "false" },
+    },
+    {
+      result: "failure",
+      outputs: { plan_version: "2", native_required: "false" },
+    },
+    {
+      result: "cancelled",
+      outputs: { plan_version: "2", native_required: "false" },
+    },
+    { result: "skipped", outputs: {} },
+    { result: "success", outputs: {} },
+    {
+      result: "success",
+      outputs: { plan_version: "2", native_required: "true" },
+    },
+    {
+      result: "success",
+      outputs: { plan_version: "2", native_required: "unknown" },
+    },
   ]) {
     assert.equal(run(plan), true, JSON.stringify(plan));
     assert.equal(run(plan, true), false);
   }
-  const eligible = {result: "success", outputs: {plan_version: "2", native_required: "false"}};
+  const eligible = {
+    result: "success",
+    outputs: { plan_version: "2", native_required: "false" },
+  };
   assert.equal(run(eligible), false);
   assert.equal(run(eligible, true), false);
-  assert.equal(run({result: "success", outputs: {}}, false, {result: "success", outputs: {eligible: "true"}}), false);
-  assert.equal(run({result: "failure", outputs: {}}, false, {result: "failure", outputs: {eligible: "true"}}), true);
+  assert.equal(
+    run({ result: "success", outputs: {} }, false, {
+      result: "success",
+      outputs: { eligible: "true" },
+    }),
+    false
+  );
+  assert.equal(
+    run({ result: "failure", outputs: {} }, false, {
+      result: "failure",
+      outputs: { eligible: "true" },
+    }),
+    true
+  );
   const steps = workflow("ci.yaml").proof_plan.steps;
-  assert.equal(steps.find(s => s.uses?.startsWith("actions/setup-node@")).with["node-version"], "22.22.0");
-  assert.equal(steps.find(s => s.uses?.startsWith("pnpm/action-setup@")).with.version, "9.12.2");
-  assert.ok(!steps.some(s => s.run?.includes("pnpm install")));
+  assert.equal(
+    steps.find((s) => s.uses?.startsWith("actions/setup-node@")).with[
+      "node-version"
+    ],
+    "22.22.0"
+  );
+  assert.equal(
+    steps.find((s) => s.uses?.startsWith("pnpm/action-setup@")).with.version,
+    "9.12.2"
+  );
+  assert.ok(!steps.some((s) => s.run?.includes("pnpm install")));
 });

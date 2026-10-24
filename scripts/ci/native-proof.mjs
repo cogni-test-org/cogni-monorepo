@@ -4,7 +4,7 @@
 /**
  * Module: `@scripts/ci/native-proof`
  * Purpose: Bind native execution to reviewed Git inputs, immutable images, and actual trusted-main proof.
- * Scope: Finite Git membership and bounded public GitHub receipts; never certifies changed dependencies.
+ * Scope: Finite Git membership and bounded public GitHub receipts; does not certify changed dependencies.
  * Invariants: UNKNOWN_MEANS_FULL; BASE_OWNS_POLICY; MAIN_AND_MQ_REMAIN_FULL.
  * Side-effects: IO (bounded Git/API reads and owned temporary image-binding/result files).
  * API: nativeEligibility, compareNativeInputs, compareProducerInputs, nativeSafeChanges, readNativeCohort,
@@ -276,8 +276,11 @@ export function compareProducerInputs({
       );
     for (const path of producer.absentSentinels)
       requireThat(validPath(path) && !found.has(path), "new-producer-input");
-    const context = rows.filter((row) =>
-      row.path.startsWith("infra/images/litellm/")
+    const context = rows.filter(
+      (row) =>
+        row.path.startsWith("infra/images/litellm/") ||
+        row.path.startsWith("infra/catalog/") ||
+        row.path.endsWith("/.cogni/repo-spec.yaml")
     );
     requireThat(
       context.every((row) => expected.has(row.path)),
@@ -286,6 +289,88 @@ export function compareProducerInputs({
     return { compatible: true };
   } catch {
     return { compatible: false, reason: "changed-or-unknown-image-producer" };
+  }
+}
+
+/** A fresh target fragment is admissible only from a reviewed metadata-producing program.
+ * Context data may change and receive FULL proof; unknown producer code cannot
+ * silently revive a tag-derived fragment. Unrelated app/docs tree drift is irrelevant.
+ */
+export function compareNativeProducerExecution({
+  head,
+  tested,
+  policy,
+  cwd = process.cwd(),
+}) {
+  try {
+    const program = policy.producerImplementation;
+    requireThat(
+      Array.isArray(program?.members) &&
+        program.members.length > 0 &&
+        program.members.length <= 100,
+      "missing-reviewed-producer-implementation"
+    );
+    const paths = new Set(program.members.map((v) => v.path));
+    requireThat(
+      paths.size === program.members.length && [...paths].every(validPath),
+      "ambiguous-producer-implementation"
+    );
+    const before = tree(head, cwd),
+      after = tree(tested, cwd);
+    for (const rows of [before, after]) {
+      const byPath = new Map(rows.map((v) => [v.path, v]));
+      for (const expected of program.members) {
+        requireThat(
+          expected.kind === "blob" &&
+            ["100644", "100755"].includes(expected.mode) &&
+            sha(expected.oid),
+          "unreviewed-producer-implementation"
+        );
+        const actual = byPath.get(expected.path);
+        requireThat(
+          actual &&
+            ["path", "mode", "kind", "oid"].every(
+              (key) => actual[key] === expected[key]
+            ),
+          "changed-producer-implementation"
+        );
+      }
+    }
+    const footprint = (rows) => {
+      const required = new Set([
+        ...paths,
+        ...(policy.litellmProducer?.members ?? []).map((v) => v.path),
+        ...(policy.litellmProducer?.absentSentinels ?? []),
+      ]);
+      for (const row of rows)
+        if (
+          row.path.startsWith("infra/images/litellm/") ||
+          row.path.startsWith("infra/catalog/") ||
+          row.path.endsWith("/.cogni/repo-spec.yaml")
+        )
+          required.add(row.path);
+      const found = new Map(rows.map((v) => [v.path, v]));
+      return [...required].sort().map((path) => {
+        requireThat(validPath(path), "unknown-producer-footprint");
+        const row = found.get(path);
+        if (!row) return { path, absent: true };
+        requireThat(
+          row.kind === "blob" && ["100644", "100755"].includes(row.mode),
+          "unsupported-producer-footprint"
+        );
+        return row;
+      });
+    };
+    requireThat(
+      hash(footprint(before)) === hash(footprint(after)),
+      "producer-source-tested-input-mismatch"
+    );
+    return { compatible: true };
+  } catch {
+    return {
+      compatible: false,
+      reason: "unreviewed-or-mismatched-producer-execution",
+    };
   }
 }
 
@@ -1085,20 +1170,12 @@ async function prepareNativeImages() {
     images.push(pin);
     producer = policy.litellmProducer.provenance;
   } else {
-    // A PR Build consumes the source HEAD, whereas native executes the tested
-    // merge tree. A changed producer must have EXACTLY the same source tree.
-    // Require rebase rather than pretending an old-head build proves new code.
-    const sourceTree = execFileSync(
-      "git",
-      ["rev-parse", `${sourceSha}^{tree}`],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
-    ).trim();
-    const testedTree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], {
-      encoding: "utf8",
-    }).trim();
+    // The exact fresh target must use the reviewed invocation-metadata
+    // producer and identical complete producer/context inputs at H and T.
     requireThat(
-      sourceTree === testedTree,
-      "producer-source-tested-tree-mismatch"
+      compareNativeProducerExecution({ head: sourceSha, tested, policy })
+        .compatible,
+      "producer-source-tested-input-mismatch"
     );
     const result = await awaitNativeImageProducer({
       repository,
@@ -1148,6 +1225,8 @@ export async function nativeEligibility({
   policy,
   token,
   cwd = process.cwd(),
+  cohortReader = readNativeCohort,
+  witnessLookup = lookupNativeWitness,
 }) {
   const full = (reason) => ({ eligible: false, reason });
   try {
@@ -1192,7 +1271,7 @@ export async function nativeEligibility({
         .compatible,
       "unqualified-native-image-pin"
     );
-    const cohort = readNativeCohort(policy.toolContract);
+    const cohort = cohortReader(policy.toolContract);
     requireThat(cohort.compatible, "unavailable-current-native-cohort");
     const policyDigest = createHash("sha256")
       .update(read(base, "scripts/ci/native-proof-policy.json"))
@@ -1202,7 +1281,7 @@ export async function nativeEligibility({
       ["rev-parse", `${base}:.github/workflows/ci.yaml`],
       { cwd, encoding: "utf8", timeout: 5_000 }
     ).trim();
-    const witness = await lookupNativeWitness({
+    const witness = await witnessLookup({
       repository,
       base,
       policyDigest,
@@ -1320,18 +1399,27 @@ function recordNativeResult() {
     return;
   }
   const cohort = readNativeCohort(policy.toolContract);
-  requireThat(cohort.compatible, "unavailable-native-result-cohort");
+  if (!cohort.compatible) {
+    console.log(
+      "NATIVE_PROOF_UNAVAILABLE full controls passed; current cohort is unavailable"
+    );
+    return;
+  }
   const nodeObserved = process.versions.node;
   const pnpmObserved = execFileSync("pnpm", ["--version"], {
     encoding: "utf8",
     timeout: 5_000,
     maxBuffer: 1024,
   }).trim();
-  requireThat(
-    nodeObserved === policy.toolContract.nativeNodeVersion &&
-      pnpmObserved === policy.toolContract.nativePnpmVersion,
-    "native-install-tool-mismatch"
-  );
+  if (
+    nodeObserved !== policy.toolContract.nativeNodeVersion ||
+    pnpmObserved !== policy.toolContract.nativePnpmVersion
+  ) {
+    console.log(
+      "NATIVE_PROOF_UNAVAILABLE full controls passed; install tools differ"
+    );
+    return;
+  }
   const receipt = {
     version: 1,
     repository: process.env.GITHUB_REPOSITORY,

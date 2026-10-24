@@ -12,6 +12,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -25,6 +26,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
+
+import { compareNativeInputs } from "../native-proof.mjs";
 
 const cli = resolve("scripts/ci/ci-proof-plan.mjs");
 const policy = "scripts/ci/ci-proof-plan.mjs";
@@ -140,6 +143,8 @@ function fixture(run) {
   const commit = () => {
     git("add", ".");
     git(
+      "-c",
+      "core.hooksPath=/dev/null",
       "-c",
       "user.name=fixture",
       "-c",
@@ -505,3 +510,93 @@ test("component aggregate requires both independent proofs", () => {
         0
       );
 });
+
+test("v2 terminal recomputes exact policy and tested membership before accepting omission", () =>
+  fixture(({ cwd, git, put, commit, base: seed }) => {
+    const members = git("ls-tree", "-rz", "--full-tree", seed)
+      .split("\0")
+      .filter(Boolean)
+      .map((line) => {
+        const [left, path] = line.split("\t");
+        const [mode, kind, oid] = left.split(" ");
+        return { path, mode, kind, oid };
+      })
+      .filter((row) => !row.path.startsWith("docs/"));
+    const nativePolicy = {
+      version: 1,
+      members,
+      absentSentinels: [],
+      images: [
+        {
+          declared: "owned:fixture",
+          image: `ghcr.io/owned/image@sha256:${"e".repeat(64)}`,
+          platform: "linux/amd64",
+        },
+      ],
+    };
+    const raw = JSON.stringify(nativePolicy);
+    put("scripts/ci/native-proof-policy.json", raw);
+    const base = commit();
+    put("docs/owned.md", "owned change\n");
+    const head = commit();
+    const inputs = compareNativeInputs({
+      base,
+      tested: head,
+      policy: nativePolicy,
+      cwd,
+    });
+    assert.equal(inputs.compatible, true);
+    const hash = (value) => createHash("sha256").update(value).digest("hex");
+    const valid = {
+      ...unit,
+      PLAN_VERSION: "2",
+      NATIVE_REQUIRED: "false",
+      NATIVE_RESULT: "skipped",
+      POLICY_SHA: base,
+      PLAN_BASE_SHA: base,
+      EVENT_BASE_SHA: base,
+      PLAN_HEAD_SHA: head,
+      EVENT_HEAD_SHA: head,
+      PLAN_TESTED_SHA: head,
+      EVENT_TESTED_SHA: head,
+      POLICY_DIGEST: hash(raw),
+      CLOSURE_DIGEST: inputs.fingerprint,
+      COHORT_DIGEST: "a".repeat(64),
+      IMAGE_DIGEST: hash(JSON.stringify(nativePolicy.images)),
+      WITNESS_RUN: "17",
+      WITNESS_ATTEMPT: "2",
+    };
+    const result = invoke("verify-unit", valid, cwd);
+    assert.equal(result.status, 0, result.stderr);
+    for (const patch of [
+      { POLICY_DIGEST: "f".repeat(64) },
+      { CLOSURE_DIGEST: "f".repeat(64) },
+      { IMAGE_DIGEST: "f".repeat(64) },
+      { COHORT_DIGEST: "" },
+      { WITNESS_RUN: "" },
+      { WITNESS_ATTEMPT: "0" },
+      { PLAN_TESTED_SHA: seed },
+      { PLAN_BASE_SHA: seed },
+      { NATIVE_RESULT: "success" },
+      { NATIVE_RESULT: "cancelled" },
+      { NATIVE_RESULT: "failure" },
+      { CORE_RESULT: "cancelled" },
+      { SHELL_RESULT: "failure" },
+      { CLASSIFIER_RESULT: "failure" },
+    ])
+      assert.notEqual(
+        invoke("verify-unit", { ...valid, ...patch }, cwd).status,
+        0,
+        JSON.stringify(patch)
+      );
+    put(config, "owned changed native config\n");
+    const changed = commit();
+    assert.notEqual(
+      invoke(
+        "verify-unit",
+        { ...valid, PLAN_TESTED_SHA: changed, EVENT_TESTED_SHA: changed },
+        cwd
+      ).status,
+      0
+    );
+  }));

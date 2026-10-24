@@ -713,7 +713,7 @@
       "path": "scripts/ci/ci-proof-plan.mjs",
       "mode": "100644",
       "kind": "blob",
-      "oid": "1fbe8b6e8f4b98e5d92d226127fcf503c93fea66"
+      "oid": "d71bad479c72cb38d1f7c0c3a6020903a081063a"
     },
     {
       "path": "scripts/ci/classify-env-manager-fast-path.sh",
@@ -755,7 +755,7 @@
       "path": "scripts/ci/native-proof.mjs",
       "mode": "100644",
       "kind": "blob",
-      "oid": "c208135fc68f2ee0399ad5b84e305d73f6e25237"
+      "oid": "33a3db752b0deb7cd13affce43a9ad9645093589"
     },
     {
       "path": "scripts/ci/next-free-node-port.sh",
@@ -1217,5 +1217,76 @@
       "platform": "linux/amd64",
       "bootstrap": "Old reviewed canonical pin; new metadata producer is intentionally incompatible. Exact-head producer and full native proof precede a separately reviewed canonical pin refresh."
     }
+  },
+  "producerImplementation": {
+    "scope": "Exact reviewed invocation-metadata-producing program, separate from the historical immutable pin. Unknown producer code is RED until explicitly reviewed.",
+    "members": [
+      {
+        "path": ".dockerignore",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "e019ed87eff07e6757f522a93df0bb0e46bdb729"
+      },
+      {
+        "path": ".github/workflows/pr-build.yml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "27d46ef5bf66bb033712da9b778eff629b387622"
+      },
+      {
+        "path": "infra/catalog/litellm.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "b1cdcb58ed7c51f00ad25e505fa07b0765850e1b"
+      },
+      {
+        "path": "scripts/ci/build-and-push-images.sh",
+        "mode": "100755",
+        "kind": "blob",
+        "oid": "daed0739913bfe4c9d3a129664958961a3490cec"
+      },
+      {
+        "path": "scripts/ci/classify-env-manager-fast-path.sh",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "8e405cd3ba162fea92c8906d3ae4713065096841"
+      },
+      {
+        "path": "scripts/ci/detect-affected.sh",
+        "mode": "100755",
+        "kind": "blob",
+        "oid": "c4c770a8fc8abc0aa3bc518dfbb865388be994f3"
+      },
+      {
+        "path": "scripts/ci/lib/appset-paths.sh",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "4d541bd189ebe29d8468495ab2b92c7577fd5e31"
+      },
+      {
+        "path": "scripts/ci/lib/image-tags.sh",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "ae7f9c6d142a9faf37ea161c3cb4cf94c56e1aa0"
+      },
+      {
+        "path": "scripts/ci/merge-build-fragments.sh",
+        "mode": "100755",
+        "kind": "blob",
+        "oid": "c7b18a6dbef51d19223d4afeb0680573b416748e"
+      },
+      {
+        "path": "scripts/ci/next-free-node-port.sh",
+        "mode": "100755",
+        "kind": "blob",
+        "oid": "bd077e08c44b578a64c07bf172b2f2f9ad58c998"
+      },
+      {
+        "path": "scripts/ci/write-build-manifest.sh",
+        "mode": "100755",
+        "kind": "blob",
+        "oid": "02da0177a038bdad230d33b850281890e21fb4d1"
+      }
+    ]
   }
 }
