@@ -271,7 +271,7 @@ fi
 echo "[4/5] scheduler off-cluster Services use env VM aliases"
 check_scheduler_vm_alias() {
   local env="$1" expected="$2"
-  local file="infra/k8s/overlays/$env/scheduler-worker/kustomization.yaml"
+  local file="${3:-infra/k8s/overlays/$env/scheduler-worker/kustomization.yaml}"
   [ -f "$file" ] || { echo "  skip - $env scheduler-worker overlay missing"; return; }
 
   mapfile -t external_names < <(grep -oE 'externalName: [^ ]+' "$file" | awk '{print $2}' | sort -u)
@@ -282,9 +282,25 @@ check_scheduler_vm_alias() {
   pass "$env scheduler-worker ExternalNames -> $expected"
 }
 
+# Workload DOMAIN controls node HTTP endpoints above. Control VM aliases follow
+# the materializer's explicit FORK_DOMAIN_ROOT and the provisioned deployment.
 SUBSTRATE_SLUG="$(cogni_deployment_slug)"
+CONTROL_ROOT="${FORK_DOMAIN_ROOT:-$(cogni_domain_root)}"
+control_vm_alias() {
+  cogni_vm_host_for_env "$1" "${FORK_DOMAIN_ROOT:-$(cogni_domain_root)}" "$(cogni_deployment_slug)"
+}
+control_fixture="$TMP_TREE/control-root.yaml"
+printf '%s\n' 'externalName: cogni-candidate-a.vm.control.example.invalid' > "$control_fixture"
+(
+  export DOMAIN=workload.example.invalid FORK_DOMAIN_ROOT=control.example.invalid COGNI_DOMAIN_ROOT=other.example.invalid
+  check_scheduler_vm_alias candidate-a "$(control_vm_alias candidate-a)" "$control_fixture"
+  if (check_scheduler_vm_alias candidate-a "$(cogni_vm_host_for_env candidate-a "$DOMAIN" "$SUBSTRATE_SLUG")" "$control_fixture") > "$TMP_TREE/wrong-control-root.out" 2>&1; then
+    fail 'workload DOMAIN must not authorize the scheduler control VM alias'
+  fi
+  grep -q 'expected cogni-candidate-a.vm.workload.example.invalid' "$TMP_TREE/wrong-control-root.out" || fail 'wrong control-root negative failed for another reason'
+)
 for env in "${DEPLOY_ENVS[@]}"; do
-  check_scheduler_vm_alias "$env" "$(cogni_vm_host_for_env "$env" "$FORK_ROOT" "$SUBSTRATE_SLUG")"
+  check_scheduler_vm_alias "$env" "$(control_vm_alias "$env")"
 done
 
 echo "[5/5] the Crossplane materializer's substrate host IS that same env VM alias"
@@ -303,8 +319,8 @@ grep -q -- 'cogni_deployment_slug' "$ACTION_YML" \
 for env in "${DEPLOY_ENVS[@]}"; do
   file="infra/k8s/overlays/$env/scheduler-worker/kustomization.yaml"
   [ -f "$file" ] || { echo "  skip - $env scheduler-worker overlay missing"; continue; }
-  expected="$(cogni_vm_host_for_env "$env" "$FORK_ROOT" "$SUBSTRATE_SLUG")"
-  apex="$(domain_for_env "$env" "$FORK_ROOT" || true)"
+  expected="$(control_vm_alias "$env")"
+  apex="$(domain_for_env "$env" "$CONTROL_ROOT" || true)"
   [ "$expected" != "$apex" ] \
     || fail "$env substrate host resolved to the Cloudflare-proxied public apex '$apex', which drops 7233/6379/4000"
   mapfile -t external_names < <(grep -oE 'externalName: [^ ]+' "$file" | awk '{print $2}' | sort -u)

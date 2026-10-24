@@ -10,7 +10,7 @@
 
 ## Purpose
 
-Native integration acceptance of declared infrastructure failure behavior in isolated CI-owned Docker containers. CI runs this directory unconditionally for ordinary changes in the dedicated native lane and requires success in the terminal unit gate. Native exemptions are disabled pending a renewed transitive executable/filesystem/install audit; an older event-base policy cannot skip this lane. The existing signed env-manager exception remains unchanged. Ordinary local root Vitest discovery still includes this directory.
+Native integration acceptance of declared infrastructure failure behavior in isolated CI-owned Docker containers. CI runs this directory fully whenever native input equivalence or a compatible trusted BASE witness is unknown. Only an exact reviewed v2 BASE policy, unchanged finite inputs, immutable fixture bindings, matching current runner/tool cohort and an actual six-control main witness may omit it. Main/MQ and fork changes run fully; old planners cannot authorize omission. The terminal gate verifies every selected proof and the exact omission metadata. The existing signed env-manager exception remains unchanged. Ordinary local root Vitest discovery still includes this directory.
 
 ## Pointers
 
@@ -53,3 +53,5 @@ Native integration acceptance of declared infrastructure failure behavior in iso
 ## Notes
 
 This narrow native-integration exception applies only here; the parent static-test guidance continues to govern sibling directories.
+
+- `scripts/ci/native-proof.mjs` owns finite input/producer/cohort/witness validation and `prepare-images` / `record-result`. Mutable fixture declarations retain source assertions while execution uses reviewed immutable digests; changed producer inputs require its exact successful target artifact, never an old tag. Native alone installs frozen dependencies with `--ignore-scripts`; all original faults, health clocks, causal ordering and cleanup remain. Machine results must include every original control, with zero skipped/todo/pending cases. Policy and helper are loaded only from event BASE for selection.

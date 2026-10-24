@@ -175,6 +175,9 @@ function fixture(run) {
             EVENT_BASE_SHA: base,
             EVENT_HEAD_SHA: head,
             EVENT_BASE_REF: "main",
+            EVENT_HEAD_REPO: "cogni-dao/cogni",
+            GITHUB_REPOSITORY: "cogni-dao/cogni",
+            EVENT_TESTED_SHA: head,
             POLICY_SHA: base,
             ...extra,
           },
@@ -189,7 +192,7 @@ function fixture(run) {
   }
 }
 
-test("app/docs, non-main and full events all require native while exemptions are disabled", () =>
+test("app/docs without a compatible BASE policy, non-main and full events require native", () =>
   fixture(({ put, commit, plan }) => {
     put("nodes/operator/app/src/example.ts");
     const head = commit();
@@ -260,12 +263,12 @@ test("native-source/config changes merged after the audit cannot inherit app exe
       assert.equal(result.native_required, "true");
       assert.equal(
         result.reason,
-        "native-exemptions-disabled-pending-transitive-audit"
+        "missing-or-incompatible-trusted-native-policy"
       );
     });
 });
 
-test("exemptions stay disabled after merged helper, lifecycle and install-surface drift", () => {
+test("merged helper, lifecycle and install-surface drift cannot bootstrap an exemption", () => {
   for (const [file, content] of [
     [
       "scripts/ci/tests/runtime-secret-authority.test.sh",

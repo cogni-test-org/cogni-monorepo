@@ -31,6 +31,7 @@ import {
 } from "testcontainers";
 import { describe, expect, it } from "vitest";
 import yaml from "yaml";
+import { nativeExecutionImage } from "../../../scripts/ci/native-proof.mjs";
 
 interface Service {
   image: string;
@@ -57,7 +58,7 @@ const { services } = yaml.parse(
 ) as { services: Record<string, Service> };
 
 function image(service: Service): string {
-  return service.image.match(/^\$\{[A-Z_]+:-(.+)\}$/)?.[1] ?? service.image;
+  return nativeExecutionImage(service.image);
 }
 
 function milliseconds(duration: string): number {

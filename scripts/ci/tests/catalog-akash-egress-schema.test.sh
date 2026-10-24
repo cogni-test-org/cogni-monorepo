@@ -12,7 +12,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-yq 'del(.compute_egress_cidrs)' "$REPO_ROOT/infra/catalog/red.yaml" >"$tmpdir/akash-without-egress.yaml"
+# Own a schema-valid Akash input rather than requiring the sovereign roster
+# to contain canonical red. All mutations below still exercise the real schema.
+yq '.name = "egress-fixture" | .envs = ["production"] | .activity_env = "production" | .deployment_provider = {"production":"akash"} | .compute_egress_cidrs = [{"cidr":"192.0.2.1/32","comment":"owned fixture"}]' \
+  "$REPO_ROOT/infra/catalog/node-template.yaml" > "$tmpdir/source.yaml"
+check-jsonschema --schemafile "$REPO_ROOT/infra/catalog/_schema.json" "$tmpdir/source.yaml" >/dev/null
+
+yq 'del(.compute_egress_cidrs)' "$tmpdir/source.yaml" >"$tmpdir/akash-without-egress.yaml"
 
 if check-jsonschema \
   --schemafile "$REPO_ROOT/infra/catalog/_schema.json" \
@@ -30,7 +36,7 @@ fi
 echo "ok 1 - Akash catalog without compute egress is rejected"
 
 yq '.deployment_provider = {"candidate-a": "k3s", "preview": "k3s", "production": "k3s"} | del(.compute_egress_cidrs)' \
-  "$REPO_ROOT/infra/catalog/red.yaml" >"$tmpdir/k3s-without-egress.yaml"
+  "$tmpdir/source.yaml" >"$tmpdir/k3s-without-egress.yaml"
 
 check-jsonschema \
   --schemafile "$REPO_ROOT/infra/catalog/_schema.json" \
@@ -39,7 +45,7 @@ check-jsonschema \
 echo "ok 2 - explicit k3s-only catalog needs no compute egress declaration"
 
 # Optional entry scopes are narrow subsets, not new substrate ports/environments.
-yq '.compute_egress_cidrs = [{"cidr":"65.108.194.156/32","comment":"production Temporal fixture","ports":[7233],"envs":["production"]}]' "$REPO_ROOT/infra/catalog/red.yaml" > "$tmpdir/scoped-valid.yaml"
+yq '.compute_egress_cidrs = [{"cidr":"65.108.194.156/32","comment":"production Temporal fixture","ports":[7233],"envs":["production"]}]' "$tmpdir/source.yaml" > "$tmpdir/scoped-valid.yaml"
 check-jsonschema --schemafile "$REPO_ROOT/infra/catalog/_schema.json" "$tmpdir/scoped-valid.yaml" >/dev/null
 echo "ok 3 - scoped numeric Temporal port in owning production env is accepted"
 for mutation in '.compute_egress_cidrs[0].ports = []' '.compute_egress_cidrs[0].ports = [8080]' '.compute_egress_cidrs[0].ports = ["7233"]' '.compute_egress_cidrs[0].ports = [7233,7233]' '.compute_egress_cidrs[0].envs = []' '.compute_egress_cidrs[0].envs = ["preview"]'; do

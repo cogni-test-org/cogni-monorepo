@@ -33,6 +33,7 @@ import {
 } from "testcontainers";
 import { describe, expect, it } from "vitest";
 import yaml from "yaml";
+import { nativeExecutionImage } from "../../../scripts/ci/native-proof.mjs";
 
 const repo = path.resolve(__dirname, "../../..");
 const { services } = yaml.parse(
@@ -166,7 +167,9 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
         }
       );
     try {
-      const postgres = await new PostgreSqlContainer(services.postgres.image)
+      const postgres = await new PostgreSqlContainer(
+        nativeExecutionImage(services.postgres.image)
+      )
         .withDatabase("litellm")
         .withUsername("litellm")
         .withPassword(randomUUID())
@@ -174,7 +177,9 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
         .withNetworkAliases("owned-pg")
         .start();
       owned.push(postgres);
-      const dolt = await new GenericContainer(services.doltgres.image)
+      const dolt = await new GenericContainer(
+        nativeExecutionImage(services.doltgres.image)
+      )
         .withEnvironment({ DOLTGRES_PASSWORD: randomUUID() })
         .withNetwork(network)
         .withWaitStrategy(Wait.forLogMessage(/server (started|listening)/i))
@@ -205,7 +210,7 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
         /^Database system identifier:\s+(\d+)$/m
       )?.[1];
       expect(systemId).toMatch(/^\d+$/);
-      const gatewayImage = execFileSync(
+      const declaredGatewayImage = execFileSync(
         "bash",
         [
           "-c",
@@ -215,7 +220,8 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
         ],
         { cwd: repo, encoding: "utf8" }
       ).trim();
-      expect(gatewayImage).toMatch(/:litellm-[a-f0-9]+$/);
+      expect(declaredGatewayImage).toMatch(/:litellm-[a-f0-9]+$/);
+      const gatewayImage = nativeExecutionImage(declaredGatewayImage);
       expect(services.litellm.labels).toContain("autoheal=false");
       expect(services.litellm.restart).toBe("unless-stopped");
       writeFileSync(
@@ -271,7 +277,9 @@ describe.skipIf(!process.env.CI)("LiteLLM normal Compose recovery", () => {
       const oldInspection = await old.inspect();
       const oldStart = oldInspection.State.StartedAt;
       const exactHealthcheck = oldInspection.Config.Healthcheck;
-      watchdog = await new GenericContainer(services.autoheal.image)
+      watchdog = await new GenericContainer(
+        nativeExecutionImage(services.autoheal.image)
+      )
         .withEnvironment({
           ...Object.fromEntries(
             services.autoheal.environment.map((entry: string) => {

@@ -1,0 +1,1221 @@
+{
+  "version": 1,
+  "repository": "cogni-dao/cogni",
+  "scope": "Reviewed Git impact only. Main and merge queue execute full native; unknown membership, cohort, witness or producer identity executes full. No ambient hermeticity claim.",
+  "toolContract": {
+    "nativeNodeVersion": "22.22.0",
+    "nativePnpmVersion": "9.12.2"
+  },
+  "members": [
+    {
+      "path": ".cogni/repo-spec.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "61a1788340bb8cb745c9f42b8950de834920ca89"
+    },
+    {
+      "path": ".dockerignore",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "e019ed87eff07e6757f522a93df0bb0e46bdb729"
+    },
+    {
+      "path": ".env.bootstrap.example",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "6cd47abfb2e5c6d033122c1a891abac913b2a159"
+    },
+    {
+      "path": ".env.docker.example",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "f55d75673e58d64cc66900a9ac30ebbe3614b688"
+    },
+    {
+      "path": ".env.local.example",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "dc7abc8b69108e5e4905c35fa2dea50ff12a7bbe"
+    },
+    {
+      "path": ".env.operator.example",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "1d42f53a3cac8137a142e7bf1212171ef142795d"
+    },
+    {
+      "path": ".env.test.example",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "25d9bc54099a1025b762cfda2fd7486da6da345a"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "cc6436e01aea8a4a7b055884ef6195efbc5cce95"
+    },
+    {
+      "path": ".github/workflows/pr-build.yml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "27d46ef5bf66bb033712da9b778eff629b387622"
+    },
+    {
+      "path": ".husky/commit-msg",
+      "mode": "100755",
+      "kind": "blob",
+      "oid": "2e6b87e2fc0235402b4ba5e262a1ffc3fb330cb4"
+    },
+    {
+      "path": ".husky/pre-commit",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "153414c9aea327fe0b11751bacc03252fdf215f2"
+    },
+    {
+      "path": ".husky/pre-push",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "a49ee5d7971c97f90bbc6a2ec39c270d965b2248"
+    },
+    {
+      "path": "config/mcp.servers.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "188770c4028609e14a28c7433f392d688815d96e"
+    },
+    {
+      "path": "infra/catalog/_schema.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "0ef31ce13c643095654220b067d98d2791aedfcb"
+    },
+    {
+      "path": "infra/catalog/beacon.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "675ea6cf21077f1460e34ef4ac54705b1166b7f9"
+    },
+    {
+      "path": "infra/catalog/doltgres.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "4c1a475686691243af1c58b502cdb5e840b76826"
+    },
+    {
+      "path": "infra/catalog/levelup.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "495ae8ccee971d291b0de736b9222c1012545bb1"
+    },
+    {
+      "path": "infra/catalog/litellm.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "b1cdcb58ed7c51f00ad25e505fa07b0765850e1b"
+    },
+    {
+      "path": "infra/catalog/node-template.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "33fa9426571a742f1fc973e57ade4b7303d9723a"
+    },
+    {
+      "path": "infra/catalog/openfga.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "1c1eafcf4112806efdb9434b77c1fabf144f8f2a"
+    },
+    {
+      "path": "infra/catalog/operator.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "be90aa516192348296e4664722a1e3d42e9cbe36"
+    },
+    {
+      "path": "infra/catalog/poly.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "66092a834701472a342eb2dd8be9d36aa2a608c6"
+    },
+    {
+      "path": "infra/catalog/red.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "f47fbd116b492be4833e385ecb86ab24e94cddaa"
+    },
+    {
+      "path": "infra/catalog/scheduler-worker.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "de8aa1bf0627906c052f7d105ea18f6277ca0ecf"
+    },
+    {
+      "path": "infra/catalog/toks5.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "83fb54d4b4e7db176ff820d47790e20f93e41fa6"
+    },
+    {
+      "path": "infra/compose/runtime/configs/alloy-config.metrics.alloy",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "c330d2568ee3b34f998258ad16f1cfef1846e96d"
+    },
+    {
+      "path": "infra/compose/runtime/docker-compose.yml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "989daa484d397624fddee17db2edc0bb743ef15d"
+    },
+    {
+      "path": "infra/compose/runtime/doltgres-init/provision.sh",
+      "mode": "100755",
+      "kind": "blob",
+      "oid": "d0e435d235d6e35ca99b76f08dcb3d34337462e7"
+    },
+    {
+      "path": "infra/images/litellm/AGENTS.md",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "520dc16075cf72b57f38cf2d797860c3c70d0104"
+    },
+    {
+      "path": "infra/images/litellm/Dockerfile",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "c598bec66906b1dd6b51a8a304b4b2453b361103"
+    },
+    {
+      "path": "infra/images/litellm/cogni_callbacks.py",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "bc0980a2f79c95fbd7f83786f3f8364db9a0b4f2"
+    },
+    {
+      "path": "nodes/operator/.cogni/repo-spec.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "97b84b266428f169c3574e84b6de7804444b1554"
+    },
+    {
+      "path": "nodes/operator/app/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "7cf931bf42cac07395b384265cd3203841e083e0"
+    },
+    {
+      "path": "nodes/operator/app/tsconfig.app.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "94df308fc67d7f6fe13aeb996c75547350e500cc"
+    },
+    {
+      "path": "nodes/operator/app/tsconfig.e2e-roundtrip.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "4218f1d4e8cf34bde483587a7bf37fb003afbfdc"
+    },
+    {
+      "path": "nodes/operator/app/tsconfig.test.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "18e15a4636518d859eb0e878fdf78540f9068c9c"
+    },
+    {
+      "path": "nodes/operator/app/vitest.config.mts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "52b47dbf7f0af14da4f5423a729150cf80dd1cf3"
+    },
+    {
+      "path": "nodes/operator/graphs/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "2b6c39c4a869a423ea75e48ebe2dbcc10ecbebf9"
+    },
+    {
+      "path": "nodes/operator/graphs/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "036d802f70a159ed2d4c63c659ed2385a9b88083"
+    },
+    {
+      "path": "nodes/operator/packages/doltgres-schema/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ffbc156de9ba4c0984291ca3ed86642660159613"
+    },
+    {
+      "path": "nodes/operator/packages/doltgres-schema/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "a2624f363dde910bb1ee39ec6a69a2c381a05dc0"
+    },
+    {
+      "path": "package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "fa09053e5e17726e558154b9e8558846a649ab3a"
+    },
+    {
+      "path": "packages/ai-core/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "610a8be4a46e4a66cb17941236f601d6afac0eac"
+    },
+    {
+      "path": "packages/ai-core/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "b60569050d9dd1fe07d2e50b6603efed1d6b6b23"
+    },
+    {
+      "path": "packages/ai-core/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "88a5dbb928008b4f6948deafc8eff0a0348163fc"
+    },
+    {
+      "path": "packages/ai-tools/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "9ad6fccc287f484ac58e390c87d7dbe989b1ead4"
+    },
+    {
+      "path": "packages/ai-tools/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ae5f20684d675c9b66e7233ab36f15d39d516aec"
+    },
+    {
+      "path": "packages/ai-tools/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "b749c678e2809a8fa793dd4a7ffd191b2f1247eb"
+    },
+    {
+      "path": "packages/aragon-osx/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "e4dc29c1a6f816613537337ed3b53ad9ecd2481e"
+    },
+    {
+      "path": "packages/aragon-osx/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ae5f20684d675c9b66e7233ab36f15d39d516aec"
+    },
+    {
+      "path": "packages/attribution-ledger/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "16cc39de00ad91a47c9320ba739ee068a7775ec3"
+    },
+    {
+      "path": "packages/attribution-ledger/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ae5f20684d675c9b66e7233ab36f15d39d516aec"
+    },
+    {
+      "path": "packages/attribution-pipeline-contracts/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "879dfc9663768ade59eae33c5325289c4d938934"
+    },
+    {
+      "path": "packages/attribution-pipeline-contracts/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ae5f20684d675c9b66e7233ab36f15d39d516aec"
+    },
+    {
+      "path": "packages/attribution-pipeline-contracts/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "e2f5a1c7b437666877095a1be76a16fa8b27d059"
+    },
+    {
+      "path": "packages/attribution-pipeline-plugins/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "b94fcd433a04a1a41a3ae230a76157cb68bb01b1"
+    },
+    {
+      "path": "packages/attribution-pipeline-plugins/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "0e1d4412f385c4fb26b6b0b98e247cdccc7fe4b2"
+    },
+    {
+      "path": "packages/attribution-pipeline-plugins/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "e790763c84d246218e263e69bad32366f79e632c"
+    },
+    {
+      "path": "packages/authorization-core/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "c5488f0a6e69d49d81ee760a1144f9513734c508"
+    },
+    {
+      "path": "packages/authorization-core/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ae5f20684d675c9b66e7233ab36f15d39d516aec"
+    },
+    {
+      "path": "packages/authorization-core/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "21e798f6506960e71cd08782b481d67ce176b60d"
+    },
+    {
+      "path": "packages/cogni-contracts/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "69cebd45a142de8f68a3f14fef6a0906dd1c53f7"
+    },
+    {
+      "path": "packages/cogni-contracts/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "d061b6a02eca755fd95a85e827a7ae36581bb843"
+    },
+    {
+      "path": "packages/db-client/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "696719f4df3af10f7b557b11cbcff1c69a7d1bfc"
+    },
+    {
+      "path": "packages/db-client/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "b6d5d91917864569b5b2113013d0852e9109c745"
+    },
+    {
+      "path": "packages/db-schema/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "bbe018c97392a0f21eca8aa9aaa2cfe940959f77"
+    },
+    {
+      "path": "packages/db-schema/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ae5f20684d675c9b66e7233ab36f15d39d516aec"
+    },
+    {
+      "path": "packages/dns-ops/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "9b662135f538916a11a3ac85287533ff95d391b9"
+    },
+    {
+      "path": "packages/dns-ops/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "a2624f363dde910bb1ee39ec6a69a2c381a05dc0"
+    },
+    {
+      "path": "packages/financial-ledger/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "313b384189a35a9cc07d4e5bd706d3b9ebe5f7b4"
+    },
+    {
+      "path": "packages/financial-ledger/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ae5f20684d675c9b66e7233ab36f15d39d516aec"
+    },
+    {
+      "path": "packages/financial-ledger/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "b37164394b7be078d82d16da439e3209d1e84713"
+    },
+    {
+      "path": "packages/graph-execution-core/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "b76cf1fee483ec8311a3170461c2b18cafbbed64"
+    },
+    {
+      "path": "packages/graph-execution-core/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "0daac56cb1f40f095108e9c3f96c6c4d66032970"
+    },
+    {
+      "path": "packages/graph-execution-host/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "bf372e585bfd8859c34a5d8dca61928da584c8bb"
+    },
+    {
+      "path": "packages/graph-execution-host/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "0c644e202d8e9505a730b647cfd553bb8ca93114"
+    },
+    {
+      "path": "packages/graph-execution-host/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "e2c319b7e3923f6da070c25ec112feb15db0fd11"
+    },
+    {
+      "path": "packages/ids/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "a9411c5cac79295c02c8364527d61b171e4bfce4"
+    },
+    {
+      "path": "packages/ids/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "d061b6a02eca755fd95a85e827a7ae36581bb843"
+    },
+    {
+      "path": "packages/ids/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "46eb886d5c053962737b726f29a17e0a3003ecec"
+    },
+    {
+      "path": "packages/ingestion-core/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "e0a456e61d7fd4c5033a63f051e12db542952330"
+    },
+    {
+      "path": "packages/ingestion-core/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ae5f20684d675c9b66e7233ab36f15d39d516aec"
+    },
+    {
+      "path": "packages/knowledge-base/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ebf7c545af3528726e6738ed572e4a8edbf0de88"
+    },
+    {
+      "path": "packages/knowledge-base/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "9a0327331637012ae6cffd427bda672f9b3ea71c"
+    },
+    {
+      "path": "packages/knowledge-store/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "e6b7dc2325b0437df49a96e5c4f5bf9115e964ff"
+    },
+    {
+      "path": "packages/knowledge-store/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ce62ff66eae22f233e801a0842a7917ba5da659e"
+    },
+    {
+      "path": "packages/knowledge-store/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "1bacb1ae70b398216d0e127d0becc594e994a63d"
+    },
+    {
+      "path": "packages/langgraph-graphs/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "e71be97bb8bc5fd2a0f9dbc58145fb5b16f8aeda"
+    },
+    {
+      "path": "packages/langgraph-graphs/tsconfig.build.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "1d18e377311c368101990294f74aca784f057657"
+    },
+    {
+      "path": "packages/langgraph-graphs/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "1a1da0488e754dae16a46f58efa473a2611d2a91"
+    },
+    {
+      "path": "packages/langgraph-graphs/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "2dddb814fdcd12a42c9dac80ccd4cf00f3b60cd0"
+    },
+    {
+      "path": "packages/node-app/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "fc7ca1947638068c6040331c7965a5386b0a98d6"
+    },
+    {
+      "path": "packages/node-app/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "8b2970a6a6335a01c65830c77057feac9d3d822c"
+    },
+    {
+      "path": "packages/node-contracts/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "1ef4b415c7d6bfb33bff18c79aa66aed3ebdf477"
+    },
+    {
+      "path": "packages/node-contracts/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "b980cc3ab85ad9f9fd8d3c0a5efd0a7474f47398"
+    },
+    {
+      "path": "packages/node-core/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "58825b3bed87f07dddc774e126cab2a03bf951ce"
+    },
+    {
+      "path": "packages/node-core/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "f5eaf1338195801265fefba7c4f060c56f012758"
+    },
+    {
+      "path": "packages/node-shared/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "0bfceaf4d67d511fee48d7dc88395e299f71e500"
+    },
+    {
+      "path": "packages/node-shared/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "8bc0dcfcf70d9f8c49e00d7647d03e3dddb8be46"
+    },
+    {
+      "path": "packages/node-streams/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "d2b42baba977fd1f1ddaec2f6d25aa3f341843c9"
+    },
+    {
+      "path": "packages/node-streams/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "d061b6a02eca755fd95a85e827a7ae36581bb843"
+    },
+    {
+      "path": "packages/node-streams/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "9770067a2239821e350ab630ef67976939a4444b"
+    },
+    {
+      "path": "packages/node-ui-kit/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "023210868930c11fe24103db58589b1213b76eff"
+    },
+    {
+      "path": "packages/node-ui-kit/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "a8629258c9516c3f88eb2df7bee157188116c7a7"
+    },
+    {
+      "path": "packages/operator-wallet/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "1e048a090f78efb3f10f21cb5da3ffac0ab264fe"
+    },
+    {
+      "path": "packages/operator-wallet/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "77fc24a78944830b682945f8989907daee80bbd1"
+    },
+    {
+      "path": "packages/operator-wallet/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "d0b9bc3d8928b6c01a54c059899c5b395f3a1cb9"
+    },
+    {
+      "path": "packages/repo-spec/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "d26833d1119434b39507b0d084a4f1af6a6cffcf"
+    },
+    {
+      "path": "packages/repo-spec/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ae5f20684d675c9b66e7233ab36f15d39d516aec"
+    },
+    {
+      "path": "packages/scheduler-core/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "900e9d4773b97d90f19c9de658e171a2f6ea8bb9"
+    },
+    {
+      "path": "packages/scheduler-core/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "e99468ce54c537cec19012cac05fb3d5d3e7874f"
+    },
+    {
+      "path": "packages/temporal-workflows/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "6cbb6d8309d942b2538f1409e6cbc4f2381364e8"
+    },
+    {
+      "path": "packages/temporal-workflows/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "9872f6b6969360248cbf5a0b79e2b7bba8337098"
+    },
+    {
+      "path": "packages/temporal-workflows/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "0f10f6255d9daf6573b4d485d24f36451db73cab"
+    },
+    {
+      "path": "pnpm-lock.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "6cb12fb31229baef6d18e4ebb14e2e2cea986bfb"
+    },
+    {
+      "path": "pnpm-workspace.yaml",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "133207e80937ce922b4a7d165de3317c68d0e871"
+    },
+    {
+      "path": "scripts/ci/build-and-push-images.sh",
+      "mode": "100755",
+      "kind": "blob",
+      "oid": "daed0739913bfe4c9d3a129664958961a3490cec"
+    },
+    {
+      "path": "scripts/ci/ci-proof-plan.mjs",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "1fbe8b6e8f4b98e5d92d226127fcf503c93fea66"
+    },
+    {
+      "path": "scripts/ci/classify-env-manager-fast-path.sh",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "8e405cd3ba162fea92c8906d3ae4713065096841"
+    },
+    {
+      "path": "scripts/ci/deploy-infra.sh",
+      "mode": "100755",
+      "kind": "blob",
+      "oid": "ce2708e6c9ad8994fc5208bf77af33e8b47aeddc"
+    },
+    {
+      "path": "scripts/ci/detect-affected.sh",
+      "mode": "100755",
+      "kind": "blob",
+      "oid": "c4c770a8fc8abc0aa3bc518dfbb865388be994f3"
+    },
+    {
+      "path": "scripts/ci/lib/appset-paths.sh",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "4d541bd189ebe29d8468495ab2b92c7577fd5e31"
+    },
+    {
+      "path": "scripts/ci/lib/image-tags.sh",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "ae7f9c6d142a9faf37ea161c3cb4cf94c56e1aa0"
+    },
+    {
+      "path": "scripts/ci/merge-build-fragments.sh",
+      "mode": "100755",
+      "kind": "blob",
+      "oid": "c7b18a6dbef51d19223d4afeb0680573b416748e"
+    },
+    {
+      "path": "scripts/ci/native-proof.mjs",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "c208135fc68f2ee0399ad5b84e305d73f6e25237"
+    },
+    {
+      "path": "scripts/ci/next-free-node-port.sh",
+      "mode": "100755",
+      "kind": "blob",
+      "oid": "bd077e08c44b578a64c07bf172b2f2f9ad58c998"
+    },
+    {
+      "path": "scripts/ci/tests/runtime-secret-authority.test.sh",
+      "mode": "100755",
+      "kind": "blob",
+      "oid": "81fda4f7892509a78fb26e8b7f10d4bb9807edef"
+    },
+    {
+      "path": "scripts/ci/write-build-manifest.sh",
+      "mode": "100755",
+      "kind": "blob",
+      "oid": "02da0177a038bdad230d33b850281890e21fb4d1"
+    },
+    {
+      "path": "scripts/vitest/vitest.native.config.mts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "477e50e5d934b2fc555e847dda909a645bc405e6"
+    },
+    {
+      "path": "services/scheduler-worker/package.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "20859b6e9a156a3b954988c29a7a0a4fff09d958"
+    },
+    {
+      "path": "services/scheduler-worker/tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "e38d3812c0f0c07a5a7465403799ac564439af5c"
+    },
+    {
+      "path": "services/scheduler-worker/vitest.config.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "430f6f8d897737751bc66adfb4a13761193b9bd6"
+    },
+    {
+      "path": "tests/ci-invariants/native/AGENTS.md",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "556cdc8c32c914b8d9b51be0c6711177f7144cff"
+    },
+    {
+      "path": "tests/ci-invariants/native/cadvisor-actor-coverage.spec.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "2e25725141b9056ee894d3a6b3fea837af23fb63"
+    },
+    {
+      "path": "tests/ci-invariants/native/image-content-identity.mjs",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "8ba04a8feef8ec3c397be7067f37e845904cd2b8"
+    },
+    {
+      "path": "tests/ci-invariants/native/litellm-readiness-recovery.spec.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "dc62ea7cb541c593301e297afa8520c696b04243"
+    },
+    {
+      "path": "tests/ci-invariants/native/openfga-readiness-recovery.spec.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "389562047b13df7458b740e50c62af89afe2a824"
+    },
+    {
+      "path": "tsconfig.base.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "229b138afc377b614a93e62035eafc41639dddbe"
+    },
+    {
+      "path": "tsconfig.eslint.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "95dcbc36c21b7f34292ae84616587999ac3d4d55"
+    },
+    {
+      "path": "tsconfig.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "87dae587eb612cb7b2accf10aefded708252606d"
+    },
+    {
+      "path": "tsconfig.scripts.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "e83869404c7263b5b0ed76a6565e2456d2b536fe"
+    },
+    {
+      "path": "turbo.json",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "d09d2c335d8f6f623f43a6ab7c5eeed31c5cb1f0"
+    },
+    {
+      "path": "vitest.config.mts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "994b45a93b867b73227290c95fd1377183a48307"
+    },
+    {
+      "path": "vitest.workspace.ts",
+      "mode": "100644",
+      "kind": "blob",
+      "oid": "86fe0f2506a25b6d0d71b0f5ce5e56decfb2330b"
+    }
+  ],
+  "absentSentinels": [
+    ".env",
+    ".env.local",
+    ".env.test",
+    ".env.test.local",
+    ".gitmodules",
+    ".npmrc",
+    ".pnpmfile.cjs",
+    "config/jsconfig.json",
+    "config/package.json",
+    "config/tsconfig.json",
+    "infra/catalog/jsconfig.json",
+    "infra/catalog/package.json",
+    "infra/catalog/tsconfig.json",
+    "infra/images/doltgres/.cogni/repo-spec.yaml",
+    "infra/images/litellm/.cogni/repo-spec.yaml",
+    "infra/images/openfga/.cogni/repo-spec.yaml",
+    "infra/jsconfig.json",
+    "infra/package.json",
+    "infra/tsconfig.json",
+    "nodes/beacon/.cogni/repo-spec.yaml",
+    "nodes/jsconfig.json",
+    "nodes/levelup/.cogni/repo-spec.yaml",
+    "nodes/node-template/.cogni/repo-spec.yaml",
+    "nodes/operator/app/jsconfig.json",
+    "nodes/operator/app/tsconfig.json",
+    "nodes/operator/graphs/jsconfig.json",
+    "nodes/operator/jsconfig.json",
+    "nodes/operator/package.json",
+    "nodes/operator/packages/doltgres-schema/jsconfig.json",
+    "nodes/operator/packages/jsconfig.json",
+    "nodes/operator/packages/package.json",
+    "nodes/operator/packages/tsconfig.json",
+    "nodes/operator/tsconfig.json",
+    "nodes/package.json",
+    "nodes/poly/.cogni/repo-spec.yaml",
+    "nodes/red/.cogni/repo-spec.yaml",
+    "nodes/toks5/.cogni/repo-spec.yaml",
+    "nodes/tsconfig.json",
+    "packages/ai-core/jsconfig.json",
+    "packages/ai-tools/jsconfig.json",
+    "packages/aragon-osx/jsconfig.json",
+    "packages/attribution-ledger/jsconfig.json",
+    "packages/attribution-pipeline-contracts/jsconfig.json",
+    "packages/attribution-pipeline-plugins/jsconfig.json",
+    "packages/authorization-core/jsconfig.json",
+    "packages/cogni-contracts/jsconfig.json",
+    "packages/db-client/jsconfig.json",
+    "packages/db-schema/jsconfig.json",
+    "packages/dns-ops/jsconfig.json",
+    "packages/financial-ledger/jsconfig.json",
+    "packages/graph-execution-core/jsconfig.json",
+    "packages/graph-execution-host/jsconfig.json",
+    "packages/ids/jsconfig.json",
+    "packages/ingestion-core/jsconfig.json",
+    "packages/jsconfig.json",
+    "packages/knowledge-base/jsconfig.json",
+    "packages/knowledge-store/jsconfig.json",
+    "packages/langgraph-graphs/jsconfig.json",
+    "packages/node-app/jsconfig.json",
+    "packages/node-contracts/jsconfig.json",
+    "packages/node-core/jsconfig.json",
+    "packages/node-shared/jsconfig.json",
+    "packages/node-streams/jsconfig.json",
+    "packages/node-ui-kit/jsconfig.json",
+    "packages/operator-wallet/jsconfig.json",
+    "packages/package.json",
+    "packages/repo-spec/jsconfig.json",
+    "packages/scheduler-core/jsconfig.json",
+    "packages/temporal-workflows/jsconfig.json",
+    "packages/tsconfig.json",
+    "pnpmfile.cjs",
+    "pnpmfile.js",
+    "scripts/ci/jsconfig.json",
+    "scripts/ci/package.json",
+    "scripts/ci/tsconfig.json",
+    "scripts/jsconfig.json",
+    "scripts/package.json",
+    "scripts/tsconfig.json",
+    "scripts/vitest/jsconfig.json",
+    "scripts/vitest/package.json",
+    "scripts/vitest/tsconfig.json",
+    "services/jsconfig.json",
+    "services/package.json",
+    "services/scheduler-worker/.cogni/repo-spec.yaml",
+    "services/scheduler-worker/jsconfig.json",
+    "services/tsconfig.json",
+    "tests/ci-invariants/jsconfig.json",
+    "tests/ci-invariants/native/jsconfig.json",
+    "tests/ci-invariants/native/package.json",
+    "tests/ci-invariants/native/tsconfig.json",
+    "tests/ci-invariants/package.json",
+    "tests/ci-invariants/tsconfig.json",
+    "tests/jsconfig.json",
+    "tests/package.json",
+    "tests/tsconfig.json",
+    "tsconfig.app.json",
+    "vite.config.cjs",
+    "vite.config.js",
+    "vite.config.mjs",
+    "vite.config.mts",
+    "vite.config.ts",
+    "vitest.config.ts"
+  ],
+  "images": [
+    {
+      "target": "postgres",
+      "declared": "postgres:15",
+      "image": "docker.io/library/postgres@sha256:b9a6ab4a977ee1b4ef2aa7f49dcf962f827ed3bcbb2eea66288ab2134ff2e2b2",
+      "platform": "linux/amd64"
+    },
+    {
+      "target": "busybox",
+      "declared": "busybox:1.37",
+      "image": "docker.io/library/busybox@sha256:66a6306db78bf2dbf3487f293aa8d6990d8e506fdffab9cc43fe422becf886e4",
+      "platform": "linux/amd64"
+    },
+    {
+      "target": "alloy",
+      "declared": "grafana/alloy:v1.14.0",
+      "image": "docker.io/grafana/alloy@sha256:91b90e5d90f092affb2db04f973a59d15740e47a3b33932756fca6f53ffbdd39",
+      "platform": "linux/amd64"
+    },
+    {
+      "target": "alloy-old",
+      "declared": "grafana/alloy:v1.9.2",
+      "image": "docker.io/grafana/alloy@sha256:afef2d9439b53afd78e79417c4f805aee87006ea5567799ecb3ec4c80ec33eb4",
+      "platform": "linux/amd64"
+    },
+    {
+      "target": "ryuk",
+      "declared": "testcontainers/ryuk:0.14.0",
+      "image": "docker.io/testcontainers/ryuk@sha256:f0456560ea5b4acdbed0da0efc33b5f9dd6bc1e59f2337106826dcb5b0b0e981",
+      "platform": "linux/amd64"
+    },
+    {
+      "target": "litellm",
+      "declared": "ghcr.io/cogni-dao/cogni-template:litellm-46f38f4447c2",
+      "image": "ghcr.io/cogni-dao/cogni-template@sha256:77257b6851341b1751c111315a3e6e5b137bdaf7aa75c0acf7b2c21eff9076f9",
+      "platform": "linux/amd64"
+    }
+  ],
+  "tests": [
+    "LiteLLM normal Compose recovery replaces the old true-policy gateway once and preserves native databases",
+    "OpenFGA dependency readiness recovery provisions fresh Dolt databases and roles without committing existing application changes",
+    "OpenFGA dependency readiness recovery rejects invalid secret authority before publishing the runtime environment",
+    "OpenFGA dependency readiness recovery survives a PostgreSQL fault while the old autoheal policy demonstrably restarts",
+    "Declared cAdvisor native actor coverage exports two owned actors and attributes a finite fsync write before relabeling",
+    "Declared cAdvisor native actor coverage compares the old collector with containerd-aware Alloy on actual Docker29 overlayfs"
+  ],
+  "testFiles": {
+    "LiteLLM normal Compose recovery replaces the old true-policy gateway once and preserves native databases": "tests/ci-invariants/native/litellm-readiness-recovery.spec.ts",
+    "OpenFGA dependency readiness recovery provisions fresh Dolt databases and roles without committing existing application changes": "tests/ci-invariants/native/openfga-readiness-recovery.spec.ts",
+    "OpenFGA dependency readiness recovery rejects invalid secret authority before publishing the runtime environment": "tests/ci-invariants/native/openfga-readiness-recovery.spec.ts",
+    "OpenFGA dependency readiness recovery survives a PostgreSQL fault while the old autoheal policy demonstrably restarts": "tests/ci-invariants/native/openfga-readiness-recovery.spec.ts",
+    "Declared cAdvisor native actor coverage exports two owned actors and attributes a finite fsync write before relabeling": "tests/ci-invariants/native/cadvisor-actor-coverage.spec.ts",
+    "Declared cAdvisor native actor coverage compares the old collector with containerd-aware Alloy on actual Docker29 overlayfs": "tests/ci-invariants/native/cadvisor-actor-coverage.spec.ts"
+  },
+  "lockedRuntimeClosure": {
+    "roots": [
+      {
+        "name": "@testcontainers/postgresql",
+        "version": "11.8.1"
+      },
+      {
+        "name": "testcontainers",
+        "version": "11.8.1"
+      },
+      {
+        "name": "dockerode",
+        "version": "4.0.9"
+      },
+      {
+        "name": "vitest",
+        "version": "4.0.7(@types/debug@4.1.12)(@types/node@22.19.7)(happy-dom@20.9.0(bufferutil@4.0.9)(utf-8-validate@5.0.10))(jiti@2.6.1)(jsdom@16.7.0(bufferutil@4.0.9)(utf-8-validate@5.0.10))(lightningcss@1.30.2)(msw@2.12.1(@types/node@22.19.7)(typescript@5.9.3))(terser@5.44.1)(tsx@4.20.6)(yaml@2.8.3)"
+      },
+      {
+        "name": "yaml",
+        "version": "2.8.3"
+      }
+    ],
+    "packageCount": 375,
+    "integrityClosureDigest": "759432f734d6f3059a6ce1f78e618abad7043cf8c35e5c8837fabb4fc5961510"
+  },
+  "litellmProducer": {
+    "members": [
+      {
+        "path": ".dockerignore",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "e019ed87eff07e6757f522a93df0bb0e46bdb729"
+      },
+      {
+        "path": ".github/workflows/pr-build.yml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "27d46ef5bf66bb033712da9b778eff629b387622"
+      },
+      {
+        "path": "infra/catalog/_schema.json",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "0ef31ce13c643095654220b067d98d2791aedfcb"
+      },
+      {
+        "path": "infra/catalog/beacon.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "675ea6cf21077f1460e34ef4ac54705b1166b7f9"
+      },
+      {
+        "path": "infra/catalog/doltgres.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "4c1a475686691243af1c58b502cdb5e840b76826"
+      },
+      {
+        "path": "infra/catalog/levelup.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "495ae8ccee971d291b0de736b9222c1012545bb1"
+      },
+      {
+        "path": "infra/catalog/litellm.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "b1cdcb58ed7c51f00ad25e505fa07b0765850e1b"
+      },
+      {
+        "path": "infra/catalog/node-template.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "33fa9426571a742f1fc973e57ade4b7303d9723a"
+      },
+      {
+        "path": "infra/catalog/openfga.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "1c1eafcf4112806efdb9434b77c1fabf144f8f2a"
+      },
+      {
+        "path": "infra/catalog/operator.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "be90aa516192348296e4664722a1e3d42e9cbe36"
+      },
+      {
+        "path": "infra/catalog/poly.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "66092a834701472a342eb2dd8be9d36aa2a608c6"
+      },
+      {
+        "path": "infra/catalog/red.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "f47fbd116b492be4833e385ecb86ab24e94cddaa"
+      },
+      {
+        "path": "infra/catalog/scheduler-worker.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "de8aa1bf0627906c052f7d105ea18f6277ca0ecf"
+      },
+      {
+        "path": "infra/catalog/toks5.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "83fb54d4b4e7db176ff820d47790e20f93e41fa6"
+      },
+      {
+        "path": "infra/images/litellm/AGENTS.md",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "520dc16075cf72b57f38cf2d797860c3c70d0104"
+      },
+      {
+        "path": "infra/images/litellm/Dockerfile",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "c598bec66906b1dd6b51a8a304b4b2453b361103"
+      },
+      {
+        "path": "infra/images/litellm/cogni_callbacks.py",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "bc0980a2f79c95fbd7f83786f3f8364db9a0b4f2"
+      },
+      {
+        "path": "nodes/operator/.cogni/repo-spec.yaml",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "97b84b266428f169c3574e84b6de7804444b1554"
+      },
+      {
+        "path": "scripts/ci/build-and-push-images.sh",
+        "mode": "100755",
+        "kind": "blob",
+        "oid": "939d920c51db6ce140b604a3f3d2971f4161c5fa"
+      },
+      {
+        "path": "scripts/ci/detect-affected.sh",
+        "mode": "100755",
+        "kind": "blob",
+        "oid": "c4c770a8fc8abc0aa3bc518dfbb865388be994f3"
+      },
+      {
+        "path": "scripts/ci/lib/image-tags.sh",
+        "mode": "100644",
+        "kind": "blob",
+        "oid": "ae7f9c6d142a9faf37ea161c3cb4cf94c56e1aa0"
+      },
+      {
+        "path": "scripts/ci/merge-build-fragments.sh",
+        "mode": "100755",
+        "kind": "blob",
+        "oid": "c7b18a6dbef51d19223d4afeb0680573b416748e"
+      },
+      {
+        "path": "scripts/ci/write-build-manifest.sh",
+        "mode": "100755",
+        "kind": "blob",
+        "oid": "02da0177a038bdad230d33b850281890e21fb4d1"
+      }
+    ],
+    "absentSentinels": [
+      "infra/images/doltgres/.cogni/repo-spec.yaml",
+      "infra/images/litellm/.cogni/repo-spec.yaml",
+      "infra/images/litellm/.dockerignore",
+      "infra/images/openfga/.cogni/repo-spec.yaml",
+      "nodes/beacon/.cogni/repo-spec.yaml",
+      "nodes/levelup/.cogni/repo-spec.yaml",
+      "nodes/node-template/.cogni/repo-spec.yaml",
+      "nodes/poly/.cogni/repo-spec.yaml",
+      "nodes/red/.cogni/repo-spec.yaml",
+      "nodes/toks5/.cogni/repo-spec.yaml",
+      "services/scheduler-worker/.cogni/repo-spec.yaml"
+    ],
+    "provenance": {
+      "sourceSha": "51980fcdd12da154d77c85bec7dba5e2a356e132",
+      "runId": 39938805919,
+      "artifactId": 12494284759,
+      "platform": "linux/amd64",
+      "bootstrap": "Old reviewed canonical pin; new metadata producer is intentionally incompatible. Exact-head producer and full native proof precede a separately reviewed canonical pin refresh."
+    }
+  }
+}

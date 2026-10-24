@@ -11,6 +11,19 @@ cd "$REPO_ROOT"
 TMPROOT=$(mktemp -d -t aggregate-rollup.XXXXXX)
 trap 'rm -rf "$TMPROOT"' EXIT
 
+# The real overlay-presence filter must see both synthetic selected targets,
+# independently of the sovereign catalog/overlays committed in this repository.
+FIXTURE_SOURCE="$TMPROOT/source"
+mkdir -p "$FIXTURE_SOURCE/scripts/ci/lib" "$FIXTURE_SOURCE/scripts/setup/lib" \
+  "$FIXTURE_SOURCE/infra/k8s/overlays/production/operator" \
+  "$FIXTURE_SOURCE/infra/k8s/overlays/production/poly"
+cp scripts/ci/aggregate-rollup.sh "$FIXTURE_SOURCE/scripts/ci/"
+cp scripts/ci/lib/*.sh "$FIXTURE_SOURCE/scripts/ci/lib/"
+cp scripts/setup/lib/*.sh "$FIXTURE_SOURCE/scripts/setup/lib/"
+mkdir -p "$FIXTURE_SOURCE/infra/catalog"
+for fixture_node in operator poly; do
+  printf '{"name":"%s","type":"node"}\n' "$fixture_node" > "$FIXTURE_SOURCE/infra/catalog/$fixture_node.yaml"
+done
 REMOTE="$TMPROOT/origin.git"
 WORK="$TMPROOT/work"
 git init --bare "$REMOTE" >/dev/null
@@ -47,7 +60,7 @@ ROLLUP_TARGETS_JSON='["operator"]' \
   REPO_URL="file://$REMOTE" \
   GH_TOKEN=dummy \
   GITHUB_REPOSITORY=Cogni-DAO/cogni \
-  bash scripts/ci/aggregate-rollup.sh production > "$TMPROOT/out.log" 2>&1
+  bash "$FIXTURE_SOURCE/scripts/ci/aggregate-rollup.sh" production > "$TMPROOT/out.log" 2>&1
 
 current_sha=$(git --git-dir="$REMOTE" show deploy/production:.promote-state/current-sha)
 if [ "$current_sha" != "$operator_tip" ]; then
@@ -94,7 +107,7 @@ ROLLUP_TARGETS_JSON='["operator","poly"]' \
   REPO_URL="file://$REMOTE" \
   GH_TOKEN=dummy \
   GITHUB_REPOSITORY=Cogni-DAO/cogni \
-  bash scripts/ci/aggregate-rollup.sh production > "$TMPROOT/deep.log" 2>&1 || {
+  bash "$FIXTURE_SOURCE/scripts/ci/aggregate-rollup.sh" production > "$TMPROOT/deep.log" 2>&1 || {
     cat "$TMPROOT/deep.log"
     exit 1
   }

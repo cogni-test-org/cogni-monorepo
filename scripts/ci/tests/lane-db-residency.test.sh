@@ -47,6 +47,9 @@ for lane in candidate-a preview production; do
 done
 echo '[2] future Akash births remain lane-resident without a ledger edit'
 
+. "$SCRIPT_DIR/fixtures/historical-lane-catalog.sh"
+seed_historical_lane_catalog "$TMPROOT/historical-catalog"
+
 # Legacy pins may model rollback, but no foreign residency gets a warning-only pass.
 (
   LANE_DB_RESIDENCY_PINNED=("poly/candidate-a")

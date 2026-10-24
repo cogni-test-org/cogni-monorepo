@@ -12,6 +12,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -27,8 +28,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import {
+  awaitNativeImageProducer,
   compareNativeInputs,
   lookupNativeWitness,
+  nativeExecutionImage,
+  nativeResultControls,
   readNativeCohort,
   validateNativeImageProducer,
   validateNativeWitness,
@@ -442,7 +446,7 @@ test("bounded main witness lookup never forwards credentials or falls back to an
   assert.equal(requested, false);
 });
 
-test("native uses only the exact successful target fragment and producing attempt", () => {
+function imageProducerFixture() {
   const sourceSha = "a".repeat(40);
   const repository = "cogni-dao/cogni";
   const image = "ghcr.io/cogni-dao/cogni-template";
@@ -501,6 +505,12 @@ test("native uses only the exact successful target fragment and producing attemp
       ],
     },
   };
+  return value;
+}
+
+test("native uses only the exact successful target fragment and producing attempt", () => {
+  const value = imageProducerFixture();
+  const image = value.fragment.image_name;
   const positive = validateNativeImageProducer(value);
   assert.equal(positive.valid, true);
   assert.equal(positive.image, value.fragment.targets[0].digest);
@@ -710,19 +720,22 @@ test("current actual runner/image/tool facts must match the witnessed cohort", (
       nativeNodeVersion: "22.22.0",
       nativePnpmVersion: "9.12.2",
       env,
+      observedNodeVersion: "22.22.0",
       command: (...args) => {
         calls.push(args);
-        return JSON.stringify(version);
+        return args[0] === "pnpm" ? "9.12.2\n" : JSON.stringify(version);
       },
       ...patch,
     });
   assert.equal(read().compatible, true);
-  assert.deepEqual(calls[0].slice(0, 2), [
+  assert.deepEqual(calls[1].slice(0, 2), [
     "docker",
     ["version", "--format", "{{json .}}"],
   ]);
   for (const patch of [
     { nativeNodeVersion: "22" },
+    { observedNodeVersion: "22.21.0" },
+    { command: (...args) => args[0] === "pnpm" ? "9.13.0" : JSON.stringify(version) },
     { nativePnpmVersion: "latest" },
     { env: { ...env, ImageVersion: "" } },
     { env: { ...env, RUNNER_OS: "macOS" } },
@@ -758,4 +771,167 @@ test("current actual runner/image/tool facts must match the witnessed cohort", (
     change(value);
     assert.equal(validateNativeWitness(value).valid, false);
   }
+});
+
+test("exact target preparation is bounded and never waits for sibling matrix legs", async () => {
+  const original = imageProducerFixture();
+  const archive = execFileSync(
+    "python3",
+    [
+      "-c",
+      "import io,sys,zipfile\nb=io.BytesIO()\nwith zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:z.writestr('build-fragment-litellm.json',sys.stdin.buffer.read())\nsys.stdout.buffer.write(b.getvalue())\n",
+    ],
+    { input: JSON.stringify(original.fragment), maxBuffer: 65_536 }
+  );
+  original.artifact.size_in_bytes = archive.length;
+  original.artifact.digest = `sha256:${createHash("sha256").update(archive).digest("hex")}`;
+  async function invoke(change = () => {}) {
+    const v = structuredClone(original);
+    change(v);
+    const calls = [];
+    let clock = 0;
+    const responses = [
+      new Response(JSON.stringify({ total_count: 1, workflow_runs: [v.run] })),
+      new Response(JSON.stringify({ total_count: 1, jobs: [v.job] })),
+      new Response(JSON.stringify({ total_count: 1, artifacts: [v.artifact] })),
+      new Response(null, {
+        status: 302,
+        headers: { location: "https://owned.blob.core.windows.net/fragment" },
+      }),
+      new Response(archive),
+    ];
+    const result = await awaitNativeImageProducer({
+      ...v,
+      token: "owned-fixture-token",
+      now: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+      fetchImpl: async (url, options) => {
+        calls.push({ url, options });
+        assert.ok(responses.length);
+        return responses.shift();
+      },
+    });
+    return { result, calls };
+  }
+  const positive = await invoke();
+  assert.equal(positive.result.valid, true);
+  assert.equal(positive.calls.length, 5);
+  assert.equal(original.run.status, "in_progress");
+  assert.ok(
+    positive.calls
+      .slice(0, 4)
+      .every(
+        ({ options }) =>
+          options.headers.Authorization === "Bearer owned-fixture-token"
+      )
+  );
+  assert.equal(positive.calls[4].options.headers, undefined);
+  assert.equal(positive.calls[4].options.redirect, "error");
+  for (const change of [
+    (v) => {
+      v.job.conclusion = "failure";
+    },
+    (v) => {
+      v.job.run_attempt = 1;
+    },
+    (v) => {
+      v.run.event = "workflow_dispatch";
+    },
+    (v) => {
+      v.run.head_sha = "d".repeat(40);
+    },
+    (v) => {
+      v.artifact.digest = `sha256:${"f".repeat(64)}`;
+    },
+    (v) => {
+      v.artifact.workflow_run.head_repository_id = 999;
+    },
+  ])
+    assert.deepEqual((await invoke(change)).result, {
+      valid: false,
+      reason: "unavailable-exact-native-image-producer",
+    });
+  let requests = 0;
+  let clock = 0;
+  const missing = await awaitNativeImageProducer({
+    ...original,
+    token: "owned-fixture-token",
+    now: () => clock,
+    sleep: async (ms) => {
+      clock += ms;
+    },
+    fetchImpl: async () => {
+      requests++;
+      return new Response(
+        JSON.stringify({ total_count: 0, workflow_runs: [] })
+      );
+    },
+  });
+  assert.equal(requests, 60);
+  assert.equal(clock, 300_000);
+  assert.equal(missing.valid, false);
+});
+
+
+test("machine native proof requires all six real controls, original files, and no skipped status", () => {
+  const names = Array.from({ length: 6 }, (_, i) => `Owned suite control ${i}`);
+  const files = Object.fromEntries(names.map((name, i) => [name, `tests/native-${i}.spec.ts`]));
+  const report = {
+    success: true, numFailedTests: 0, numPendingTests: 0, numTodoTests: 0,
+    numTotalTests: 6, numPassedTests: 6,
+    testResults: names.map((name) => ({
+      name: `${process.cwd()}/${files[name]}`, status: "passed",
+      assertionResults: [{ fullName: name, status: "passed" }],
+    })),
+  };
+  assert.equal(nativeResultControls(report, names, files).length, 6);
+  for (const change of [
+    (v) => { v.success = false; },
+    (v) => { v.numPendingTests = 1; },
+    (v) => { v.numTodoTests = 1; },
+    (v) => { v.numFailedTests = 1; },
+    (v) => { v.numPassedTests = 5; },
+    (v) => { v.testResults.pop(); },
+    (v) => { v.testResults[0].assertionResults[0].status = "skipped"; },
+    (v) => { v.testResults[0].assertionResults[0].status = "pending"; },
+    (v) => { v.testResults[0].name = `${process.cwd()}/tests/copied.spec.ts`; },
+    (v) => { v.testResults[0].assertionResults[0].fullName = names[1]; },
+  ]) {
+    const value = structuredClone(report); change(value);
+    assert.throws(() => nativeResultControls(value, names, files));
+  }
+  // Future discovered native cases still execute and must pass, but a receipt
+  // with additional cases cannot match the old exact six-control witness.
+  const extra = structuredClone(report);
+  extra.numTotalTests = 7; extra.numPassedTests = 7;
+  extra.testResults[0].assertionResults.push({fullName: "Owned future native control", status: "passed"});
+  assert.equal(nativeResultControls(extra, names, files).length, 7);
+});
+
+test("mutable declared images require a unique exact immutable execution binding", () => {
+  const directory = mkdtempSync(join(tmpdir(), "native-image-bindings-"));
+  const path = join(directory, "bindings.json");
+  const pinned = `docker.io/library/postgres@sha256:${"a".repeat(64)}`;
+  const value = { version: 1, images: [{declared: "postgres:15", image: pinned, platform: "linux/amd64"}] };
+  const put = (v) => writeFileSync(path, JSON.stringify(v));
+  try {
+    put(value);
+    assert.equal(nativeExecutionImage("postgres:15", path), pinned);
+    assert.equal(nativeExecutionImage("${POSTGRES_IMAGE:-postgres:15}", path), pinned);
+    assert.equal(nativeExecutionImage(pinned, path), pinned);
+    for (const change of [
+      (v) => { v.version = 0; },
+      (v) => { v.images = []; },
+      (v) => { v.images[0].image = "postgres:latest"; },
+      (v) => { v.images[0].platform = "linux/arm64"; },
+      (v) => { v.images.push(v.images[0]); },
+      (v) => { v.images[0].declared = "postgres:16"; },
+    ]) {
+      const v = structuredClone(value); change(v); put(v);
+      assert.throws(() => nativeExecutionImage("postgres:15", path));
+    }
+    assert.throws(() => nativeExecutionImage("postgres:15", join(directory, "absent")));
+  } finally { rmSync(directory, {recursive: true, force: true}); }
 });

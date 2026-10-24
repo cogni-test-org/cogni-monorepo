@@ -66,10 +66,9 @@ test("CI always aggregates split children while retaining bounded signed skips",
     "shell",
     "native",
   ]);
-  // Full native execution no longer consumes a selection decision. Its only
-  // scheduling dependency is the signed exception classifier; the terminal
-  // still waits for and verifies the plan alongside every ordinary proof.
-  assert.deepEqual(jobs.native.needs, ["env_manager_fast_path"]);
+  // Only the v2 trusted-base decision can omit native; terminal proof still
+  // requires the plan and all ordinary children.
+  assert.deepEqual(jobs.native.needs, ["env_manager_fast_path", "proof_plan"]);
   for (const dependency of ["proof_plan", "unit_core", "shell", "native"])
     assert.ok(jobs.unit.needs.includes(dependency));
   const terminal = jobs.unit.steps.find((step) =>
@@ -125,11 +124,22 @@ test("CI always aggregates split children while retaining bounded signed skips",
       step.run?.includes("check-jsonschema==0.37.1")
     )
   );
-  // A false decision from an older event-base policy cannot skip native now.
-  assert.ok(!jobs.native.if.includes("native_required"));
-  assert.ok(!jobs.native.if.includes("proof_plan.outputs"));
+  assert.ok(
+    jobs.native.if.includes("needs.proof_plan.outputs.plan_version != '2'")
+  );
+  assert.ok(
+    jobs.native.if.includes(
+      "needs.proof_plan.outputs.native_required != 'false'"
+    )
+  );
   const plan = jobs.proof_plan.steps.find((step) => step.id === "plan").run;
-  assert.ok(plan.includes('git show "$EVENT_BASE_SHA:$classifier"'));
+  assert.ok(plan.includes('git show "$EVENT_BASE_SHA:scripts/ci/$file"'));
+  assert.ok(
+    plan.includes(
+      "for file in ci-proof-plan.mjs native-proof.mjs native-proof-policy.json"
+    )
+  );
+  assert.ok(!plan.includes("node scripts/ci/ci-proof-plan.mjs plan"));
   assert.ok(!plan.includes('git show "origin/main:'));
 });
 
@@ -207,7 +217,13 @@ test("actual heavy job conditions stop on cancellation and enforce classifier fa
     )(
       () => cancelled,
       () => true,
-      { env_manager_fast_path: { result, outputs: { eligible } } },
+      {
+        env_manager_fast_path: { result, outputs: { eligible } },
+        proof_plan: {
+          result: "success",
+          outputs: { plan_version: "2", native_required: "true" },
+        },
+      },
       { event_name: eventName }
     );
   for (const name of heavy) {
@@ -247,4 +263,34 @@ test("actual heavy job conditions stop on cancellation and enforce classifier fa
     );
     assert.match(jobs[name].if, /^always\(\)/);
   }
+});
+
+
+test("actual native job expression omits only successful v2 decisions and cancels promptly", () => {
+  const expression = workflow("ci.yaml").native.if;
+  const run = (plan, cancelled = false, classifier = {result: "success", outputs: {eligible: "false"}}) =>
+    Function("cancelled", "needs", `return (${expression.replace(/^\$\{\{\s*|\s*\}\}$/g, "")});`)(
+      () => cancelled, {env_manager_fast_path: classifier, proof_plan: plan}
+    );
+  for (const plan of [
+    {result: "success", outputs: {plan_version: "1", native_required: "false"}},
+    {result: "failure", outputs: {plan_version: "2", native_required: "false"}},
+    {result: "cancelled", outputs: {plan_version: "2", native_required: "false"}},
+    {result: "skipped", outputs: {}},
+    {result: "success", outputs: {}},
+    {result: "success", outputs: {plan_version: "2", native_required: "true"}},
+    {result: "success", outputs: {plan_version: "2", native_required: "unknown"}},
+  ]) {
+    assert.equal(run(plan), true, JSON.stringify(plan));
+    assert.equal(run(plan, true), false);
+  }
+  const eligible = {result: "success", outputs: {plan_version: "2", native_required: "false"}};
+  assert.equal(run(eligible), false);
+  assert.equal(run(eligible, true), false);
+  assert.equal(run({result: "success", outputs: {}}, false, {result: "success", outputs: {eligible: "true"}}), false);
+  assert.equal(run({result: "failure", outputs: {}}, false, {result: "failure", outputs: {eligible: "true"}}), true);
+  const steps = workflow("ci.yaml").proof_plan.steps;
+  assert.equal(steps.find(s => s.uses?.startsWith("actions/setup-node@")).with["node-version"], "22.22.0");
+  assert.equal(steps.find(s => s.uses?.startsWith("pnpm/action-setup@")).with.version, "9.12.2");
+  assert.ok(!steps.some(s => s.run?.includes("pnpm install")));
 });

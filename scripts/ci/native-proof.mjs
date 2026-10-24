@@ -3,16 +3,22 @@
 
 /**
  * Module: `@scripts/ci/native-proof`
- * Purpose: Compare a finite reviewed native input inventory and exact trusted-main proof identity.
- * Scope: Git objects and bounded public GitHub metadata; never discovers or certifies dependencies.
+ * Purpose: Bind native execution to reviewed Git inputs, immutable images, and actual trusted-main proof.
+ * Scope: Finite Git membership and bounded public GitHub receipts; never certifies changed dependencies.
  * Invariants: UNKNOWN_MEANS_FULL; BASE_OWNS_POLICY; MAIN_AND_MQ_REMAIN_FULL.
- * Side-effects: IO (bounded read-only Git subprocesses and GitHub metadata/log requests).
- * API: compareNativeInputs, validateNativeWitness, lookupNativeWitness; load only from the event base.
+ * Side-effects: IO (bounded Git/API reads and owned temporary image-binding/result files).
+ * API: nativeEligibility, compareNativeInputs, compareProducerInputs, nativeSafeChanges, readNativeCohort,
+ *      validateNativeWitness, lookupNativeWitness, validateNativeImageProducer, awaitNativeImageProducer,
+ *      nativeExecutionImage, nativeResultControls; CLI prepare-images|record-result. Load planner inputs from BASE.
  * Links: scripts/ci/ci-proof-plan.mjs, task.5314
  * @internal
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+export const trustedNativeBranch = "main";
 
 const sha = (value) =>
   typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
@@ -22,7 +28,7 @@ const hash = (value) =>
   createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const validPath = (value) =>
   typeof value === "string" &&
-  /^[A-Za-z0-9_.@/-]+$/.test(value) &&
+  /^[A-Za-z0-9_.@/()[\]-]+$/.test(value) &&
   !value.startsWith("/") &&
   value
     .split("/")
@@ -49,7 +55,7 @@ function tree(commit, cwd) {
   requireThat(rows.length <= 50_000, "input-tree-budget");
   return rows.map((line) => {
     const match = /^(\d{6}) (blob|commit) ([a-f0-9]{40})\t(.+)$/.exec(line);
-    requireThat(match && validPath(match[4]), "unsupported-input-path");
+    requireThat(match, "unsupported-input-path");
     return { path: match[4], mode: match[1], kind: match[2], oid: match[3] };
   });
 }
@@ -60,7 +66,15 @@ function discovered(path) {
   const basename = path.slice(path.lastIndexOf("/") + 1);
   return (
     basename === "package.json" ||
-    /^tsconfig[^/]*\.json$/.test(basename) ||
+    basename === ".npmrc" ||
+    /^\.?pnpmfile\./.test(basename) ||
+    /^(?:vite|vitest|jsconfig)\.config\./.test(basename) ||
+    /^jsconfig[^/]*\.jsonc?$/.test(basename) ||
+    path.startsWith(".env") ||
+    path.startsWith("patches/") ||
+    path === ".cogni/repo-spec.yaml" ||
+    path.endsWith("/.cogni/repo-spec.yaml") ||
+    /^tsconfig[^/]*\.jsonc?$/.test(basename) ||
     [
       "config/",
       "tests/ci-invariants/native/",
@@ -176,12 +190,112 @@ function validNativeCohort(value) {
   );
 }
 
+/** Additional finite affected-source classes, AFTER full input equivalence. */
+export function nativeSafeChanges({ base, tested, cwd = process.cwd() }) {
+  try {
+    const before = new Map(tree(base, cwd).map((row) => [row.path, row]));
+    const after = new Map(tree(tested, cwd).map((row) => [row.path, row]));
+    const paths = [...new Set([...before.keys(), ...after.keys()])].filter(
+      (path) => {
+        const a = before.get(path);
+        const b = after.get(path);
+        return (
+          !a || !b || a.mode !== b.mode || a.kind !== b.kind || a.oid !== b.oid
+        );
+      }
+    );
+    requireThat(
+      paths.length > 0 && paths.length <= 500,
+      "unknown-change-membership"
+    );
+    const prefixes = [
+      "nodes/operator/app/",
+      "services/scheduler-worker/",
+      "docs/",
+      ".agents/skills/",
+      ".claude/skills/",
+      "work/",
+      "infra/k8s/",
+    ];
+    for (const path of paths) {
+      requireThat(validPath(path), "unsupported-changed-path");
+      requireThat(
+        [before.get(path), after.get(path)]
+          .filter(Boolean)
+          .every(
+            (v) => v.kind === "blob" && ["100644", "100755"].includes(v.mode)
+          ),
+        "unsupported-changed-mode"
+      );
+      requireThat(
+        prefixes.some((prefix) => path.startsWith(prefix)) ||
+          /^packages\/[^/]+\/(?:src|tests?)\//.test(path) ||
+          path.endsWith(".md"),
+        "unknown-native-impact-class"
+      );
+    }
+    return { safe: true, paths };
+  } catch {
+    return { safe: false, reason: "unknown-or-native-impacting-change" };
+  }
+}
+
+/** Exact producer-context identity; unlike native closure, it has no source skip implication. */
+export function compareProducerInputs({
+  tested,
+  producer,
+  cwd = process.cwd(),
+}) {
+  try {
+    requireThat(
+      Array.isArray(producer?.members) &&
+        producer.members.length > 0 &&
+        producer.members.length <= 500 &&
+        Array.isArray(producer.absentSentinels) &&
+        producer.absentSentinels.length <= 20,
+      "missing-reviewed-producer"
+    );
+    const rows = tree(tested, cwd);
+    const found = new Map(rows.map((row) => [row.path, row]));
+    const expected = new Map(producer.members.map((row) => [row.path, row]));
+    requireThat(
+      expected.size === producer.members.length &&
+        [...expected.keys()].every(validPath),
+      "ambiguous-producer-membership"
+    );
+    for (const row of producer.members)
+      requireThat(
+        row.kind === "blob" &&
+          ["100644", "100755"].includes(row.mode) &&
+          sha(row.oid) &&
+          found.has(row.path) &&
+          ["path", "mode", "kind", "oid"].every(
+            (key) => found.get(row.path)[key] === row[key]
+          ),
+        "changed-producer-input"
+      );
+    for (const path of producer.absentSentinels)
+      requireThat(validPath(path) && !found.has(path), "new-producer-input");
+    const context = rows.filter((row) =>
+      row.path.startsWith("infra/images/litellm/")
+    );
+    requireThat(
+      context.every((row) => expected.has(row.path)),
+      "new-producer-context-member"
+    );
+    return { compatible: true };
+  } catch {
+    return { compatible: false, reason: "changed-or-unknown-image-producer" };
+  }
+}
+
 /** Read the actual hosted runner/Docker cohort before any omission decision. */
 export function readNativeCohort({
   nativeNodeVersion,
   nativePnpmVersion,
   env = process.env,
   command = execFileSync,
+  observedNodeVersion = process.versions.node,
 }) {
   try {
     requireThat(
@@ -196,6 +310,17 @@ export function readNativeCohort({
         /^ubuntu[0-9]+$/.test(env.ImageOS ?? "") &&
         /^[0-9.]{1,80}$/.test(env.ImageVersion ?? ""),
       "unavailable-hosted-cohort"
+    );
+    const observedPnpmVersion = command("pnpm", ["--version"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      maxBuffer: 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    requireThat(
+      observedNodeVersion === nativeNodeVersion &&
+        observedPnpmVersion === nativePnpmVersion,
+      "unavailable-current-tool-cohort"
     );
     const version = JSON.parse(
       command("docker", ["version", "--format", "{{json .}}"], {
@@ -274,7 +399,7 @@ export function validateNativeWitness({
     requireThat(
       run?.repository?.full_name?.toLowerCase() === repository &&
         run.event === "push" &&
-        run.head_branch === "main" &&
+        run.head_branch === trustedNativeBranch &&
         run.head_sha === base &&
         run.status === "completed" &&
         run.conclusion === "success" &&
@@ -298,7 +423,7 @@ export function validateNativeWitness({
         receipt.repository === repository &&
         receipt.sourceSha === base &&
         receipt.event === "push" &&
-        receipt.ref === "refs/heads/main" &&
+        receipt.ref === `refs/heads/${trustedNativeBranch}` &&
         receipt.runId === run.id &&
         receipt.runAttempt === run.run_attempt &&
         receipt.workflowBlob === workflowBlob &&
@@ -321,7 +446,7 @@ export function validateNativeWitness({
             typeof v.declared === "string" &&
             /^[A-Za-z0-9_.:/@-]{1,250}$/.test(v.declared) &&
             typeof v.image === "string" &&
-            /^[a-z0-9./_-]+@sha256:[a-f0-9]{64}$/.test(v.image) &&
+            /^[a-z0-9./_:-]+@sha256:[a-f0-9]{64}$/.test(v.image) &&
             v.platform === "linux/amd64"
         ) &&
         hash(receipt.cohort) === hash(currentCohort) &&
@@ -408,7 +533,7 @@ export async function lookupNativeWitness({
   }
   try {
     const census = await metadata(
-      `workflows/ci.yaml/runs?event=push&branch=main&head_sha=${base}&per_page=10`
+      `workflows/ci.yaml/runs?event=push&branch=${encodeURIComponent(trustedNativeBranch)}&head_sha=${base}&per_page=10`
     );
     requireThat(
       Number.isSafeInteger(census.total_count) &&
@@ -435,7 +560,7 @@ export async function lookupNativeWitness({
     requireThat(
       run.repository?.full_name?.toLowerCase() === repository &&
         run.event === "push" &&
-        run.head_branch === "main" &&
+        run.head_branch === trustedNativeBranch &&
         run.head_sha === base &&
         run.path === ".github/workflows/ci.yaml",
       "untrusted-main-run"
@@ -833,7 +958,13 @@ z=zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read(65537)))
 m=z.infolist()
 assert len(m)==1 and m[0].filename=='build-fragment-litellm.json' and 0<m[0].file_size<=16384
 assert not m[0].is_dir() and not m[0].flag_bits&1
-sys.stdout.buffer.write(z.read(m[0]))
+def unique(pairs):
+ d={}
+ for k,v in pairs:
+  assert k not in d
+  d[k]=v
+ return d
+json.dump(json.loads(z.read(m[0]),object_pairs_hook=unique),sys.stdout)
 `,
               ],
               {
@@ -871,4 +1002,377 @@ sys.stdout.buffer.write(z.read(m[0]))
     clearTimeout(timer);
   }
   return { valid: false, reason: "unavailable-exact-native-image-producer" };
+}
+
+/** Preserve the declared source assertion while selecting immutable execution bytes. */
+export function nativeExecutionImage(
+  declared,
+  bindingsPath = process.env.NATIVE_IMAGE_BINDINGS_FILE
+) {
+  const normalized = declared.match(/^\$\{[A-Z_]+:-(.+)\}$/)?.[1] ?? declared;
+  const immutable = /^[a-z0-9./_:-]+@sha256:[a-f0-9]{64}$/;
+  if (immutable.test(normalized)) return normalized;
+  requireThat(
+    typeof bindingsPath === "string" && bindingsPath.length < 1_000,
+    "missing-native-image-bindings"
+  );
+  const raw = readFileSync(bindingsPath, "utf8");
+  requireThat(Buffer.byteLength(raw) <= 16_384, "native-image-binding-budget");
+  const value = JSON.parse(raw);
+  requireThat(
+    value.version === 1 &&
+      Array.isArray(value.images) &&
+      value.images.length <= 20,
+    "invalid-native-image-bindings"
+  );
+  const matches = value.images.filter((row) => row.declared === normalized);
+  requireThat(
+    matches.length === 1 &&
+      immutable.test(matches[0].image) &&
+      matches[0].platform === "linux/amd64",
+    "missing-immutable-native-image"
+  );
+  return matches[0].image;
+}
+
+async function prepareNativeImages() {
+  const repository = process.env.GITHUB_REPOSITORY;
+  requireThat(
+    ["cogni-dao/cogni", "cogni-test-org/cogni-monorepo"].includes(repository),
+    "unsupported-native-image-repository"
+  );
+  const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+  const eventName = process.env.GITHUB_EVENT_NAME;
+  const sourceSha =
+    eventName === "pull_request"
+      ? event.pull_request?.head?.sha
+      : process.env.GITHUB_SHA;
+  requireThat(
+    sha(sourceSha) &&
+      ["pull_request", "push", "merge_group"].includes(eventName),
+    "unresolved-native-image-source"
+  );
+  const policy = JSON.parse(
+    readFileSync("scripts/ci/native-proof-policy.json", "utf8")
+  );
+  requireThat(
+    policy.repository === repository &&
+      Array.isArray(policy.images) &&
+      policy.images.length === 6,
+    "unreviewed-native-image-policy"
+  );
+  const expectedTag = execFileSync(
+    "bash",
+    ["-c", "source scripts/ci/lib/image-tags.sh; infra_image_tag litellm"],
+    {
+      encoding: "utf8",
+      timeout: 10_000,
+      maxBuffer: 4096,
+      stdio: ["ignore", "pipe", "pipe"],
+    }
+  ).trim();
+  const tested = execFileSync("git", ["rev-parse", "HEAD"], {
+    encoding: "utf8",
+  }).trim();
+  const images = policy.images.filter((row) => row.target !== "litellm");
+  let producer;
+  if (
+    compareProducerInputs({ tested, producer: policy.litellmProducer })
+      .compatible
+  ) {
+    const pin = policy.images.find((row) => row.target === "litellm");
+    requireThat(pin?.declared === expectedTag, "source-tag-pin-mismatch");
+    images.push(pin);
+    producer = policy.litellmProducer.provenance;
+  } else {
+    // A PR Build consumes the source HEAD, whereas native executes the tested
+    // merge tree. A changed producer must have EXACTLY the same source tree.
+    // Require rebase rather than pretending an old-head build proves new code.
+    const sourceTree = execFileSync(
+      "git",
+      ["rev-parse", `${sourceSha}^{tree}`],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
+    ).trim();
+    const testedTree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], {
+      encoding: "utf8",
+    }).trim();
+    requireThat(
+      sourceTree === testedTree,
+      "producer-source-tested-tree-mismatch"
+    );
+    const result = await awaitNativeImageProducer({
+      repository,
+      sourceSha,
+      event: eventName,
+      expectedTag,
+      token: process.env.GITHUB_TOKEN,
+    });
+    requireThat(result.valid, "missing-exact-native-image-producer");
+    images.push({
+      target: "litellm",
+      declared: expectedTag,
+      image: result.image,
+      platform: "linux/amd64",
+    });
+    producer = result.producer;
+  }
+  const output = process.env.NATIVE_IMAGE_BINDINGS_FILE;
+  requireThat(
+    typeof output === "string" &&
+      output.startsWith(`${process.env.RUNNER_TEMP}/`) &&
+      !output.includes("\n"),
+    "unowned-native-image-output"
+  );
+  writeFileSync(
+    output,
+    `${JSON.stringify({ version: 1, images, producer })}\n`,
+    { mode: 0o600, flag: "wx" }
+  );
+  console.log(
+    JSON.stringify({
+      nativeImagePreparation: "ready",
+      sourceSha,
+      images,
+      producer,
+    })
+  );
+}
+
+/** The caller loads this module AND policy only from exact event BASE. */
+export async function nativeEligibility({
+  repository,
+  base,
+  head,
+  tested,
+  baseRef,
+  policy,
+  token,
+  cwd = process.cwd(),
+}) {
+  const full = (reason) => ({ eligible: false, reason });
+  try {
+    requireThat(
+      baseRef === trustedNativeBranch &&
+        policy.repository === repository &&
+        ["cogni-dao/cogni", "cogni-test-org/cogni-monorepo"].includes(
+          repository
+        ) &&
+        sha(base) &&
+        sha(head) &&
+        sha(tested),
+      "unsupported-native-event"
+    );
+    const read = (ref, path) =>
+      execFileSync("git", ["show", `${ref}:${path}`], {
+        cwd,
+        encoding: "utf8",
+        timeout: 5_000,
+        maxBuffer: 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    requireThat(
+      read(base, "scripts/ci/native-proof-policy.json") ===
+        read(tested, "scripts/ci/native-proof-policy.json") &&
+        read(base, "scripts/ci/native-proof-policy.json") ===
+          read(head, "scripts/ci/native-proof-policy.json"),
+      "changed-native-policy"
+    );
+    const inputs = compareNativeInputs({ base, tested, policy, cwd });
+    requireThat(
+      inputs.compatible &&
+        compareNativeInputs({ base, tested: head, policy, cwd }).compatible,
+      "changed-reviewed-native-inputs"
+    );
+    requireThat(
+      nativeSafeChanges({ base, tested, cwd }).safe,
+      "unknown-native-impact-class"
+    );
+    requireThat(
+      compareProducerInputs({ tested, producer: policy.litellmProducer, cwd })
+        .compatible,
+      "unqualified-native-image-pin"
+    );
+    const cohort = readNativeCohort(policy.toolContract);
+    requireThat(cohort.compatible, "unavailable-current-native-cohort");
+    const policyDigest = createHash("sha256")
+      .update(read(base, "scripts/ci/native-proof-policy.json"))
+      .digest("hex");
+    const workflowBlob = execFileSync(
+      "git",
+      ["rev-parse", `${base}:.github/workflows/ci.yaml`],
+      { cwd, encoding: "utf8", timeout: 5_000 }
+    ).trim();
+    const witness = await lookupNativeWitness({
+      repository,
+      base,
+      policyDigest,
+      fingerprint: inputs.fingerprint,
+      workflowBlob,
+      expectedTests: policy.tests,
+      currentCohort: cohort.cohort,
+      expectedImages: policy.images,
+      token,
+    });
+    requireThat(witness.valid, "missing-compatible-native-witness");
+    return {
+      eligible: true,
+      reason: "unchanged-reviewed-native-inputs",
+      fingerprint: inputs.fingerprint,
+      policyDigest,
+      cohortDigest: hash(cohort.cohort),
+      imageDigest: hash(policy.images),
+      witnessRun: witness.runId,
+      witnessAttempt: witness.runAttempt,
+    };
+  } catch {
+    return full("unknown-or-unproved-native-inputs");
+  }
+}
+
+/** Validate actual Vitest machine results; no skipped/omitted controls count as proof. */
+export function nativeResultControls(report, expectedTests, testFiles) {
+  requireThat(
+    report?.success === true &&
+      report.numFailedTests === 0 &&
+      report.numPendingTests === 0 &&
+      (report.numTodoTests ?? 0) === 0 &&
+      report.numTotalTests === report.numPassedTests &&
+      Array.isArray(report.testResults),
+    "incomplete-native-machine-results"
+  );
+  requireThat(
+    Array.isArray(expectedTests) &&
+      expectedTests.length === 6 &&
+      new Set(expectedTests).size === 6 &&
+      testFiles,
+    "missing-original-native-contract"
+  );
+  const controls = [];
+  for (const file of report.testResults) {
+    requireThat(
+      file.status === "passed" &&
+        typeof file.name === "string" &&
+        Array.isArray(file.assertionResults),
+      "failed-native-test-file"
+    );
+    for (const result of file.assertionResults) {
+      requireThat(
+        result.status === "passed" &&
+          typeof result.fullName === "string" &&
+          result.fullName.length <= 500,
+        "incomplete-native-control"
+      );
+      if (expectedTests.includes(result.fullName))
+        requireThat(
+          file.name === `${process.cwd()}/${testFiles[result.fullName]}`,
+          "native-control-file-mismatch"
+        );
+      controls.push({ name: result.fullName, status: "passed" });
+    }
+  }
+  requireThat(
+    controls.length === report.numTotalTests &&
+      new Set(controls.map((v) => v.name)).size === controls.length &&
+      expectedTests.every((name) => controls.some((v) => v.name === name)),
+    "missing-native-control"
+  );
+  return controls;
+}
+
+function recordNativeResult() {
+  const raw = readFileSync("scripts/ci/native-proof-policy.json", "utf8");
+  const policy = JSON.parse(raw);
+  const reportPath = process.env.NATIVE_RESULT_FILE;
+  requireThat(
+    typeof reportPath === "string" &&
+      reportPath.startsWith(`${process.env.RUNNER_TEMP}/`),
+    "unowned-native-result-file"
+  );
+  const report = readFileSync(reportPath, "utf8");
+  requireThat(
+    Buffer.byteLength(report) <= 4 * 1024 * 1024,
+    "native-result-budget"
+  );
+  const controls = nativeResultControls(
+    JSON.parse(report),
+    policy.tests,
+    policy.testFiles
+  );
+  const sourceSha = execFileSync("git", ["rev-parse", "HEAD"], {
+    encoding: "utf8",
+  }).trim();
+  const inputs = compareNativeInputs({
+    base: sourceSha,
+    tested: sourceSha,
+    policy,
+  });
+  const prepared = JSON.parse(
+    readFileSync(process.env.NATIVE_IMAGE_BINDINGS_FILE, "utf8")
+  );
+  if (
+    !inputs.compatible ||
+    hash(prepared.images) !== hash(policy.images) ||
+    controls.length !== policy.tests.length
+  ) {
+    console.log(
+      "NATIVE_PROOF_UNAVAILABLE reviewed input/image binding differs; full controls passed"
+    );
+    return;
+  }
+  const cohort = readNativeCohort(policy.toolContract);
+  requireThat(cohort.compatible, "unavailable-native-result-cohort");
+  const nodeObserved = process.versions.node;
+  const pnpmObserved = execFileSync("pnpm", ["--version"], {
+    encoding: "utf8",
+    timeout: 5_000,
+    maxBuffer: 1024,
+  }).trim();
+  requireThat(
+    nodeObserved === policy.toolContract.nativeNodeVersion &&
+      pnpmObserved === policy.toolContract.nativePnpmVersion,
+    "native-install-tool-mismatch"
+  );
+  const receipt = {
+    version: 1,
+    repository: process.env.GITHUB_REPOSITORY,
+    sourceSha,
+    event: process.env.GITHUB_EVENT_NAME,
+    ref: process.env.GITHUB_REF,
+    runId: Number(process.env.GITHUB_RUN_ID),
+    runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+    workflowBlob: execFileSync(
+      "git",
+      ["rev-parse", "HEAD:.github/workflows/ci.yaml"],
+      { encoding: "utf8" }
+    ).trim(),
+    policyDigest: createHash("sha256").update(raw).digest("hex"),
+    fingerprint: inputs.fingerprint,
+    install: "pnpm install --frozen-lockfile --ignore-scripts",
+    cohort: cohort.cohort,
+    nodeObserved,
+    pnpmObserved,
+    images: prepared.images,
+    tests: controls,
+  };
+  console.log(`NATIVE_PROOF_RECEIPT ${JSON.stringify(receipt)}`);
+}
+
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  try {
+    requireThat(
+      process.argv.length === 3 &&
+        ["prepare-images", "record-result"].includes(process.argv[2]),
+      "unsupported-native-proof-operation"
+    );
+    if (process.argv[2] === "prepare-images") await prepareNativeImages();
+    else recordNativeResult();
+  } catch {
+    console.error(
+      "Native image/control qualification failed; no proof fallback"
+    );
+    process.exitCode = 1;
+  }
 }

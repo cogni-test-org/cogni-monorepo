@@ -30,6 +30,7 @@ import {
 } from "testcontainers";
 import { describe, expect, it } from "vitest";
 import yaml from "yaml";
+import { nativeExecutionImage } from "../../../scripts/ci/native-proof.mjs";
 import { imageContentIdentity } from "./image-content-identity.mjs";
 
 const runtime = path.resolve(__dirname, "../../../infra/compose/runtime");
@@ -294,7 +295,7 @@ describe.skipIf(!process.env.CI)(
         console.info(
           "CADVISOR_DECLARED_BASELINE",
           JSON.stringify({
-            image: alloyService.image,
+            image: nativeExecutionImage(alloyService.image),
             exporterSha256: createHash("sha256")
               .update(exporter ?? "")
               .digest("hex"),
@@ -320,7 +321,7 @@ describe.skipIf(!process.env.CI)(
               `cogni.native-proof=${token}`,
               "--entrypoint",
               "/bin/sh",
-              services["repo-init"].image,
+              nativeExecutionImage(services["repo-init"].image),
               "-c",
               "sleep 420"
             )
@@ -341,7 +342,7 @@ describe.skipIf(!process.env.CI)(
             `cogni.native-proof=${token}`,
             "--mount",
             `type=bind,source=${missingSource},target=/owned-missing-source,readonly`,
-            services["repo-init"].image,
+            nativeExecutionImage(services["repo-init"].image),
           ]);
           if (rejected.exitCode === 0) remember(rejected.stdout.trim());
           expect(rejected.exitCode).not.toBe(0);
@@ -400,7 +401,9 @@ describe.skipIf(!process.env.CI)(
             `type=bind,source=${configPath},target=/etc/alloy/config.alloy,readonly`,
             "-p",
             "127.0.0.1::12345",
-            hostCgroup ? alloyService.image : "grafana/alloy:v1.9.2",
+            nativeExecutionImage(
+              hostCgroup ? alloyService.image : "grafana/alloy:v1.9.2"
+            ),
             "run",
             "/etc/alloy/config.alloy",
             "--server.http.listen-addr=0.0.0.0:12345",
@@ -708,7 +711,7 @@ describe.skipIf(!process.env.CI)(
             "-d",
             "--label",
             `com.docker.compose.service=${service}`,
-            "busybox:1.37",
+            nativeExecutionImage("busybox:1.37"),
             "sh",
             "-c",
             "sleep 540"
@@ -891,12 +894,12 @@ describe.skipIf(!process.env.CI)(
           ...dummyEnvironment,
           "--mount",
           "type=bind,source=/tmp/cadvisor-full-declared.alloy,target=/etc/alloy/full.alloy,readonly",
-          "grafana/alloy:v1.14.0",
+          nativeExecutionImage("grafana/alloy:v1.14.0"),
           "validate",
           "/etc/alloy/full.alloy"
         );
         console.info("CADVISOR_NEW_FULL_CONFIG_VALIDATED", {
-          image: "grafana/alloy:v1.14.0",
+          image: nativeExecutionImage("grafana/alloy:v1.14.0"),
           network: "none",
           sourceSha256: createHash("sha256").update(fullConfig).digest("hex"),
         });
@@ -997,7 +1000,7 @@ describe.skipIf(!process.env.CI)(
         const coreConfig = yaml.stringify({
           services: {
             postgres: {
-              image: services.postgres.image,
+              image: nativeExecutionImage(services.postgres.image),
               environment: { POSTGRES_PASSWORD: "owned-native-only" },
             },
             doltgres: {
@@ -1007,7 +1010,7 @@ describe.skipIf(!process.env.CI)(
             },
             redis: { image: services.redis.image },
             alloy: {
-              image: services.alloy.image,
+              image: nativeExecutionImage(services.alloy.image),
               user: services.alloy.user,
               cgroup: services.alloy.cgroup,
               command: [
@@ -1145,7 +1148,7 @@ describe.skipIf(!process.env.CI)(
           };
         };
         const old = await launch(
-          "grafana/alloy:v1.9.2",
+          nativeExecutionImage("grafana/alloy:v1.9.2"),
           "/tmp/cadvisor-old.alloy",
           false
         );
@@ -1177,7 +1180,7 @@ describe.skipIf(!process.env.CI)(
         expect(actorRows(baseline, idle)).toEqual([]);
         await cli("stop", old.id);
         const next = await launch(
-          services.alloy.image,
+          nativeExecutionImage(services.alloy.image),
           "/tmp/cadvisor-next.alloy",
           true
         );
@@ -1243,7 +1246,7 @@ describe.skipIf(!process.env.CI)(
         );
         const written = writeBytes(actorRows(after, writer));
         console.info("CADVISOR_OVERLAYFS_NEW_RESULT", {
-          image: "grafana/alloy:v1.14.0",
+          image: nativeExecutionImage("grafana/alloy:v1.14.0"),
           socket,
           namespace: info.Containerd?.Namespaces,
           actors: [writer, idle].map((owned) => ({
