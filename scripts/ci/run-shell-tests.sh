@@ -104,8 +104,12 @@ done
 
 run_one() {
   local name="$1"
+  local started="$SECONDS"
+  local rc
   bash "$TESTS_DIR/$name" >"$tmpdir/$name.log" 2>&1
-  echo $? >"$tmpdir/$name.rc"
+  rc=$?
+  echo "$rc" >"$tmpdir/$name.rc"
+  echo "$((SECONDS - started))" >"$tmpdir/$name.seconds"
 }
 
 # Phase 1 — mutators, serial, alone (no reader may run concurrently).
@@ -132,6 +136,8 @@ passed=0
 total=$(( ${#MUTATORS[@]} + ${#PARALLEL[@]} ))
 for t in "${MUTATORS[@]}" "${PARALLEL[@]}"; do
   rc="$(cat "$tmpdir/$t.rc" 2>/dev/null || echo 1)"
+  duration="$(cat "$tmpdir/$t.seconds" 2>/dev/null || echo unknown)"
+  echo "run-shell-tests: test=$t duration_seconds=$duration exit=$rc"
   if [[ "$rc" == "0" ]]; then
     echo "::group::✅ $t"
     cat "$tmpdir/$t.log"

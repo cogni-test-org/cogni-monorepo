@@ -589,8 +589,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build workspace packages
-        run: pnpm packages:build
+      # All41 shell fixtures execute source TS/stdlib or installed third-party
+      # packages; none imports a workspace dist export. Full frozen install stays.
 
       - name: Install catalog schema validator for shell fixtures
         run: pipx install 'check-jsonschema==0.37.1'
@@ -739,7 +739,9 @@ jobs:
           password: ${{ github.token }}
 
       - name: Component tests (testcontainers)
-        run: pnpm test:component
+        # The identically guarded migrator lane owns these three suites and the
+        # terminal component gate requires it. Ordinary/local discovery stays full.
+        run: pnpm exec vitest run --config nodes/operator/app/vitest.component.config.mts --exclude '**/db/doltgres-*.int.test.ts'
 
       - name: CI Telemetry
         if: always()

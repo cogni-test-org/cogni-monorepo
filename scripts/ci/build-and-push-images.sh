@@ -96,6 +96,11 @@ IMAGE_NAME_MIGRATOR=$(printf "%s" "$IMAGE_NAME_MIGRATOR" | tr '[:upper:]' '[:low
 # See bug.0313.
 git_sha="${BUILD_SHA:-${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}}"
 build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# The exporter owns this fresh metadata file. Reading a mutable tag after push
+# can accidentally resolve another concurrent invocation's output.
+build_metadata_dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/cogni-build-metadata.XXXXXX")
+trap 'rm -rf "$build_metadata_dir"' EXIT
+BUILD_DIGEST_REF=""
 
 # bug.0344: image_name_for_target picks APP vs MIGRATOR package per-target.
 # image-tags.sh's image_tag_for_target joins them with the tag suffix.
@@ -135,7 +140,10 @@ build_target() {
   # their own self-contained dir so the Dockerfile stays context-relative.
   context=$(yq -N '.build_context // "."' "$catalog")
 
-  local args=(--platform "$PLATFORM" --file "$dockerfile")
+  local metadata_file="$build_metadata_dir/output.json"
+  rm -f "$metadata_file"
+  BUILD_DIGEST_REF=""
+  local args=(--platform "$PLATFORM" --file "$dockerfile" --metadata-file "$metadata_file")
   if [ "$type" = "node" ]; then
     args+=(--target runner --build-arg "BUILD_SHA=${git_sha}")
   fi
@@ -170,17 +178,40 @@ build_target() {
   started=$SECONDS
   docker buildx build --progress plain "${args[@]}"
   log_info "Build complete target=${target} elapsed_seconds=$((SECONDS - started)) source_sha=${git_sha}"
+  if [ "$SHOULD_PUSH" != false ]; then
+    # Buildx documents containerimage.digest as THIS invocation's image output.
+    # Missing or malformed output is RED; never fall back to a registry tag.
+    BUILD_DIGEST_REF=$(resolve_digest_ref "$tag" "$metadata_file")
+  fi
 }
 
 resolve_digest_ref() {
   local tag="$1"
+  local metadata_file="$2"
   local digest
-
-  digest=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')
-  if [ -z "$digest" ] || [ "$digest" = "null" ]; then
-    log_error "Failed to resolve pushed digest for ${tag}"
-    exit 1
-  fi
+  digest=$(python3 - "$metadata_file" <<'PYCODE'
+import json, os, re, sys
+try:
+    path = sys.argv[1]
+    if not 0 < os.path.getsize(path) <= 1024 * 1024:
+        raise ValueError()
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError()
+            result[key] = value
+        return result
+    with open(path, encoding="utf-8") as stream:
+        value = json.load(stream, object_pairs_hook=unique)
+    digest = value["containerimage.digest"]
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
+        raise ValueError()
+    print(digest)
+except Exception:
+    sys.exit("Missing or invalid invocation-owned Buildx output digest")
+PYCODE
+  ) || return 1
 
   printf '%s@%s' "${tag%%:*}" "$digest"
 }
@@ -200,7 +231,7 @@ for target in "${requested_targets[@]}"; do
     digest_ref=""
     log_info "Built ${target} (not pushed); no digest"
   else
-    digest_ref=$(resolve_digest_ref "$full_tag")
+    digest_ref="$BUILD_DIGEST_REF"
     log_info "Resolved ${target} digest: ${digest_ref}"
   fi
 

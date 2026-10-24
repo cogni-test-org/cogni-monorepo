@@ -24,7 +24,11 @@ function list(...args) {
     execFileSync(
       "pnpm",
       ["exec", "vitest", "list", "--filesOnly", "--json", ...args],
-      { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 }
+      {
+        encoding: "utf8",
+        maxBuffer: 8 * 1024 * 1024,
+        env: { ...process.env, DOTENV_CONFIG_QUIET: "true" },
+      }
     )
   )
     .map(({ file }) => file)
@@ -138,6 +142,45 @@ test("manifest always runs on ordinary events, independent of upstream result", 
     gate.steps
       .find((step) => step.name === "Require coherent successful build plan")
       .run.includes("verify-manifest")
+  );
+});
+
+test("dedicated migrator partitions actual component discovery without losing a suite", () => {
+  const jobs = workflow("ci.yaml");
+  const command = jobs.component_core.steps.find(
+    (step) => step.name === "Component tests (testcontainers)"
+  ).run;
+  const match =
+    /^pnpm exec vitest run --config ([A-Za-z0-9_./-]+) --exclude '([^']+)'$/.exec(
+      command
+    );
+  assert.ok(
+    match,
+    "bounded workflow command must expose its actual config/exclusion"
+  );
+  const full = list("--config", match[1]);
+  const component = list("--config", match[1], "--exclude", match[2]);
+  const migrator = list(
+    "--config",
+    "nodes/operator/app/vitest.doltgres.config.mts"
+  );
+  const expected = [
+    "doltgres-contribution-concurrency.int.test.ts",
+    "doltgres-migrate.int.test.ts",
+    "doltgres-usewhen-patch.int.test.ts",
+  ]
+    .map((name) => resolve("nodes/operator/app/tests/component/db", name))
+    .sort();
+  assert.deepEqual(migrator, expected);
+  assert.ok(migrator.every((path) => !component.includes(path)));
+  assert.deepEqual([...component, ...migrator].sort(), full);
+  assert.equal(jobs.component_core.if, jobs.migrator.if);
+  assert.ok(jobs.component.needs.includes("migrator"));
+  assert.equal(
+    jobs.migrator.steps.find(
+      (step) => step.name === "Doltgres migrator regression (testcontainers)"
+    ).run,
+    "pnpm test:doltgres-migrate"
   );
 });
 
