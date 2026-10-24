@@ -5,7 +5,7 @@
 ## Metadata
 
 - **Owners:** @derek @core-dev
-- **Last reviewed:** 2026-10-09
+- **Last reviewed:** 2026-10-24
 - **Status:** draft
 
 ## Purpose
@@ -38,6 +38,7 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
 
 - **Exports:** none
 - **Routes (if any):**
+  - `/api/v1/nodes/[id]/observability/langfuse/api/public/v2/observations` [GET] — developer-gated native Langfuse observation reads with independent receipt ownership, bounded native pagination and privacy projection
   - `/api/auth/[...nextauth]` [GET, POST]
   - `/api/setup/verify` [POST] - DAO formation verification
   - `/api/v1/nodes` [GET, POST] - managed-node registry: list owner's nodes + create a new registration
@@ -46,6 +47,7 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
   - `/api/v1/nodes/[id]/developers` [POST] - owner-gated approve/reject for registered agent developer flight authority
   - `/api/v1/nodes/[id]/reconcile-merge-queue` [POST] - env-manager-gated convergence of a node repo's live merge queue to the git-owned operator policy
   - `/api/v1/nodes/[id]/launch-pack` [GET] - owner-gated AI-assistant handoff for post-publish node launch
+  - `/api/v1/nodes/[id]/launch-pack/v2` [GET] - owner-gated successor handoff with maintained canonical guidance; the legacy route retains its published metadata
   - `/api/v1/nodes/[id]/publish` [POST] - mints the node repo, opens the submodule deployment PR, advances dao_formed → published
   - `/api/v1/nodes/[id]/activate-distributions` [POST] - terminal owner/developer-gated repo-spec PR; verifies distributor ownership/token and paired CAS publishing authority before recording active
   - `/api/v1/nodes/[id]/distributions-status` [GET] - owner/developer-gated read of the git-plane activation record (repo-spec main + open/merged activation PR + distributor addresses)
@@ -80,6 +82,7 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
   - `/api/v1/agent/runs` [GET] - machine-authenticated run list
   - `/api/v1/agent/runs/[runId]/stream` [GET] - machine-authenticated run stream SSE
   - `/api/v1/knowledge/contributions/[id]/commits` [GET, POST] - list/append authenticated contribution branch commits
+- Fixed service target `scheduler-worker-custodied-routing` on `/api/v1/deploy/infra-reconcile`: own-production custodian only; additive Git publication or receipt rollback; publication is not rollout proof.
 - **Files considered API:** v1/_/route.ts, admin/_/route.ts
 
 ## Responsibilities

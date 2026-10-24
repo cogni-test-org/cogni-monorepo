@@ -258,6 +258,47 @@ case ",$placement_billing," in
   *) fail "billing za should use the public URL: $placement_billing" ;;
 esac
 
+# Exercise the deploy caller, not just the catalog helper: an invented VM alias
+# dropped production billing callbacks even while model completions succeeded.
+deploy_billing_fragment="$(awk '
+  /^source .*\/cogni-deployment-identity.sh"$/ ||
+  /^LITELLM_NODE_HOST=/ || /^LITELLM_NODE_ENDPOINTS=/ { print }
+' scripts/ci/deploy-infra.sh)"
+assert_deploy_billing_route() {
+  local env="$1" root="$2" fallback_root="$3" slug="$4" want_host="$5" csv alias
+  csv="$(
+    REPO_ROOT="$REPO_ROOT" COGNI_CATALOG_ROOT="$PLACEMENT_CATALOG" \
+      DEPLOY_ENVIRONMENT="$env" DOMAIN=isolated-workload.example.test \
+      FORK_DOMAIN_ROOT="$root" COGNI_DOMAIN_ROOT="$fallback_root" \
+      COGNI_DEPLOYMENT_SLUG="$slug" DEPLOY_BILLING_FRAGMENT="$deploy_billing_fragment" \
+      bash -eu -c '
+        source "$REPO_ROOT/scripts/ci/lib/image-tags.sh"
+        eval "$DEPLOY_BILLING_FRAGMENT"
+        printf "%s" "$LITELLM_NODE_ENDPOINTS"
+      '
+  )" || fail "deploy billing route render failed for $env"
+  for alias in zk "$ZK_ID"; do
+    case ",$csv," in
+      *",$alias=http://$want_host:30401,"*) : ;;
+      *) fail "$env deploy billing $alias should use $want_host:30401, got: $csv" ;;
+    esac
+  done
+  if [ "$env" != preview ]; then
+    for alias in za "$ZA_ID"; do
+      case ",$csv," in
+        *",$alias=https://za-isolated-workload.example.test,"*) : ;;
+        *) fail "$env deploy billing changed Akash workload address for $alias: $csv" ;;
+      esac
+    done
+  fi
+  pass "$env deploy billing uses $want_host and preserves placement"
+}
+assert_deploy_billing_route production '' '' '' cogni.vm.cognidao.org
+assert_deploy_billing_route preview '' '' '' cogni-preview.vm.cognidao.org
+assert_deploy_billing_route candidate-a '' '' '' cogni-candidate-a.vm.cognidao.org
+assert_deploy_billing_route production substrate.example.test ignored.example.test fleet fleet.vm.substrate.example.test
+assert_deploy_billing_route candidate-a '' fallback.example.test fleet fleet-candidate-a.vm.fallback.example.test
+
 # An unsupported placement value must fail loud, never silently fall back to k3s.
 yq '.deployment_provider = {"candidate-a": "fly"}' "$PLACEMENT_CATALOG/za.yaml" > "$PLACEMENT_CATALOG/za.tmp" \
   && mv "$PLACEMENT_CATALOG/za.tmp" "$PLACEMENT_CATALOG/za.yaml"
@@ -282,11 +323,9 @@ check_scheduler_vm_alias() {
   pass "$env scheduler-worker ExternalNames -> $expected"
 }
 
-# Workload URLs follow DOMAIN; VM discovery follows its independent substrate root.
-SUBSTRATE_ROOT="${FORK_DOMAIN_ROOT:-$(cogni_domain_root)}"
 SUBSTRATE_SLUG="$(cogni_deployment_slug)"
 for env in "${DEPLOY_ENVS[@]}"; do
-  check_scheduler_vm_alias "$env" "$(cogni_vm_host_for_env "$env" "$SUBSTRATE_ROOT" "$SUBSTRATE_SLUG")"
+  check_scheduler_vm_alias "$env" "$(cogni_vm_host_for_env "$env" "$FORK_ROOT" "$SUBSTRATE_SLUG")"
 done
 
 echo "[5/5] the Crossplane materializer's substrate host IS that same env VM alias"
@@ -305,7 +344,7 @@ grep -q -- 'cogni_deployment_slug' "$ACTION_YML" \
 for env in "${DEPLOY_ENVS[@]}"; do
   file="infra/k8s/overlays/$env/scheduler-worker/kustomization.yaml"
   [ -f "$file" ] || { echo "  skip - $env scheduler-worker overlay missing"; continue; }
-  expected="$(cogni_vm_host_for_env "$env" "$SUBSTRATE_ROOT" "$SUBSTRATE_SLUG")"
+  expected="$(cogni_vm_host_for_env "$env" "$FORK_ROOT" "$SUBSTRATE_SLUG")"
   apex="$(domain_for_env "$env" "$FORK_ROOT" || true)"
   [ "$expected" != "$apex" ] \
     || fail "$env substrate host resolved to the Cloudflare-proxied public apex '$apex', which drops 7233/6379/4000"
@@ -354,7 +393,7 @@ CATALOG_JSON="$(yq -o=json -I=0 '.' infra/catalog/scheduler-worker.yaml)" \
   pnpm --dir nodes/operator/app exec tsx -e '
     import assert from "node:assert/strict";
     import { resolveDeploymentTargets } from "./src/features/compute/node-deployment-targets.ts";
-    assert.deepEqual(resolveDeploymentTargets({catalogRows:[JSON.parse(process.env.CATALOG_JSON!)],environment:"candidate-a",flightTargets:["scheduler-worker"]}), {
+    assert.deepEqual(resolveDeploymentTargets({catalogRows:[JSON.parse(process.env.CATALOG_JSON!)],environment:"candidate-a",parentRepository:"cogni-dao/cogni",flightTargets:["scheduler-worker"]}), {
       deployment:[],substrate:[],offCluster:[],providers:{"scheduler-worker":"k3s"},
       k3s:["scheduler-worker"],k3sNodes:[],sourceRepositories:{},sourceShas:{}
     });

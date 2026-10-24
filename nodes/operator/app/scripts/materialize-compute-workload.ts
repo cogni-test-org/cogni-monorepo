@@ -23,7 +23,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs, promisify } from "node:util";
 
-import { parseRepoSpec, resolveNodeArtifactBundle } from "@cogni/repo-spec";
+import {
+  parseRepoSpec,
+  resolveNodeArtifactBundle,
+  resolveNodeArtifactBundleForEnvironment,
+} from "@cogni/repo-spec";
 import { parse, stringify } from "yaml";
 
 import {
@@ -48,6 +52,7 @@ import {
   resolveDeploymentTargets,
   resolvePromoteDeploymentTargets,
 } from "@/features/compute/node-deployment-targets";
+import { resolveNodeIsolatedServices } from "@/features/compute/node-isolated-services";
 import { resolveNodeLeaseGeneration } from "@/features/compute/node-lease-generation";
 import { resolveNodeRequiredPlacement } from "@/features/compute/node-required-placement";
 import { assertDeclaredNodeDeployment } from "@/features/compute/node-services-workload-spec";
@@ -65,6 +70,11 @@ const options = {
   // `envs:` membership, so a production-only node never reaches deploy/preview-<node>.
   "preview-forward": { type: "string" },
   "catalog-projection-targets-json": { type: "string" },
+  // GitHub owner/name of the repository running this workflow (bug.5510): the
+  // source repository of in-repo nodes such as operator. Defaults to the
+  // Actions-provided GITHUB_REPOSITORY so the existing workflow call sites need
+  // no edit; absent both, target selection fails closed.
+  "parent-repository": { type: "string" },
   "github-output": { type: "string" },
   "repo-spec": { type: "string" },
   bundle: { type: "string" },
@@ -103,6 +113,10 @@ async function main(): Promise<void> {
       catalogRoot: required(values["catalog-root"], "--catalog-root"),
       environment,
       flightTargetsJson: values["flight-targets-json"],
+      parentRepository: parentRepository(values["parent-repository"]),
+      ...(values["source-sha"] !== undefined && {
+        parentSourceSha: values["source-sha"],
+      }),
       githubOutput: required(values["github-output"], "--github-output"),
     });
     return;
@@ -125,6 +139,7 @@ async function main(): Promise<void> {
       promoteTargetsCsv: values["promote-targets-csv"] ?? "",
       legacyK3sTargetsJson: values["legacy-k3s-targets-json"],
       previewForwardMode: values["preview-forward"] === "true",
+      parentRepository: parentRepository(values["parent-repository"]),
       githubOutput: required(values["github-output"], "--github-output"),
     });
     return;
@@ -211,6 +226,40 @@ async function main(): Promise<void> {
     throw new Error(
       "[materialize-compute-workload] declared database pool limits require Crossplane runtime topology"
     );
+  // story.5093 — PLACEMENT_IS_OPERATOR_POLICY. The catalog row may move declared private
+  // services into their own lease. A cell naming a service this source does not declare for
+  // this environment is skipped (and reported), so the operator cell can merge before the
+  // node's own PR without breaking that node's flights.
+  const declaredForEnvironment = new Set(
+    resolveNodeArtifactBundleForEnvironment(bundle, environment).services.map(
+      ({ service }) => service.name
+    )
+  );
+  const isolatedCells = resolveNodeIsolatedServices({ catalog, environment });
+  const isolated = isolatedCells.filter(({ service }) =>
+    declaredForEnvironment.has(service)
+  );
+  for (const { service } of isolatedCells) {
+    if (!declaredForEnvironment.has(service)) {
+      process.stderr.write(
+        `${JSON.stringify({
+          event: "compute.workload.isolated_service_undeclared",
+          nodeSlug: catalogIdentity.slug,
+          environment,
+          service,
+        })}\n`
+      );
+    }
+  }
+  if (isolated.length > 0 && computeApi !== "crossplane") {
+    throw new Error(
+      `[materialize-compute-workload] isolated_services require compute_api=crossplane for ${catalogIdentity.slug} in ${environment}`
+    );
+  }
+  const dnsIntent =
+    computeApi === "crossplane" && dnsZoneId
+      ? { dns: { provider: "cloudflare" as const, zoneId: dnsZoneId } }
+      : {};
   const manifest = buildComputeWorkloadManifest({
     slug: catalogIdentity.slug,
     environment,
@@ -228,8 +277,9 @@ async function main(): Promise<void> {
       : {}),
     bootRecovery,
     // DNS intent is Crossplane-only: the legacy controller resolves its own zone in-cluster.
-    ...(computeApi === "crossplane" && dnsZoneId
-      ? { dns: { provider: "cloudflare" as const, zoneId: dnsZoneId } }
+    ...dnsIntent,
+    ...(isolated.length > 0
+      ? { isolatedServices: isolated.map(({ service }) => service) }
       : {}),
     ...(computeApi === "crossplane" && values["substrate-host"]?.trim()
       ? {
@@ -246,9 +296,40 @@ async function main(): Promise<void> {
   // gate (story.5043), so a sidecar dropped from this environment contributes no service here and
   // therefore no secret keys either — the projection can never re-introduce a gated-out service's
   // secrets. This keeps the "projected secrets match the workload" invariant true by construction.
-  const resolvedSecretRefs = manifest.spec.workload.services.flatMap(
-    (service) => service.secretRefs ?? []
-  );
+  // ISOLATED_SERVICE_IS_ITS_OWN_LEASE: one more workload per isolated service, sharing the
+  // node's bundle and placement policy but no substrate runtime, under its own generation.
+  const instanceManifests = isolated.map(({ service, leaseGeneration }) => ({
+    file: `xcomputeworkload-${service}.yaml`,
+    manifest: buildComputeWorkloadManifest({
+      slug: catalogIdentity.slug,
+      environment,
+      bundleRef: bundleInput.ref,
+      bundle,
+      publicHost: hostForNode(
+        `${catalogIdentity.slug}-${service}`,
+        false,
+        domain
+      ),
+      computeApi,
+      leaseGeneration,
+      ...(requiredPlacementCountries.length > 0
+        ? { requiredPlacementCountries }
+        : {}),
+      bootRecovery,
+      ...dnsIntent,
+      instance: service,
+    }),
+  }));
+  const resolvedSecretRefs = [
+    manifest,
+    ...instanceManifests.map((i) => i.manifest),
+  ]
+    .flatMap((built) => built.spec.workload.services)
+    .flatMap((service) => service.secretRefs ?? [])
+    .filter(
+      (ref, index, all) =>
+        all.findIndex((other) => other.key === ref.key) === index
+    );
   // Observability (stderr — stdout is the machine contract): make the EXACT set of secret keys
   // this flight will project into the workload visible in the flight log. Key NAMES are public
   // (they live in the git repo-spec); values never touch logs. This is the signal that turns a
@@ -280,6 +361,7 @@ async function main(): Promise<void> {
     namespace: `cogni-${environment}`,
     resources: [
       workloadFile,
+      ...instanceManifests.map((instance) => instance.file),
       ...secretResources.map((resource) => resource.file),
     ],
   };
@@ -288,6 +370,14 @@ async function main(): Promise<void> {
   await writeAtomically(
     `${outputDir}/${workloadFile}`,
     stringify(manifest, { lineWidth: 0 })
+  );
+  await Promise.all(
+    instanceManifests.map(({ file, manifest: instance }) =>
+      writeAtomically(
+        `${outputDir}/${file}`,
+        stringify(instance, { lineWidth: 0 })
+      )
+    )
   );
   await Promise.all(
     secretResources.map(({ file, manifest: resource }) =>
@@ -310,6 +400,8 @@ async function selectDeploymentTargets(input: {
   readonly catalogRoot: string;
   readonly environment: "candidate-a" | "preview" | "production";
   readonly flightTargetsJson: string;
+  readonly parentRepository: string;
+  readonly parentSourceSha?: string;
   readonly githubOutput: string;
 }): Promise<void> {
   const parsed = parseStringArray(
@@ -330,6 +422,10 @@ async function selectDeploymentTargets(input: {
     catalogRows: rows,
     environment: input.environment,
     flightTargets: parsed,
+    parentRepository: input.parentRepository,
+    ...(input.parentSourceSha !== undefined && {
+      parentSourceSha: input.parentSourceSha,
+    }),
   });
   const outputs = {
     deployment_node_targets_json: JSON.stringify(deployment),
@@ -360,6 +456,7 @@ async function selectPromoteTargets(input: {
   readonly promoteTargetsCsv: string;
   readonly legacyK3sTargetsJson: string;
   readonly previewForwardMode: boolean;
+  readonly parentRepository: string;
   readonly githubOutput: string;
 }): Promise<void> {
   const requestedTargets = input.promoteTargetsCsv
@@ -375,6 +472,7 @@ async function selectPromoteTargets(input: {
       "--legacy-k3s-targets-json"
     ),
     previewForwardMode: input.previewForwardMode,
+    parentRepository: input.parentRepository,
   });
   // AN EMPTY APP PROMOTE IS A REFUSAL, NOT A SILENT SUCCESS (bug.5203). Every downstream job
   // gates on `has_targets`, so a promote that resolves nothing otherwise SKIPS its way to a
@@ -559,6 +657,14 @@ async function resolveBundleInput(input: {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+}
+
+function parentRepository(value: string | undefined): string {
+  return required(
+    // biome-ignore lint/style/noProcessEnv: the Actions runner identity of the parent repository; the reviewed workflow call sites pass no flag
+    value || process.env.GITHUB_REPOSITORY,
+    "--parent-repository (or GITHUB_REPOSITORY)"
+  );
 }
 
 function required(value: string | undefined, flag: string): string {

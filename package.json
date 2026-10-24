@@ -68,7 +68,7 @@
     "db:migrate:operator:doltgres:container": "tsx node_modules/drizzle-kit/bin.cjs migrate --config=nodes/operator/drizzle.doltgres.config.ts && node nodes/operator/packages/doltgres-schema/stamp-commit.mjs",
     "db:provision": "docker compose --env-file .env.local -f infra/compose/runtime/docker-compose.dev.yml --profile bootstrap run --rm db-provision && pnpm db:provision:doltgres",
     "db:provision:doltgres": "docker compose --env-file .env.local -f infra/compose/runtime/docker-compose.dev.yml --profile bootstrap run --rm doltgres-provision",
-    "doltgres:nuke": "docker stop doltgres 2>/dev/null; docker rm doltgres 2>/dev/null; docker volume rm doltgres_data 2>/dev/null; echo '✅ Doltgres nuked (container + volume)'",
+    "doltgres:nuke": "docker stop doltgres 2>/dev/null; docker rm doltgres 2>/dev/null; docker volume rm doltgres_data 2>/dev/null; echo '\u2705 Doltgres nuked (container + volume)'",
     "db:provision:test": "docker compose --env-file .env.test -f infra/compose/runtime/docker-compose.dev.yml --profile bootstrap run --rm db-provision && docker compose --env-file .env.test -f infra/compose/runtime/docker-compose.dev.yml --profile bootstrap run --rm doltgres-provision",
     "db:migrate": "pnpm db:migrate:dev",
     "db:migrate:dev": "dotenv -e .env.local -- tsx node_modules/drizzle-kit/bin.cjs migrate --config=nodes/operator/drizzle.config.ts",
@@ -119,6 +119,7 @@
     "packages:build": "pnpm -r --filter \"./packages/**\" --filter \"./nodes/operator/packages/**\" --filter \"./nodes/operator/graphs/**\" build && tsc -b packages/*/tsconfig.json packages/langgraph-graphs/tsconfig.build.json nodes/operator/packages/*/tsconfig.json && pnpm packages:validate",
     "packages:build:clean": "rm -rf packages/*/dist packages/*/*.tsbuildinfo nodes/operator/packages/*/dist nodes/operator/packages/*/*.tsbuildinfo nodes/operator/graphs/dist && pnpm packages:build",
     "packages:validate": "tsx --tsconfig tsconfig.scripts.json scripts/validate-package-declarations.ts",
+    "eval:guidance-routing": "tsx packages/knowledge-store/evals/guidance-routing/run.ts",
     "packages:clean": "rm -rf packages/*/dist packages/*/*.tsbuildinfo",
     "prebuild": "pnpm validate:chain",
     "build": "COGNI_REPO_PATH=$(pwd) dotenv -e .env.local -- pnpm --filter operator build",
@@ -188,6 +189,7 @@
     ]
   },
   "dependencies": {
+    "@cogni-dao/doltgres-admission": "https://github.com/cogni-dao/node-template/releases/download/doltgres-admission-v0.1.0/cogni-dao-doltgres-admission-0.1.0.tgz",
     "@cogni/ai-core": "workspace:*",
     "@cogni/ai-tools": "workspace:*",
     "@cogni/aragon-osx": "workspace:*",
@@ -210,7 +212,7 @@
     "@cogni/repo-spec": "workspace:*",
     "@cogni/scheduler-core": "workspace:*",
     "@cogni/temporal-workflows": "workspace:*",
-    "@cogni/work-items": "https://github.com/cogni-dao/node-template/releases/download/work-items-v0.1.9/cogni-dao-work-items-0.1.9.tgz",
+    "@cogni/work-items": "https://github.com/cogni-dao/node-template/releases/download/work-items-v0.2.4/cogni-dao-work-items-0.2.4.tgz",
     "@privy-io/node": "^0.10.1",
     "cron-parser": "^4.9.0",
     "drizzle-orm": "^0.44.7",
