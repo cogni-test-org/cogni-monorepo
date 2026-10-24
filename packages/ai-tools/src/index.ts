@@ -12,6 +12,7 @@
  */
 
 export type {
+  ActiveGoalInfo,
   ApproveWorkflowRunsResult,
   AuthCapability,
   ChainDirection,
@@ -30,6 +31,7 @@ export type {
   EnvSummary,
   GetChainParams,
   GetChainResult,
+  GoverningIndexEntry,
   HypothesizeParams,
   KnowledgeCapability,
   KnowledgeEntry,
@@ -76,6 +78,7 @@ export type {
   WorkItemAssignee,
   WorkItemCapability,
   WorkItemInfo,
+  WorkItemQueryPage,
   WorkItemQueryParams,
   WorkItemTransitionResult,
 } from "./capabilities";
@@ -87,6 +90,7 @@ export {
   REPO_CITATION_REGEX,
   stubAuthCapability,
   systemClock,
+  WorkItemPatchConflictError,
 } from "./capabilities";
 // Tool catalog
 export {
@@ -161,6 +165,31 @@ export {
   getCurrentTimeImplementation,
 } from "./tools/get-current-time";
 export {
+  createGoalListImplementation,
+  GOAL_LIST_NAME,
+  type GoalListDeps,
+  type GoalListInput,
+  GoalListInputSchema,
+  type GoalListOutput,
+  GoalListOutputSchema,
+  goalListBoundTool,
+  goalListContract,
+  goalListStubImplementation,
+} from "./tools/goal-list";
+export {
+  createKnowledgeIndexImplementation,
+  KNOWLEDGE_INDEX_MAX_BYTES,
+  KNOWLEDGE_INDEX_NAME,
+  type KnowledgeIndexDeps,
+  type KnowledgeIndexInput,
+  KnowledgeIndexInputSchema,
+  type KnowledgeIndexOutput,
+  KnowledgeIndexOutputSchema,
+  knowledgeIndexBoundTool,
+  knowledgeIndexContract,
+  knowledgeIndexStubImplementation,
+} from "./tools/knowledge-index";
+export {
   createKnowledgeReadImplementation,
   KNOWLEDGE_READ_NAME,
   type KnowledgeReadDeps,
@@ -175,6 +204,7 @@ export {
 } from "./tools/knowledge-read";
 export {
   createKnowledgeSearchImplementation,
+  KNOWLEDGE_SEARCH_CONTENT_MAX_CHARS,
   KNOWLEDGE_SEARCH_NAME,
   type KnowledgeSearchDeps,
   type KnowledgeSearchInput,

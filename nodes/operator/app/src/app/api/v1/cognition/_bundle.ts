@@ -5,7 +5,8 @@
  * Module: `@app/api/v1/cognition/_bundle`
  * Purpose: Pure composition of the session-start kickstart bundle — the
  *   irreducible tooling invariants (code-owned) plus the markdown renderer
- *   that frames hub-delivered skills + domain pointers for a SessionStart hook.
+ *   that frames the hub-delivered governing index + domain pointers for a
+ *   SessionStart hook.
  * Scope: Pure functions + the invariants constant. No I/O, no env, no container.
  * Invariants:
  *   - INVARIANTS_ARE_THE_FLOOR: the code-owned `SESSION_BOOTSTRAP_INVARIANTS` +
@@ -20,6 +21,16 @@
  *     is rendered IN FULL — the node MAP that rides alongside the invariant
  *     floor, so the git skeleton stays minimal and the Dolt orientation carries
  *     the node-specific substance.
+ *   - GOALS_AFTER_MISSION: the approved DAO goals (`listActiveGoals`) render as
+ *     `## Goals` right after the orientation, title + content verbatim; zero
+ *     goals renders `no approved goals`, a read failure `goals unavailable: …`.
+ *   - GOVERNING_INDEX_IN_CONTEXT (guidance-routing-design): the session index is
+ *     the hub's governing index (`listGoverningIndex`) — id, type, domain,
+ *     useWhen — never a skills-only subset and never bodies.
+ *   - WHOLE_BUNDLE_BUDGET_64KIB: the whole rendered bundle stays within
+ *     `WHOLE_BUNDLE_BUDGET_BYTES`. Past it, the governing section carries only
+ *     the `method` shelf inline and points the agent at
+ *     `/api/v1/knowledge/index?domain=<shelf>` for the rest (approach T).
  * Side-effects: none
  * Links: https://cognidao.org/knowledge/node-baas-substrate-model
  * @internal
@@ -27,7 +38,7 @@
 
 import type {
   CognitionDomainPointer,
-  CognitionSkillPointer,
+  CognitionGoverningPointer,
 } from "@cogni/node-contracts";
 
 /**
@@ -54,7 +65,7 @@ import type {
 export const SESSION_BOOTSTRAP_INVARIANTS: readonly string[] = [
   "ONE work item + ONE node per session — it is your plan and your checklist. Claim it, then write the definition of done as an ordered checklist in `outcome` BEFORE you act; heartbeat; link your PR. You are not done until every box is checked and proven; coordination.nextAction is authoritative and may add boxes.",
   "Cite before you act. Recall first — your <slug>-agent-orientation, then skills/guides → this hub (/api/v1/knowledge?domain=) → our code (node-template, operator) → external OSS; merged + your own open branch. Refine in place over adding new. Every checklist step names the skill/guide/entry it follows; an uncited step is the exception you justify.",
-  "Follow the CICD checklist exactly — recall it, never improvise the mechanism: branch → CI green → flight to candidate THROUGH the operator (POST /api/v1/vcs/flight — never a personal `gh` dispatch) → /validate-candidate → operator merge (POST /api/v1/vcs/merge) → promote. NEVER enter the merge queue or enable auto-merge before validate passes. Watch each async gate (CI, flight, deploy) the ONE portable way — see <watch-gate> below.",
+  "Follow the CICD checklist exactly — recall it, never improvise the mechanism: branch → PR → a fresh /review-implementation while CI runs (never the implementer) → APPROVE + CI green at one head SHA → flight that SHA THROUGH the operator (POST /api/v1/vcs/flight — never a personal `gh` dispatch) → /validate-candidate → /closeout: operator merge (POST /api/v1/vcs/merge) → promote. NEVER enter the merge queue or enable auto-merge before review and validate pass. Watch each async gate (CI, flight, deploy) the ONE portable way — see <watch-gate> below.",
   "Done = before→after behavior proven on the live candidate, NOT a SHA deployed. Capture the BROKEN signal, flight, then read the FIXED behavior back from Loki at that SHA. 'Request reached the build' is deploy proof, not function. The /validate-candidate scorecard is the merge gate; reprove prod-facing changes in preview/prod.",
   "Persist what outlives the session in the durable substrate, never a doc that rots: plan + status → the work item; durable strategy/why → operator Dolt, linked to the item (specRefs / cite edge). Specs hold contracts + invariants only — never a rollout plan.",
   "Drive autonomously; interrupt a human only for the irreversible, outward-facing, or out-of-scope — never for approval you already hold, never to merge/promote something unvalidated. When you ask: one scorecard → the single decision → a clickable link.",
@@ -73,16 +84,18 @@ export const SESSION_WATCH_GATE = `<watch-gate rule="ONE blocking command; its e
   <truth>/version.buildSha is the only ground truth — CI and workflow "success" can lie.</truth>
 </watch-gate>`;
 
-const COGNITION_ENTRY_TYPES: ReadonlySet<string> = new Set([
-  "skill",
-  "guide",
-  "playbook",
-]);
+/**
+ * WHOLE_BUNDLE_BUDGET_64KIB (guidance-routing-design). Harness limits do not
+ * bind (Claude Code `@import` accepts 4 MiB, Codex is uncapped); the cap
+ * protects model context — about 16k tokens, 8% of a 200k window.
+ */
+export const WHOLE_BUNDLE_BUDGET_BYTES = 64 * 1024;
 
-/** True for hub entries that belong in an agent's actionable skills index. */
-export function isCognitionEntry(entryType: string | undefined): boolean {
-  return COGNITION_ENTRY_TYPES.has(entryType ?? "");
-}
+/** The shelf rendered inline when the whole index no longer fits the budget. */
+const INLINE_FALLBACK_SHELF = "method";
+
+const utf8Bytes = (text: string): number =>
+  new TextEncoder().encode(text).byteLength;
 
 /** Make a string safe to drop into a GFM table cell (no `|`, no line breaks). */
 export function escapeCell(value: string | null | undefined): string {
@@ -108,7 +121,7 @@ export interface OrientationLookupPort {
 /**
  * Resolve the current-node orientation entry by direct id lookup.
  *
- * The domain scan that feeds the skills index only reads the newest
+ * The domain scan that discovers orientation entries only reads the newest
  * PER_DOMAIN_LIMIT rows per domain, so once a domain outgrows the limit an
  * older `<slug>-agent-orientation` entry silently drops out of the scan and
  * the bundle reports it as unseeded (bug.5280). Direct lookup by exact id is
@@ -135,6 +148,88 @@ export async function resolveOrientation(
   return null;
 }
 
+/** One approved DAO goal as the bundle renders it (title + content verbatim). */
+export interface GoalView {
+  id: string;
+  title: string;
+  content: string;
+  /** The goal's deadline, read from the `evaluate_at` column — never parsed from content. */
+  evaluateAt: Date | null;
+}
+
+/**
+ * The Goals section state. `unavailable` is a visible line, never an omitted
+ * section (NO_GOALS_FAILS_LOUD): a session must be able to tell "no goals" from
+ * "could not read goals".
+ */
+export type GoalsSection =
+  | { status: "ok"; goals: readonly GoalView[] }
+  | { status: "unavailable"; reason: string };
+
+/** Minimal read surface `resolveGoals` needs — `KnowledgeStorePort.listActiveGoals`. */
+export interface GoalsLookupPort {
+  listActiveGoals(): Promise<readonly GoalView[]>;
+}
+
+/**
+ * Read the approved DAO goals by one direct query — not the PER_DOMAIN_LIMIT
+ * domain scan, which silently drops older rows (bug.5280). Any failure,
+ * including `TooManyActiveGoalsError` (MAX_THREE_GOALS) or an unconfigured hub,
+ * becomes a visible `unavailable` state rather than a missing section.
+ */
+export async function resolveGoals(
+  port: GoalsLookupPort | undefined
+): Promise<GoalsSection> {
+  if (!port) {
+    return { status: "unavailable", reason: "knowledge hub not configured" };
+  }
+  try {
+    const goals = await port.listActiveGoals();
+    return {
+      status: "ok",
+      goals: goals.map((g) => ({
+        id: g.id,
+        title: g.title,
+        content: g.content,
+        evaluateAt: g.evaluateAt,
+      })),
+    };
+  } catch (e) {
+    return {
+      status: "unavailable",
+      reason: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
+/** `YYYY-MM-DD` from the `evaluate_at` column, or an explicit gap marker. */
+function goalDeadline(evaluateAt: Date | null): string {
+  return evaluateAt ? evaluateAt.toISOString().slice(0, 10) : "no deadline set";
+}
+
+/**
+ * Render the `## Goals` section lines: per goal its title, the deadline from
+ * the `evaluate_at` column (never parsed from content), then content verbatim.
+ */
+export function renderGoalsLines(goals: GoalsSection): string[] {
+  const head = ["", "## Goals", ""];
+  if (goals.status === "unavailable") {
+    return [...head, `goals unavailable: ${escapeCell(goals.reason)}`];
+  }
+  if (goals.goals.length === 0) return [...head, "no approved goals"];
+  return [
+    ...head,
+    ...goals.goals.flatMap((g, i) => [
+      ...(i > 0 ? [""] : []),
+      `### ${g.title}`,
+      "",
+      `By: ${goalDeadline(g.evaluateAt)} · \`${g.id}\``,
+      "",
+      g.content,
+    ]),
+  ];
+}
+
 export interface RenderBundleInput {
   node: string;
   name: string;
@@ -143,18 +238,92 @@ export interface RenderBundleInput {
   origin: string;
   buildSha: string;
   toolingInvariants: readonly string[];
-  skillsIndex: readonly CognitionSkillPointer[];
+  /** The hub's governing index (`KnowledgeStorePort.listGoverningIndex`). */
+  governingIndex: readonly CognitionGoverningPointer[];
   domainPointers: readonly CognitionDomainPointer[];
   /** The current node's `<slug>-agent-orientation` entry (full), or null if unseeded. */
   orientation: OrientationEntry | null;
+  /** Approved DAO goals, rendered right after the mission/orientation. */
+  goals: GoalsSection;
 }
 
 /**
  * Render the kickstart bundle as GFM markdown. A SessionStart hook echoes this
  * verbatim to stdout; Claude Code and Codex both inject SessionStart stdout
  * into the model's context.
+ *
+ * WHOLE_BUNDLE_BUDGET_64KIB: renders the whole governing index inline when the
+ * bundle fits `WHOLE_BUNDLE_BUDGET_BYTES`; otherwise re-renders with only the
+ * `method` shelf inline plus a pointer to pull other shelves (approach T).
  */
+export function renderBundle(input: RenderBundleInput): RenderedBundle {
+  const whole = renderWith(input, "whole-index");
+  const wholeBytes = utf8Bytes(whole);
+  if (wholeBytes <= WHOLE_BUNDLE_BUDGET_BYTES)
+    return {
+      markdown: whole,
+      governingRender: { mode: "whole-index", wholeBytes },
+    };
+  return {
+    markdown: renderWith(input, "shelf-pointer"),
+    governingRender: { mode: "shelf-pointer", wholeBytes },
+  };
+}
+
+/** `renderBundle(input).markdown`. */
 export function renderBundleMarkdown(input: RenderBundleInput): string {
+  return renderBundle(input).markdown;
+}
+
+/** Which governing section the bundle rendered: the whole index, or the `method` shelf plus a shelf-pull pointer. */
+export type GoverningMode = "whole-index" | "shelf-pointer";
+
+/** The rendered bundle plus how its governing section was rendered (eval row 0 reads this). */
+export interface RenderedBundle {
+  markdown: string;
+  governingRender: {
+    mode: GoverningMode;
+    /** UTF-8 bytes of the whole-index render, whether or not it was served. */
+    wholeBytes: number;
+  };
+}
+
+/** The governing section lines for one render mode. */
+function governingLines(
+  rows: readonly CognitionGoverningPointer[],
+  mode: GoverningMode,
+  origin: string
+): string[] {
+  const inline =
+    mode === "whole-index"
+      ? rows
+      : rows.filter((r) => r.domain === INLINE_FALLBACK_SHELF);
+  const tableRows =
+    inline.length > 0
+      ? inline.map(
+          (r) =>
+            `| \`${r.id}\` | ${r.entryType} | ${r.domain} | ${escapeCell(r.useWhen)} |`
+        )
+      : ["| _(none merged yet)_ | | | |"];
+  const lead =
+    mode === "whole-index"
+      ? "Every skill, guide, playbook, rule, design, decision and reference on this hub. " +
+        `Pick the rows whose use-when matches your task, then read each chosen entry (\`GET ${origin}/api/v1/knowledge/{id}\`) before acting.`
+      : `_The governing index (${rows.length} rows) exceeds the 64 KiB bundle budget, so only the \`${INLINE_FALLBACK_SHELF}\` shelf is inline. ` +
+        `Pick 1–3 shelves from the domains below and pull each with \`GET ${origin}/api/v1/knowledge/index?domain=<shelf>\`; ` +
+        "keep only skill, guide, playbook, rule, design, decision and reference rows, then read each chosen entry before acting._";
+  return [
+    "## Governing index — pick by use-when, read before acting",
+    "",
+    lead,
+    "",
+    "| entry | type | domain | use when |",
+    "| --- | --- | --- | --- |",
+    ...tableRows,
+  ];
+}
+
+function renderWith(input: RenderBundleInput, mode: GoverningMode): string {
   const {
     node,
     name,
@@ -164,13 +333,14 @@ export function renderBundleMarkdown(input: RenderBundleInput): string {
     buildSha,
     toolingInvariants,
     orientation,
+    goals,
   } = input;
-  const { skillsIndex, domainPointers } = input;
+  const { governingIndex, domainPointers } = input;
   // "2026-06-16 14:20" — human date, not an ISO wall of digits.
   const loadedAt = generatedAt.replace("T", " ").slice(0, 16);
   const subtitle = [
     mission,
-    `${skillsIndex.length} skills`,
+    `${governingIndex.length} governing entries`,
     `${domainPointers.length} domains`,
     `loaded ${loadedAt}`,
   ]
@@ -186,20 +356,6 @@ export function renderBundleMarkdown(input: RenderBundleInput): string {
   // a slugged test host. Concrete so agents stop guessing the hostname.
   const candidateHost =
     name === "operator" ? "test.cognidao.org" : `${name}-test.cognidao.org`;
-
-  const skillRows =
-    skillsIndex.length > 0
-      ? skillsIndex
-          .map(
-            // The column header has always said "use when"; before the
-            // `use_when` column existed it rendered the title, which is the
-            // claim, not the trigger. Prefer the real field and fall back to
-            // the title so a node that has not backfilled still shows a line.
-            (s) =>
-              `| \`${s.id}\` | ${s.entryType} | ${escapeCell(s.useWhen ?? s.title)} |`
-          )
-          .join("\n")
-      : "| _(none merged yet)_ | | |";
 
   const domainRows =
     domainPointers.length > 0
@@ -258,13 +414,10 @@ export function renderBundleMarkdown(input: RenderBundleInput): string {
     `> Delivered at session start from ${origin}/api/v1/cognition — replaces git-synced AGENTS.md sprawl. (node \`${node}\` · build \`${buildSha}\`)`,
     "",
     ...orientationLines,
+    ...renderGoalsLines(goals),
     ...toolingFloor,
     "",
-    "## Skills index (recall full content from the hub before acting)",
-    "",
-    "| entry | type | use when |",
-    "| --- | --- | --- |",
-    skillRows,
+    ...governingLines(governingIndex, mode, origin),
     "",
     "## Knowledge domains — RECALL_BEFORE_WRITE",
     "",

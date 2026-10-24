@@ -4,8 +4,10 @@
 /**
  * Module: `@app/_facades/work/items.server`
  * Purpose: Server-side facade for work item read/write operations across the markdown + Doltgres surfaces.
- * Scope: Maps port results to contract DTOs. Routes Doltgres-allocated IDs (5000+) to the Doltgres port from `getContainer()`; legacy markdown IDs to the markdown port.
+ * Scope: Maps content results to DTOs; does not own adapters or PostgreSQL coordination. Dolt IDs start at 5000; lower IDs use markdown.
  * Invariants: PORT_VIA_CONTAINER (no direct adapter imports), CONTRACTS_ARE_TRUTH, ID_RANGE_RESERVED.
+ *   Priority (including 0/1) carries no extra node-admin gate (task.5306); the store's own
+ *   author-scoped write authority applies unchanged.
  * Side-effects: IO (filesystem read via port; database read/write via Doltgres port)
  * Links: contracts/work.items.{list,get,create,patch}.v1.contract, work/items/task.0423.doltgres-work-items-source-of-truth.md
  * @internal
@@ -64,17 +66,106 @@ export class WorkItemAuthorizationError extends Error {
   }
 }
 
+/** Permanent retirement: cancel the durable item instead of reusing its identity. */
+export class WorkItemDeletionRetiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkItemDeletionRetiredError";
+  }
+}
+
+/** A current mutation may have committed; preserve lookup evidence and forbid automatic replay. */
+export class WorkItemWriteOutcomeUnknownError extends Error {
+  readonly code = "work_item_write_outcome_unknown";
+  readonly retryable = false;
+  constructor(
+    readonly operationId: string,
+    readonly branch: string,
+    readonly commitHash?: string,
+    readonly itemId?: string
+  ) {
+    super(
+      "Work-item write outcome is unknown; inspect the operation branch and main before retrying."
+    );
+    this.name = "WorkItemWriteOutcomeUnknownError";
+  }
+  get receipt() {
+    return {
+      code: this.code,
+      retryable: false as const,
+      lookup: {
+        operationId: this.operationId,
+        branch: this.branch,
+        commitHash: this.commitHash ?? null,
+        itemId: this.itemId ?? null,
+      },
+    };
+  }
+}
+
 /**
  * Thrown when the store was momentarily unavailable (query timeout, destroyed
  * connection, contended Dolt operation branch). RETRYABLE: the identical
  * request typically succeeds on the next attempt — the route answers 503 with
  * a retry hint, never an opaque 500.
  */
+
 export class WorkItemsBusyError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "WorkItemsBusyError";
   }
+}
+
+/**
+ * Thrown when a patch's `expectedRevision` no longer matches the row. RETRY
+ * AFTER RE-READ: nothing was written; the route answers 409 `revision_conflict`
+ * with the row's current revision.
+ */
+export class WorkItemRevisionConflictError extends Error {
+  readonly expectedRevision: number;
+  readonly currentRevision: number;
+
+  constructor(
+    message: string,
+    expectedRevision: number,
+    currentRevision: number
+  ) {
+    super(message);
+    this.name = "WorkItemRevisionConflictError";
+    this.expectedRevision = expectedRevision;
+    this.currentRevision = currentRevision;
+  }
+}
+
+/** One `scores` bound violation, as reported by `parseWorkItemScores`. */
+export type WorkItemScoresIssue = {
+  readonly code: string;
+  readonly path: readonly string[];
+  readonly message: string;
+};
+
+/**
+ * Thrown when a `scores` write broke the package bounds (story.5111).
+ * PERMANENT, CALLER'S ERROR: the adapter's `parseWorkItemScores` (the ONLY
+ * bounds check — SCORES_ONE_ENFORCER) rejected it before any SQL, so nothing
+ * was written; the route answers 400 with the package issues, never 500.
+ */
+export class WorkItemScoresInvalidError extends Error {
+  readonly code = "work_item_scores_invalid" as const;
+  constructor(readonly issues: readonly WorkItemScoresIssue[]) {
+    super("Invalid work-item scores");
+    this.name = "WorkItemScoresInvalidError";
+  }
+}
+
+function isScoresIssue(value: unknown): value is WorkItemScoresIssue {
+  const issue = value as Partial<WorkItemScoresIssue> | null;
+  return (
+    typeof issue?.code === "string" &&
+    typeof issue.message === "string" &&
+    Array.isArray(issue.path)
+  );
 }
 
 /**
@@ -92,11 +183,55 @@ function mapStoreError(e: unknown): unknown {
   if (name === "DoltgresNotConfiguredError") {
     return new WorkItemsBackendNotReadyError(message);
   }
+  if (name === "WorkItemWriteOutcomeUnknownError") {
+    const receipt = e as {
+      operationId?: unknown;
+      branch?: unknown;
+      commitHash?: unknown;
+      itemId?: unknown;
+    };
+    if (
+      typeof receipt.operationId === "string" &&
+      typeof receipt.branch === "string"
+    )
+      return new WorkItemWriteOutcomeUnknownError(
+        receipt.operationId,
+        receipt.branch,
+        typeof receipt.commitHash === "string" ? receipt.commitHash : undefined,
+        typeof receipt.itemId === "string" ? receipt.itemId : undefined
+      );
+    return e;
+  }
+  if (name === "WorkItemDeletionRetiredError") {
+    return new WorkItemDeletionRetiredError(message);
+  }
   if (name === "WorkItemAuthorizationError") {
     return new WorkItemAuthorizationError(message);
   }
+  if (name === "WorkItemScoresInvalidError") {
+    const issues = (e as { issues?: unknown }).issues;
+    return new WorkItemScoresInvalidError(
+      Array.isArray(issues) ? issues.filter(isScoresIssue) : []
+    );
+  }
   if (name === "WorkItemsBusyError") {
     return new WorkItemsBusyError(message);
+  }
+  if (name === "WorkItemRevisionConflictError") {
+    const { expectedRevision, currentRevision } = e as {
+      expectedRevision?: unknown;
+      currentRevision?: unknown;
+    };
+    if (
+      typeof expectedRevision === "number" &&
+      typeof currentRevision === "number"
+    ) {
+      return new WorkItemRevisionConflictError(
+        message,
+        expectedRevision,
+        currentRevision
+      );
+    }
   }
   return e;
 }
@@ -111,6 +246,7 @@ function toDto(item: WorkItem): WorkItemDto {
     priority: item.priority,
     rank: item.rank,
     estimate: item.estimate,
+    ...(item.scores !== undefined && { scores: item.scores }),
     summary: item.summary,
     outcome: item.outcome,
     projectId: item.projectId as string | undefined,
@@ -262,6 +398,7 @@ export async function createWorkItem(
         ...(input.priority !== undefined && { priority: input.priority }),
         ...(input.rank !== undefined && { rank: input.rank }),
         ...(input.estimate !== undefined && { estimate: input.estimate }),
+        ...(input.scores !== undefined && { scores: input.scores }),
       },
       authorTagFromSession(sessionUser)
     );
@@ -280,6 +417,9 @@ export async function patchWorkItem(
     const patched = await container.doltgresWorkItems.patch(
       {
         id: toWorkItemId(input.id),
+        ...(input.expectedRevision !== undefined && {
+          expectedRevision: input.expectedRevision,
+        }),
         set: dropUndefined(input.set),
       },
       authorTagFromSession(sessionUser)

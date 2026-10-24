@@ -94,6 +94,11 @@ export interface InProcGraphRequest {
     readonly tenantId?: string;
     readonly subjectId?: string;
     readonly graphId?: string;
+    /**
+     * Execution grant of a scheduled (grant-backed) run. Absent for API/chat runs; threaded into
+     * tool authz audit.
+     */
+    readonly grantId?: string;
   };
 }
 

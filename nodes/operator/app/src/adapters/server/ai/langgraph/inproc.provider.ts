@@ -12,6 +12,10 @@
  *   - NODE_BUNDLE_IS_CANONICAL: Resolves BoundTool from injected node bundle (CORE_TOOL_BUNDLE [+ POLY_TOOL_BUNDLE for poly]); never iterates the global TOOL_CATALOG (which is per-package and can drift behind per-node bundles).
  *   - DENY_BY_DEFAULT: Tool policy explicitly provided per graph
  *   - MCP_VIA_ASYNC_SOURCE: MCP tools resolved via async getMcpToolSource() function (shared cache with reconnect-on-error)
+ *   - TOOL_AUTHZ_CONTEXT_ALWAYS_THREADED (authz v0): actor/tenant/graph/node/grant reach the tool runner with or
+ *     without an authz adapter, plus one `ai.tool_authz.decision` log per evaluated call; `authz` only when installed.
+ *   - CATALOG_REPORT_SEAM: a catalog entry's `report` (not a graph name) decides whether the run's structured
+ *     telemetry is logged as registered events and echoed onto the stream; graphs never touch the logger or ALS.
  * Side-effects: IO (executes graphs via package runner, MCP tool resolution via HTTP)
  * Notes: Discovery is in LangGraphInProcAgentCatalogProvider, not here.
  * Links: GRAPH_EXECUTION.md, LANGGRAPH_AI.md
@@ -30,6 +34,8 @@ import {
   type CompletionFn,
   type CreateGraphFn,
   createInProcGraphRunner,
+  GRAPH_REPORT_CLOSE,
+  GRAPH_REPORT_OPEN,
   type GraphResult,
   type InProcGraphRequest,
   type ToolExecFn,
@@ -82,6 +88,13 @@ interface ProviderCatalogEntry {
   readonly mcpServerIds?: readonly string[];
   readonly graphFactory: CreateGraphFn;
   readonly systemPrompt?: string;
+  /** Graph-owned run report to log + echo on the stream (CatalogEntry.report). */
+  readonly report?: GraphReportDecl;
+}
+
+/** CatalogEntry.report: the registered event name for the graph's telemetry. */
+interface GraphReportDecl {
+  readonly event: string;
 }
 
 /**
@@ -239,13 +252,40 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
         const toolRunner = createToolRunner(source, emit, {
           policy,
           ctx: { runId },
+          // authz v0: trusted identity + audit flow regardless of adapter presence — declared
+          // node policies are evaluated with or without OpenFGA; `authz` only when installed.
+          // Undeclared tools keep the legacy path (authz-checked only when an adapter exists).
+          ...(actorId !== undefined ? { actorId } : {}),
+          tenantId,
+          graphId,
+          ...(scope.nodeId !== undefined ? { nodeId: scope.nodeId } : {}),
+          ...(scope.grantId !== undefined ? { grantId: scope.grantId } : {}),
+          onAuthzDecision: (record) => {
+            const fields = {
+              event: EVENT_NAMES.AI_TOOL_AUTHZ_DECISION,
+              runId,
+              graphName,
+              tool: record.toolName,
+              toolCallId: record.toolCallId,
+              decision: record.decision,
+              code: record.code,
+              policy: record.policy,
+              ...(record.reason !== undefined && {
+                reason: record.reason.slice(0, 200),
+              }),
+              actorId: record.actorId,
+              nodeId: record.nodeId,
+              graphId: record.graphId,
+              grantId: record.grantId,
+            };
+            if (record.decision === "allow") {
+              this.log.info(fields, "tool authz decision");
+            } else {
+              this.log.warn(fields, "tool authz decision");
+            }
+          },
           ...(this.authorization !== undefined
-            ? {
-                authz: this.authorization,
-                ...(actorId !== undefined ? { actorId } : {}),
-                tenantId,
-                graphId,
-              }
+            ? { authz: this.authorization }
             : {}),
         });
 
@@ -298,10 +338,12 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
             : {}),
           tenantId: scope.billing.billingAccountId,
           graphId,
+          // Scheduled-run signal for graphs (absent for API/chat runs).
+          ...(scope.grantId !== undefined ? { grantId: scope.grantId } : {}),
         },
       };
 
-      return createInProcGraphRunner({
+      const runner = createInProcGraphRunner({
         createGraph: entry.graphFactory,
         completionFn,
         createToolExecFn,
@@ -315,12 +357,31 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
           systemPrompt: entry.systemPrompt,
         }),
       });
+      // CatalogEntry.report: the graph's own report → registry events (graphs have no logger).
+      const report = entry.report;
+      if (report) {
+        void runner.final
+          .then((result) => {
+            for (const fields of graphReportLogFields(
+              report,
+              runId,
+              result.structuredOutput
+            )) {
+              this.log.info(fields, "graph report");
+            }
+          })
+          .catch(() => {
+            // Run failure is already logged by the inproc error path.
+          });
+      }
+      return runner;
     };
 
     // Execute: resolve MCP (if needed) then run graph.
     // Returns {stream, final} synchronously per GraphRunResult contract;
     // the inner async generator awaits the promise.
     const innerResult = resolveMcpAndExecute();
+    const report = entry.report;
 
     const stream = (async function* () {
       let inner: Awaited<ReturnType<typeof resolveMcpAndExecute>>;
@@ -334,7 +395,14 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
         yield { type: "done" as const };
         return;
       }
-      yield* inner.stream;
+      for await (const event of inner.stream) {
+        // CatalogEntry.report: echo the telemetry as one text delta just before `done`.
+        if (event.type === "done" && report) {
+          const delta = graphReportDelta((await inner.final).structuredOutput);
+          if (delta) yield { type: "text_delta" as const, delta };
+        }
+        yield event;
+      }
     })();
 
     const final = innerResult.then(
@@ -476,4 +544,29 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
       }),
     };
   }
+}
+
+/**
+ * Log lines for a catalog-declared report: one `report.event` from `structuredOutput.telemetry`. Empty when
+ * the output carries none.
+ */
+export function graphReportLogFields(
+  report: GraphReportDecl,
+  runId: string,
+  structuredOutput: Record<string, unknown> | undefined
+): Record<string, unknown>[] {
+  const telemetry = structuredOutput?.telemetry;
+  return telemetry && typeof telemetry === "object"
+    ? [{ event: report.event, runId, ...telemetry }]
+    : [];
+}
+
+/** The stream echo of a catalog-declared report (`<graph_report>{telemetry}</graph_report>`), or null. */
+export function graphReportDelta(
+  structuredOutput: Record<string, unknown> | undefined
+): string | null {
+  const telemetry = structuredOutput?.telemetry;
+  return telemetry && typeof telemetry === "object"
+    ? `\n${GRAPH_REPORT_OPEN}${JSON.stringify(telemetry)}${GRAPH_REPORT_CLOSE}\n`
+    : null;
 }
