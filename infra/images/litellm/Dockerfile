@@ -13,3 +13,5 @@ RUN pip install --no-cache-dir httpx>=0.27
 
 # Copy custom callback module
 COPY cogni_callbacks.py /app/cogni_callbacks.py
+
+# TEST ONLY bug.5535: unsupported neighboring path fixture; never merge or deploy.
