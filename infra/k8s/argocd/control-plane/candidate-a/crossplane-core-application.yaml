@@ -84,3 +84,5 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
+
+# TEST ONLY bug.5535: mixed-lane classifier fixture; never merge or deploy.

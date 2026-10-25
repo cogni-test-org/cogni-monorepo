@@ -187,3 +187,5 @@ class CogniNodeRouter(CustomLogger):
 # Module-level instance — LiteLLM `callbacks` config expects an instance, not a class.
 # Config: `callbacks: cogni_callbacks.cogni_node_router`
 cogni_node_router = CogniNodeRouter()
+
+# TEST ONLY bug.5535: mixed-lane classifier fixture; never merge or deploy.
