@@ -463,3 +463,7 @@ patches:
                     value: candidate-a
                   - name: FORK_DOMAIN_ROOT
                     value: cognidao.org
+  - target:
+      kind: Deployment
+      name: node-app
+    path: .prepare-init-compatibility.json
