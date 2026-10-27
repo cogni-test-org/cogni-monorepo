@@ -46,7 +46,7 @@ transformers:
 images:
   - name: ghcr.io/cogni-dao/cogni-template
     newName: ghcr.io/cogni-dao/cogni-template
-    digest: "sha256:85bad1fdda372732f70d2a1b57e33ed027fd80c506c76e0a34c9230b4110b27b"
+    digest: "sha256:aef59ccd417ce70ad2f904aec41628c629cf080c1f582f6cd3f1655f4f8074f2"
 replacements:
   - source:
       kind: Application
@@ -463,7 +463,3 @@ patches:
                     value: candidate-a
                   - name: FORK_DOMAIN_ROOT
                     value: cognidao.org
-  - target:
-      kind: Deployment
-      name: node-app
-    path: .prepare-init-compatibility.json
