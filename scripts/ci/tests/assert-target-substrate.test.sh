@@ -825,7 +825,8 @@ case "$1" in
   *) exit 1 ;;
 esac
 EOF
-for command in flock systemctl netfilter-persistent; do
+# This parent's existing hardener installs persistence unconditionally.
+for command in flock systemctl netfilter-persistent apt-get; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$NEW_HARDEN_BIN/$command"
 done
 chmod +x "$NEW_HARDEN_BIN/"*
