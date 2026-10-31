@@ -14,6 +14,7 @@
  * @public
  */
 
+import { KnowledgeRowSchema } from "@cogni/shared-knowledge-store/contracts";
 import { z } from "zod";
 
 import type { KnowledgeCapability } from "../capabilities/knowledge";
@@ -42,23 +43,19 @@ export const KnowledgeReadInputSchema = z
       .max(50)
       .optional()
       .describe("Max results for list mode (1-50, default 20)"),
+    includeEdo: z
+      .boolean()
+      .optional()
+      .describe(
+        "List mode only: include EDO rows (event/hypothesis/decision/outcome); default false"
+      ),
   })
   .refine((d) => d.id || d.domain, {
     message: "Either 'id' or 'domain' is required",
   });
 export type KnowledgeReadInput = z.infer<typeof KnowledgeReadInputSchema>;
 
-export const KnowledgeReadEntrySchema = z.object({
-  id: z.string(),
-  domain: z.string(),
-  entityId: z.string().nullable(),
-  title: z.string(),
-  content: z.string(),
-  confidencePct: z.number().nullable(),
-  sourceType: z.string(),
-  sourceRef: z.string().nullable(),
-  tags: z.array(z.string()).nullable(),
-});
+export const KnowledgeReadEntrySchema = KnowledgeRowSchema;
 
 export const KnowledgeReadOutputSchema = z.object({
   mode: z.enum(["get", "list"]),
@@ -84,6 +81,7 @@ export const knowledgeReadContract: ToolContract<
     "Use with 'id' to get a specific entry, or 'domain' to list entries (optionally filtered by tags). " +
     "Each entry includes a confidence score (0-100): 30=draft, 80=verified, 95+=hardened.",
   effect: "read_only",
+  requires: "node.collaborate",
   inputSchema: KnowledgeReadInputSchema,
   outputSchema: KnowledgeReadOutputSchema,
   redact: (output) => output,
@@ -105,21 +103,7 @@ export function createKnowledgeReadImplementation(
         const entry = await deps.knowledgeCapability.get(input.id);
         return {
           mode: "get" as const,
-          entries: entry
-            ? [
-                {
-                  id: entry.id,
-                  domain: entry.domain,
-                  entityId: entry.entityId,
-                  title: entry.title,
-                  content: entry.content,
-                  confidencePct: entry.confidencePct,
-                  sourceType: entry.sourceType,
-                  sourceRef: entry.sourceRef,
-                  tags: entry.tags,
-                },
-              ]
-            : [],
+          entries: entry ? [{ ...entry }] : [],
           totalFound: entry ? 1 : 0,
         };
       }
@@ -130,20 +114,11 @@ export function createKnowledgeReadImplementation(
         domain,
         tags: input.tags,
         limit: input.limit ?? 20,
+        ...(input.includeEdo ? { includeEdo: true } : {}),
       });
       return {
         mode: "list" as const,
-        entries: entries.map((e) => ({
-          id: e.id,
-          domain: e.domain,
-          entityId: e.entityId,
-          title: e.title,
-          content: e.content,
-          confidencePct: e.confidencePct,
-          sourceType: e.sourceType,
-          sourceRef: e.sourceRef,
-          tags: e.tags,
-        })),
+        entries: entries.map((e) => ({ ...e })),
         totalFound: entries.length,
       };
     },

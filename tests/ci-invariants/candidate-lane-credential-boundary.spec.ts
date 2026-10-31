@@ -47,6 +47,7 @@ const CANDIDATE_WORKFLOWS = [
 
 interface WorkflowStep {
   name?: string;
+  if?: string;
   run?: string;
   env?: Record<string, unknown>;
   with?: Record<string, unknown>;
@@ -160,6 +161,30 @@ describe.each(CANDIDATE_WORKFLOWS)("%s", (workflowPath) => {
     expect(jobs.length).toBeGreaterThan(0);
   });
 
+  it("keeps foreign compute convergence public-only without control credentials", () => {
+    if (workflowPath !== ".github/workflows/candidate-flight.yml") return;
+    const verify = parsed.jobs?.["verify-candidate"];
+    expect(jobEnvironmentName(verify?.environment)).toBe("candidate-a");
+    const wait = verify?.steps?.find(
+      (step) => step.name === "Wait for external ComputeWorkload readiness"
+    );
+    expect(wait).toBeDefined();
+    expect(wait?.if).toBe(
+      "steps.ssh-setup.outputs.has_vm == 'true' && env.DEPLOYMENT_PROVIDER != 'k3s'"
+    );
+    expect(wait?.with?.public_only).toBe(
+      "${{ steps.custody.outputs.control_env != 'candidate-a' }}"
+    );
+    expect(wait?.with?.manifest).toBe(
+      "${{ steps.workload-manifest.outputs.path }}"
+    );
+    const finalVerify = verify?.steps?.find(
+      (step) => step.name === "Verify buildSha on endpoint (per-node)"
+    );
+    expect(finalVerify?.env?.CUTOVER_TIMEOUT).toBe("420");
+    expect(finalVerify?.env?.VERIFY_BUNDLE_MARKER).toBe("1");
+  });
+
   it("LANE_CREDENTIALS_MATCH_LANE: a step holding VM credentials for a named lane runs in that lane's environment", () => {
     const violations: string[] = [];
 
@@ -217,16 +242,34 @@ describe.each(CANDIDATE_WORKFLOWS)("%s", (workflowPath) => {
     expect(violations).toEqual([]);
   });
 
-  it("CUSTODIAN_BRIDGE_IS_EXACT: only the reviewed wrapper and SSH setup receive custody authority", () => {
+  it("CUSTODIAN_BRIDGE_IS_EXACT: only SSH setup and the reviewed wrapper receive custody authority", () => {
     if (workflowPath !== ".github/workflows/candidate-flight.yml") return;
     const jobId = "external-node-preflight";
     const job = parsed.jobs?.[jobId];
     expect(job).toBeDefined();
     if (!job) throw new Error("external-node-preflight job is required");
     const credentialSteps = job?.steps?.filter(readsVmCredentials) ?? [];
-    expect(credentialSteps).toHaveLength(2);
+    expect(credentialSteps.map((step) => step.name)).toEqual([
+      "Setup SSH to candidate-a VM",
+      "Provision node state and assert Akash prerequisites",
+    ]);
+    for (const step of job.steps ?? []) {
+      expect(step.name).not.toBe(
+        "Read owning candidate producer inventory before mutation"
+      );
+      expect(step.run ?? "").not.toMatch(
+        /maintenance-drain\.mjs|candidate-preflight/
+      );
+    }
     for (const step of credentialSteps) {
       expect(isCustodianBridgeStep(workflowPath, jobId, job, step)).toBe(true);
+      expect(
+        isCustodianBridgeStep(workflowPath, jobId, job, {
+          ...step,
+          name: "Read owning candidate producer inventory before mutation",
+          run: "pnpm exec tsx scripts/ops/maintenance-drain.mjs candidate-preflight",
+        })
+      ).toBe(false);
       expect(
         isCustodianBridgeStep(workflowPath, "application", job, step)
       ).toBe(false);

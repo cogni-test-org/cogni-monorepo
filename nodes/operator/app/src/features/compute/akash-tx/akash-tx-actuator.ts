@@ -73,7 +73,7 @@
  * @internal
  */
 
-import { createHash, X509Certificate } from "node:crypto";
+import { X509Certificate } from "node:crypto";
 import { rootCertificates } from "node:tls";
 
 import type { ProvisionOutput, ProvisionSpec } from "@cogni/ai-tools";
@@ -82,10 +82,12 @@ import {
   type AkashAllocationProbe,
   type AkashTxActuatorPort,
   type AkashTxAllocationLedgerPort,
+  type AkashTxAllocationPolicy,
   type AkashTxAllocationRecord,
   type AkashTxCompositeVerdict,
   type AkashTxConsolePort,
   type AkashTxCreateResult,
+  type AkashTxDatabaseCellRecoveryInput,
   AkashTxError,
   type AkashTxErrorCode,
   type AkashTxLeaseLogSource,
@@ -103,8 +105,12 @@ import {
   type ComputeCostStorePort,
   type NodeMigrationReportStorePort,
 } from "@/ports";
-
+import type { DatabaseCellAppliedCustody } from "@/types/database-cell";
 import { runMigrationStep } from "./akash-tx-migration-step";
+import {
+  DatabaseCellRecoveryProfileSchema,
+  databaseCellRecoveryIntent,
+} from "./database-cell-recovery";
 
 /** Structural pino subset. Fields first, stable marker second. */
 export interface AkashTxLogger {
@@ -154,6 +160,12 @@ export interface AkashTxActuatorDeps {
    * whatever history exists, but recovery attempts record nothing (test/degraded mode).
    */
   readonly outcomes?: AkashTxProviderOutcomesPort;
+  readonly recoveryProfile?: () => Promise<unknown>;
+  /** Read current private custody afresh; historical DSN hashes are not release pins. */
+  readonly appliedCellCustody?: (
+    nodeId: string,
+    environment: "production"
+  ) => Promise<DatabaseCellAppliedCustody>;
 }
 
 const SYSTEM_ROOT_FINGERPRINTS = new Set(
@@ -351,6 +363,8 @@ export class AkashTxActuator implements AkashTxActuatorPort {
   private readonly costStore: ComputeCostStorePort;
   private readonly providerConsumerAccountId: string;
   private readonly outcomes?: AkashTxProviderOutcomesPort;
+  private readonly recoveryProfile?: () => Promise<unknown>;
+  private readonly appliedCellCustody?: AkashTxActuatorDeps["appliedCellCustody"];
   /**
    * Per-process load-shed for boot_ok writes on every observe tick — correctness comes
    * from the DB's unique (lease_id, outcome), never from this cache (task.5153).
@@ -368,6 +382,9 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     this.costStore = deps.costStore;
     this.providerConsumerAccountId = deps.providerConsumerAccountId;
     if (deps.outcomes) this.outcomes = deps.outcomes;
+    if (deps.recoveryProfile) this.recoveryProfile = deps.recoveryProfile;
+    if (deps.appliedCellCustody)
+      this.appliedCellCustody = deps.appliedCellCustody;
   }
 
   async observe(input: {
@@ -484,6 +501,93 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       ),
       spec: input.spec,
     });
+    return this.allocate(input);
+  }
+
+  /** References only: applied source identity admits capacity, never an app release. */
+  async createDatabaseCellRecovery(
+    input: AkashTxDatabaseCellRecoveryInput
+  ): Promise<AkashTxCreateResult> {
+    const parsed = DatabaseCellRecoveryProfileSchema.safeParse(
+      await this.recoveryProfile?.()
+    );
+    if (
+      !parsed.success ||
+      !parsed.data.enabled ||
+      parsed.data.funding_status !== "qualified"
+    ) {
+      const reasonCode = !parsed.success
+        ? "profile_unavailable"
+        : !parsed.data.enabled
+          ? "profile_disabled"
+          : "funding_unqualified";
+      this.log.warn(
+        {
+          cogniKey: input.cogniKey,
+          nodeId: input.identity.nodeId,
+          environment: input.environment,
+          profileId: "pg15-cold-capacity-v1",
+          reasonCode,
+        },
+        "akash_tx_database_cell_recovery_refused"
+      );
+      throw new AkashTxError(
+        "invalid_request",
+        "cold recovery profile unavailable, disabled or funding unqualified"
+      );
+    }
+    const source = await this.readLedger(input.recovery.sourceCogniKey);
+    const bindings =
+      source?.appliedDatabaseCellBinding?.filter(
+        ({ binding }) =>
+          binding.phase === "applied" &&
+          binding.nodeId === input.identity.nodeId &&
+          binding.nodeSlug === input.nodeSlug &&
+          binding.environment === input.environment &&
+          binding.receiptId === source.receiptId &&
+          binding.cogniKey === source.cogniKey &&
+          source.providerAccount !== undefined &&
+          binding.providerAccount === source.providerAccount &&
+          binding.dseq === input.recovery.sourceExternalName &&
+          binding.systemIdentifier === input.recovery.sourceSystemIdentifier
+      ) ?? [];
+    if (
+      !source ||
+      source.state !== "allocated" ||
+      source.retentionPolicy !== "retain" ||
+      source.identity.nodeId !== input.identity.nodeId ||
+      source.environment !== input.environment ||
+      source.externalName !== input.recovery.sourceExternalName ||
+      bindings.length !== 1 ||
+      input.cogniKey === source.cogniKey ||
+      input.recovery.profileId !== "pg15-cold-capacity-v1"
+    )
+      throw new AkashTxError(
+        "identity_conflict",
+        "recovery source lacks one owned retained applied binding"
+      );
+    const intent = databaseCellRecoveryIntent(input, source, parsed.data);
+    if (input.cogniKey !== intent.key)
+      throw new AkashTxError(
+        "identity_conflict",
+        "recovery key differs from immutable source and policy"
+      );
+    return this.allocate({
+      ...input,
+      spec: intent.spec,
+      allocationPolicy: intent.policy,
+      recoveryFamilyPrefix: intent.familyPrefix,
+    });
+  }
+
+  private async allocate(input: {
+    cogniKey: string;
+    environment: string;
+    identity: AkashTxWorkloadIdentity;
+    spec: ProvisionSpec;
+    allocationPolicy?: AkashTxAllocationPolicy;
+    recoveryFamilyPrefix?: string;
+  }): Promise<AkashTxCreateResult> {
     // The claim IS the receipt, and it is the FIRST mutation this method does: its INSERT carries
     // {nodeId, environment, compositeUid, compositeGeneration, cogniKey}. Everything below this
     // line — the cursor read and the paid POST — happens strictly after that row is durable.
@@ -533,6 +637,15 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       );
     }
 
+    // A preparing receipt is not transferable request ownership. Another pod may
+    // still be executing it; only observe/sweeper may resolve abandoned custody.
+    if (input.recoveryFamilyPrefix && claim.state === "owned")
+      throw new AkashTxError(
+        "wallet_allocation_blocked",
+        "recovery receipt already preparing; observe its durable outcome",
+        input.cogniKey
+      );
+
     if (claim.state === "settled") {
       if (claim.record.externalName) {
         this.log.info(
@@ -574,6 +687,43 @@ export class AkashTxActuator implements AkashTxActuatorPort {
         "allocation_rolled_back",
         "the previous attempt under this key is proven closed; its receipt was settled — retry with the same key"
       );
+    }
+
+    const recoveryFamilyPrefix = input.recoveryFamilyPrefix;
+    if (recoveryFamilyPrefix) {
+      try {
+        const receipts = await this.ledger.listReceipts({
+          nodeId: input.identity.nodeId,
+          environment: input.environment,
+          limit: 100,
+        });
+        if (
+          receipts.length >= 100 ||
+          receipts.some(
+            (record) =>
+              record.cogniKey !== input.cogniKey &&
+              record.cogniKey.startsWith(recoveryFamilyPrefix)
+          )
+        )
+          throw new AkashTxError(
+            "identity_conflict",
+            "recovery family already has a target or receipt scan is truncated"
+          );
+      } catch (error) {
+        // No cursor/handle and no provider IO: only this unused claim is safe to fail.
+        const current = await this.readLedger(input.cogniKey);
+        if (
+          current?.state === "preparing" &&
+          !current.externalName &&
+          !current.allocationCursor
+        )
+          await this.ledger.fail({
+            cogniKey: input.cogniKey,
+            failureCode: "recovery_family_refused",
+          });
+        if (error instanceof AkashTxError) throw error;
+        throw this.ledgerUnavailable(error, input.cogniKey, "recovery family");
+      }
     }
 
     // task.5153 — LEDGER-DERIVED TRIED SET + STRIKE ON RECOVERY ENTRY. Crossplane
@@ -657,6 +807,9 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     try {
       allocated = await this.console.allocateAndLease({
         spec: input.spec,
+        ...(input.allocationPolicy
+          ? { allocationPolicy: input.allocationPolicy }
+          : {}),
         ...(excludedProviders && excludedProviders.size > 0
           ? { excludedProviders }
           : {}),
@@ -708,7 +861,7 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     });
     await this.ledger.recordAppliedSdlHash({
       cogniKey: input.cogniKey,
-      sdlHash: this.console.sdlHash(input.spec),
+      sdlHash: this.console.sdlHash(input.spec, input.allocationPolicy),
     });
     const allocationRecord = await this.requireStoredHandle(
       input.cogniKey,
@@ -1001,7 +1154,7 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     );
   }
 
-  /** Initial admission stays immutable; app releases preserve its consumer/pool boundary. */
+  /** App releases use current owned credentials; retained-cell recovery keeps its own guards. */
   private async requireQualifiedCellRelease(input: {
     cogniKey: string;
     environment: string;
@@ -1086,22 +1239,60 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       const consumer = consumers[0];
       const env = consumer?.env;
       // provider-http resolves the owned references before this private wire call.
-      // Compare the actual credentials with their immutable audited digests.
-      const digest = (value: string | undefined) =>
-        value === undefined
-          ? undefined
-          : createHash("sha256").update(value).digest("hex");
+      // A moved endpoint or rotated password must not require rewriting a cutover receipt.
+      let custody: DatabaseCellAppliedCustody;
+      let app: URL;
+      let service: URL;
+      try {
+        if (!this.appliedCellCustody) throw new Error();
+        custody = await this.appliedCellCustody(
+          cell.binding.nodeId,
+          input.environment
+        );
+        app = new URL(custody.app.dsn);
+        service = new URL(custody.service.dsn);
+      } catch {
+        throw new AkashTxError(
+          "ledger_unavailable",
+          "current database cell custody unavailable"
+        );
+      }
+      const ownedConsumers = [
+        { url: app, role: cell.binding.appRole },
+        { url: service, role: cell.binding.serviceRole },
+      ].every(
+        ({ url, role }) =>
+          url.protocol === "postgresql:" &&
+          url.hostname === custody.canonicalEndpointHost &&
+          url.port !== "" &&
+          url.port === app.port &&
+          url.username === role &&
+          url.pathname === `/${cell.binding.databaseName}` &&
+          url.searchParams.get("sslmode") === "verify-full"
+      );
       const ca = env?.DATABASE_SSL_CA_CERT?.replaceAll("\\n", "\n");
       const tlsMatches =
-        cell.registration?.tlsTrustKind === "system"
+        custody.tls.kind === "system"
           ? usesSystemTrust(ca)
-          : ca !== undefined && digest(ca) === cell.registration?.tlsCaSha256;
+          : ca?.trim() ===
+            custody.tls.caCertificate.replaceAll("\\n", "\n").trim();
+      const currentPools = custody.runtimePoolLimits;
       if (
         consumers.length !== 1 ||
         !env ||
-        digest(env.DATABASE_URL) !== cell.registration?.appDsnSha256 ||
-        digest(env.DATABASE_SERVICE_URL) !==
-          cell.registration?.serviceDsnSha256 ||
+        custody.nodeId !== cell.binding.nodeId ||
+        custody.nodeSlug !== input.workload ||
+        custody.environment !== input.environment ||
+        custody.databaseName !== cell.binding.databaseName ||
+        custody.appRole !== cell.binding.appRole ||
+        custody.serviceRole !== cell.binding.serviceRole ||
+        !ownedConsumers ||
+        currentPools?.replicaCount !== pools.replicaCount ||
+        currentPools.app !== pools.app ||
+        currentPools.service !== pools.service ||
+        currentPools.read !== pools.read ||
+        env.DATABASE_URL !== custody.app.dsn ||
+        env.DATABASE_SERVICE_URL !== custody.service.dsn ||
         !tlsMatches ||
         env.COGNI_REPO_SHA !== input.requestedShas[0] ||
         env.DB_POOL_MAX !== String(pools.app) ||

@@ -40,10 +40,6 @@ env:
   OVERLAY_ENV: candidate-a
   # Public workload zone for fork-aware generated scheduler routes.
   FORK_DOMAIN_ROOT: ${{ vars.FORK_DOMAIN_ROOT || 'cognidao.org' }}
-  # Capture the repository's workload ROOT before a job selects its GitHub Environment.
-  # candidate-a's DOMAIN may be an operator apex; routing renders every lane from the root.
-  # Environment-level variables do not overwrite this workflow env context (GitHub variables reference).
-  DOMAIN: ${{ vars.DOMAIN }}
   # FLEET_CONTROL_ENV (subtask.5007): the env whose cluster reconciles + pays for akash
   # lanes. Default 'production' (cogni-dao fleet); an isolated fleet (cogni-test-org) sets
   # the repo var to 'candidate-a' so its own control plane owns akash lanes and no test
@@ -335,11 +331,13 @@ jobs:
         working-directory: app-src
         env:
           FLIGHT_TARGETS_JSON: ${{ steps.flight-targets.outputs.flight_targets_json }}
+          PARENT_SOURCE_SHA: ${{ steps.meta.outputs.head_sha }}
         run: |
           pnpm --filter operator materialize:compute-workload \
             --catalog-root "${GITHUB_WORKSPACE}/app-src/infra/catalog" \
             --environment candidate-a \
             --flight-targets-json "$FLIGHT_TARGETS_JSON" \
+            --source-sha "$PARENT_SOURCE_SHA" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -413,82 +411,19 @@ jobs:
           path: ${{ runner.temp }}/resolved-pr-images.json
           retention-days: 1
 
-  reconcile-compute-egress:
-    needs: decide
-    if: needs.decide.result == 'success'
-    runs-on: ubuntu-latest
-    environment: candidate-a
-    steps:
-      - name: Checkout reviewed application source
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
-        with:
-          ref: ${{ needs.decide.outputs.head_sha }}
-          fetch-depth: 1
-          path: app-src
-
-      - name: Reconcile catalog-derived external compute egress
-        uses: ./app-src/.github/actions/reconcile-compute-egress
-        with:
-          app_source_root: ${{ github.workspace }}/app-src
-          environment: candidate-a
-          fork_domain_root: ${{ vars.FORK_DOMAIN_ROOT }}
-          vm_host: ${{ secrets.VM_HOST }}
-          ssh_deploy_key: ${{ secrets.SSH_DEPLOY_KEY }}
-
-  # A foreign-custodied lane's substrate (Postgres/Temporal/LiteLLM) lives on the
-  # CONTROL env's VM (production for cogni-dao nodes), not the candidate VM. The
-  # job above hardens the candidate VM only, so the Akash provider NAT hole for
-  # such lanes never reaches the machine their substrate answers from: the leased
-  # app boots but readyz?deep=1 dies on unreachable Postgres/Temporal. Same
-  # lane-vs-control conflation as bug.5216. This twin binds environment:
-  # production for its VM secrets while rendering the candidate-a lane allowlist —
-  # the action already separates those two concerns.
-  reconcile-compute-egress-control:
-    needs: decide
-    if: needs.decide.result == 'success'
-    runs-on: ubuntu-latest
-    # The control env owns the akash lane's substrate VM. Default 'production' (cogni-dao);
-    # an isolated fleet (cogni-test-org) binds its own control env via FLEET_CONTROL_ENV so
-    # this job reads that env's VM_HOST/SSH_DEPLOY_KEY, never production's (subtask.5007).
-    environment: ${{ vars.FLEET_CONTROL_ENV || 'production' }}
-    steps:
-      - name: Checkout reviewed application source
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
-        with:
-          ref: ${{ needs.decide.outputs.head_sha }}
-          fetch-depth: 1
-          path: app-src
-
-      - name: Reconcile lane egress on the control-env substrate VM
-        uses: ./app-src/.github/actions/reconcile-compute-egress
-        with:
-          app_source_root: ${{ github.workspace }}/app-src
-          environment: candidate-a
-          destination_environment: ${{ vars.FLEET_CONTROL_ENV || 'production' }}
-          fork_domain_root: ${{ vars.FORK_DOMAIN_ROOT }}
-          vm_host: ${{ secrets.VM_HOST }}
-          ssh_deploy_key: ${{ secrets.SSH_DEPLOY_KEY }}
-
+  # Shared firewall policy is applied only by the explicit infrastructure lane.
   prepare-substrate-deploy-branch:
-    needs:
-      [
-        decide,
-        reconcile-compute-egress,
-        reconcile-compute-egress-control,
-        external-node-preflight,
-      ]
+    needs: [decide, external-node-preflight]
     if: |
       always() &&
       needs.decide.result == 'success' &&
-      needs.decide.outputs.has_deployment_node_targets == 'true' &&
-      needs.reconcile-compute-egress.result == 'success' &&
-      needs.reconcile-compute-egress-control.result == 'success'
+      needs.decide.outputs.has_deployment_node_targets == 'true'
     strategy:
       fail-fast: false
       matrix:
         node: ${{ fromJson(needs.decide.outputs.deployment_node_targets_json) }}
     concurrency:
-      group: prepare-substrate-deploy-branch-candidate-a-${{ matrix.node }}
+      group: flight-candidate-a-${{ matrix.node }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     environment: candidate-a
@@ -616,6 +551,9 @@ jobs:
           DEPLOY_REPOSITORY: ${{ steps.deploy-repo.outputs.repository }}
           NODE: ${{ matrix.node }}
           PER_NODE_BRANCH: deploy/candidate-a-${{ matrix.node }}
+          SOURCE_REPOSITORY: ${{ fromJSON(needs.decide.outputs.source_repository_by_target_json)[matrix.node] }}
+          SOURCE_SHA: ${{ needs.decide.outputs.node_source_sha || fromJSON(needs.decide.outputs.source_sha_by_target_json)[matrix.node] }}
+          SOURCE_READ_TOKEN: ${{ secrets.GIT_READ_TOKEN || github.token }}
         run: |
           set -euo pipefail
           required=(
@@ -643,6 +581,7 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          python3 ../ci-src/scripts/ci/lib/maintenance-fence.py check .
 
           PRESERVED_IMAGE_REF=""
           if [ "$DEPLOYMENT_PROVIDER" = "k3s" ]; then
@@ -653,6 +592,11 @@ jobs:
             if ! PRESERVED_IMAGE_REF=$(extract_overlay_image_ref candidate-a "$NODE"); then
               PRESERVED_IMAGE_REF=""
             fi
+          fi
+
+          if [[ "$PRESERVED_IMAGE_REF" == *"@sha256:"* ]]; then
+            snapshot_overlay_init_contract candidate-a "$NODE" "$PRESERVED_IMAGE_REF" \
+              "$RUNNER_TEMP/preserved-init-${NODE}.json"
           fi
 
           rsync -a --delete ../app-src/infra/k8s/base/ infra/k8s/base/
@@ -668,6 +612,8 @@ jobs:
             # digest unchanged through this preliminary shape commit.
             bash ../ci-src/scripts/ci/promote-k8s-image.sh --no-commit \
               --env candidate-a --app "$NODE" --digest "$PRESERVED_IMAGE_REF"
+            restore_overlay_init_contract candidate-a "$NODE" "$PRESERVED_IMAGE_REF" \
+              "$RUNNER_TEMP/preserved-init-${NODE}.json"
           fi
           mkdir -p infra/catalog
           cp "../app-src/infra/catalog/${NODE}.yaml" "infra/catalog/${NODE}.yaml"
@@ -678,6 +624,7 @@ jobs:
               "nodes/${NODE}/k8s/external-secrets/candidate-a/"
           fi
 
+          python3 ../ci-src/scripts/ci/lib/maintenance-fence.py check .
           git add -A
           if git diff --cached --quiet; then
             echo "Deploy branch ${PER_NODE_BRANCH} already has substrate shape"
@@ -974,12 +921,11 @@ jobs:
           retention-days: 1
 
   external-node-preflight:
-    needs: [decide, reconcile-compute-egress, reconcile-compute-egress-control]
+    needs: decide
     if: |
       always() &&
-      needs.decide.outputs.has_external_compute_node_targets == 'true' &&
-      needs.reconcile-compute-egress.result == 'success' &&
-      needs.reconcile-compute-egress-control.result == 'success'
+      needs.decide.result == 'success' &&
+      needs.decide.outputs.has_external_compute_node_targets == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1282,7 +1228,7 @@ jobs:
         env: [candidate-a]
         node: ${{ fromJson(needs.decide.outputs.flight_targets_json) }}
     concurrency:
-      group: candidate-flight-pipeline-${{ matrix.env }}-${{ matrix.node }}
+      group: flight-candidate-a-${{ matrix.node }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     environment: candidate-a
@@ -1380,6 +1326,9 @@ jobs:
           GH_TOKEN: ${{ steps.deploy-app.outputs.token || github.token }}
           DEPLOY_REPOSITORY: ${{ steps.deploy-repo.outputs.repository }}
           PER_NODE_BRANCH: deploy/${{ matrix.env }}-${{ matrix.node }}
+          SOURCE_REPOSITORY: ${{ fromJSON(needs.decide.outputs.source_repository_by_target_json)[matrix.node] }}
+          SOURCE_SHA: ${{ needs.decide.outputs.node_source_sha || fromJSON(needs.decide.outputs.source_sha_by_target_json)[matrix.node] }}
+          SOURCE_READ_TOKEN: ${{ secrets.GIT_READ_TOKEN || github.token }}
         run: |
           set -euo pipefail
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${DEPLOY_REPOSITORY}.git" deploy-branch
@@ -1394,6 +1343,7 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          python3 ../ci-src/scripts/ci/lib/maintenance-fence.py check .
 
       - name: Sync base + per-node overlay + per-node catalog to deploy branch
         if: matrix.node != 'scheduler-worker'
@@ -1462,8 +1412,12 @@ jobs:
           PER_NODE_BRANCH: deploy/${{ matrix.env }}-${{ matrix.node }}
           NODE: ${{ matrix.node }}
           HEAD_SHA: ${{ needs.decide.outputs.head_sha }}
+          SOURCE_REPOSITORY: ${{ fromJSON(needs.decide.outputs.source_repository_by_target_json)[matrix.node] }}
+          SOURCE_SHA: ${{ needs.decide.outputs.node_source_sha || fromJSON(needs.decide.outputs.source_sha_by_target_json)[matrix.node] }}
+          SOURCE_READ_TOKEN: ${{ secrets.GIT_READ_TOKEN || github.token }}
         run: |
           set -euo pipefail
+          python3 ../ci-src/scripts/ci/lib/maintenance-fence.py check .
           git add -A
           if git diff --cached --quiet; then
             echo "No deploy-state changes to push"
@@ -1636,8 +1590,14 @@ jobs:
   # base/scheduler-worker onto that branch; Argo + the Reloader annotation (#1609) roll
   # the worker. Env-singleton, mirrors reconcile-dns: single per-env job, not per-node.
   reconcile-scheduler-worker-routing:
-    needs: [decide]
-    if: needs.decide.result == 'success'
+    needs: [decide, external-node-preflight]
+    # Shared routing is a watched-ref mutation too: selected external nodes must
+    # prove their native inventory before this job can publish any worker change.
+    if: |
+      always() && !cancelled() &&
+      needs.decide.result == 'success' &&
+      ((needs.decide.outputs.has_external_compute_node_targets == 'true' && needs.external-node-preflight.result == 'success') ||
+       (needs.decide.outputs.has_external_compute_node_targets == 'false' && needs.external-node-preflight.result == 'skipped'))
     # This is the ONLY writer of deploy/candidate-a-scheduler-worker. Routing and
     # an optional scheduler image promotion are committed locally and pushed
     # together, so concurrent flights cannot interleave two clone→push writers.
@@ -1745,6 +1705,7 @@ jobs:
           SWR_RECONCILE_NODE_SOURCE_SHA: ${{ needs.decide.outputs.node_source_sha }}
           SWR_RECONCILE_PR_NUMBER: ${{ needs.decide.outputs.resolved_pr_number }}
           SWR_RECONCILE_NODE_SLUG: ${{ needs.decide.outputs.node_slug }}
+          SWR_RECONCILE_FLIGHT_TARGETS_JSON: ${{ needs.decide.outputs.flight_targets_json }}
           SWR_RECONCILE_STATUS_URL: ${{ needs.decide.outputs.status_url }}
         run: |
           set -euo pipefail
@@ -1986,11 +1947,9 @@ jobs:
           WORKLOAD_FILE="$(compute_workload_manifest_file "$NODE" candidate-a)"
           echo "path=${GITHUB_WORKSPACE}/deploy-branch/infra/k8s/overlays/candidate-a/${NODE}/${WORKLOAD_FILE}" >> "$GITHUB_OUTPUT"
 
-      # A foreign-custodied lane's XCW lives on the CONTROL cluster (its AppSet is
-      # rendered under appsets/<control-env>/), not on this candidate VM. Polling the
-      # candidate VM for it is a structurally guaranteed resource_absent timeout
-      # (bug.5216, run 35281632015). Mirror the custody skip the AppSet-apply step
-      # already does; for those lanes the external /version probe below is the gate.
+      # A foreign-custodied lane's XCW lives on the CONTROL cluster, not this VM.
+      # Keep candidate credentials lane-bound and use the manifest's public SHA
+      # for the same convergence phase; never poll the wrong cluster or skip it.
       - name: Resolve lane custody
         id: custody
         if: steps.ssh-setup.outputs.has_vm == 'true' && env.DEPLOYMENT_PROVIDER != 'k3s'
@@ -2002,15 +1961,16 @@ jobs:
           CONTROL_ENV="$(CATALOG_DIR=app-src/infra/catalog control_env_for candidate-a "$NODE")"
           echo "control_env=$CONTROL_ENV" >> "$GITHUB_OUTPUT"
           if [ "$CONTROL_ENV" != "candidate-a" ]; then
-            echo "::notice::$NODE's candidate-a lane is custodied by '$CONTROL_ENV' — its XCW lives on that cluster; skipping the candidate-VM XCW wait and gating on the external /version probe."
+            echo "::notice::$NODE's candidate-a lane is custodied by '$CONTROL_ENV'; waiting for its exact public revision without control-plane access."
           fi
 
       - name: Wait for external ComputeWorkload readiness
-        if: steps.ssh-setup.outputs.has_vm == 'true' && env.DEPLOYMENT_PROVIDER != 'k3s' && steps.custody.outputs.control_env == 'candidate-a'
+        if: steps.ssh-setup.outputs.has_vm == 'true' && env.DEPLOYMENT_PROVIDER != 'k3s'
         uses: ./ci-src/.github/actions/wait-for-compute-workload
         with:
           app_source_root: ${{ github.workspace }}/app-src
           manifest: ${{ steps.workload-manifest.outputs.path }}
+          public_only: ${{ steps.custody.outputs.control_env != 'candidate-a' }}
           vm_host: ${{ secrets.VM_HOST }}
           ssh_identity: /home/runner/.ssh/deploy_key
 
@@ -2088,7 +2048,6 @@ jobs:
     needs:
       [
         decide,
-        reconcile-compute-egress,
         prepare-substrate-deploy-branch,
         node-substrate,
         assert-substrate,
@@ -2109,7 +2068,6 @@ jobs:
           HAS_DEPLOYMENT_NODE_TARGETS: ${{ needs.decide.outputs.has_deployment_node_targets }}
           HAS_EXTERNAL_COMPUTE_NODE_TARGETS: ${{ needs.decide.outputs.has_external_compute_node_targets }}
           HAS_SUBSTRATE_NODE_TARGETS: ${{ needs.decide.outputs.has_substrate_node_targets }}
-          COMPUTE_EGRESS_RESULT: ${{ needs.reconcile-compute-egress.result }}
           PREPARE_SUBSTRATE_DEPLOY_BRANCH_RESULT: ${{ needs.prepare-substrate-deploy-branch.result }}
           NODE_SUBSTRATE_RESULT: ${{ needs.node-substrate.result }}
           ASSERT_SUBSTRATE_RESULT: ${{ needs.assert-substrate.result }}
@@ -2118,7 +2076,7 @@ jobs:
           TARGETS_JSON: ${{ needs.decide.outputs.flight_targets_json }}
         run: |
           set -euo pipefail
-          echo "has_targets=${HAS_TARGETS} has_flight_targets=${HAS_FLIGHT_TARGETS} external_compute=${HAS_EXTERNAL_COMPUTE_NODE_TARGETS} compute_egress=${COMPUTE_EGRESS_RESULT} substrate=${HAS_SUBSTRATE_NODE_TARGETS} prepare_substrate_deploy_branch=${PREPARE_SUBSTRATE_DEPLOY_BRANCH_RESULT} node_substrate=${NODE_SUBSTRATE_RESULT} assert_substrate=${ASSERT_SUBSTRATE_RESULT} flight=${FLIGHT_RESULT} verify=${VERIFY_RESULT} flight_targets=${TARGETS_JSON}"
+          echo "has_targets=${HAS_TARGETS} has_flight_targets=${HAS_FLIGHT_TARGETS} external_compute=${HAS_EXTERNAL_COMPUTE_NODE_TARGETS} substrate=${HAS_SUBSTRATE_NODE_TARGETS} prepare_substrate_deploy_branch=${PREPARE_SUBSTRATE_DEPLOY_BRANCH_RESULT} node_substrate=${NODE_SUBSTRATE_RESULT} assert_substrate=${ASSERT_SUBSTRATE_RESULT} flight=${FLIGHT_RESULT} verify=${VERIFY_RESULT} flight_targets=${TARGETS_JSON}"
           if [ "$HAS_FLIGHT_TARGETS" != "true" ]; then
             # No k8s app-lever targets. Either nothing affected, or the affected
             # set is type:infra only (e.g. litellm) — which deploys via the
@@ -2129,9 +2087,6 @@ jobs:
             else
               DESC="Candidate flight no-op (no affected nodes)"
             fi
-          elif [ "$HAS_DEPLOYMENT_NODE_TARGETS" = "true" ] && [ "$COMPUTE_EGRESS_RESULT" != "success" ]; then
-            STATE=failure
-            DESC="Candidate flight failed before desired-state write (reconcile-compute-egress=${COMPUTE_EGRESS_RESULT})"
           elif [ "$HAS_DEPLOYMENT_NODE_TARGETS" = "true" ] && [ "$PREPARE_SUBSTRATE_DEPLOY_BRANCH_RESULT" != "success" ]; then
             STATE=failure
             DESC="Candidate flight failed before promotion (prepare-substrate-deploy-branch=${PREPARE_SUBSTRATE_DEPLOY_BRANCH_RESULT})"
