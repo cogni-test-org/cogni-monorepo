@@ -16,7 +16,7 @@
 
 import { describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
-
+import { writerFor } from "../../node-registry/crossplane-control-plane";
 import {
   appsetPath,
   appsetsKustomizationPath,
@@ -33,6 +33,11 @@ import {
   planEnvAddShape,
   schedulerEndpointPatchPath,
 } from "./env-membership-plan";
+
+import {
+  setCustodiedSchedulerEndpointMembership,
+  setSchedulerEndpointMembership,
+} from "./scheduler-endpoints";
 
 const SLUG = "blue";
 
@@ -134,6 +139,7 @@ metadata:
   name: scheduler-worker-config
 data:
   COGNI_NODE_ENDPOINTS: "${SLUG}=${url},${NODE_ID}=${url}"
+  TEMPORAL_CUSTODIED_NODE_ENDPOINTS: "{}"
 `;
 
 function baseCurrent(envs: readonly string[]): EnvPlanCurrent {
@@ -141,7 +147,7 @@ function baseCurrent(envs: readonly string[]): EnvPlanCurrent {
   const templateOverlayByEnv: Record<string, string> = {};
   const templateExternalSecretByEnv: Record<string, string> = {};
   const schedulerEndpointPatchByEnv: Record<string, string> = {};
-  for (const e of envs) {
+  for (const e of new Set([...envs, "candidate-a", "preview", "production"])) {
     appsetsKustomizationByEnv[e] = kustWith(e, ["blue", "operator"]);
     templateOverlayByEnv[e] = TEMPLATE_OVERLAY;
     templateExternalSecretByEnv[e] = TEMPLATE_EXTERNAL_SECRET;
@@ -354,6 +360,7 @@ dockerfile: nodes/node-template/app/Dockerfile
 envs: [${envs.join(", ")}]
 activity_env: production
 path_prefix: nodes/node-template/
+node_id: ${NODE_ID}
 `;
 
   const templateCurrent = (envs: readonly string[]): EnvPlanCurrent => {
@@ -378,6 +385,14 @@ path_prefix: nodes/node-template/
       appsetsKustomizationByEnv,
       port: 3200,
       nodePort: 30200,
+      schedulerEndpointPatchByEnv: Object.fromEntries(
+        ["candidate-a", "preview", "production"].map((env) => [
+          env,
+          schedulerPatchFixture(
+            "http://node-template-node-app:3000"
+          ).replaceAll("blue=", "node-template="),
+        ])
+      ),
     };
   };
 
@@ -706,6 +721,7 @@ describe("buildEnvDeltaPlan — akash-derived ADD (story.5039)", () => {
     port: 3200,
     nodePort: 31100,
     schedulerEndpointPatchByEnv: {
+      production: schedulerPatchFixture("http://blue-node-app:3000"),
       "candidate-a": schedulerPatchFixture(`http://${SLUG}-node-app:3000`),
     },
   });
@@ -724,6 +740,8 @@ describe("buildEnvDeltaPlan — akash-derived ADD (story.5039)", () => {
       port: 3200,
       nodePort: 31100,
       schedulerEndpointPatchByEnv: {
+        production: schedulerPatchFixture("http://blue-node-app:3000"),
+        "candidate-a": schedulerPatchFixture("http://blue-node-app:3000"),
         preview: schedulerPatchFixture(`http://${SLUG}-node-app:3000`),
       },
     };
@@ -794,6 +812,7 @@ describe("buildEnvDeltaPlan — akash-derived ADD (story.5039)", () => {
         appsetPath("production", "candidate-a", SLUG),
         appsetsKustomizationPath("production"),
         schedulerEndpointPatchPath("candidate-a"),
+        schedulerEndpointPatchPath("production"),
       ].sort()
     );
 
@@ -1155,6 +1174,7 @@ node_id: ${TEMPLATE_NODE_ID}
       port: 3200,
       nodePort: 30200,
       schedulerEndpointPatchByEnv: {
+        production: schedulerPatchFixture("http://blue-node-app:3000"),
         "candidate-a": `apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1312,6 +1332,7 @@ describe("buildEnvDeltaPlan — akash REMOVE (REMOVE_COMPLETES_THE_ROW, story.50
     templateOverlayByEnv: {},
     appsetsKustomizationByEnv: { production: PROD_KUST },
     schedulerEndpointPatchByEnv: {
+      production: schedulerPatchFixture("http://blue-node-app:3000"),
       "candidate-a": schedulerPatchFixture(`https://${SLUG}-test.cognidao.org`),
     },
   });
@@ -1342,7 +1363,7 @@ describe("buildEnvDeltaPlan — akash REMOVE (REMOVE_COMPLETES_THE_ROW, story.50
     }
   };
 
-  it("drops the env's three placement cells, deletes the CONTROL-env appset, and restores the scheduler route", () => {
+  it("drops the env's three placement cells, deletes the CONTROL-env appset, and removes the scheduler route", () => {
     const res = buildEnvDeltaPlan({
       slug: SLUG,
       env: "candidate-a",
@@ -1388,15 +1409,13 @@ describe("buildEnvDeltaPlan — akash REMOVE (REMOVE_COMPLETES_THE_ROW, story.50
       );
     }
 
-    // Byte-inverse of planAdd's scheduler write: back to the k3s in-cluster default.
+    // Canonical rendering excludes nodes whose lane membership was removed.
     const schedulerOp = res.ops.find(
       (o) => o.path === schedulerEndpointPatchPath("candidate-a")
     );
     expect(schedulerOp?.op).toBe("upsert");
     if (schedulerOp?.op === "upsert") {
-      expect(schedulerOp.content).toContain(
-        `${SLUG}=http://${SLUG}-node-app:3000,${NODE_ID}=http://${SLUG}-node-app:3000`
-      );
+      expect(parseYaml(schedulerOp.content).data.COGNI_NODE_ENDPOINTS).toBe("");
     }
   });
 
@@ -1479,11 +1498,12 @@ describe("buildEnvDeltaPlan — akash REMOVE (REMOVE_COMPLETES_THE_ROW, story.50
     }
   });
 
-  it("emits no scheduler op when the route is already the in-cluster default (idempotent restore)", () => {
+  it("removes a stale in-cluster alias when membership is removed", () => {
     const base = akashRemoveCurrent();
     const current: EnvPlanCurrent = {
       ...base,
       schedulerEndpointPatchByEnv: {
+        production: schedulerPatchFixture("http://blue-node-app:3000"),
         "candidate-a": schedulerPatchFixture(`http://${SLUG}-node-app:3000`),
       },
     };
@@ -1494,9 +1514,7 @@ describe("buildEnvDeltaPlan — akash REMOVE (REMOVE_COMPLETES_THE_ROW, story.50
       current,
     });
     if (res.kind === "no_changes") throw new Error("unexpected no_changes");
-    expect(paths(res.ops)).not.toContain(
-      schedulerEndpointPatchPath("candidate-a")
-    );
+    expect(paths(res.ops)).toContain(schedulerEndpointPatchPath("candidate-a"));
   });
 
   it("throws env_render_inputs_missing naming the CONTROL env when its kustomization is absent", () => {
@@ -1550,6 +1568,7 @@ node_id: ${TEMPLATE_NODE_ID}
         production: `${KUST_HEADER}\n  - candidate-a-node-template-applicationset.yaml\n  - production-node-template-applicationset.yaml\n`,
       },
       schedulerEndpointPatchByEnv: {
+        production: schedulerPatchFixture("http://blue-node-app:3000"),
         "candidate-a": `apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1791,5 +1810,323 @@ describe("buildRegionPlan (story.5050)", () => {
         current: akashPlaced("preview"),
       })
     ).toThrow(re);
+  });
+});
+
+describe("removed node-template candidate membership", () => {
+  // Historical removed inputs captured from operator main d6e38096c7; never read live catalog state.
+  const removedPatch = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-worker-config
+  annotations:
+    reloader.stakater.com/ignore: "true"
+data:
+  COGNI_NODE_ENDPOINTS: "operator=http://operator-node-app:3000,4ff8eac1-4eba-4ed0-931b-b1fe4f64713d=http://operator-node-app:3000,poly=https://poly-test.cognidao.org,4b06359a-a859-4399-888e-a8c7a6696f7e=https://poly-test.cognidao.org,red=https://red-test.cognidao.org,921b1d1d-4ded-4a6d-b3f1-f7d6affa406a=https://red-test.cognidao.org"
+  TEMPORAL_CUSTODIED_NODE_ENDPOINTS: "{}"
+`;
+  const actualCatalog = `name: node-template
+type: node
+port: 3200
+node_port: 30200
+dockerfile: nodes/node-template/app/Dockerfile
+image_tag_suffix: "-node-template"
+migrator_tag_suffix: "-node-template-migrate"
+source_repo: https://github.com/Cogni-DAO/node-template.git
+image_repository: ghcr.io/cogni-dao/node-template
+source_sha: 654e5f2132cdc774a329f24c69340170e4721d2a
+candidate_a_branch: deploy/candidate-a-node-template
+preview_branch: deploy/preview-node-template
+production_branch: deploy/production-node-template
+envs: [production]
+database:
+  production: { tier: shared, budget_profile: shared-default-v1 }
+deployment_provider:
+  production: akash
+compute_api:
+  production: crossplane
+lease_generation:
+  production: 2
+activity_env: production
+owner_wallet: "0x070075F1389Ae1182aBac722B36CA12285d0c949"
+path_prefix: nodes/node-template/
+node_id: b927a9dd-6132-4fc9-a51e-e3cee2568e3c
+compute_egress_cidrs:
+  - cidr: 80.200.246.35/32
+    comment: shared egress NAT of Akash providers zencloud + digitalfrontier (story.5016)
+`;
+  const originalCatalog = parseYaml(actualCatalog);
+  const current: EnvPlanCurrent = {
+    catalog: actualCatalog,
+    port: originalCatalog.port,
+    nodePort: originalCatalog.node_port,
+    publicDomainRoot: "cognidao.org",
+    templateOverlayByEnv: {
+      "candidate-a": TEMPLATE_OVERLAY,
+    },
+    templateExternalSecretByEnv: {
+      "candidate-a": TEMPLATE_EXTERNAL_SECRET,
+    },
+    appsetTemplate: APPSET_TEMPLATE,
+    appsetRepoUrl: "https://github.com/cogni-dao/cogni.git",
+    appsetsKustomizationByEnv: {
+      production: kustWith("production", ["node-template", "operator"]),
+    },
+    schedulerEndpointPatchByEnv: {
+      "candidate-a": removedPatch,
+      production: removedPatch,
+    },
+  };
+  const add = (state: EnvPlanCurrent) =>
+    buildEnvDeltaPlan({
+      slug: "node-template",
+      env: "candidate-a",
+      present: true,
+      current: state,
+      fleetControlEnv: "production",
+      leaseGeneration: 7,
+    });
+  const apply = (
+    state: EnvPlanCurrent,
+    result: EnvDeltaResult
+  ): EnvPlanCurrent => {
+    if (result.kind === "no_changes")
+      throw new Error("Expected membership delta");
+    const content = (path: string, fallback: string) => {
+      const op = result.ops.find((op) => op.path === path);
+      return op?.op === "upsert" ? op.content : fallback;
+    };
+    return {
+      ...state,
+      catalog: content(CATALOG_PATH("node-template"), state.catalog),
+      appsetsKustomizationByEnv: {
+        production: content(
+          appsetsKustomizationPath("production"),
+          state.appsetsKustomizationByEnv.production!
+        ),
+      },
+      schedulerEndpointPatchByEnv: {
+        production: content(
+          schedulerEndpointPatchPath("production"),
+          state.schedulerEndpointPatchByEnv!.production!
+        ),
+        "candidate-a": content(
+          schedulerEndpointPatchPath("candidate-a"),
+          state.schedulerEndpointPatchByEnv!["candidate-a"]!
+        ),
+      },
+    };
+  };
+
+  it("readds the actual removed pair after remove and canonical rendering without changing the payer", () => {
+    expect(originalCatalog.envs).toEqual(["production"]);
+    const originalCells = parseYaml(
+      removedPatch
+    ).data.COGNI_NODE_ENDPOINTS.split(",") as string[];
+    expect(
+      originalCells.some((cell) => cell.startsWith("node-template="))
+    ).toBe(false);
+    const added = apply(current, add(current));
+    const removal = buildEnvDeltaPlan({
+      slug: "node-template",
+      env: "candidate-a",
+      present: false,
+      current: added,
+      fleetControlEnv: "production",
+    });
+    const removed = apply(added, removal);
+    expect(parseYaml(removed.catalog).envs).toEqual(["production"]);
+    // The canonical renderer omits members outside this env, as the actual committed patch does.
+    const readdedPlan = add({
+      ...removed,
+      schedulerEndpointPatchByEnv: {
+        "candidate-a": removedPatch,
+        production: removedPatch,
+      },
+    });
+    const readded = apply(removed, readdedPlan);
+    const catalog = parseYaml(readded.catalog);
+    const cells = parseYaml(
+      readded.schedulerEndpointPatchByEnv!["candidate-a"]!
+    ).data.COGNI_NODE_ENDPOINTS.split(",") as string[];
+    const url = "https://node-template-test.cognidao.org";
+    expect(cells.filter((cell) => cell.startsWith("node-template="))).toEqual([
+      `node-template=${url}`,
+    ]);
+    expect(
+      cells.filter((cell) => cell.startsWith(`${catalog.node_id}=`))
+    ).toEqual([`${catalog.node_id}=${url}`]);
+    expect(
+      cells.filter(
+        (cell) =>
+          !cell.startsWith("node-template=") &&
+          !cell.startsWith(`${catalog.node_id}=`)
+      )
+    ).toEqual(originalCells);
+    expect(catalog.owner_wallet).toBe(originalCatalog.owner_wallet);
+    expect(catalog.activity_env).toBe("production");
+    expect(catalog.lease_generation.production).toBe(
+      originalCatalog.lease_generation.production
+    );
+    expect(catalog.compute_api["candidate-a"]).toBe("crossplane");
+    expect(
+      planEnvAddShape(readded.catalog, "candidate-a", "production").controlEnv
+    ).toBe("production");
+    expect(writerFor("candidate-a", "cogni-dao")?.id).toBe(
+      "production/akash-tx-actuator"
+    );
+    expect(add(readded)).toEqual({ kind: "no_changes" });
+  });
+});
+
+describe("custodied membership routing (bug.5536)", () => {
+  it("adds a foreign lane alias to the existing control worker namespace", () => {
+    const current = baseCurrent(["production"]);
+    const result = buildEnvDeltaPlan({
+      slug: SLUG,
+      env: "preview",
+      present: true,
+      fleetControlEnv: "production",
+      current: {
+        ...current,
+        catalog:
+          current.catalog +
+          "source_repo: https://github.com/cogni-dao/blue.git\n",
+        schedulerEndpointPatchByEnv: {
+          ...current.schedulerEndpointPatchByEnv,
+          production:
+            schedulerPatchFixture("https://blue.cognidao.org").replace(
+              '  TEMPORAL_CUSTODIED_NODE_ENDPOINTS: "{}"\n',
+              ""
+            ) +
+            `  TEMPORAL_CUSTODIED_NODE_ENDPOINTS: '{"cogni-candidate-a":"red=https://red-test.cognidao.org,921b1d1d-4ded-4a6d-b3f1-f7d6affa406a=https://red-test.cognidao.org"}'\n`,
+        },
+      },
+    });
+    if (result.kind === "no_changes") throw new Error("Expected addition");
+    const op = result.ops.find(
+      (o) => o.path === schedulerEndpointPatchPath("production")
+    );
+    expect(op?.op).toBe("upsert");
+    if (op?.op !== "upsert") throw new Error("Missing control routing");
+    const data = parseYaml(op.content).data;
+    expect(JSON.parse(data.TEMPORAL_CUSTODIED_NODE_ENDPOINTS)).toEqual({
+      "cogni-candidate-a":
+        "red=https://red-test.cognidao.org,921b1d1d-4ded-4a6d-b3f1-f7d6affa406a=https://red-test.cognidao.org",
+      "cogni-preview": `blue=https://blue-preview.cognidao.org,${NODE_ID}=https://blue-preview.cognidao.org`,
+    });
+    expect(data.COGNI_NODE_ENDPOINTS).toBe(
+      `blue=https://blue.cognidao.org,${NODE_ID}=https://blue.cognidao.org`
+    );
+  });
+});
+
+describe("custodied paired delta guards", () => {
+  const red =
+    "red=https://red-test.cognidao.org,921b1d1d-4ded-4a6d-b3f1-f7d6affa406a=https://red-test.cognidao.org";
+  const patch = (map: string) =>
+    schedulerPatchFixture("https://blue.cognidao.org").replace(
+      '"{}"',
+      `'${map}'`
+    );
+  it("preserves sibling namespaces and routes through add/remove roundtrip", () => {
+    const original = patch(
+      JSON.stringify({ "cogni-candidate-a": red, "cogni-preview": red })
+    );
+    const added = setCustodiedSchedulerEndpointMembership(
+      original,
+      "candidate-a",
+      "blue",
+      NODE_ID,
+      "https://blue-test.cognidao.org"
+    );
+    const data = JSON.parse(
+      parseYaml(added).data.TEMPORAL_CUSTODIED_NODE_ENDPOINTS
+    );
+    expect(data["cogni-candidate-a"]).toBe(
+      `blue=https://blue-test.cognidao.org,${NODE_ID}=https://blue-test.cognidao.org,${red}`
+    );
+    expect(data["cogni-preview"]).toBe(red);
+    expect(
+      setCustodiedSchedulerEndpointMembership(
+        added,
+        "candidate-a",
+        "blue",
+        NODE_ID,
+        null
+      )
+    ).toBe(original);
+  });
+  it("drops the last namespace and leaves no stale route", () => {
+    const original = schedulerPatchFixture("https://blue.cognidao.org");
+    const added = setCustodiedSchedulerEndpointMembership(
+      original,
+      "preview",
+      "blue",
+      NODE_ID,
+      "https://blue-preview.cognidao.org"
+    );
+    expect(
+      setCustodiedSchedulerEndpointMembership(
+        added,
+        "preview",
+        "blue",
+        NODE_ID,
+        null
+      )
+    ).toBe(original);
+    const lane = setSchedulerEndpointMembership(
+      original,
+      "blue",
+      NODE_ID,
+      null
+    );
+    expect(parseYaml(lane).data.COGNI_NODE_ENDPOINTS).toBe("");
+    expect(parseYaml(lane).data.TEMPORAL_CUSTODIED_NODE_ENDPOINTS).toBe("{}");
+  });
+  it.each([
+    '{"cogni-preview":"red=https://red-test.cognidao.org"}',
+    '{"cogni-preview":"","cogni-preview":""}',
+    '{"cogni-preview":42}',
+    '{"unscoped":""}',
+    JSON.stringify({ "cogni-preview": red + "," + red }),
+  ])("refuses malformed custody map %s", (raw) => {
+    expect(() =>
+      setCustodiedSchedulerEndpointMembership(
+        patch(raw),
+        "preview",
+        "blue",
+        NODE_ID,
+        "https://blue-preview.cognidao.org"
+      )
+    ).toThrow();
+  });
+  it("refuses UUID alias collisions and absent control inputs", () => {
+    expect(() =>
+      setCustodiedSchedulerEndpointMembership(
+        patch(JSON.stringify({ "cogni-preview": red })),
+        "preview",
+        "blue",
+        "921b1d1d-4ded-4a6d-b3f1-f7d6affa406a",
+        "https://blue-preview.cognidao.org"
+      )
+    ).toThrow(/identity mismatch/);
+    const current = baseCurrent(["production"]);
+    expect(() =>
+      buildEnvDeltaPlan({
+        slug: SLUG,
+        env: "preview",
+        present: true,
+        current: {
+          ...current,
+          catalog:
+            current.catalog +
+            "source_repo: https://github.com/cogni-dao/blue.git\n",
+          schedulerEndpointPatchByEnv: {
+            preview: schedulerPatchFixture("http://blue-node-app:3000"),
+          },
+        },
+      })
+    ).toThrow(/missing 'production'/);
   });
 });

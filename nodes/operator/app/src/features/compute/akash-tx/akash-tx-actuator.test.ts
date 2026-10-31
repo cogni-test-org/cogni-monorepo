@@ -26,6 +26,7 @@ import { rootCertificates } from "node:tls";
 
 import type { ProvisionOutput, ProvisionSpec } from "@cogni/ai-tools";
 import { describe, expect, it } from "vitest";
+import { parse as parseYaml } from "yaml";
 
 import type {
   AkashAllocationProbe,
@@ -44,12 +45,19 @@ import type {
   RecordNodeMigrationReportInput,
 } from "@/ports";
 import { AkashTxError } from "@/ports";
+import type { DatabaseCellAppliedCustody } from "@/types/database-cell";
 
 import {
   AkashTxActuator,
+  type AkashTxActuatorDeps,
   type AkashTxLogger,
   mapConsoleFailure,
 } from "./akash-tx-actuator";
+import { createAkashTxDispatcher } from "./akash-tx-http";
+import {
+  DatabaseCellRecoveryProfileSchema,
+  databaseCellRecoveryIntent,
+} from "./database-cell-recovery";
 
 const SPEC: ProvisionSpec = {
   name: "toks9",
@@ -613,8 +621,13 @@ function recordingLogger(): AkashTxLogger & {
   };
 }
 
-function build(consoleOptions: FakeConsoleOptions = {}) {
-  const ledger = new FakeLedger();
+function build(
+  consoleOptions: FakeConsoleOptions = {},
+  recoveryProfile?: unknown,
+  sharedLedger?: FakeLedger,
+  appliedCellCustody?: AkashTxActuatorDeps["appliedCellCustody"]
+) {
+  const ledger = sharedLedger ?? new FakeLedger();
   const api = new FakeConsole(consoleOptions);
   const log = recordingLogger();
   const migration = new FakeMigration();
@@ -623,6 +636,8 @@ function build(consoleOptions: FakeConsoleOptions = {}) {
     console: api,
     ledger,
     log,
+    recoveryProfile: async () => recoveryProfile,
+    ...(appliedCellCustody ? { appliedCellCustody } : {}),
     migration,
     costEvidence: costs.costEvidence,
     costStore: costs.costStore,
@@ -634,8 +649,11 @@ function build(consoleOptions: FakeConsoleOptions = {}) {
 describe("qualified cell app releases", () => {
   const qualifiedSha = "a".repeat(40);
   const otherSha = "b".repeat(40);
-  function withCell() {
-    const context = build();
+  function withCell(
+    recoveryProfile?: unknown,
+    appliedCellCustody?: AkashTxActuatorDeps["appliedCellCustody"]
+  ) {
+    const context = build({}, recoveryProfile, undefined, appliedCellCustody);
     const provider = `akash1${"a".repeat(38)}`;
     context.ledger.rows.set("cell", {
       receiptId: "22222222-2222-4222-8222-222222222222",
@@ -690,6 +708,310 @@ describe("qualified cell app releases", () => {
     });
     return context;
   }
+  const recoveryProfile = {
+    enabled: true,
+    funding_status: "qualified",
+    cpu_units: 4,
+    memory_mib: 16384,
+    ephemeral_size_mib: 1024,
+    persistent_size_mib: 204800,
+    postgres_major: 15,
+    image:
+      "postgres:15@sha256:1b92e7a80c021647bf70f5d3eb66066a998e4f5cf43c07bb9dc9f729782cf88e",
+    command: ["sleep"],
+    args: ["infinity"],
+    volume_name: "database",
+    mount_path: "/var/lib/postgresql/data",
+    pgdata: "/var/lib/postgresql/data/pgdata",
+    volume_tier: "nvme",
+    pricing_denom: "uact",
+    max_price_per_block: "100",
+    initial_escrow_usd: "0.5",
+  };
+  function recoveryRequest(context: ReturnType<typeof withCell>) {
+    const source = context.ledger.rows.get("cell");
+    if (!source) throw new Error("missing source");
+    context.ledger.rows.set("cell", { ...source, retentionPolicy: "retain" });
+    const reference = {
+      environment: "production",
+      identity: IDENTITY,
+      nodeSlug: "toks9",
+      recovery: {
+        profileId: "pg15-cold-capacity-v1" as const,
+        sourceCogniKey: "cell",
+        sourceExternalName: "9001",
+        sourceSystemIdentifier: "123",
+      },
+    };
+    const intent = databaseCellRecoveryIntent(
+      reference,
+      source,
+      DatabaseCellRecoveryProfileSchema.parse(recoveryProfile)
+    );
+    return { ...reference, cogniKey: intent.key };
+  }
+  it("allocates source-qualified cold recovery through the same receipt and keeps ordinary app admission", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).resolves.toMatchObject({ externalName: "7001" });
+    expect(context.api.allocateCalls).toBe(1);
+    expect(context.ledger.rows.get(input.cogniKey)).toMatchObject({
+      state: "allocated",
+      retentionPolicy: "retain",
+      allocationCursor: "7000",
+    });
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).resolves.toMatchObject({ replayed: true });
+    expect(context.api.allocateCalls).toBe(1);
+    await expect(
+      context.actuator.create({
+        cogniKey: "disguised",
+        environment: "production",
+        identity: IDENTITY,
+        spec: { ...SPEC, retentionPolicy: "retain" },
+      })
+    ).rejects.toMatchObject({ code: "identity_conflict" });
+  });
+  it("refuses disabled, changed-key, foreign and wrong-system recovery before a paid transaction", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    for (const bad of [
+      { ...input, cogniKey: `${input.cogniKey.slice(0, -1)}z` },
+      { ...input, identity: OTHER_IDENTITY },
+      {
+        ...input,
+        recovery: { ...input.recovery, sourceSystemIdentifier: "999" },
+      },
+    ]) {
+      await expect(
+        context.actuator.createDatabaseCellRecovery(bad)
+      ).rejects.toBeInstanceOf(AkashTxError);
+    }
+    const disabled = withCell({ ...recoveryProfile, enabled: false });
+    const disabledInput = recoveryRequest(disabled);
+    await expect(
+      disabled.actuator.createDatabaseCellRecovery(disabledInput)
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(disabled.log.lines).toContainEqual({
+      level: "warn",
+      marker: "akash_tx_database_cell_recovery_refused",
+      fields: {
+        cogniKey: disabledInput.cogniKey,
+        nodeId: IDENTITY.nodeId,
+        environment: "production",
+        profileId: "pg15-cold-capacity-v1",
+        reasonCode: "profile_disabled",
+      },
+    });
+    expect(disabled.ledger.rows.size).toBe(1);
+    expect(context.api.allocateCalls).toBe(0);
+  });
+  it("refuses another retained target in the same source family and clears only the unused claim", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    const prefix = input.cogniKey.slice(0, -64);
+    const source = context.ledger.rows.get("cell");
+    if (!source) throw new Error("missing source");
+    context.ledger.rows.set(prefix + "f".repeat(64), {
+      ...source,
+      cogniKey: prefix + "f".repeat(64),
+      receiptId: "other",
+      externalName: "8001",
+      appliedDatabaseCellBinding: [],
+    });
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).rejects.toMatchObject({ code: "identity_conflict" });
+    expect(context.api.allocateCalls).toBe(0);
+    expect(context.ledger.rows.get(input.cogniKey)?.state).toBe("failed");
+    expect(context.ledger.rows.get("cell")?.state).toBe("allocated");
+  });
+  it("fails a truncated family scan without stranding the unused wallet claim", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    const source = context.ledger.rows.get("cell");
+    if (!source) throw new Error("missing source");
+    for (let i = 0; i < 98; i++)
+      context.ledger.rows.set(`other-${i}`, {
+        ...source,
+        cogniKey: `other-${i}`,
+        receiptId: `other-${i}`,
+        externalName: String(10000 + i),
+        appliedDatabaseCellBinding: [],
+      });
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).rejects.toMatchObject({ code: "identity_conflict" });
+    expect(context.ledger.rows.get(input.cogniKey)?.state).toBe("failed");
+    expect(context.api.cursorCalls).toBe(0);
+    expect(context.api.allocateCalls).toBe(0);
+  });
+  it("concurrent changed recovery keys cannot purchase another target", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    const results = await Promise.allSettled([
+      context.actuator.createDatabaseCellRecovery(input),
+      context.actuator.createDatabaseCellRecovery({
+        ...input,
+        cogniKey: input.cogniKey.slice(0, -64) + "f".repeat(64),
+      }),
+    ]);
+    expect(results.map((result) => result.status).sort()).toEqual([
+      "fulfilled",
+      "rejected",
+    ]);
+    expect(context.api.allocateCalls).toBe(1);
+  });
+  it("keeps recovery reference-only and the existing fresh branch unchanged", async () => {
+    const context = withCell({ ...recoveryProfile, enabled: false });
+    let freshCalls = 0;
+    const dispatch = createAkashTxDispatcher({
+      token: "fixture",
+      actuator: context.actuator,
+      databaseCellSpec: () => {
+        freshCalls++;
+        return SPEC;
+      },
+    });
+    const input = {
+      ...recoveryRequest(context),
+      budgetProfile: "dedicated-high-throughput-v1",
+    };
+    const request = (body: unknown) =>
+      dispatch({
+        method: "POST",
+        path: "/v1/akash/create-database-cell",
+        authorization: "Bearer fixture",
+        body: JSON.stringify(body),
+      });
+    expect((await request(input)).status).toBe(400);
+    expect(freshCalls).toBe(0);
+    expect(
+      (
+        await request({
+          ...input,
+          recovery: { ...input.recovery, pricingAmount: 10000 },
+        })
+      ).status
+    ).toBe(400);
+    const { recovery: _recovery, ...fresh } = input;
+    await request(fresh);
+    expect(freshCalls).toBe(1);
+    expect(context.api.allocateCalls).toBe(0);
+  });
+  it("refuses unqualified funding even if a future recipe is enabled", async () => {
+    const context = withCell({
+      ...recoveryProfile,
+      enabled: true,
+      funding_status: "unqualified",
+    });
+    const input = recoveryRequest(context);
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(context.log.lines).toContainEqual({
+      level: "warn",
+      marker: "akash_tx_database_cell_recovery_refused",
+      fields: {
+        cogniKey: input.cogniKey,
+        nodeId: IDENTITY.nodeId,
+        environment: "production",
+        profileId: "pg15-cold-capacity-v1",
+        reasonCode: "funding_unqualified",
+      },
+    });
+    expect(context.ledger.rows.size).toBe(1);
+    expect(context.api.cursorCalls).toBe(0);
+    expect(context.api.allocateCalls).toBe(0);
+  });
+  it("two actuator instances cannot both spend under the same preparing recovery key", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    const other = build({}, recoveryProfile, context.ledger);
+    let signalEntered = () => {};
+    let resume = () => {};
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    context.api.allocationCursor = async () => {
+      context.api.cursorCalls++;
+      signalEntered();
+      await gate;
+      return "7000";
+    };
+    const first = context.actuator.createDatabaseCellRecovery(input);
+    await entered;
+    await expect(
+      other.actuator.createDatabaseCellRecovery(input)
+    ).rejects.toMatchObject({ code: "wallet_allocation_blocked" });
+    expect(other.api.cursorCalls).toBe(0);
+    expect(other.api.allocateCalls).toBe(0);
+    expect(context.ledger.rows.get(input.cogniKey)?.state).toBe("preparing");
+    resume();
+    await first;
+    await expect(
+      other.actuator.createDatabaseCellRecovery(input)
+    ).resolves.toMatchObject({ externalName: "7001", replayed: true });
+    expect(context.api.allocateCalls + other.api.allocateCalls).toBe(1);
+  });
+  it("uses the packaged cold profile through the retained recovery writer", async () => {
+    const file = path.resolve(
+      __dirname,
+      "../../../../../../../infra/database-budget-profiles.yaml"
+    );
+    const document = parseYaml(readFileSync(file, "utf8")) as {
+      recovery_profiles: Record<string, unknown>;
+    };
+    const packaged = DatabaseCellRecoveryProfileSchema.parse(
+      document.recovery_profiles["pg15-cold-capacity-v1"]
+    );
+    expect(packaged).toEqual(recoveryProfile);
+    const context = withCell(packaged);
+    const input = recoveryRequest(context);
+    const retainedSource = structuredClone(context.ledger.rows.get("cell"));
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).resolves.toMatchObject({ externalName: "7001" });
+    expect(context.api.allocateCalls).toBe(1);
+    expect(context.ledger.rows.get(input.cogniKey)).toMatchObject({
+      state: "allocated",
+      retentionPolicy: "retain",
+    });
+    expect(context.ledger.rows.get("cell")).toEqual(retainedSource);
+  });
+  it("cold recipe and key are bounded and contain no database initialization or credentials", () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    const source = context.ledger.rows.get("cell");
+    if (!source) throw new Error("missing source");
+    const intent = databaseCellRecoveryIntent(
+      input,
+      source,
+      DatabaseCellRecoveryProfileSchema.parse(recoveryProfile)
+    );
+    expect(intent.key).toHaveLength(191);
+    expect(intent.key).toMatch(/^[A-Za-z0-9._:/-]+$/);
+    expect(intent.spec.services[0]).toMatchObject({
+      command: ["sleep"],
+      args: ["infinity"],
+      cpuUnits: 4,
+      memoryMi: 16384,
+      env: { PGDATA: "/var/lib/postgresql/data/pgdata" },
+      volumes: [{ sizeMi: 204800 }],
+    });
+    expect(Object.keys(intent.spec.services[0]?.env ?? {})).toEqual(["PGDATA"]);
+    expect(intent.policy).toEqual({
+      pricingDenom: "uact",
+      pricingAmount: 100,
+      initialEscrowUsd: 0.5,
+    });
+  });
   const specAt = (sha: string): ProvisionSpec => ({
     ...SPEC,
     services: SPEC.services.map((service) => ({
@@ -697,8 +1019,44 @@ describe("qualified cell app releases", () => {
       env: { COGNI_REPO_SHA: sha },
     })),
   });
-  function withBoundedManualCell() {
-    const context = withCell();
+  function withBoundedManualCell(
+    resolve?: AkashTxActuatorDeps["appliedCellCustody"]
+  ) {
+    const custody: { value: DatabaseCellAppliedCustody } = {
+      value: {
+        version: 1,
+        nodeId: IDENTITY.nodeId,
+        nodeSlug: SPEC.name,
+        environment: "production",
+        manualProvenance: {
+          kind: "manual-observed",
+          postgresImageDigest: `sha256:${"1".repeat(64)}`,
+          managedSdlSha256: "d".repeat(64),
+          qualificationArtifactSha256: "2".repeat(64),
+          qualifiedAt: "2026-10-15T00:00:00Z",
+        },
+        targetBuildSha: qualifiedSha,
+        canonicalEndpointHost: "owned.example",
+        databaseName: "cogni_toks9",
+        appRole: "app_toks9",
+        serviceRole: "service_toks9",
+        budgetProfile: "dedicated-high-throughput-v1",
+        runtimePoolLimits: { replicaCount: 1, app: 3, service: 4, read: 2 },
+        budget: { kind: "preserved-role-bounds", roles: [] },
+        tlsCertificate: rootCertificates[0] ?? "",
+        tls: { kind: "system" },
+        app: {
+          dsn: appDsn,
+          custody: { service: "toks9", key: "DATABASE_URL" },
+        },
+        service: {
+          dsn: serviceDsn,
+          custody: { service: "toks9", key: "DATABASE_SERVICE_URL" },
+        },
+        migration: { kind: "app-database-url" },
+      },
+    };
+    const context = withCell(undefined, resolve ?? (async () => custody.value));
     const receipt =
       context.ledger.rows.get("cell")?.appliedDatabaseCellBinding?.[0];
     if (!receipt) throw new Error("missing cell fixture");
@@ -729,12 +1087,12 @@ describe("qualified cell app releases", () => {
       runtimePoolLimits: { replicaCount: 1, app: 3, service: 4, read: 2 },
       registeredAt: "2026-10-15T00:00:00Z",
     };
-    return context;
+    return { ...context, custody };
   }
   const appDsn =
-    "postgresql://app:fixture@owned.example/cogni_toks9?sslmode=verify-full";
+    "postgresql://app_toks9:fixture@owned.example:30349/cogni_toks9?sslmode=verify-full";
   const serviceDsn =
-    "postgresql://service:fixture@owned.example/cogni_toks9?sslmode=verify-full";
+    "postgresql://service_toks9:fixture@owned.example:30349/cogni_toks9?sslmode=verify-full";
   const boundedSpecAt = (sha: string): ProvisionSpec => ({
     ...specAt(sha),
     services: specAt(sha).services.map((service) => ({
@@ -779,6 +1137,149 @@ describe("qualified cell app releases", () => {
     expect(migration.calls).toHaveLength(1);
     expect(ledger.rows.get("cell")).toEqual(admission);
     expect(ledger.rows.get("app")?.externalName).toBe("7001");
+  });
+  const moveCustody = (
+    custody: { value: DatabaseCellAppliedCustody },
+    port: string
+  ) => {
+    const moved = (dsn: string) => {
+      const url = new URL(dsn);
+      url.port = port;
+      return url.toString();
+    };
+    custody.value = {
+      ...custody.value,
+      app: { ...custody.value.app, dsn: moved(custody.value.app.dsn) },
+      service: {
+        ...custody.value.service,
+        dsn: moved(custody.value.service.dsn),
+      },
+    };
+  };
+  const specForCustody = (
+    custody: { value: DatabaseCellAppliedCustody },
+    sha: string
+  ): ProvisionSpec => {
+    const spec = boundedSpecAt(sha);
+    return {
+      ...spec,
+      services: spec.services.map((service) => ({
+        ...service,
+        env: {
+          ...service.env,
+          DATABASE_URL: custody.value.app.dsn,
+          DATABASE_SERVICE_URL: custody.value.service.dsn,
+        },
+      })),
+    };
+  };
+  it("releases at the current owned port without rewriting historical DSN hashes", async () => {
+    const { actuator, custody, ledger, api, migration } =
+      withBoundedManualCell();
+    const admission = structuredClone(ledger.rows.get("cell"));
+    moveCustody(custody, "32728");
+    await actuator.create({
+      cogniKey: "app",
+      environment: "production",
+      identity: IDENTITY,
+      spec: specForCustody(custody, qualifiedSha),
+    });
+    await actuator.observe({
+      cogniKey: "app",
+      workload: SPEC.name,
+      environment: "production",
+      migration: STEP,
+      expectedSourceSha: otherSha,
+    });
+    await actuator.update({
+      cogniKey: "app",
+      externalName: "7001",
+      environment: "production",
+      identity: { ...IDENTITY, compositeGeneration: 4 },
+      spec: specForCustody(custody, otherSha),
+    });
+    expect(api.allocateCalls).toBe(1);
+    expect(api.updateCalls).toBe(1);
+    expect(migration.calls).toHaveLength(1);
+    expect(ledger.rows.get("cell")).toEqual(admission);
+  });
+  it("rereads custody and refuses stale endpoint bytes before an update", async () => {
+    const { actuator, custody, api } = withBoundedManualCell();
+    await actuator.create({
+      cogniKey: "app",
+      environment: "production",
+      identity: IDENTITY,
+      spec: boundedSpecAt(qualifiedSha),
+    });
+    moveCustody(custody, "32728");
+    const input = {
+      cogniKey: "app",
+      externalName: "7001",
+      environment: "production",
+      identity: { ...IDENTITY, compositeGeneration: 4 },
+    };
+    await expect(
+      actuator.update({ ...input, spec: boundedSpecAt(otherSha) })
+    ).rejects.toMatchObject({ code: "identity_conflict" });
+    expect(api.updateCalls).toBe(0);
+    await actuator.update({
+      ...input,
+      spec: specForCustody(custody, otherSha),
+    });
+    expect(api.updateCalls).toBe(1);
+  });
+  it("refuses absent custody even when the request matches historical hashes", async () => {
+    const original = withBoundedManualCell();
+    const { actuator, api, ledger } = build({}, undefined, original.ledger);
+    await expect(
+      actuator.create({
+        cogniKey: "app",
+        environment: "production",
+        identity: IDENTITY,
+        spec: boundedSpecAt(qualifiedSha),
+      })
+    ).rejects.toMatchObject({ code: "ledger_unavailable" });
+    expect(api.allocateCalls).toBe(0);
+    expect(ledger.rows.has("app")).toBe(false);
+  });
+  it.each([
+    { nodeId: "foreign-node" },
+    { nodeSlug: "foreign" },
+    { environment: "preview" },
+    { databaseName: "foreign" },
+    { appRole: "foreign" },
+    { serviceRole: "foreign" },
+    { canonicalEndpointHost: "foreign.example" },
+    { runtimePoolLimits: { replicaCount: 1, app: 30, service: 4, read: 2 } },
+  ])("refuses foreign custody before allocation: %j", async (change) => {
+    const { actuator, custody, api } = withBoundedManualCell();
+    Object.assign(custody.value, change);
+    await expect(
+      actuator.create({
+        cogniKey: "app",
+        environment: "production",
+        identity: IDENTITY,
+        spec: boundedSpecAt(qualifiedSha),
+      })
+    ).rejects.toMatchObject({ code: "identity_conflict" });
+    expect(api.allocateCalls).toBe(0);
+  });
+  it("redacts custody read failures before allocating", async () => {
+    const { actuator, api } = withBoundedManualCell(async () => {
+      throw new Error("postgresql://secret:password@private.example/db");
+    });
+    await expect(
+      actuator.create({
+        cogniKey: "app",
+        environment: "production",
+        identity: IDENTITY,
+        spec: boundedSpecAt(qualifiedSha),
+      })
+    ).rejects.toMatchObject({
+      code: "ledger_unavailable",
+      message: "current database cell custody unavailable",
+    });
+    expect(api.allocateCalls).toBe(0);
   });
   it.each([
     { DB_POOL_MAX: "30" },
@@ -848,10 +1349,18 @@ describe("qualified cell app releases", () => {
     expect(api.allocateCalls).toBe(1);
   });
   it("preserves private CA bytes across releases and refuses a replacement before provider mutation", async () => {
-    const { actuator, ledger, api } = withBoundedManualCell();
+    const { actuator, ledger, api, custody } = withBoundedManualCell();
     const receipt = ledger.rows.get("cell")?.appliedDatabaseCellBinding?.[0];
     const ca = rootCertificates[0];
     if (!receipt?.registration || !ca) throw new Error("missing TLS fixture");
+    custody.value = {
+      ...custody.value,
+      tls: {
+        kind: "private-ca",
+        caCertificate: ca,
+        custody: { service: "toks9", key: "DATABASE_SSL_CA_CERT" },
+      },
+    };
     receipt.registration = {
       ...receipt.registration,
       tlsTrustKind: "private-ca",

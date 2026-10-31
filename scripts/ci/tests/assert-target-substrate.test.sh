@@ -283,7 +283,7 @@ yq -i '.deployment_provider."candidate-a" = "akash"' "$MISRESIDENT_TREE/infra/ca
 # Placement moves the control env, so it also moves the AppSet directory (bug.5204). Park a
 # copy at the relocated path so the EARLIER appset-existence check cannot absorb this case —
 # the residency gate is what must produce the verdict.
-misresident_appset="$MISRESIDENT_TREE/$(FLEET_CONTROL_ENV=production CATALOG_DIR="$MISRESIDENT_TREE/infra/catalog" appset_rel_path candidate-a node-template)"
+misresident_appset="$MISRESIDENT_TREE/$(CATALOG_DIR="$MISRESIDENT_TREE/infra/catalog" appset_rel_path candidate-a node-template)"
 mkdir -p "$(dirname "$misresident_appset")"
 cp "$HAPPY_TREE/$(CATALOG_DIR="$HAPPY_TREE/infra/catalog" appset_rel_path candidate-a node-template)" \
   "$misresident_appset"
@@ -293,8 +293,7 @@ cp scripts/ci/assert-target-substrate.sh "$MISRESIDENT_SCRIPT/"
 cp scripts/ci/lib/*.sh "$MISRESIDENT_SCRIPT/lib/"
 printf '\nLANE_DB_RESIDENCY_PINNED=("node-template/candidate-a")\n' \
   >> "$MISRESIDENT_SCRIPT/lib/lane-db-residency.sh"
-# This historical pin models production custody, independently of the runner fleet.
-if env "${BASE_ENV[@]}" FLEET_CONTROL_ENV=production APP_SOURCE_DIR="$MISRESIDENT_TREE" \
+if env "${BASE_ENV[@]}" APP_SOURCE_DIR="$MISRESIDENT_TREE" \
   COGNI_CATALOG_ROOT="$MISRESIDENT_TREE/infra/catalog" \
   bash "$MISRESIDENT_SCRIPT/assert-target-substrate.sh" >"$TMPROOT/misresident.out" 2>&1; then
   echo "expected an explicitly foreign PG lane to fail the substrate preflight" >&2
@@ -568,8 +567,6 @@ EXTERNAL_ALLOWLIST="$TMPROOT/compute-egress-allowlist"
 # whole-line `grep -Fx` shipped and failed closed on every real host.
 printf '%s\n' '80.200.246.35/32:5432,5435,6379,4000,7233' > "$EXTERNAL_ALLOWLIST"
 EXTERNAL_ENV=(
-  # This birth scenario explicitly exercises the historical production custodian.
-  FLEET_CONTROL_ENV=production
   TARGET=toks4
   DEPLOYMENT_PROVIDER=akash
   DEPLOY_ENVIRONMENT=candidate-a
@@ -773,6 +770,76 @@ XCW_ENV=(
   ASSERT_TARGET_SUBSTRATE_EGRESS_ALLOWLIST="$EXTERNAL_ALLOWLIST"
   FAKE_REMOTE_PATH="$XCW_BIN"
 )
+
+# A new node declaration on an existing production environment must not reach
+# its workload-write dependency until explicit infra has installed its new grant.
+NEW_NODE_SRC="$TMPROOT/new-node-grant-src"
+cp -R "$XCW_SRC" "$NEW_NODE_SRC"
+yq -i '.envs = ["production"] | .deployment_provider.production = "akash" | .compute_api.production = "crossplane" | .compute_egress_cidrs += [{"cidr":"198.51.100.45/32","ports":[5432],"envs":["production"],"comment":"new node requires explicit infra admission"}]' "$NEW_NODE_SRC/infra/catalog/toks5.yaml"
+NEW_NODE_ENV=(
+  "${XCW_ENV[@]}"
+  FLEET_CONTROL_ENV=production
+  DEPLOY_ENVIRONMENT=production
+  FAKE_EXPECT_CONTROL_ENV=production
+  FAKE_EXPECT_LANE_ENV=production
+  APP_SOURCE_DIR="$NEW_NODE_SRC"
+  COGNI_CATALOG_ROOT="$NEW_NODE_SRC/infra/catalog"
+)
+new_node_workload_write() {
+  env "${NEW_NODE_ENV[@]}" bash scripts/ci/assert-target-substrate.sh || return
+  touch "$TMPROOT/new-node-workload-written"
+}
+if new_node_workload_write > "$TMPROOT/new-node-grant-missing.out" 2>&1; then
+  echo "new node preflight accepted a grant that explicit infra has not installed" >&2; exit 1
+fi
+grep -Fq 'missing exact catalog rule: 198.51.100.45/32:5432' "$TMPROOT/new-node-grant-missing.out"
+[ ! -e "$TMPROOT/new-node-workload-written" ]
+cp "$EXTERNAL_ALLOWLIST" "$TMPROOT/allowlist-before-new-node"
+
+# Use the real catalog renderer and hardener, with host commands isolated to
+# this fixture. The preflight must consume the installed complete policy.
+NEW_HARDEN_BIN="$TMPROOT/new-node-harden-bin"
+mkdir -p "$NEW_HARDEN_BIN" "$TMPROOT/netfilter-persistent/plugins.d"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMPROOT/netfilter-persistent/plugins.d/15-ip4tables"
+chmod +x "$TMPROOT/netfilter-persistent/plugins.d/15-ip4tables"
+cat > "$NEW_HARDEN_BIN/iptables" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  -A) printf '%s\n' "$*" >> "$NEW_NODE_IPT_RULES" ;;
+  -S) cat "$NEW_NODE_IPT_RULES" ;;
+esac
+exit 0
+EOF
+cat > "$NEW_HARDEN_BIN/ip" <<'EOF'
+#!/usr/bin/env bash
+echo '8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.10'
+EOF
+cat > "$NEW_HARDEN_BIN/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  -W) printf 'install ok installed' ;;
+  -L) printf '%s\n' "$NEW_NODE_PERSISTENCE_PLUGIN" ;;
+  *) exit 1 ;;
+esac
+EOF
+for command in flock systemctl netfilter-persistent; do
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$NEW_HARDEN_BIN/$command"
+done
+chmod +x "$NEW_HARDEN_BIN/"*
+env COGNI_CATALOG_ROOT="$NEW_NODE_SRC/infra/catalog" FLEET_CONTROL_ENV=production \
+  bash scripts/ci/render-compute-egress-allowlist.sh production > "$TMPROOT/new-node-staged-policy"
+env PATH="$NEW_HARDEN_BIN:$PATH" NEW_NODE_IPT_RULES="$TMPROOT/new-node-iptables" \
+  NEW_NODE_PERSISTENCE_PLUGIN="$TMPROOT/netfilter-persistent/plugins.d/15-ip4tables" \
+  ALLOWLIST_FILE="$EXTERNAL_ALLOWLIST" STAGED_ALLOWLIST="$TMPROOT/new-node-staged-policy" \
+  HARDEN_LOCK_FILE="$TMPROOT/new-node-harden.lock" \
+  HARDEN_BOOT_SCRIPT="$TMPROOT/new-node-boot.sh" HARDEN_BOOT_UNIT="$TMPROOT/new-node-boot.service" \
+  bash infra/provision/cherry/harden-docker-public-ports.sh > "$TMPROOT/new-node-harden.out"
+cmp "$TMPROOT/new-node-staged-policy" "$EXTERNAL_ALLOWLIST"
+grep -Fq -- '-s 198.51.100.45/32 -p tcp -m conntrack --ctdir ORIGINAL --ctorigdstport 5432' "$TMPROOT/new-node-iptables"
+new_node_workload_write > "$TMPROOT/new-node-grant-ready.out"
+grep -Fq 'catalog compute egress CIDRs are installed' "$TMPROOT/new-node-grant-ready.out"
+[ -e "$TMPROOT/new-node-workload-written" ]
+cp "$TMPROOT/allowlist-before-new-node" "$EXTERNAL_ALLOWLIST"
 
 env "${XCW_ENV[@]}" bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/xcw-success.out"
 grep -q "compute_api=crossplane" "$TMPROOT/xcw-success.out"

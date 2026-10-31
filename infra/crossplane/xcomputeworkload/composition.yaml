@@ -71,8 +71,18 @@ spec:
               object: no managed resource is produced, so NOTHING IS SPENT, and Crossplane
               surfaces the message on the XR.
             */ -}}
-            {{- if ne $name $spec.nodeId }}
-            {{- fail (printf "XComputeWorkload %s/%s: metadata.name must equal spec.nodeId (%s) - one paid workload per node per environment namespace" $ns $name $spec.nodeId) }}
+            {{- /*
+              ISOLATED_SERVICE_IS_ITS_OWN_LEASE (story.5093). A node may own exactly one more
+              workload per isolated service the operator catalog names. Its name is
+              `<nodeId>-<instance>`, so the idempotence key below (`xcw:<ns>:<name>:<gen>`)
+              is a distinct paid lease while the receipt identity stays the node's nodeId.
+              Absent instance keeps the original one-workload-per-node gate byte-for-byte.
+            */ -}}
+            {{- $instance := dig "instance" "" $spec }}
+            {{- $expectedName := $spec.nodeId }}
+            {{- if ne $instance "" }}{{ $expectedName = printf "%s-%s" $spec.nodeId $instance }}{{ end }}
+            {{- if ne $name $expectedName }}
+            {{- fail (printf "XComputeWorkload %s/%s: metadata.name must equal %s (spec.nodeId %s, spec.instance %q) - one paid workload per node per instance per environment namespace" $ns $name $expectedName $spec.nodeId $instance) }}
             {{- end }}
             {{- if ne (printf "cogni-%s" $env) $ns }}
             {{- fail (printf "XComputeWorkload %s/%s: spec.environment %s must be reconciled in namespace cogni-%s" $ns $name $env $env) }}
@@ -214,6 +224,14 @@ spec:
             {{- $_ := set $e "LITELLM_BASE_URL" (printf "http://%s:4000" $substrate) }}
             {{- $_ := set $e "SCHEDULER_WORKER_HEALTH_URL" (printf "http://%s:30900" $substrate) }}
             {{- end }}
+            {{- end }}
+            {{- /*
+              An isolated-service lease has no node-app profile, but its public service must
+              still prove the exact source SHA on /version. It receives the SHA and nothing
+              else: no substrate topology, no profile secrets, no log-push credentials.
+            */ -}}
+            {{- if and (ne $instance "") (eq $svc.visibility "public") }}
+            {{- $_ := set $e "COGNI_REPO_SHA" $desiredSha }}
             {{- end }}
             {{- /* bindings -> sibling service URLs (legacy bindingEnv). */ -}}
             {{- range $k, $target := $svc.bindings }}
@@ -632,11 +650,13 @@ spec:
               kube-apiserver interruption can still strand the generic guard after the actuator
               has returned the existing allocation, which froze Red production on its prior SHA.
 
-              Release that guard only when FIVE independent facts agree: provider-http itself
+              Release that guard only when FOUR independent facts agree: provider-http itself
               reports the ambiguity; the pending timestamp exists; provider-http's current OR
               cached successful response is a real found:true OBSERVE (not a CREATE/UPDATE echo);
               that observation is active with a non-empty external handle under the exact current
-              cogniKey; and the XR has not served the desired SHA. The cache fallback is necessary
+              cogniKey. A previously served desired SHA is history, not allocation identity: using
+              it to refuse this acknowledgement strands an existing lease after a later response
+              loses serving. The cache fallback is necessary
               because provider-http overwrites status.response with a later transient refusal while
               preserving its last successful observation in status.cache.response. It is used only
               when the current response has no `found` key, and the cached response itself must be
@@ -668,8 +688,7 @@ spec:
             {{- $leaseReceiptState := dig "state" "unknown" $leaseReceiptRes }}
             {{- $leaseReceiptExternalName := dig "externalName" "" $leaseReceiptRes }}
             {{- $leaseReceiptProven := and (ge $leaseReceiptStatus 200) (lt $leaseReceiptStatus 300) $leaseReceiptObserved $leaseReceiptFound (eq $leaseReceiptState "active") (ne $leaseReceiptExternalName "") (eq $responseKey $currentKey) }}
-            {{- $leaseRevisionPending := ne $prevSha $desiredSha }}
-            {{- $recoverLeaseCreateAmbiguity := and $leaseCreateAmbiguous (ne $leaseCreatePending "") $leaseReceiptProven $leaseRevisionPending }}
+            {{- $recoverLeaseCreateAmbiguity := and $leaseCreateAmbiguous (ne $leaseCreatePending "") $leaseReceiptProven }}
             {{- $unsafeLeaseCreateAmbiguity := and $leaseCreateAmbiguous (not $recoverLeaseCreateAmbiguity) }}
             {{- /*
               TARGETED REQUEUE AFTER A LOST PROVIDER EVENT (bug.0001). A transient kube-apiserver
@@ -697,10 +716,9 @@ spec:
               creation, a never-served XR older than the deadline was a roach motel:
               $closeForBudget latched true, the lease Request stopped rendering, so no
               OBSERVE could ever set $prevSha and no spec change could un-close it. The
-              anchor is latched through status.bootEpoch: same key -> keep the recorded
-              start; key changed -> this render opens a fresh window. A first render (no
-              recorded epoch) keeps creationTimestamp, so every existing XR renders
-              byte-identically until its spec next changes.
+              at/key retain the attempt's render time. The spend deadline starts only
+              after the current paid allocation is observed (bug.5551). An unallocated
+              attempt must keep rendering its Request, even after a long pause/refusal.
             */ -}}
             {{- $bootKey := printf "%s:%d" $desiredSha $leaseGeneration }}
             {{- if gt $recoveryCount 0 }}{{ $bootKey = printf "%s:recover:%d" $bootKey $recoveryCount }}{{ end }}
@@ -712,9 +730,18 @@ spec:
             {{- else if ne $prevBootKey "" }}
             {{- $bootAnchorAt = dateInZone "2006-01-02T15:04:05Z07:00" now "UTC" }}
             {{- end }}
+            {{- $mintedAt := "" }}
+            {{- if eq $prevBootKey $bootKey }}
+            {{- $mintedAt = dig "status" "bootEpoch" "mintedAt" "" $xr | default "" }}
+            {{- end }}
+            {{- if and (eq $mintedAt "") $found (not $closed) (ne $externalName "") (eq $responseKey $currentKey) }}
+            {{- $mintedAt = dateInZone "2006-01-02T15:04:05Z07:00" now "UTC" }}
+            {{- end }}
             {{- $anchorTime := toDate "2006-01-02T15:04:05Z07:00" $bootAnchorAt }}
             {{- $ageSeconds := int (sub (now | unixEpoch) ($anchorTime | unixEpoch)) }}
-            {{- $bootDeadlineAt := dateInZone "2006-01-02T15:04:05Z07:00" ($anchorTime | dateModify (printf "%ds" $bootDeadlineSeconds)) "UTC" }}
+            {{- $mintTime := toDate "2006-01-02T15:04:05Z07:00" (default $bootAnchorAt $mintedAt) }}
+            {{- $mintAgeSeconds := int (sub (now | unixEpoch) ($mintTime | unixEpoch)) }}
+            {{- $bootDeadlineAt := dateInZone "2006-01-02T15:04:05Z07:00" ($mintTime | dateModify (printf "%ds" $bootDeadlineSeconds)) "UTC" }}
             {{- /*
               THE DEADLINE MUST BIND TO THE CURRENT ATTEMPT, NOT TO "EVER SERVED ANYTHING"
               (bug.5287, the arc's original finding). `$prevSha` is the LATCHED
@@ -742,7 +769,7 @@ spec:
               a live node on a false negative is worse than leaving that case to a human; it
               waits on bug.5237's host-routed probe.
             */ -}}
-            {{- $deadlineExceeded := and (not $hasServedDesired) (gt $ageSeconds $bootDeadlineSeconds) }}
+            {{- $deadlineExceeded := and (ne $mintedAt "") (not $hasServedDesired) (gt $mintAgeSeconds $bootDeadlineSeconds) }}
             {{- $closeForBudget := and $deadlineExceeded (eq $onDeadline "Close") }}
 
             {{- /*
@@ -1237,10 +1264,20 @@ spec:
             status:
               phase: {{ $phase | quote }}
               serving: {{ and $active $serving }}
+              {{- if ne $mintedAt "" }}
               bootDeadlineAt: {{ $bootDeadlineAt | quote }}
+              {{- else }}
+              bootDeadlineAt: null
+              {{- end }}
               bootEpoch:
                 key: {{ $bootKey | quote }}
                 at: {{ $bootAnchorAt | quote }}
+                {{- if ne $mintedAt "" }}
+                mintedAt: {{ $mintedAt | quote }}
+                {{- else }}
+                {{- /* Status fields merge: omission would carry the previous attempt's clock. */}}
+                mintedAt: null
+                {{- end }}
               {{- if gt $recoveryCount 0 }}
               recovery:
                 leaseGeneration: {{ $leaseGeneration }}

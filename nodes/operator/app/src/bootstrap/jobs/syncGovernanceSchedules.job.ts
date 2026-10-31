@@ -4,20 +4,23 @@
 /**
  * Module: `@bootstrap/jobs/syncGovernanceSchedules.job`
  * Purpose: Job module that wires governance schedule sync to the application container.
- * Scope: Acquires advisory lock, resolves dependencies from container, and syncs governance schedules
- *   for the operator's OWN node AND for every OTHER routable node (their epoch-collect NodeTaskWorkflow
- *   dispatch). Does not contain business logic (the pure orchestration lives in scheduler-core).
+ * Scope: Syncs own governance and foreign Ledger dispatch under an advisory lock; does not contain business logic (scheduler-core owns orchestration).
  * Invariants:
  *   - SINGLE_WRITER: pg_advisory_lock on a reserved (pinned) pool connection prevents concurrent sync runs
  *   - GRANT_VIA_PORT: Uses ensureGrant on ExecutionGrantUserPort, no raw SQL
  *   - SYSTEM_PRINCIPAL: Grant created for COGNI_SYSTEM_PRINCIPAL_USER_ID
- *   - MULTI_NODE_SCHEDULE_ID: each NON-operator node's sync prunes only ITS OWN `governance:{nodeId}:`
- *     schedules; the operator syncs its FLAT `governance:{charter}` schedules.
+ *   - FOREIGN_LEDGER_ONLY: foreign desired writes and prune candidates contain only the exact
+ *     node-scoped Ledger dispatch; sovereign mission/graph schedules remain node-owned.
+ *     The operator syncs its own FLAT `governance:{charter}` schedules.
  *   - OPERATOR_STAYS_ON_COLLECT_EPOCH (story.5001 REGRESSION_BAR): step 1 syncs the operator with
  *     `isOperator=true`, so its LEDGER_INGEST stays on the live FLAT `governance:ledger_ingest`
  *     CollectEpochWorkflow schedule (`ledger-tasks` queue) — byte-for-byte unchanged, NOT rewired
  *     onto NodeTaskWorkflow(/collect). The dispatch swap is other-nodes-only (step 2), so there is
  *     no dead 404 (before the operator `/collect` route ships) and no latent double-collect (after).
+ *   - SELF_SCOPE_NEEDS_NO_REGISTRY (task.5282): scope "self" runs ONLY step 1 — the operator's own
+ *     charters from its image repo-spec — under the same advisory lock, and never reads the fleet
+ *     registry / routable-node configs. Boot uses it so the operator's own schedules activate even
+ *     while catalog projection is failing. Scope "all" (default; ops route) is today's behavior.
  * Side-effects: IO (database advisory lock, Temporal RPC, grant creation)
  * Links: packages/scheduler-core/src/services/syncGovernanceSchedules.ts,
  *   nodes/operator/app/src/bootstrap/jobs/resolveRoutableNodeGovernanceConfigs.ts,
@@ -55,6 +58,27 @@ function computeNextRun(cron: string, timezone: string): Date {
   return interval.next().toDate();
 }
 
+/** "self" = the operator's own charters only; "all" = own charters + every routable node. */
+export type GovernanceSyncScope = "self" | "all";
+
+export interface GovernanceSyncJobOptions {
+  /** Default "all" (unchanged behavior). */
+  readonly scope?: GovernanceSyncScope;
+  /**
+   * Throw instead of returning a no-op summary when another sync holds the advisory lock.
+   * Boot retry loops set this so a kick that lost the lock race is retried, not dropped.
+   */
+  readonly throwIfLocked?: boolean;
+}
+
+/** Thrown (only with `throwIfLocked`) when another governance sync holds the lock. */
+export class GovernanceSyncLockedError extends Error {
+  constructor() {
+    super("governance sync already running (advisory lock held)");
+    this.name = "GovernanceSyncLockedError";
+  }
+}
+
 export interface GovernanceScheduleSyncSummary {
   created: number;
   updated: number;
@@ -70,7 +94,10 @@ export interface GovernanceScheduleSyncSummary {
  * 2. Resolves deps from the application container
  * 3. Calls syncGovernanceSchedules with repo-spec config
  */
-export async function runGovernanceSchedulesSyncJob(): Promise<GovernanceScheduleSyncSummary> {
+export async function runGovernanceSchedulesSyncJob(
+  options: GovernanceSyncJobOptions = {}
+): Promise<GovernanceScheduleSyncSummary> {
+  const scope: GovernanceSyncScope = options.scope ?? "all";
   const container = getContainer();
   const { log } = container;
 
@@ -80,7 +107,7 @@ export async function runGovernanceSchedulesSyncJob(): Promise<GovernanceSchedul
     return { created: 0, updated: 0, resumed: 0, skipped: 0, paused: 0 };
   }
 
-  log.info({}, "Starting governance schedule sync job");
+  log.info({ scope }, "Starting governance schedule sync job");
 
   // Advisory lock: non-blocking single-writer guard.
   // Pin a single pool connection so lock + unlock use the same session
@@ -92,6 +119,7 @@ export async function runGovernanceSchedulesSyncJob(): Promise<GovernanceSchedul
   const acquired = (lockRow as { acquired: boolean } | undefined)?.acquired;
   if (!acquired) {
     reservedConn.release();
+    if (options.throwIfLocked) throw new GovernanceSyncLockedError();
     log.info({}, "Governance sync already running, skipping");
     return { created: 0, updated: 0, resumed: 0, skipped: 0, paused: 0 };
   }
@@ -114,9 +142,8 @@ export async function runGovernanceSchedulesSyncJob(): Promise<GovernanceSchedul
         );
     };
 
-    // Sync ONE node's governance schedules. Deps are identical across nodes except
-    // `nodeId` + the prune scope (MULTI_NODE_SCHEDULE_ID): a node prunes only its
-    // own `governance:{nodeId}:` schedules, never a sibling node's.
+    // Sync own flat charters or a foreign node's operator-owned Ledger dispatch.
+    // Foreign sovereign charters stay outside both desired writes and prune ownership.
     //
     // `isOperator` (OPERATOR_STAYS_ON_COLLECT_EPOCH, story.5001 REGRESSION_BAR): true ONLY for
     // the operator's own node (step 1). It keeps the operator's LEDGER_INGEST on the live FLAT
@@ -148,6 +175,25 @@ export async function runGovernanceSchedulesSyncJob(): Promise<GovernanceSchedul
             scopes: [scope],
           });
           return grant.id;
+        },
+        // GRAPH_CHARTER (task.5282): a charter that declares `graph` runs on its own
+        // `graph:execute:{graphId}` grant, so the sandbox governance grant (and the
+        // LEDGER_INGEST schedule that shares it) is untouched.
+        ensureGraphGrant: async (graphId: string) => {
+          const grant = await container.executionGrantPort.ensureGrant({
+            userId: systemUserId,
+            billingAccountId: COGNI_SYSTEM_BILLING_ACCOUNT_ID,
+            scopes: [`graph:execute:${graphId}`],
+          });
+          return grant.id;
+        },
+        // GRAPH_CRON_DRIFT: next fire time of a cron, minute precision, for drift detection.
+        nextCronRun: (cron: string, timezone: string) => {
+          try {
+            return computeNextRun(cron, timezone).toISOString();
+          } catch {
+            return null;
+          }
         },
         upsertGovernanceScheduleRow: async (params) => {
           const nextRunAt = computeNextRun(params.cron, params.timezone);
@@ -202,8 +248,9 @@ export async function runGovernanceSchedulesSyncJob(): Promise<GovernanceSchedul
         nodeId,
         scheduleControl: container.scheduleControl,
         // Prune scope:
-        //  - NON-operator node → MULTI_NODE_SCHEDULE_ID: only its own
-        //    `governance:{nodeId}:` schedules (never a sibling's, never the operator's flat).
+        //  - Foreign node → only the exact operator-owned Ledger dispatch.
+        //    Sovereign mission/graph schedules belong to that node's startup; even a
+        //    removed foreign declaration must never make them prune candidates.
         //  - operator (isOperator) → its own FLAT `governance:{charter}` schedules only. It
         //    lists the bare `governance:` prefix (pre-swap behavior) then filters to the flat
         //    (legacy, 2-segment) ids, so it prunes a removed operator charter WITHOUT ever
@@ -214,10 +261,13 @@ export async function runGovernanceSchedulesSyncJob(): Promise<GovernanceSchedul
                 await container.scheduleControl.listScheduleIds("governance:");
               return all.filter(isLegacyGovernanceScheduleId);
             }
-          : () =>
-              container.scheduleControl.listScheduleIds(
+          : async () => {
+              const all = await container.scheduleControl.listScheduleIds(
                 governancePrunePrefix(nodeId)
-              ),
+              );
+              const collectSid = governanceScheduleId(nodeId, "LEDGER_INGEST");
+              return all.filter((id) => id === collectSid);
+            },
         disableSchedule,
         log,
       });
@@ -253,6 +303,12 @@ export async function runGovernanceSchedulesSyncJob(): Promise<GovernanceSchedul
     const operatorNodeId = getNodeId();
     add(await syncFor(operatorNodeId, getGovernanceConfig(), true));
 
+    // SELF_SCOPE_NEEDS_NO_REGISTRY: the operator's own charters need no GitHub/catalog read.
+    if (scope === "self") {
+      log.info(totals, "Governance schedule sync complete (self)");
+      return totals;
+    }
+
     // 2) Every OTHER routable node — read its git-authoritative governance config and sync its
     //    epoch-collect NodeTaskWorkflow(/collect) dispatch. THIS is what gives spawned nodes
     //    multi-node epochs (previously the operator scheduled only its own — single-tenant).
@@ -264,7 +320,15 @@ export async function runGovernanceSchedulesSyncJob(): Promise<GovernanceSchedul
     for (const { nodeId, slug, config } of nodeConfigs) {
       if (nodeId === operatorNodeId) continue; // OPERATOR_NOT_DOUBLE_COLLECTED
       try {
-        add(await syncFor(nodeId, config, false));
+        // Foreign graph/mission declarations are reconciled only by sovereign startup.
+        // Match the router's case-insensitive Ledger classification.
+        const foreignLedgerConfig = {
+          ...config,
+          schedules: config.schedules.filter(
+            ({ charter }) => charter.toUpperCase() === "LEDGER_INGEST"
+          ),
+        };
+        add(await syncFor(nodeId, foreignLedgerConfig, false));
 
         // DEPLOY_COLLECT: kick each routable node's epoch-collect dispatch once per sync so a
         // node's ledger is populated promptly instead of waiting up to a full cron period. This

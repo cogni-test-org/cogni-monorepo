@@ -22,24 +22,20 @@ export const KnowledgeListQuerySchema = z.object({
     .enum(["human", "analysis_signal", "external", "derived", "agent"])
     .optional(),
   limit: z.number().int().min(1).max(500).optional().default(100),
+  /**
+   * SCHEMA_REFINED_BY_READ_FILTER opt-in: include EDO machinery rows
+   * (event/hypothesis/decision/outcome). Default false — excluded.
+   */
+  includeEdo: z.boolean().optional(),
 });
 export type KnowledgeListQuery = z.infer<typeof KnowledgeListQuerySchema>;
 
-export const KnowledgeRowSchema = z.object({
-  id: z.string(),
-  domain: z.string(),
-  entityId: z.string().nullable(),
-  title: z.string(),
-  content: z.string(),
-  useWhen: z.string().nullable(),
-  entryType: z.string(),
-  confidencePct: z.number().int().nullable(),
-  sourceType: z.string(),
-  sourceRef: z.string().nullable(),
-  tags: z.array(z.string()).nullable(),
-  createdAt: z.string().nullable(),
-});
-export type KnowledgeRow = z.infer<typeof KnowledgeRowSchema>;
+import { KnowledgeRowSchema } from "@cogni/shared-knowledge-store/contracts";
+
+export {
+  type KnowledgeRow,
+  KnowledgeRowSchema,
+} from "@cogni/shared-knowledge-store/contracts";
 
 export const KnowledgeListResponseSchema = z.object({
   items: z.array(KnowledgeRowSchema),

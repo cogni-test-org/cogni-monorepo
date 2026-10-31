@@ -9,13 +9,14 @@
  *   - TOOL_ID_NAMESPACED: ID is `core__edo_decide`
  *   - EFFECT_TYPED: effect is `state_change`
  *   - DECISION_CITES_HYPOTHESIS: derivesFromHypothesisId is required.
- *   - EDGE_TYPE_MATCHES_CITED_ENTRY_TYPE: cited row must be a hypothesis.
+ *   - EDGE_TYPE_MATCHES_CITED_ENTRY_TYPE: cited row must be a hypothesis or a DAO goal.
  *   - EDO_TOOLS_ATOMIC: write + edge + commit happen in one call.
  * Side-effects: IO (database write + dolt_commit)
  * Links: docs/spec/knowledge-syntropy.md
  * @public
  */
 
+import { KnowledgeRowSchema } from "@cogni/shared-knowledge-store/contracts";
 import { z } from "zod";
 
 import type { EdoCapability } from "../capabilities/edo";
@@ -37,7 +38,7 @@ export const EdoDecideInputSchema = z.object({
     .string()
     .min(1)
     .describe(
-      "ID of the hypothesis this decision acts on. MUST refer to entry_type='hypothesis' — the adapter rejects otherwise."
+      "ID of the hypothesis or DAO goal this decision acts on. MUST refer to entry_type='hypothesis' or 'goal' — the adapter rejects otherwise."
     ),
   sourceType: z
     .enum(["human", "agent", "analysis_signal", "external", "derived"])
@@ -49,13 +50,7 @@ export const EdoDecideInputSchema = z.object({
 export type EdoDecideInput = z.infer<typeof EdoDecideInputSchema>;
 
 export const EdoDecideOutputSchema = z.object({
-  entry: z.object({
-    id: z.string(),
-    domain: z.string(),
-    title: z.string(),
-    confidencePct: z.number().nullable(),
-    sourceType: z.string(),
-  }),
+  entry: KnowledgeRowSchema,
   derivesFromHypothesisId: z.string(),
   committed: z.boolean(),
   message: z.string(),
@@ -77,8 +72,9 @@ export const edoDecideContract: ToolContract<
   description:
     "File a decision (the action taken on a hypothesis) + derives_from citation + auto-commit. " +
     "Decisions without a falsifiable prediction should be filed as 'finding' via core__knowledge_write instead. " +
-    "The derivesFromHypothesisId MUST refer to a hypothesis row — the adapter rejects mismatched entry_types.",
+    "The derivesFromHypothesisId MUST refer to a hypothesis or goal row — the adapter rejects mismatched entry_types.",
   effect: "state_change",
+  requires: "node.collaborate",
   inputSchema: EdoDecideInputSchema,
   outputSchema: EdoDecideOutputSchema,
   redact: (output) => output,
@@ -114,13 +110,7 @@ export function createEdoDecideImplementation(
       });
 
       return {
-        entry: {
-          id: entry.id,
-          domain: entry.domain,
-          title: entry.title,
-          confidencePct: entry.confidencePct,
-          sourceType: entry.sourceType,
-        },
+        entry: { ...entry },
         derivesFromHypothesisId: input.derivesFromHypothesisId,
         committed: true,
         message: `Decision '${entry.id}' filed; derives from '${input.derivesFromHypothesisId}'`,
