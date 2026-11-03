@@ -37,7 +37,6 @@ resources:
   - ../../../base/node-deploy-sequencer
   - ./node-deploy-secrets-namespace.yaml
   - ./secrets-writer-sa.yaml
-  - ./compute-workload-platform-application.yaml
   # task.5247 — private read-only database status observation.
   - ../../../base/database-reliability-actuator
   - ./database-reliability-actuator-external-secret.yaml
@@ -67,13 +66,6 @@ replacements:
       - select: {kind: Role, name: node-deploy-sequencer}
         fieldPaths: [metadata.namespace]
       - select: {kind: RoleBinding, name: node-deploy-sequencer}
-        fieldPaths: [metadata.namespace]
-  - source:
-      kind: Application
-      name: compute-workload-platform
-      fieldPath: spec.destination.namespace
-    targets:
-      - select: {kind: Application, name: compute-workload-platform}
         fieldPaths: [metadata.namespace]
 patches:
   - target:
@@ -561,3 +553,7 @@ patches:
                     value: candidate-a
                   - name: FORK_DOMAIN_ROOT
                     value: cognidao.org
+  - target:
+      kind: Deployment
+      name: node-app
+    path: .prepare-init-compatibility.json
