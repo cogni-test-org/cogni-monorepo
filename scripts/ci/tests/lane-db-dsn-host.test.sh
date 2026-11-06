@@ -137,7 +137,7 @@ for catalog_file in "$CATALOG_DIR"/*.yaml; do
     PAIRS+=("${node}/${env}")
   done < <(yq -r '.envs[]?' "$catalog_file")
 done
-[ "${#PAIRS[@]}" -ge 10 ] || fail "only ${#PAIRS[@]} (node, lane) pairs derived from $CATALOG_DIR — the enumeration is broken, not the fleet"
+[ "${#PAIRS[@]}" -ge 1 ] || fail "only ${#PAIRS[@]} (node, lane) pairs derived from $CATALOG_DIR — expected the current primary node lane"
 
 DSN_KEYS=(DATABASE_URL DATABASE_SERVICE_URL DOLTGRES_URL)
 

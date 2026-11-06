@@ -31,6 +31,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+. "$SCRIPT_DIR/lib/catalog-input.sh"
+TEST_NODE="$(catalog_test_primary_node "$REPO_ROOT/infra/catalog")"
 TARGET="$REPO_ROOT/scripts/secrets/set-secret.sh"
 
 TMPROOT=$(mktemp -d -t openbao-clobber.XXXXXX)
@@ -149,27 +151,27 @@ path_dir() { printf '%s/cogni_candidate-a_%s' "$STORE" "$1"; }
 
 # ── (c) genuinely absent → put (create) ──────────────────────────────────────
 # Seed a sibling first so we can later prove (a) preserves it. Absent path:
-set_secret "" candidate-a node-template SIBLING_ONE seed-value-1
+set_secret "" candidate-a "$TEST_NODE" SIBLING_ONE seed-value-1
 check "(c) absent path → create succeeds (exit 0)" "[[ $RC -eq 0 ]]"
 check "(c) key written on create" \
-  "[[ \"\$(cat \"$(path_dir node-template)/SIBLING_ONE\" 2>/dev/null)\" == seed-value-1 ]]"
+  "[[ \"\$(cat \"$(path_dir "$TEST_NODE")/SIBLING_ONE\" 2>/dev/null)\" == seed-value-1 ]]"
 
 # ── (a) existing bucket → patch merges, siblings preserved, NO clobber ────────
-set_secret "" candidate-a node-template SECOND_KEY second-value
+set_secret "" candidate-a "$TEST_NODE" SECOND_KEY second-value
 check "(a) patch on existing path succeeds (exit 0)" "[[ $RC -eq 0 ]]"
 check "(a) new key present after patch" \
-  "[[ \"\$(cat \"$(path_dir node-template)/SECOND_KEY\" 2>/dev/null)\" == second-value ]]"
+  "[[ \"\$(cat \"$(path_dir "$TEST_NODE")/SECOND_KEY\" 2>/dev/null)\" == second-value ]]"
 check "(a) SIBLING PRESERVED after patch (no clobber)" \
-  "[[ \"\$(cat \"$(path_dir node-template)/SIBLING_ONE\" 2>/dev/null)\" == seed-value-1 ]]"
+  "[[ \"\$(cat \"$(path_dir "$TEST_NODE")/SIBLING_ONE\" 2>/dev/null)\" == seed-value-1 ]]"
 
 # ── (b) transient error → NO put, non-zero exit (fail-closed) ────────────────
 # Path exists + patch injected to fail transiently. The bug would put→clobber.
-set_secret patch candidate-a node-template THIRD_KEY third-value
+set_secret patch candidate-a "$TEST_NODE" THIRD_KEY third-value
 check "(b) transient patch failure → non-zero exit" "[[ $RC -ne 0 ]]"
 check "(b) THIRD_KEY NOT written (no put on transient)" \
-  "[[ ! -e \"$(path_dir node-template)/THIRD_KEY\" ]]"
+  "[[ ! -e \"$(path_dir "$TEST_NODE")/THIRD_KEY\" ]]"
 check "(b) SIBLINGS INTACT after transient failure (no clobber)" \
-  "[[ \"\$(cat \"$(path_dir node-template)/SIBLING_ONE\" 2>/dev/null)\" == seed-value-1 && \"\$(cat \"$(path_dir node-template)/SECOND_KEY\" 2>/dev/null)\" == second-value ]]"
+  "[[ \"\$(cat \"$(path_dir "$TEST_NODE")/SIBLING_ONE\" 2>/dev/null)\" == seed-value-1 && \"\$(cat \"$(path_dir "$TEST_NODE")/SECOND_KEY\" 2>/dev/null)\" == second-value ]]"
 check "(b) refuses with an explanatory 'refusing to put' message" \
   "printf '%s' \"\$OUT\" | grep -qi 'refusing to put'"
 

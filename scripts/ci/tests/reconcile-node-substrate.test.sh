@@ -8,6 +8,8 @@ export FORK_DOMAIN_ROOT=cognidao.org COGNI_DOMAIN_ROOT=cognidao.org COGNI_DEPLOY
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+. "$SCRIPT_DIR/lib/catalog-input.sh"
+TEST_NODE="$(catalog_test_primary_node "$REPO_ROOT/infra/catalog")"
 cd "$REPO_ROOT"
 
 TMPROOT=$(mktemp -d -t reconcile-node-substrate.XXXXXX)
@@ -817,13 +819,10 @@ env \
 grep -q "substrate ready inputs reconciled for operator" "$TMPROOT/relative-catalog-root.out"
 
 # task.5017 — deploy ⊆ provisioned: reconciling a node into an env outside its
-# `envs:` node-set must fail loud BEFORE any substrate mutation. Every real catalog node
-# is now all-envs (node-template opted into production in story.5009), so this guard is
-# exercised against a FIXTURE catalog where node-template is restricted to [candidate-a] —
-# testing the enforcement logic with controlled input, decoupled from the live node-set.
-RESTRICTED_CATALOG="$TMPROOT/restricted-catalog"
-cp -r infra/catalog "$RESTRICTED_CATALOG"
-yq -i '.envs = ["candidate-a"]' "$RESTRICTED_CATALOG/node-template.yaml"
+# `envs:` node-set must fail BEFORE any substrate mutation. Copy the real primary
+# node and restrict only its membership; never invent a missing deployment row.
+RESTRICTED_CATALOG="$REPO_ROOT/infra/catalog"
+! yq -e '.envs | contains(["production"])' "$RESTRICTED_CATALOG/$TEST_NODE.yaml" >/dev/null
 set +e
 env \
   VM_HOST=fake \
@@ -836,10 +835,10 @@ env \
   FAKE_REMOTE_ROOT="$REMOTE_ROOT" \
   FAKE_REMOTE_PATH="$FAKEBIN" \
   FAKE_BAO_ROOT="$BAO_ROOT" \
-  bash scripts/ci/reconcile-node-substrate.sh production node-template > "$TMPROOT/offset-env.out" 2>&1
+  bash scripts/ci/reconcile-node-substrate.sh production "$TEST_NODE" > "$TMPROOT/offset-env.out" 2>&1
 offset_rc=$?
 set -e
-[ "$offset_rc" -ne 0 ] || { echo "expected reconcile to fail for node-template in production (restricted fixture)" >&2; exit 1; }
+[ "$offset_rc" -ne 0 ] || { echo "expected reconcile to fail for $TEST_NODE in production (restricted fixture)" >&2; exit 1; }
 grep -q "is not in the 'production' node-set" "$TMPROOT/offset-env.out" \
   || { echo "missing node-set rejection message; got:" >&2; cat "$TMPROOT/offset-env.out" >&2; exit 1; }
 

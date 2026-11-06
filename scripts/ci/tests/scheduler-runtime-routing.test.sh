@@ -19,6 +19,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+. "$SCRIPT_DIR/lib/catalog-input.sh"
+TEST_NODE="$(catalog_test_primary_node "$REPO_ROOT/infra/catalog")"
 cd "$REPO_ROOT"
 
 # shellcheck source=scripts/ci/lib/image-tags.sh
@@ -151,7 +153,7 @@ cp nodes/operator/.cogni/repo-spec.yaml "$TMP_TREE/nodes/operator/.cogni/repo-sp
 AY_ID="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 # (a) projection present → routed (slug + projected UUID), no parent-readable repo-spec needed
 yq ".name = \"ay\" | .path_prefix = \"nodes/ay/\" | .node_port = 30400 | .image_tag_suffix = \"-ay\" | .migrator_tag_suffix = \"-ay-migrate\" | .source_repo = \"https://github.com/cogni-test-org/ay.git\" | .image_repository = \"ghcr.io/cogni-test-org/ay\" | .node_id = \"$AY_ID\"" \
-  infra/catalog/node-template.yaml > "$TMP_CATALOG/ay.yaml"
+  "$REPO_ROOT/infra/catalog/$TEST_NODE.yaml" > "$TMP_CATALOG/ay.yaml"
 
 fixture_endpoints="$(COGNI_CATALOG_ROOT="$TMP_CATALOG" bash scripts/ci/render-scheduler-worker-endpoints.sh)" \
   || fail "render failed for a submodule catalog node carrying a node_id projection"
@@ -197,9 +199,9 @@ mkdir -p "$PLACEMENT_CATALOG"
 ZK_ID="11111111-2222-3333-4444-555555555555"
 ZA_ID="66666666-7777-8888-9999-aaaaaaaaaaaa"
 yq ".name = \"zk\" | .envs = [\"candidate-a\", \"preview\", \"production\"] | .path_prefix = \"nodes/zk/\" | .node_port = 30401 | .image_tag_suffix = \"-zk\" | .migrator_tag_suffix = \"-zk-migrate\" | .source_repo = \"https://github.com/cogni-test-org/zk.git\" | .image_repository = \"ghcr.io/cogni-test-org/zk\" | .node_id = \"$ZK_ID\" | del(.deployment_provider) | del(.is_primary_host)" \
-  infra/catalog/node-template.yaml > "$PLACEMENT_CATALOG/zk.yaml"
+  "$REPO_ROOT/infra/catalog/$TEST_NODE.yaml" > "$PLACEMENT_CATALOG/zk.yaml"
 yq ".name = \"za\" | .envs = [\"candidate-a\", \"preview\", \"production\"] | .path_prefix = \"nodes/za/\" | .node_port = 30402 | .image_tag_suffix = \"-za\" | .migrator_tag_suffix = \"-za-migrate\" | .source_repo = \"https://github.com/cogni-test-org/za.git\" | .image_repository = \"ghcr.io/cogni-test-org/za\" | .node_id = \"$ZA_ID\" | del(.is_primary_host) | .deployment_provider = {\"candidate-a\": \"akash\", \"production\": \"akash\"}" \
-  infra/catalog/node-template.yaml > "$PLACEMENT_CATALOG/za.yaml"
+  "$REPO_ROOT/infra/catalog/$TEST_NODE.yaml" > "$PLACEMENT_CATALOG/za.yaml"
 
 assert_endpoint() {
   local env="$1" want_zk="$2" want_za="$3" csv

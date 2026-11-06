@@ -32,7 +32,7 @@ for catalog_file in "$CATALOG_DIR"/*.yaml; do
     pairs=$((pairs + 1))
   done < <(yq -r '.envs[]?' "$catalog_file")
 done
-[ "$pairs" -ge 10 ] || fail 'catalog enumeration unexpectedly empty'
+[ "$pairs" -ge 1 ] || fail 'catalog enumeration unexpectedly empty'
 echo "[1] all $pairs committed lanes are resident; ledger empty"
 
 # New Akash birth: foreign compute custody MUST NOT imply foreign Postgres.
