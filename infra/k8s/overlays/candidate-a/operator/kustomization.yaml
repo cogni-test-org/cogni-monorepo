@@ -264,8 +264,8 @@ patches:
                   # cognidao.org (hub test-fleet-parity-boundary; dns-ops skill). Its Cloudflare token
                   # (OpenBao cogni/candidate-a/operator/CLOUDFLARE_API_TOKEN) is scoped to this zone only,
                   # so the sequencer resolves the zone id BY NAME with that token. The operator endpoint
-                  # (test.cognidao.org) and the substrate host above stay in cognidao.org. Production and
-                  # production sets cognidao.org explicitly; preview has no local binding.
+                  # (test.cognidao.org) and the substrate host above stay in cognidao.org. Production sets
+                  # cognidao.org explicitly; preview has no local binding.
   - target:
       kind: ConfigMap
       name: node-app-config
@@ -571,3 +571,7 @@ patches:
                     value: candidate-a
                   - name: FORK_DOMAIN_ROOT
                     value: cognidao.org
+  - target:
+      kind: Deployment
+      name: node-app
+    path: .prepare-init-compatibility.json
