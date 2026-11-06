@@ -49,7 +49,7 @@ transformers:
 images:
   - name: ghcr.io/cogni-dao/cogni-template
     newName: ghcr.io/cogni-dao/cogni-template
-    digest: "sha256:cb99f692228d44a9b2f16047d284dec48b33e4a063c83d52d4cbed8672efbd01"
+    digest: "sha256:5f81d3d58e69f38042e869e7d710d87e46fec750a9dcdeab01e66d572639007f"
 replacements:
   # task.5400 — the sequencer's secrets live in a DEDICATED namespace, not the wallet namespace
   # (cogni-candidate-a). The `namespace:` transformer above forces EVERYTHING it can into cogni-candidate-a, including
