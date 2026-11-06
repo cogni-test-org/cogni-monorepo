@@ -256,18 +256,6 @@ compose_base_ref() {
 echo '[current] all catalog lanes compose lane-local app/service/migration DSNs; Doltgres unchanged'
 
 # Historical pins are an EXPLICIT rollback fixture, not the committed contract.
-. "$SCRIPT_DIR/fixtures/catalog.sh"
-write_historical_catalog_fixture "$CATALOG_DIR" "$TMPROOT/historical-catalog"
-export CATALOG_DIR="$TMPROOT/historical-catalog" COGNI_CATALOG_ROOT="$TMPROOT/historical-catalog"
-export FLEET_CONTROL_ENV=production
-# The real reader caches its roster at source time; rebuild it from the selected fixture.
-. "$REPO_ROOT/scripts/ci/lib/image-tags.sh"
-# Include each authored rollback pair even when the current fleet has no such node.
-for fixture_pair in poly/candidate-a poly/preview red/candidate-a toks5/preview; do
-  found=false
-  for pair in "${PAIRS[@]}"; do [ "$pair" != "$fixture_pair" ] || found=true; done
-  if [ "$found" = false ]; then PAIRS+=("$fixture_pair"); fi
-done
 # Old inertness baselines apply only to the historical four or local-custody rows;
 # a future foreign-compute birth is covered above and never inherits these pins.
 HISTORICAL_PAIRS=()
@@ -470,12 +458,9 @@ echo "  ok  scope guards hold"
   fixture="$TMPROOT/db-provision"
   mkdir -p "$fixture/infra/catalog"
   cp "$REPO_ROOT/infra/database-budget-profiles.yaml" "$fixture/infra/"
-  # This caller scenario owns its full roster, including preview membership and tiers.
-  write_akash_catalog_fixture "$fixture/infra/catalog" operator shared operator-control-v1
-  write_akash_catalog_fixture "$fixture/infra/catalog" red
-  write_akash_catalog_fixture "$fixture/infra/catalog" poly dedicated dedicated-high-throughput-v1
-  yq -i '.envs = ["candidate-a", "production"]' "$fixture/infra/catalog/red.yaml"
-  cp "$fixture/infra/catalog/operator.yaml" "$fixture/operator-baseline.yaml"
+  for node in operator red poly; do
+    cp "$REPO_ROOT/infra/catalog/$node.yaml" "$fixture/infra/catalog/"
+  done
   for function_name in render_shared_db_provision_config read_node_db_secret provision_shared_node_databases; do
     function_source="$(awk -v name="$function_name" '
       $0 == name "() {" { capture=1 }
@@ -490,8 +475,6 @@ echo "  ok  scope guards hold"
   log_info() { :; }
   log_warn() { printf '%s\n' "$*" >> "$fixture/skips"; }
   REPO_ROOT="$fixture"
-  export CATALOG_DIR="$fixture/infra/catalog" COGNI_CATALOG_ROOT="$fixture/infra/catalog"
-  . "$real_repo/scripts/ci/lib/image-tags.sh"
   NODE_TARGETS=(operator red poly)
   DEPLOY_ENVIRONMENT=candidate-a
   NODE_DB_PROVISION_CONFIG="$(render_shared_db_provision_config)"
@@ -508,15 +491,15 @@ echo "  ok  scope guards hold"
   # An absent profile, bad limit or unknown tier fails before the caller runs.
   yq -i '.database."candidate-a".budget_profile = "absent"' "$fixture/infra/catalog/operator.yaml"
   if render_shared_db_provision_config >/dev/null 2>&1; then fail "missing profile accepted"; fi
-  cp "$fixture/operator-baseline.yaml" "$fixture/infra/catalog/operator.yaml"
+  cp "$real_repo/infra/catalog/operator.yaml" "$fixture/infra/catalog/"
   yq -i '."operator-control-v1".roles.app.connection_limit = 0' "$fixture/infra/database-budget-profiles.yaml"
   if render_shared_db_provision_config >/dev/null 2>&1; then fail "zero budget accepted"; fi
   cp "$real_repo/infra/database-budget-profiles.yaml" "$fixture/infra/"
   yq -i '.database."candidate-a".tier = "foreign"' "$fixture/infra/catalog/operator.yaml"
   if render_shared_db_provision_config >/dev/null 2>&1; then fail "unknown database boundary accepted"; fi
-  cp "$fixture/operator-baseline.yaml" "$fixture/infra/catalog/operator.yaml"
+  cp "$real_repo/infra/catalog/operator.yaml" "$fixture/infra/catalog/"
 
-  # Use the ACTUAL remote read helper with a hermetic kubectl substitute. A
+  # Use the ACTUAL remote read helper with a hermetic cached-reader substitute. A
   # migration password in the public bank is deliberately wrong: the isolated
   # bank is the sole permissible source. Fake values contain shell metacharacters
   # to catch accidental word splitting or evaluation in Docker argument assembly.
@@ -524,15 +507,17 @@ echo "  ok  scope guards hold"
   compose_log="$fixture/compose"
   : > "$read_log"
   : > "$compose_log"
-  timeout() { shift; "$@"; }
-  kubectl() {
-    printf '%s\n' "${*: -2}" >> "$read_log"
-    case "${*: -2}" in
-      '-field=APP_DB_PASSWORD cogni/candidate-a/operator') printf '%s' "app fixture ' \$(literal)" ;;
-      '-field=APP_DB_SERVICE_PASSWORD cogni/candidate-a/operator') printf '%s' 'service fixture' ;;
-      '-field=APP_DB_MIGRATION_PASSWORD cogni/candidate-a/operator-database-migration')
-        [[ "${missing_migration:-false}" == false ]] && printf '%s' 'isolated fixture' ;;
-      '-field=APP_DB_MIGRATION_PASSWORD cogni/candidate-a/operator') printf '%s' 'WRONG PUBLIC VALUE' ;;
+  openbao_get_field() {
+    [[ "$#" == 4 && "$3" == 10 && "$4" == 1 ]] \
+      || fail "late DB reads must retain one bounded ten-second attempt"
+    printf '%s\n' "-field=$2 cogni/${DEPLOY_ENVIRONMENT}/$1" >> "$read_log"
+    case "$1/$2" in
+      operator/APP_DB_PASSWORD) printf '%s' "app fixture ' \$(literal)" ;;
+      operator/APP_DB_SERVICE_PASSWORD) printf '%s' 'service fixture' ;;
+      operator-database-migration/APP_DB_MIGRATION_PASSWORD)
+        if [[ "${missing_migration:-false}" == false ]]; then printf '%s' 'isolated fixture'; fi ;;
+      operator/APP_DB_MIGRATION_PASSWORD) printf '%s' 'WRONG PUBLIC VALUE' ;;
+      red/APP_DB_PASSWORD | red/APP_DB_SERVICE_PASSWORD | red-database-migration/APP_DB_MIGRATION_PASSWORD) return 0 ;;
       *) return 1 ;;
     esac
   }
