@@ -12,6 +12,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+. "$SCRIPT_DIR/lib/catalog-input.sh"
+TEST_NODE="$(catalog_test_primary_node "$REPO_ROOT/infra/catalog")"
 TARGET="$REPO_ROOT/scripts/secrets/set-secret.sh"
 
 TMPROOT=$(mktemp -d -t set-secret.XXXXXX)
@@ -62,8 +64,8 @@ run_case() {
 
 # Case 1 — happy path: valid env + catalog service + key + value via stdin.
 run_case "happy path writes through to bao" "hunter2" 0 \
-  "cogni/candidate-a/node-template|OPENROUTER_API_KEY|hunter2" \
-  candidate-a node-template OPENROUTER_API_KEY
+  "cogni/candidate-a/${TEST_NODE}|OPENROUTER_API_KEY|hunter2" \
+  candidate-a "$TEST_NODE" OPENROUTER_API_KEY
 
 # Case 2 — preview env accepted.
 run_case "preview env accepted" "v" 0 \
@@ -85,7 +87,7 @@ run_case "_unknown reserved namespace rejected" "x" 2 "" \
 
 # Case 6 — unknown env rejected.
 run_case "unknown env rejected" "x" 2 "" \
-  staging node-template FOO
+  staging "$TEST_NODE" FOO
 
 # Case 7 — unknown service (no catalog file) rejected.
 run_case "unknown service rejected" "x" 2 "" \
@@ -93,23 +95,23 @@ run_case "unknown service rejected" "x" 2 "" \
 
 # Case 8 — lowercase key rejected.
 run_case "lowercase key rejected" "x" 2 "" \
-  candidate-a node-template lowercase_key
+  candidate-a "$TEST_NODE" lowercase_key
 
 # Case 9 — key starting with digit rejected.
 run_case "digit-leading key rejected" "x" 2 "" \
-  candidate-a node-template 1_BAD_KEY
+  candidate-a "$TEST_NODE" 1_BAD_KEY
 
 # Case 10 — key with hyphen rejected.
 run_case "hyphenated key rejected" "x" 2 "" \
-  candidate-a node-template BAD-KEY
+  candidate-a "$TEST_NODE" BAD-KEY
 
 # Case 11 — empty stdin value rejected.
 run_case "empty value rejected" "" 2 "" \
-  candidate-a node-template GOOD_KEY
+  candidate-a "$TEST_NODE" GOOD_KEY
 
 # Case 12 — wrong arg count rejected.
 run_case "missing service arg rejected" "x" 2 "" \
-  candidate-a node-template
+  candidate-a "$TEST_NODE"
 
 # Give dynamic ownership validation its own catalog identity, even in a TEST fleet.
 # The real typed validator and package tools remain in the checkout; only ownership is synthetic.

@@ -30,7 +30,7 @@
 # So BOTH halves are discovered at runtime: the example node is the first renderer-owned
 # node with a catalog row and a committed overlay, and the example ENV is whichever env
 # that overlay lives in. The only tree-shape assumption left is the irreducible one —
-# ≥1 wizard-born node is deployed SOMEWHERE.
+# zero wizard-born deployments is supported and tested explicitly.
 #
 # Run: bash scripts/ci/tests/render-node-overlays.test.sh
 set -euo pipefail
@@ -66,8 +66,23 @@ pick_fixture_pair() {
   done
   return 1
 }
-read -r FIXTURE_ENV FIXTURE_NODE < <(pick_fixture_pair) \
-  || fail "no wizard-born node with a committed overlay found to use as the render fixture"
+if ! read -r FIXTURE_ENV FIXTURE_NODE < <(pick_fixture_pair); then
+  # A current fleet with no legacy wizard rows is valid. Test that real case.
+  declared="$(yq -N 'select(.type == "node" and .source_repo != null and .name != "node-template") | .name' infra/catalog/*.yaml)"
+  [ -z "$declared" ] || fail "declared wizard nodes have no committed overlay: $declared"
+  bash "$RENDER" --check >/dev/null || fail "current empty-wizard fleet has overlay drift"
+  empty_tree="$(mktemp -d -t empty-wizard.XXXXXX)"
+  trap 'rm -rf "$empty_tree"' EXIT
+  git clone --quiet --shared "$REPO_ROOT" "$empty_tree/tree"
+  bash "$empty_tree/tree/$RENDER" --write >/dev/null
+  git -C "$empty_tree/tree" diff --exit-code -- infra/k8s/overlays >/dev/null \
+    || fail "empty-wizard reconciliation changed protected current overlays"
+  if bash "$RENDER" candidate-a not-a-current-node >/dev/null 2>&1; then
+    fail "renderer accepted an undeclared node"
+  fi
+  echo 'PASS: current zero-wizard roster; drift, no-op and refusal verified'
+  exit 0
+fi
 [ -n "${FIXTURE_ENV:-}" ] && [ -n "${FIXTURE_NODE:-}" ] \
   || fail "no wizard-born node with a committed overlay found to use as the render fixture"
 echo "  (render fixture: env=$FIXTURE_ENV node=$FIXTURE_NODE)"

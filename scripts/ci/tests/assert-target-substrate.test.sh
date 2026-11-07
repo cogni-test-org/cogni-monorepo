@@ -7,6 +7,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$REPO_ROOT"
+. "$SCRIPT_DIR/lib/catalog-input.sh"
+TEST_NODE="$(catalog_test_primary_node "$REPO_ROOT/infra/catalog")"
+[ "$TEST_NODE" = operator ] || { echo "expected the current operator primary" >&2; exit 1; }
+export FAKE_EXPECTED_NODEPORT="$(yq -N ' .node_port' infra/catalog/operator.yaml)"
 
 TMPROOT=$(mktemp -d -t assert-target-substrate.XXXXXX)
 trap 'rm -rf "$TMPROOT"' EXIT
@@ -16,15 +20,15 @@ REMOTE_ROOT="$TMPROOT/remote"
 mkdir -p "$FAKEBIN" "$REMOTE_ROOT/opt/cogni-template-edge/configs" "$REMOTE_ROOT/opt/cogni-template-runtime"
 
 cat > "$REMOTE_ROOT/opt/cogni-template-edge/.env" <<'EOF'
-NODE_TEMPLATE_DOMAIN=node-template-test.cognidao.org
+OPERATOR_UPSTREAM=host.docker.internal:30000
 EOF
 cat > "$REMOTE_ROOT/opt/cogni-template-edge/configs/Caddyfile.tmpl" <<'EOF'
-node-template-test.cognidao.org {
-  reverse_proxy host.docker.internal:30200
+test.cognidao.org {
+  reverse_proxy host.docker.internal:30000
 }
 EOF
 cat > "$REMOTE_ROOT/opt/cogni-template-runtime/.env" <<'EOF'
-COGNI_NODE_DBS=cogni_operator,cogni_node_template
+COGNI_NODE_DBS=cogni_operator
 POSTGRES_ROOT_USER=postgres
 EOF
 touch "$REMOTE_ROOT/opt/cogni-template-edge/docker-compose.yml"
@@ -80,64 +84,75 @@ if [ "${1:-}" = "get" ]; then
       [ "${FAKE_MISSING_NAMESPACE:-}" = "1" ] && exit 1
       exit 0
       ;;
-    "argocd:applicationset:cogni-candidate-a-node-template")
+    "argocd:applicationset:cogni-candidate-a-operator")
       [ "${FAKE_MISSING_APPSET:-}" = "1" ] && exit 1
       exit 0
       ;;
-    "argocd:application:candidate-a-node-template")
+    "argocd:application:candidate-a-operator")
       [ "${FAKE_MISSING_APPLICATION:-}" = "1" ] && exit 1
       exit 0
       ;;
-    "cogni-candidate-a:deployment:node-template-node-app")
+    "cogni-candidate-a:deployment:operator-node-app")
       [ "${FAKE_MISSING_DEPLOYMENT:-}" = "1" ] && exit 1
       if printf '%s\n' "$*" | grep -Fq 'jsonpath='; then
         if printf '%s\n' "$*" | grep -Fq 'initContainers'; then
-          echo "node-template-env-secrets node-template-migration-secrets"
+          echo "operator-env-secrets operator-migration-secrets"
         elif [ "${FAKE_LEGACY_SECRET_CONSUMER:-}" = "1" ]; then
-          echo "node-template-node-app-secrets"
+          echo "operator-node-app-secrets"
         elif [ "${FAKE_WRONG_SECRET_CONSUMER:-}" = "1" ]; then
           echo "other-secret"
         elif [ "${FAKE_RUNTIME_MIGRATION_SECRET_CONSUMER:-}" = "1" ]; then
-          echo "node-template-env-secrets node-template-migration-secrets"
+          echo "operator-env-secrets operator-migration-secrets"
         else
-          echo "node-template-env-secrets"
+          echo "operator-env-secrets"
         fi
       fi
       exit 0
       ;;
-    "cogni-candidate-a:service:node-template-node-app")
+    "cogni-candidate-a:service:operator-node-app")
       [ "${FAKE_MISSING_SERVICE:-}" = "1" ] && exit 1
       if printf '%s\n' "$*" | grep -Fq 'jsonpath='; then
         if [ "${FAKE_SERVICE_NODEPORT_MISMATCH:-}" = "1" ]; then
           echo 39999
         else
-          echo 30200
+          echo "$FAKE_EXPECTED_NODEPORT"
         fi
       fi
       exit 0
       ;;
-    "cogni-candidate-a:secret:node-template-env-secrets")
+    "cogni-candidate-a:secret:database-reliability-actuator-env-secrets")
+      [ "${FAKE_MISSING_RELIABILITY_SECRET:-}" = 1 ] && exit 1
+      case "$*" in
+        *'{.data.DATABASE_RELIABILITY_ADMIN_URL}'*)
+          [ "${FAKE_MISSING_RELIABILITY_KEY:-}" = DATABASE_RELIABILITY_ADMIN_URL ] || echo cHJlc2VudA== ;;
+        *'{.data.DATABASE_RELIABILITY_STATUS_TOKEN}'*)
+          [ "${FAKE_MISSING_RELIABILITY_KEY:-}" = DATABASE_RELIABILITY_STATUS_TOKEN ] || echo cHJlc2VudA== ;;
+        *jsonpath=*) exit 1 ;;
+      esac
+      exit 0
+      ;;
+    "cogni-candidate-a:secret:operator-env-secrets")
       [ "${FAKE_MISSING_SECRET:-}" = "1" ] && exit 1
       if printf '%s\n' "$*" | grep -Fq 'jsonpath='; then
         [ "${FAKE_MISSING_DSN:-}" = "1" ] || echo "cG9zdGdyZXM6Ly8="
       fi
       exit 0
       ;;
-    "cogni-candidate-a:secret:node-template-migration-secrets")
+    "cogni-candidate-a:secret:operator-migration-secrets")
       [ "${FAKE_MISSING_MIGRATION_SECRET:-}" = "1" ] && exit 1
       if printf '%s\n' "$*" | grep -Fq 'jsonpath='; then
         [ "${FAKE_MISSING_MIGRATION_DSN:-}" = "1" ] || echo "cG9zdGdyZXM6Ly8="
       fi
       exit 0
       ;;
-    "cogni-candidate-a:externalsecret:node-template-env-secrets")
+    "cogni-candidate-a:externalsecret:operator-env-secrets")
       [ "${FAKE_MISSING_EXTERNAL_SECRET:-}" = "1" ] && exit 1
       if printf '%s\n' "$*" | grep -Fq 'jsonpath='; then
         [ "${FAKE_EXTERNAL_SECRET_NOT_READY:-}" = "1" ] || echo True
       fi
       exit 0
       ;;
-    "cogni-candidate-a:externalsecret:node-template-migration-secrets")
+    "cogni-candidate-a:externalsecret:operator-migration-secrets")
       [ "${FAKE_MISSING_MIGRATION_EXTERNAL_SECRET:-}" = "1" ] && exit 1
       exit 0
       ;;
@@ -146,12 +161,12 @@ fi
 if [ "${1:-}" = "wait" ]; then
   resource="${*: -2:1}"
   case "${ns}:${resource}" in
-    "cogni-candidate-a:externalsecret/node-template-env-secrets")
+    "cogni-candidate-a:externalsecret/operator-env-secrets")
       [ "${FAKE_MISSING_EXTERNAL_SECRET:-}" = "1" ] && exit 1
       [ "${FAKE_EXTERNAL_SECRET_NOT_READY:-}" = "1" ] && exit 1
       exit 0
       ;;
-    "cogni-candidate-a:externalsecret/node-template-migration-secrets")
+    "cogni-candidate-a:externalsecret/operator-migration-secrets")
       [ "${FAKE_MISSING_MIGRATION_EXTERNAL_SECRET:-}" = "1" ] && exit 1
       [ "${FAKE_MIGRATION_EXTERNAL_SECRET_NOT_READY:-}" = "1" ] && exit 1
       exit 0
@@ -173,7 +188,7 @@ if printf '%s\n' "$*" | grep -q ' exec -T caddy wget '; then
   if [ "${FAKE_MISSING_LIVE_CADDY_ROUTE:-}" = "1" ]; then
     echo '{"apps":{"http":{"servers":{}}}}'
   else
-    echo '{"host":"node-template-test.cognidao.org","upstream":"host.docker.internal:30200"}'
+    echo '{"host":"test.cognidao.org","upstream":"host.docker.internal:30000"}'
   fi
   exit 0
 fi
@@ -197,9 +212,6 @@ case "$url" in
   *"name=test.cognidao.org&type=A"*)
     echo '{"result":[{"content":"84.32.9.111","proxied":false}]}'
     ;;
-  *"name=node-template-test.cognidao.org&type=A"*)
-    echo '{"result":[{"content":"84.32.9.111","proxied":false}]}'
-    ;;
   *)
     echo '{"result":[]}'
     ;;
@@ -211,29 +223,32 @@ chmod +x "$FAKEBIN/cf-curl"
 # preflight logic for one (env, target) pair; it is not a statement about which nodes the
 # live catalog deploys where. Pointing APP_SOURCE_DIR at the repo made it both, so
 # task.5130 (removing the last cogni-dao nodes from the candidate-a TEST-wallet env, which
-# deleted appsets/candidate-a/candidate-a-node-template-applicationset.yaml) turned this
+# deleted appsets/candidate-a/candidate-a-operator-applicationset.yaml) turned this
 # unit test red for a reason that has nothing to do with the code under test. The tree
 # below carries exactly the three artifacts the k3s branch reads — catalog row, overlay
 # dir, per-target AppSet file — so the negative fixtures further down (each of which omits
 # ONE of them) remain the only thing asserting those reads.
 HAPPY_TREE="$TMPROOT/happy"
 mkdir -p "$HAPPY_TREE/infra/catalog" \
-  "$HAPPY_TREE/infra/k8s/overlays/candidate-a/node-template" \
-  "$HAPPY_TREE/infra/k8s/argocd/appsets/candidate-a"
-cp infra/catalog/node-template.yaml "$HAPPY_TREE/infra/catalog/node-template.yaml"
-cp infra/k8s/overlays/candidate-a/node-template/*.yaml \
-  "$HAPPY_TREE/infra/k8s/overlays/candidate-a/node-template/"
+  "$HAPPY_TREE/infra/k8s/overlays/candidate-a/operator" \
+  "$HAPPY_TREE/infra/k8s/argocd/appsets/candidate-a" \
+  "$HAPPY_TREE/nodes/operator/.cogni"
+cp infra/catalog/operator.yaml "$HAPPY_TREE/infra/catalog/operator.yaml"
+cp nodes/operator/.cogni/repo-spec.yaml "$HAPPY_TREE/nodes/operator/.cogni/"
+cp infra/k8s/overlays/candidate-a/operator/*.yaml \
+  "$HAPPY_TREE/infra/k8s/overlays/candidate-a/operator/"
 # Derive both the AppSet path and its directory from the copied catalog. Candidate
 # compute custody may be production even while this fixture exercises k3s probes;
 # spelling the directory by hand breaks when normal env membership is enabled.
 # shellcheck source=scripts/ci/lib/appset-paths.sh
 CATALOG_DIR="$HAPPY_TREE/infra/catalog" . "$REPO_ROOT/scripts/ci/lib/appset-paths.sh"
-happy_appset="$HAPPY_TREE/$(CATALOG_DIR="$HAPPY_TREE/infra/catalog" appset_rel_path candidate-a node-template)"
+happy_appset="$HAPPY_TREE/$(CATALOG_DIR="$HAPPY_TREE/infra/catalog" appset_rel_path candidate-a operator)"
 mkdir -p "$(dirname "$happy_appset")"
-bash scripts/ci/render-node-appset.sh candidate-a node-template > "$happy_appset"
+happy_rel="${happy_appset#"$HAPPY_TREE/"}"
+cp "$REPO_ROOT/$happy_rel" "$happy_appset"
 
 BASE_ENV=(
-  TARGET=node-template
+  TARGET=operator
   DEPLOY_ENVIRONMENT=candidate-a
   VM_HOST=192.0.2.10
   DOMAIN=test.cognidao.org
@@ -248,12 +263,12 @@ BASE_ENV=(
 )
 
 env "${BASE_ENV[@]}" bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/success.out"
-grep -q "Node substrate ready for node-template" "$TMPROOT/success.out"
+grep -q "Node substrate ready for operator" "$TMPROOT/success.out"
 # bug.5299 — the preflight states WHOSE Postgres the lane's database is on, not just that
-# some database exists. node-template/candidate-a is reconciled by its own env, so this is
+# some database exists. operator/candidate-a is reconciled by its own env, so this is
 # the resident verdict and the asserted name is unchanged (lane_db_suffix is empty).
-grep -q "\[OK\] lane database residency: node-template/candidate-a uses its own environment" "$TMPROOT/success.out"
-grep -q "runtime env includes DB inventory: cogni_node_template" "$TMPROOT/success.out"
+grep -q "\[OK\] lane database residency: operator/candidate-a uses its own environment" "$TMPROOT/success.out"
+grep -q "runtime env includes DB inventory: cogni_operator" "$TMPROOT/success.out"
 
 # Run the real generated argument decoder through both shell layers, stopping
 # before any remote probe. The controller flag precedes the optional root at10.
@@ -279,19 +294,19 @@ done
 MISRESIDENT_TREE="$TMPROOT/misresident-src"
 mkdir -p "$MISRESIDENT_TREE"
 cp -R "$HAPPY_TREE/." "$MISRESIDENT_TREE/"
-yq -i '.deployment_provider."candidate-a" = "akash"' "$MISRESIDENT_TREE/infra/catalog/node-template.yaml"
+yq -i '.deployment_provider."candidate-a" = "akash"' "$MISRESIDENT_TREE/infra/catalog/operator.yaml"
 # Placement moves the control env, so it also moves the AppSet directory (bug.5204). Park a
 # copy at the relocated path so the EARLIER appset-existence check cannot absorb this case —
 # the residency gate is what must produce the verdict.
-misresident_appset="$MISRESIDENT_TREE/$(FLEET_CONTROL_ENV=production CATALOG_DIR="$MISRESIDENT_TREE/infra/catalog" appset_rel_path candidate-a node-template)"
+misresident_appset="$MISRESIDENT_TREE/$(FLEET_CONTROL_ENV=production CATALOG_DIR="$MISRESIDENT_TREE/infra/catalog" appset_rel_path candidate-a operator)"
 mkdir -p "$(dirname "$misresident_appset")"
-cp "$HAPPY_TREE/$(CATALOG_DIR="$HAPPY_TREE/infra/catalog" appset_rel_path candidate-a node-template)" \
+cp "$HAPPY_TREE/$(CATALOG_DIR="$HAPPY_TREE/infra/catalog" appset_rel_path candidate-a operator)" \
   "$misresident_appset"
 MISRESIDENT_SCRIPT="$TMPROOT/misresident-reader"
 mkdir -p "$MISRESIDENT_SCRIPT/lib"
 cp scripts/ci/assert-target-substrate.sh "$MISRESIDENT_SCRIPT/"
 cp scripts/ci/lib/*.sh "$MISRESIDENT_SCRIPT/lib/"
-printf '\nLANE_DB_RESIDENCY_PINNED=("node-template/candidate-a")\n' \
+printf '\nLANE_DB_RESIDENCY_PINNED=("operator/candidate-a")\n' \
   >> "$MISRESIDENT_SCRIPT/lib/lane-db-residency.sh"
 # This historical pin models production custody, independently of the runner fleet.
 if env "${BASE_ENV[@]}" FLEET_CONTROL_ENV=production APP_SOURCE_DIR="$MISRESIDENT_TREE" \
@@ -300,10 +315,10 @@ if env "${BASE_ENV[@]}" FLEET_CONTROL_ENV=production APP_SOURCE_DIR="$MISRESIDEN
   echo "expected an explicitly foreign PG lane to fail the substrate preflight" >&2
   exit 1
 fi
-grep -q "node-template/candidate-a must use its own environment's Postgres; foreign residency is forbidden" "$TMPROOT/misresident.out"
-grep -q "lane database residency check failed for node-template/candidate-a" "$TMPROOT/misresident.out"
+grep -q "operator/candidate-a must use its own environment's Postgres; foreign residency is forbidden" "$TMPROOT/misresident.out"
+grep -q "lane database residency check failed for operator/candidate-a" "$TMPROOT/misresident.out"
 # It must fail on RESIDENCY, before claiming anything about the husk on this host.
-if grep -q "Postgres database exists: cogni_node_template" "$TMPROOT/misresident.out"; then
+if grep -q "Postgres database exists: cogni_operator" "$TMPROOT/misresident.out"; then
   echo "expected no husk verdict once the lane is known to be misresident" >&2
   exit 1
 fi
@@ -311,9 +326,9 @@ fi
 env "${BASE_ENV[@]}" CHECK_DNS=true \
   CLOUDFLARE_API_TOKEN=test-token CLOUDFLARE_ZONE_ID=zone123 FORK_DOMAIN_ROOT=cognidao.org \
   CF_CURL="$FAKEBIN/cf-curl" bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/scoped-dns.out"
-grep -q "Node substrate ready for node-template" "$TMPROOT/scoped-dns.out"
+grep -q "Node substrate ready for operator" "$TMPROOT/scoped-dns.out"
 
-if env TARGET=node-template DEPLOY_ENVIRONMENT=candidate-a VM_HOST="" DOMAIN=test.cognidao.org \
+if env TARGET=operator DEPLOY_ENVIRONMENT=candidate-a VM_HOST="" DOMAIN=test.cognidao.org \
   APP_SOURCE_DIR="$HAPPY_TREE" COGNI_CATALOG_ROOT="$HAPPY_TREE/infra/catalog" CHECK_DNS=false \
   ASSERT_TARGET_SUBSTRATE_SSH_BIN="$FAKEBIN/ssh" bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/missing-vm.out" 2>&1; then
   echo "expected missing VM_HOST to fail" >&2
@@ -328,15 +343,15 @@ fi
 grep -q "missing catalog file" "$TMPROOT/missing-catalog.out"
 
 mkdir -p "$TMPROOT/no-overlay/infra/catalog"
-cp infra/catalog/node-template.yaml "$TMPROOT/no-overlay/infra/catalog/node-template.yaml"
+cp infra/catalog/operator.yaml "$TMPROOT/no-overlay/infra/catalog/operator.yaml"
 if env "${BASE_ENV[@]}" APP_SOURCE_DIR="$TMPROOT/no-overlay" COGNI_CATALOG_ROOT="$TMPROOT/no-overlay/infra/catalog" bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/missing-overlay.out" 2>&1; then
   echo "expected missing overlay to fail" >&2
   exit 1
 fi
 grep -q "missing overlay dir" "$TMPROOT/missing-overlay.out"
 
-mkdir -p "$TMPROOT/no-appset/infra/catalog" "$TMPROOT/no-appset/infra/k8s/overlays/candidate-a/node-template"
-cp infra/catalog/node-template.yaml "$TMPROOT/no-appset/infra/catalog/node-template.yaml"
+mkdir -p "$TMPROOT/no-appset/infra/catalog" "$TMPROOT/no-appset/infra/k8s/overlays/candidate-a/operator"
+cp infra/catalog/operator.yaml "$TMPROOT/no-appset/infra/catalog/operator.yaml"
 if env "${BASE_ENV[@]}" APP_SOURCE_DIR="$TMPROOT/no-appset" COGNI_CATALOG_ROOT="$TMPROOT/no-appset/infra/catalog" bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/missing-appset-file.out" 2>&1; then
   echo "expected missing appset file to fail" >&2
   exit 1
@@ -383,7 +398,7 @@ if env "${BASE_ENV[@]}" FAKE_LEGACY_SECRET_CONSUMER=1 bash scripts/ci/assert-tar
   echo "expected legacy Secret consumer to fail" >&2
   exit 1
 fi
-grep -q "Deployment app runtime consumes legacy plain Secret node-template-node-app-secrets" "$TMPROOT/legacy-secret-consumer.out"
+grep -q "Deployment app runtime consumes legacy plain Secret operator-node-app-secrets" "$TMPROOT/legacy-secret-consumer.out"
 
 if env "${BASE_ENV[@]}" FAKE_WRONG_SECRET_CONSUMER=1 bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/wrong-secret-consumer.out" 2>&1; then
   echo "expected wrong Secret consumer to fail" >&2
@@ -395,7 +410,7 @@ if env "${BASE_ENV[@]}" FAKE_RUNTIME_MIGRATION_SECRET_CONSUMER=1 bash scripts/ci
   echo "expected app runtime migration Secret consumer to fail" >&2
   exit 1
 fi
-grep -q "app runtime consumes unexpected Secret node-template-migration-secrets" "$TMPROOT/runtime-migration-secret-consumer.out"
+grep -q "app runtime consumes unexpected Secret operator-migration-secrets" "$TMPROOT/runtime-migration-secret-consumer.out"
 
 if env "${BASE_ENV[@]}" FAKE_MISSING_SECRET=1 bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/missing-secret.out" 2>&1; then
   echo "expected missing secret to fail" >&2
@@ -413,7 +428,7 @@ if env "${BASE_ENV[@]}" FAKE_MISSING_MIGRATION_EXTERNAL_SECRET=1 bash scripts/ci
   echo "expected missing migration ExternalSecret to fail" >&2
   exit 1
 fi
-grep -q "ExternalSecret missing for Deployment-consumed Secret: node-template-migration-secrets" "$TMPROOT/missing-migration-external-secret.out"
+grep -q "ExternalSecret missing for Deployment-consumed Secret: operator-migration-secrets" "$TMPROOT/missing-migration-external-secret.out"
 
 if env "${BASE_ENV[@]}" FAKE_EXTERNAL_SECRET_NOT_READY=1 bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/external-secret-not-ready.out" 2>&1; then
   echo "expected not-Ready ExternalSecret to fail" >&2
@@ -431,7 +446,18 @@ if env "${BASE_ENV[@]}" FAKE_MISSING_MIGRATION_DSN=1 bash scripts/ci/assert-targ
   echo "expected missing migration DSN key to fail" >&2
   exit 1
 fi
-grep -q "migration Secret node-template-migration-secrets missing DATABASE_MIGRATION_URL" "$TMPROOT/missing-migration-dsn.out"
+grep -q "migration Secret operator-migration-secrets missing DATABASE_MIGRATION_URL" "$TMPROOT/missing-migration-dsn.out"
+
+if env "${BASE_ENV[@]}" FAKE_MISSING_RELIABILITY_SECRET=1 bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/missing-reliability.out" 2>&1; then
+  echo 'missing reliability Secret was accepted' >&2; exit 1
+fi
+grep -q 'database reliability Secret missing' "$TMPROOT/missing-reliability.out"
+for key in DATABASE_RELIABILITY_ADMIN_URL DATABASE_RELIABILITY_STATUS_TOKEN; do
+  if env "${BASE_ENV[@]}" FAKE_MISSING_RELIABILITY_KEY="$key" bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/missing-reliability-key.out" 2>&1; then
+    echo "missing reliability key was accepted: $key" >&2; exit 1
+  fi
+  grep -q "missing $key" "$TMPROOT/missing-reliability-key.out"
+done
 
 if env "${BASE_ENV[@]}" FAKE_MISSING_DB=1 bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/missing-db.out" 2>&1; then
   echo "expected missing DB to fail" >&2
@@ -441,14 +467,14 @@ grep -q "Postgres database missing" "$TMPROOT/missing-db.out"
 
 cp "$REMOTE_ROOT/opt/cogni-template-runtime/.env" "$REMOTE_ROOT/opt/cogni-template-runtime/.env.bak"
 cat > "$REMOTE_ROOT/opt/cogni-template-runtime/.env" <<'EOF'
-COGNI_NODE_DBS=cogni_operator
+COGNI_NODE_DBS=
 POSTGRES_ROOT_USER=postgres
 EOF
 if env "${BASE_ENV[@]}" bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/missing-db-inventory.out" 2>&1; then
   echo "expected missing DB inventory to fail" >&2
   exit 1
 fi
-grep -q "runtime env COGNI_NODE_DBS missing cogni_node_template" "$TMPROOT/missing-db-inventory.out"
+grep -q "runtime env COGNI_NODE_DBS missing cogni_operator" "$TMPROOT/missing-db-inventory.out"
 mv "$REMOTE_ROOT/opt/cogni-template-runtime/.env.bak" "$REMOTE_ROOT/opt/cogni-template-runtime/.env"
 
 mv "$REMOTE_ROOT/opt/cogni-template-edge/.env" "$REMOTE_ROOT/opt/cogni-template-edge/.env.bak"
@@ -465,7 +491,7 @@ if env "${BASE_ENV[@]}" FAKE_MISSING_LIVE_CADDY_ROUTE=1 bash scripts/ci/assert-t
 fi
 grep -q "live Caddy config missing" "$TMPROOT/missing-live-caddy.out"
 
-if env TARGET=node-template DEPLOY_ENVIRONMENT=candidate-a VM_HOST=192.0.2.10 DOMAIN=test.cognidao.org \
+if env TARGET=operator DEPLOY_ENVIRONMENT=candidate-a VM_HOST=192.0.2.10 DOMAIN=test.cognidao.org \
   APP_SOURCE_DIR="$HAPPY_TREE" COGNI_CATALOG_ROOT="$HAPPY_TREE/infra/catalog" CHECK_DNS=true \
   ASSERT_TARGET_SUBSTRATE_SSH_BIN="$FAKEBIN/ssh" ASSERT_TARGET_SUBSTRATE_REMOTE_ROOT="$REMOTE_ROOT" \
   FAKE_REMOTE_PATH="$FAKEBIN" bash scripts/ci/assert-target-substrate.sh >"$TMPROOT/missing-dns.out" 2>&1; then

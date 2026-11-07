@@ -52,15 +52,24 @@ const composition = readYaml("composition.yaml");
 const activation = readYaml("activation-policy.yaml");
 const providerConfig = readYaml("provider-config.yaml");
 const kustomization = readYaml("kustomization.yaml");
-const application = parse(
-  readFileSync(
-    path.join(
-      REPO_ROOT,
-      "infra/k8s/argocd/control-plane/candidate-a/crossplane-xcomputeworkload-application.yaml"
+// Read actual registrations. The test-owned candidate root retired this composite in #161;
+// source safety checks still cover its retained preview/production registrations.
+const controlPlaneRoot = path.join(REPO_ROOT, "infra/k8s/argocd/control-plane");
+const applications = readdirSync(controlPlaneRoot, { withFileTypes: true })
+  .filter((entry) => entry.isDirectory())
+  .map((entry) => ({
+    environment: entry.name,
+    file: path.join(
+      controlPlaneRoot,
+      entry.name,
+      "crossplane-xcomputeworkload-application.yaml"
     ),
-    "utf8"
-  )
-) as YamlObject;
+  }))
+  .filter(({ file }) => existsSync(file))
+  .map(({ environment, file }) => ({
+    environment,
+    application: parse(readFileSync(file, "utf8")) as YamlObject,
+  }));
 
 const compositionSpec = composition.spec as YamlObject;
 const pipeline = compositionSpec.pipeline as YamlObject[];
@@ -1065,16 +1074,25 @@ describe("XComputeWorkload authority handoff (task.5096)", () => {
     ]);
   });
 
-  it("is flightable on candidate-a before it is merged", () => {
-    const source = (application.spec as YamlObject).source as YamlObject;
-    // main would make the control plane un-flightable — the whole point of candidate-a is to
-    // prove a control-plane change BEFORE it lands.
-    expect(source.targetRevision).toBe("deploy/candidate-a-control-plane");
-    expect(source.path).toBe("infra/crossplane/xcomputeworkload");
-    expect((application.spec as YamlObject).destination).toEqual({
-      server: "https://kubernetes.default.svc",
-      namespace: "crossplane-system",
-    });
+  it("uses the reviewed selector for every actual composite registration", () => {
+    expect(applications.length).toBeGreaterThan(0);
+    for (const { environment, application } of applications) {
+      const source = (application.spec as YamlObject).source as YamlObject;
+      expect(source.targetRevision, environment).toBe(
+        environment === "candidate-a"
+          ? "deploy/candidate-a-control-plane"
+          : "main"
+      );
+      expect(source.path, environment).toBe(
+        "infra/crossplane/xcomputeworkload"
+      );
+      expect((application.spec as YamlObject).destination, environment).toEqual(
+        {
+          server: "https://kubernetes.default.svc",
+          namespace: "crossplane-system",
+        }
+      );
+    }
   });
 });
 

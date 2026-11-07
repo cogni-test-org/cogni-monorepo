@@ -8,7 +8,7 @@
  *   never about dormancy: no credential and NO DESIRED STATE may live in this directory.
  * Scope: Static YAML checks over every environment's Argo Applications plus the shared Crossplane package manifests. Does NOT contact a cluster, a provider, or a wallet.
  * Invariants: NO_DESIRED_STATE_IN_GIT, ENGINE_IS_UNIFORM_ACROSS_ENVS, IMMUTABLE_PACKAGES,
- *   RESOURCE_BOUNDED, OBSERVABLE_BEFORE_AUTHORITY, CONSTANT_TRACKS_INSTALLED_REALITY,
+ *   RESOURCE_BOUNDED, OBSERVABLE_BEFORE_AUTHORITY, DECLARED_AUTHORITY_REQUIRES_INSTALLED_API,
  *   INSTALLED_IS_NOT_FUNDED, NO_CONSOLE_KEY_SLOT_OUTSIDE_A_WRITER.
  * Side-effects: IO (reads repo manifests)
  * Links: story.5016 R2, task.5094, task.5096, task.5097, task.5104, task.5138,
@@ -82,6 +82,13 @@ function controlPlaneApplications(
     composite: readYaml(path.join(dir, COMPOSITE_APPLICATION_FILE)),
   };
 }
+
+/** Known deployment environments come from the catalog schema, independently of installed APIs. */
+const DEPLOYMENT_ENVS = Object.keys(
+  JSON.parse(
+    readFileSync(path.join(REPO_ROOT, "infra/catalog/_schema.json"), "utf8")
+  ).properties.deployment_provider.properties
+).sort();
 
 /**
  * Environments whose control plane installs the composite API, derived from GIT rather than from
@@ -355,22 +362,21 @@ describe("Crossplane substrate boundary (task.5094, task.5096, task.5097)", () =
   });
 
   /**
-   * CONSTANT_TRACKS_INSTALLED_REALITY (task.5104). `CROSSPLANE_CONTROL_PLANE_ENVS` is what the
-   * operator's TypeScript believes about where an `XComputeWorkload` can be reconciled — the
-   * node-formation generator filters a birth's `compute_api` through it, and
-   * `resolveNodeComputeApi` throws on any row that names `crossplane` outside it. Belief and
-   * git must be the same set in BOTH directions:
-   *   - an env in the constant with no control plane → the wizard mints a row whose promote
-   *     renders a composite into a cluster with no such CRD, reconciled by nobody;
-   *   - an env with a control plane missing from the constant → the guard rejects a legitimate
-   *     row and blocks the very cutover the install was for.
-   * So installing Crossplane on production (task.5097) and preview (task.5129) was DELIBERATELY
-   * a red build until this constant was widened in the same PR. The assertion is now derived from
-   * git in both directions rather than pinned to a literal, so the next env to gain or lose a
-   * control plane still cannot drift from what the operator believes.
+   * The isolated test root can retire an API without changing shared code's supported-env
+   * vocabulary. Every installed API must be supported, and every actual catalog opt-in must
+   * have its API installed. An empty opt-in roster is valid after the node purge (bug.5583).
    */
-  it("names exactly the environments whose control plane installs the composite API", () => {
-    expect([...CROSSPLANE_CONTROL_PLANE_ENVS].sort()).toEqual(INSTALLED_ENVS);
+  it("installs the supported composite API for every actual catalog opt-in", () => {
+    expect(INSTALLED_ENVS.length).toBeGreaterThan(0);
+    for (const environment of INSTALLED_ENVS) {
+      expect([...CROSSPLANE_CONTROL_PLANE_ENVS]).toContain(environment);
+    }
+    for (const { env } of CROSSPLANE_SELECTED_PAIRS) {
+      expect(
+        INSTALLED_ENVS,
+        `${env} selects an uninstalled composite API`
+      ).toContain(env);
+    }
   });
 
   /**
@@ -384,11 +390,11 @@ describe("Crossplane substrate boundary (task.5094, task.5096, task.5097)", () =
    *     paid transaction is refused with `actuator_account_id_missing`;
    *   - pinned but unlisted → a funded, cut-over environment silently keeps minting births onto
    *     the retiring bespoke controller.
-   * A wallet env must also have a control plane: paying for a composite nothing reconciles is
-   * strictly worse than not paying.
+   * Actuator writers also serve the node-deploy sequencer. Their wallet custody is independent
+   * of whether a local root still installs the retired composite API.
    */
   it("names exactly the environments whose actuator pins a wallet account", () => {
-    const pinned = INSTALLED_ENVS.filter(
+    const pinned = DEPLOYMENT_ENVS.filter(
       (environment) => actuatorAccountId(environment).length > 0
     ).sort();
 
@@ -396,7 +402,7 @@ describe("Crossplane substrate boundary (task.5094, task.5096, task.5097)", () =
     for (const environment of CROSSPLANE_ACTUATOR_WALLET_ENVS) {
       expect(
         [...CROSSPLANE_CONTROL_PLANE_ENVS],
-        `${environment} pins a wallet but installs no control plane`
+        `${environment} pins a wallet outside the supported environment vocabulary`
       ).toContain(environment);
     }
   });
@@ -485,7 +491,7 @@ describe("Crossplane substrate boundary (task.5094, task.5096, task.5097)", () =
     const writerClusters = new Set(
       CROSSPLANE_ACTUATOR_WRITERS.map((writer) => writer.cluster)
     );
-    for (const environment of INSTALLED_ENVS) {
+    for (const environment of DEPLOYMENT_ENVS) {
       if (writerClusters.has(environment)) continue;
       expect(
         actuatorSecretPath(environment),
@@ -503,7 +509,6 @@ describe("Crossplane substrate boundary (task.5094, task.5096, task.5097)", () =
    * widens automatically the moment a row moves to the Crossplane authority.
    */
   it("names exactly one writer for every (env, owner) the catalog selects crossplane in", () => {
-    expect(CROSSPLANE_SELECTED_PAIRS.length).toBeGreaterThan(0);
     const byPair = writersByServedPair(CROSSPLANE_ACTUATOR_WRITERS);
     for (const { env, owner } of CROSSPLANE_SELECTED_PAIRS) {
       expect(
@@ -525,7 +530,7 @@ describe("Crossplane substrate boundary (task.5094, task.5096, task.5097)", () =
     for (const writer of CROSSPLANE_ACTUATOR_WRITERS) {
       expect(writer.serves.length, writer.id).toBeGreaterThan(0);
       for (const environment of writer.serves) {
-        expect(INSTALLED_ENVS, `${writer.id} serves ${environment}`).toContain(
+        expect(DEPLOYMENT_ENVS, `${writer.id} serves ${environment}`).toContain(
           environment
         );
       }

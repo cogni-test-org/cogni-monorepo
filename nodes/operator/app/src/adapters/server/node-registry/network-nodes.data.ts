@@ -60,12 +60,4 @@ export const NETWORK_NODES: readonly NetworkNode[] = [
     nodeId: "4ff8eac1-4eba-4ed0-931b-b1fe4f64713d",
     primary: true,
   },
-  { name: "node-template", nodeId: "b927a9dd-6132-4fc9-a51e-e3cee2568e3c" },
-  { name: "yo", nodeId: "bb5abfa8-5435-47e8-8725-3ae5e0762791" },
-  { name: "test-cog", nodeId: "cea5ddea-a18d-44cd-8ffb-4fdd1fd104ac" },
-  { name: "brother", nodeId: "9565871a-cb82-444e-ba18-fed9f6ea3ce1" },
-  { name: "ghcr", nodeId: "21d7ae14-210c-4495-ab6c-6fe5caad34a6" },
-  { name: "anotha", nodeId: "e8ff1874-bde9-46c5-9b62-baee1349735e" },
-  { name: "toks2", nodeId: "cf909432-5324-4bff-bb2d-7806f545eeda" },
-  { name: "spawny-boi", nodeId: "d520f82e-486a-40f1-9e4f-c8ef7a016e9a" },
 ];

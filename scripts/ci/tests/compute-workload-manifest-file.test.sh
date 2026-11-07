@@ -29,6 +29,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+. "$SCRIPT_DIR/lib/catalog-input.sh"
+TEST_NODE="$(catalog_test_primary_node "$REPO_ROOT/infra/catalog")"
 cd "$REPO_ROOT"
 
 LIB="$REPO_ROOT/scripts/ci/lib/image-tags.sh"
@@ -44,9 +46,9 @@ trap 'rm -rf "$TMP_CATALOG"' EXIT
 cp "$REPO_ROOT"/infra/catalog/*.yaml "$TMP_CATALOG/"
 cp "$REPO_ROOT"/infra/catalog/_schema.json "$TMP_CATALOG/" 2>/dev/null || true
 
-# The fixture row. `node-template` is a real type:node; case 1 strips its compute_api from
+# Copy a real current node; case 1 strips its compute_api from
 # the throwaway copy to synthesize the absent-cell shape; later cases mutate only the copy.
-FIXTURE_NODE="node-template"
+FIXTURE_NODE="$TEST_NODE"
 FIXTURE_FILE="$TMP_CATALOG/${FIXTURE_NODE}.yaml"
 
 # Resolve (api, file) for a cell against the throwaway catalog. Each invocation re-sources the

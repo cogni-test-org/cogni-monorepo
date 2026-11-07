@@ -2,29 +2,28 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
 # SPDX-FileCopyrightText: 2025 Cogni-DAO
 #
-# Proves the materialize side of the secret-materialize / reconcile split:
-#   - source:agent app keys ARE materialized per-node (AUTH_SECRET);
-#   - genuinely-shared values inherited from the env bank ARE materialized
-#     (POSTHOG_API_KEY from node-template via the blind ancestor scan);
-#   - canonical-custody (inheritFrom: operator) keys are materialized from the
-#     operator path, NOT the blind ancestor scan (OPENROUTER_API_KEY — kills the
-#     per-node split-brain that 429'd freshly-formed prod nodes);
-#   - per-node DB creds + ALL THREE DSNs ARE composed sole-source here
-#     (APP_DB_PASSWORD/SERVICE generated; DATABASE_URL/SERVICE_URL embed the
-#     per-node app_<node> role; DOLTGRES_PASSWORD derived per-node + DOLTGRES_URL
-#     composed from it as the postgres superuser — the bug.5002 cutover, both planes);
-#   - non-node PLATFORM_SERVICES get their source:agent keys minted into their OWN
-#     cogni/<env>/<service> bucket, by the OWNER leg only (story.5016 amendment 1);
-#   - catalog-declared LiteLLM virtual keys are explicitly registered under the
-#     canonical node/env alias, without placing the plaintext key in lookup URLs;
-#   - lookup, registration, alias collision, and transport errors fail closed;
-#   - no secret VALUE is echoed to stdout.
+# Actual-catalog operator materialization: shared-bank inheritance, own-bank
+# canonical preservation, generated DB credentials, private consumer isolation,
+# explicit LiteLLM registration, idempotence and fail-closed transport behavior.
+# This catalog has no second node; this file does not claim consumer-bank repair
+# or a successful non-owner node invocation. It also proves an unregistered
+# consumer is rejected before any remote call. No deployment row is fabricated.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$REPO_ROOT"
+export APP_SOURCE_DIR="$REPO_ROOT" COGNI_CATALOG_ROOT="$REPO_ROOT/infra/catalog"
+export CATALOG_DIR="$COGNI_CATALOG_ROOT"
+. scripts/ci/lib/image-tags.sh
+. scripts/ci/lib/appset-paths.sh
+TEST_NODE="$(reliability_controller_for_env candidate-a)"
+[ "$TEST_NODE" = operator ] || { echo 'expected the actual operator controller' >&2; exit 1; }
+target_in_env "$TEST_NODE" candidate-a
+NODE_ID="$(node_id_for_target "$TEST_NODE")"
+unset POSTHOG_API_KEY POSTHOG_HOST
+
 
 # The materializer and read-only reconciler share this exact auth helper. Invoke
 # its hermetic transient/permanent matrix from an already-required CI test rather
@@ -37,7 +36,7 @@ trap 'rm -rf "$TMPROOT"' EXIT
 FAKEBIN="$TMPROOT/bin"
 REMOTE_ROOT="$TMPROOT/remote"
 BAO_ROOT="$REMOTE_ROOT/openbao"
-mkdir -p "$FAKEBIN" "$REMOTE_ROOT/tmp" "$BAO_ROOT/cogni/candidate-a/node-template"
+mkdir -p "$FAKEBIN" "$REMOTE_ROOT/tmp" "$BAO_ROOT/cogni/candidate-a/operator"
 
 put_secret() {
   local svc="$1" key="$2" value="$3"
@@ -47,18 +46,16 @@ put_secret() {
 
 # Blind-ancestor-scan shared values a node legitimately inherits (transitional).
 # POSTHOG_* are source:human shared substrate inherited from an ancestor.
-put_secret node-template POSTHOG_API_KEY phc_existing
-put_secret node-template POSTHOG_HOST https://us.i.posthog.com
+put_secret _shared POSTHOG_API_KEY phc_existing
+put_secret _shared POSTHOG_HOST https://us.i.posthog.com
 # Canonical-custody (inheritFrom: operator) values: seeded at the OPERATOR path
-# only, with a divergent copy at the TARGET node (node-template). That divergent
-# per-node copy must be IGNORED — the node inherits the operator value
-# (overwrite-on-drift), killing the split-brain bug.5021/429 class.
+# only. A divergent _shared value must not replace the actual owner value.
 # EVM_RPC_URL joined this class (was blind-scan shared): the operator holds the one
 # billed Base RPC and every node inherits it.
 put_secret operator OPENROUTER_API_KEY sk-or-operator-canonical
-put_secret node-template OPENROUTER_API_KEY sk-or-stale-divergent
+put_secret _shared OPENROUTER_API_KEY sk-or-stale-divergent
 put_secret operator EVM_RPC_URL https://base-mainnet.example/v2/operator-key
-put_secret node-template EVM_RPC_URL https://base-mainnet.example/v2/stale-divergent
+put_secret _shared EVM_RPC_URL https://base-mainnet.example/v2/stale-divergent
 put_secret operator LITELLM_MASTER_KEY sk-cogni-operator-master
 
 cat > "$FAKEBIN/ssh" <<'EOF'
@@ -235,6 +232,20 @@ esac
 EOF
 chmod +x "$FAKEBIN/curl"
 
+cat > "$TMPROOT/unexpected-ssh" <<'SH'
+#!/usr/bin/env bash
+: > "${UNEXPECTED_REMOTE_CALL:?}"
+exit 99
+SH
+chmod +x "$TMPROOT/unexpected-ssh"
+if env VM_HOST=fake SECRET_MATERIALIZE_SSH_BIN="$TMPROOT/unexpected-ssh" \
+  UNEXPECTED_REMOTE_CALL="$TMPROOT/unexpected-remote-call" \
+  bash scripts/ci/secret-materialize.sh candidate-a not-a-current-node >"$TMPROOT/unregistered.out" 2>&1; then
+  echo 'unregistered materialization target was accepted' >&2; exit 1
+fi
+grep -q 'not a type=node catalog target' "$TMPROOT/unregistered.out"
+[ ! -e "$TMPROOT/unexpected-remote-call" ]
+
 LITELLM_STORE="$REMOTE_ROOT/litellm-keys"
 LITELLM_LOG="$REMOTE_ROOT/litellm-calls.log"
 : > "$LITELLM_STORE"
@@ -260,68 +271,69 @@ env \
   FAKE_LITELLM_STORE="$LITELLM_STORE" \
   FAKE_LITELLM_LOG="$LITELLM_LOG" \
   FAKE_LITELLM_MASTER_KEY=sk-cogni-operator-master \
-  bash scripts/ci/secret-materialize.sh candidate-a node-template > "$TMPROOT/out.txt"
+  bash scripts/ci/secret-materialize.sh candidate-a operator > "$TMPROOT/out.txt"
 
 # source:agent app key generated per-node
-test -f "$BAO_ROOT/cogni/candidate-a/node-template/AUTH_SECRET" \
+test -f "$BAO_ROOT/cogni/candidate-a/operator/AUTH_SECRET" \
   || { echo "materialize did not seed AUTH_SECRET" >&2; exit 1; }
 # source:human shared substrate inherited via blind ancestor scan (POSTHOG_*).
 # required:true — a node MUST receive them or the fail-fast guard trips (bug.5087).
 for k in POSTHOG_API_KEY POSTHOG_HOST; do
-  test -f "$BAO_ROOT/cogni/candidate-a/node-template/$k" \
+  test -f "$BAO_ROOT/cogni/candidate-a/operator/$k" \
     || { echo "materialize did not inherit required shared substrate $k" >&2; exit 1; }
 done
-# canonical-custody keys (inheritFrom: operator): must be the OPERATOR value, NOT a
-# stale per-node copy — proves inheritFrom overwrites the per-node split-brain.
+test "$(cat "$BAO_ROOT/cogni/candidate-a/operator/POSTHOG_API_KEY")" = phc_existing
+test "$(cat "$BAO_ROOT/cogni/candidate-a/operator/POSTHOG_HOST")" = https://us.i.posthog.com
+# Own-bank canonical keys must survive a divergent value in _shared. This proves
+# owner preservation; a separate consumer-bank repair is not claimed here.
 # OPENROUTER_API_KEY (bug.5021/429) and EVM_RPC_URL (bug.5087 chain substrate) share
 # this shape: the operator holds the one billed value and every node inherits it.
-test "$(cat "$BAO_ROOT/cogni/candidate-a/node-template/OPENROUTER_API_KEY")" = sk-or-operator-canonical \
-  || { echo "OPENROUTER_API_KEY must inherit the operator-canonical value, not the stale per-node copy" >&2; exit 1; }
-test "$(cat "$BAO_ROOT/cogni/candidate-a/node-template/EVM_RPC_URL")" = https://base-mainnet.example/v2/operator-key \
-  || { echo "EVM_RPC_URL must inherit the operator value (inheritFrom: operator), not the stale per-node copy" >&2; exit 1; }
+test "$(cat "$BAO_ROOT/cogni/candidate-a/operator/OPENROUTER_API_KEY")" = sk-or-operator-canonical \
+  || { echo "OPENROUTER_API_KEY must retain the actual operator-canonical value" >&2; exit 1; }
+test "$(cat "$BAO_ROOT/cogni/candidate-a/operator/EVM_RPC_URL")" = https://base-mainnet.example/v2/operator-key \
+  || { echo "EVM_RPC_URL must retain the actual operator-canonical value" >&2; exit 1; }
 # per-node DB creds generated (source:agent), not inherited from any shared bank
 for k in APP_DB_PASSWORD APP_DB_SERVICE_PASSWORD; do
-  test -f "$BAO_ROOT/cogni/candidate-a/node-template/$k" \
+  test -f "$BAO_ROOT/cogni/candidate-a/operator/$k" \
     || { echo "materialize did not generate per-node $k" >&2; exit 1; }
 done
 # Postgres DSNs composed sole-source here, embedding the per-node app_<node> role
 # (regression guard: a shared app_user DSN is the bug.5002 split-brain we killed)
 # Real multiline public CA bytes survive Bao JSON and the materializer prefetch cache.
-openssl x509 -in "$BAO_ROOT/cogni/candidate-a/node-template/DATABASE_SSL_CA_CERT" -noout >/dev/null
-cmp "$BAO_ROOT/cogni/candidate-a/node-template/DATABASE_SSL_CA_CERT" "$BAO_ROOT/cogni/candidate-a/node-template-database-migration/DATABASE_SSL_CA_CERT"
-test -f "$BAO_ROOT/cogni/candidate-a/node-template/DATABASE_URL" \
+openssl x509 -in "$BAO_ROOT/cogni/candidate-a/operator/DATABASE_SSL_CA_CERT" -noout >/dev/null
+cmp "$BAO_ROOT/cogni/candidate-a/operator/DATABASE_SSL_CA_CERT" "$BAO_ROOT/cogni/candidate-a/operator-database-migration/DATABASE_SSL_CA_CERT"
+test -f "$BAO_ROOT/cogni/candidate-a/operator/DATABASE_URL" \
   || { echo "materialize did not compose DATABASE_URL" >&2; exit 1; }
-test -f "$BAO_ROOT/cogni/candidate-a/node-template/DATABASE_SERVICE_URL" \
+test -f "$BAO_ROOT/cogni/candidate-a/operator/DATABASE_SERVICE_URL" \
   || { echo "materialize did not compose DATABASE_SERVICE_URL" >&2; exit 1; }
-grep -q '://app_node_template:' "$BAO_ROOT/cogni/candidate-a/node-template/DATABASE_URL" \
-  || { echo "DATABASE_URL must embed per-node role app_node_template, not shared app_user" >&2; exit 1; }
-grep -q '://service_node_template:' "$BAO_ROOT/cogni/candidate-a/node-template/DATABASE_SERVICE_URL" \
-  || { echo "DATABASE_SERVICE_URL must embed per-node role service_node_template" >&2; exit 1; }
+grep -q '://app_operator:' "$BAO_ROOT/cogni/candidate-a/operator/DATABASE_URL" \
+  || { echo "DATABASE_URL must embed per-node role app_operator, not shared app_user" >&2; exit 1; }
+grep -q '://service_operator:' "$BAO_ROOT/cogni/candidate-a/operator/DATABASE_SERVICE_URL" \
+  || { echo "DATABASE_SERVICE_URL must embed per-node role service_operator" >&2; exit 1; }
 # Doltgres half of the cutover: the env superuser is the operator-canonical SSOT
 # (cogni/<env>/operator/DOLTGRES_PASSWORD); with operator unseeded in this isolated
 # materialize the composer falls back to the deterministic genesis derive, and
 # DOLTGRES_URL is composed sole-source from it (non-empty superuser pw). The pod
 # reaches its own knowledge_<node> DB as the `postgres` superuser — Doltgres 0.56.3
 # RBAC is table-DML-only (databases.md §5.2), so a per-node role is not yet possible.
-test -f "$BAO_ROOT/cogni/candidate-a/node-template/DOLTGRES_PASSWORD" \
+test -f "$BAO_ROOT/cogni/candidate-a/operator/DOLTGRES_PASSWORD" \
   || { echo "materialize did not materialize per-node DOLTGRES_PASSWORD" >&2; exit 1; }
-test -f "$BAO_ROOT/cogni/candidate-a/node-template/DOLTGRES_URL" \
+test -f "$BAO_ROOT/cogni/candidate-a/operator/DOLTGRES_URL" \
   || { echo "materialize did not compose DOLTGRES_URL" >&2; exit 1; }
-grep -qE '://postgres:[^@]+@[^/]+/knowledge_node_template\?' "$BAO_ROOT/cogni/candidate-a/node-template/DOLTGRES_URL" \
-  || { echo "DOLTGRES_URL must reach knowledge_node_template as the postgres superuser (non-empty pw)" >&2; exit 1; }
+grep -qE '://postgres:[^@]+@[^/]+/knowledge_operator\?' "$BAO_ROOT/cogni/candidate-a/operator/DOLTGRES_URL" \
+  || { echo "DOLTGRES_URL must reach knowledge_operator as the postgres superuser (non-empty pw)" >&2; exit 1; }
 
 # Per-node LiteLLM key: exact format, distinct from the fleet master, and the
 # explicit value's hash is registered under the repo-spec identity alias.
-VK_FILE="$BAO_ROOT/cogni/candidate-a/node-template/LITELLM_VIRTUAL_KEY"
+VK_FILE="$BAO_ROOT/cogni/candidate-a/operator/LITELLM_VIRTUAL_KEY"
 test -f "$VK_FILE" \
   || { echo "materialize did not mint catalog-derived LITELLM_VIRTUAL_KEY" >&2; exit 1; }
 VK="$(cat "$VK_FILE")"
 [[ "$VK" =~ ^sk-cogni-[0-9a-f]{48}$ ]] \
   || { echo "LITELLM_VIRTUAL_KEY must match sk-cogni-<48 lowercase hex>" >&2; exit 1; }
-test "$VK" != "$(cat "$BAO_ROOT/cogni/candidate-a/node-template/LITELLM_MASTER_KEY")" \
+test "$VK" != "$(cat "$BAO_ROOT/cogni/candidate-a/operator/LITELLM_MASTER_KEY")" \
   || { echo "virtual key must differ from the fleet-shared master" >&2; exit 1; }
 VK_HASH="$(printf '%s' "$VK" | sha256sum | awk '{print $1}')"
-NODE_ID="$(yq -N '.node_id' infra/catalog/node-template.yaml)"
 ALIAS="cogni:candidate-a:${NODE_ID}:app:v1"
 grep -qxF "${VK_HASH}"$'\t'"${ALIAS}" "$LITELLM_STORE" \
   || { echo "explicit virtual key hash was not registered under ${ALIAS}" >&2; exit 1; }
@@ -342,15 +354,15 @@ fi
 # matrix is parallel — two minters on a cold bucket would race), and it is MINTED, never
 # hand-seeded (the killer rule: a generated value must never be human-typed).
 
-# 1. A non-owner leg must not touch the platform bucket. The run above was
-#    `node-template` with the default owner (operator), so the path must still be absent.
-if [ -e "$BAO_ROOT/cogni/candidate-a/akash-tx-actuator" ]; then
-  echo "a non-owner node leg wrote the platform-service bucket (parallel-matrix race)" >&2
-  exit 1
-fi
+# The actual catalog's only node is the platform owner. Prove its cold mint,
+# private consumer isolation and idempotence; this is not non-owner-node proof.
+PLATFORM_TOKEN_FILE="$BAO_ROOT/cogni/candidate-a/akash-tx-actuator/AKASH_TX_ACTUATOR_TOKEN"
+test -s "$PLATFORM_TOKEN_FILE"
+PLATFORM_TOKEN_BEFORE="$(cat "$PLATFORM_TOKEN_FILE")"
+[[ "$PLATFORM_TOKEN_BEFORE" =~ ^[0-9a-f]{64}$ ]]
+! grep -qF "$PLATFORM_TOKEN_BEFORE" "$TMPROOT/out.txt"
 
-# 2. The owner leg mints it. PLATFORM_SERVICE_OWNER_NODE is overridden so this exercises
-#    the pass without dragging in the whole operator-node materialization.
+# A second real owner run must converge without rotating its bearer.
 env \
   VM_HOST=fake \
   DOMAIN=test.cognidao.org \
@@ -361,13 +373,13 @@ env \
   FAKE_LITELLM_STORE="$LITELLM_STORE" \
   FAKE_LITELLM_LOG="$LITELLM_LOG" \
   FAKE_LITELLM_MASTER_KEY=sk-cogni-operator-master \
-  PLATFORM_SERVICE_OWNER_NODE=node-template \
-  bash scripts/ci/secret-materialize.sh candidate-a node-template > "$TMPROOT/out-platform.txt"
+  bash scripts/ci/secret-materialize.sh candidate-a operator > "$TMPROOT/out-platform.txt"
 
 PLATFORM_TOKEN_FILE="$BAO_ROOT/cogni/candidate-a/akash-tx-actuator/AKASH_TX_ACTUATOR_TOKEN"
 test -f "$PLATFORM_TOKEN_FILE" \
   || { echo "owner leg did not mint AKASH_TX_ACTUATOR_TOKEN into cogni/candidate-a/akash-tx-actuator" >&2; exit 1; }
 PLATFORM_TOKEN="$(cat "$PLATFORM_TOKEN_FILE")"
+test "$PLATFORM_TOKEN" = "$PLATFORM_TOKEN_BEFORE"
 [[ "$PLATFORM_TOKEN" =~ ^[0-9a-f]{64}$ ]] \
   || { echo "AKASH_TX_ACTUATOR_TOKEN must be the catalog generator's hex/32 output" >&2; exit 1; }
 
@@ -392,7 +404,7 @@ fi
 
 # 4. The platform key must not also land in the node bucket (that is the leak we moved
 #    it out of), and its value must never be echoed.
-if [ -e "$BAO_ROOT/cogni/candidate-a/node-template/AKASH_TX_ACTUATOR_TOKEN" ]; then
+if [ -e "$BAO_ROOT/cogni/candidate-a/operator/AKASH_TX_ACTUATOR_TOKEN" ]; then
   echo "platform-service key leaked into a node bucket" >&2
   exit 1
 fi
@@ -413,8 +425,7 @@ env \
   FAKE_LITELLM_STORE="$LITELLM_STORE" \
   FAKE_LITELLM_LOG="$LITELLM_LOG" \
   FAKE_LITELLM_MASTER_KEY=sk-cogni-operator-master \
-  PLATFORM_SERVICE_OWNER_NODE=node-template \
-  bash scripts/ci/secret-materialize.sh candidate-a node-template > "$TMPROOT/out-platform2.txt"
+  bash scripts/ci/secret-materialize.sh candidate-a operator > "$TMPROOT/out-platform2.txt"
 test "$(cat "$PLATFORM_TOKEN_FILE")" = "$PLATFORM_TOKEN" \
   || { echo "re-run rotated AKASH_TX_ACTUATOR_TOKEN" >&2; exit 1; }
 for key in AKASH_DATABASE_CELL_APPLIED_CUSTODIES_JSON AKASH_DATABASE_CELL_APPLIED_EVIDENCE_BUNDLES_JSON; do
@@ -430,8 +441,8 @@ done
 # canonical superuser, matching DATABASE_URL/_SERVICE_URL behavior. This is the
 # prod oss 28P01 class: node-substrate provisions Doltgres with the operator SSOT
 # while the pod migrator reads this node-local URL.
-printf '%s' 'postgresql://postgres:stale@10.0.0.1:5435/knowledge_node_template?sslmode=disable' \
-  > "$BAO_ROOT/cogni/candidate-a/node-template/DOLTGRES_URL"
+printf '%s' 'postgresql://postgres:stale@10.0.0.1:5435/knowledge_operator?sslmode=disable' \
+  > "$BAO_ROOT/cogni/candidate-a/operator/DOLTGRES_URL"
 env \
   VM_HOST=fake \
   DOMAIN=test.cognidao.org \
@@ -442,13 +453,13 @@ env \
   FAKE_LITELLM_STORE="$LITELLM_STORE" \
   FAKE_LITELLM_LOG="$LITELLM_LOG" \
   FAKE_LITELLM_MASTER_KEY=sk-cogni-operator-master \
-  bash scripts/ci/secret-materialize.sh candidate-a node-template > "$TMPROOT/out-drift.txt"
+  bash scripts/ci/secret-materialize.sh candidate-a operator > "$TMPROOT/out-drift.txt"
 
 grep -q 'recomposed DOLTGRES_URL (drift corrected)' "$TMPROOT/out-drift.txt" \
   || { echo "stale DOLTGRES_URL was not reported as recomposed" >&2; cat "$TMPROOT/out-drift.txt" >&2; exit 1; }
-grep -qE '://postgres:[^@]+@[^/]+/knowledge_node_template\?' "$BAO_ROOT/cogni/candidate-a/node-template/DOLTGRES_URL" \
-  || { echo "DOLTGRES_URL must still reach knowledge_node_template as postgres after drift correction" >&2; exit 1; }
-if grep -q ':stale@' "$BAO_ROOT/cogni/candidate-a/node-template/DOLTGRES_URL"; then
+grep -qE '://postgres:[^@]+@[^/]+/knowledge_operator\?' "$BAO_ROOT/cogni/candidate-a/operator/DOLTGRES_URL" \
+  || { echo "DOLTGRES_URL must still reach knowledge_operator as postgres after drift correction" >&2; exit 1; }
+if grep -q ':stale@' "$BAO_ROOT/cogni/candidate-a/operator/DOLTGRES_URL"; then
   echo "DOLTGRES_URL still contains stale password after materialize" >&2
   exit 1
 fi
@@ -466,7 +477,7 @@ env \
   FAKE_LITELLM_STORE="$LITELLM_STORE" \
   FAKE_LITELLM_LOG="$LITELLM_LOG" \
   FAKE_LITELLM_MASTER_KEY=sk-cogni-operator-master \
-  bash scripts/ci/secret-materialize.sh candidate-a node-template > "$TMPROOT/out2.txt"
+  bash scripts/ci/secret-materialize.sh candidate-a operator > "$TMPROOT/out2.txt"
 
 grep -q 'created=0 ' "$TMPROOT/out2.txt" \
   || { echo "re-run must create 0 keys (idempotent); got:" >&2; grep 'materialize complete' "$TMPROOT/out2.txt" >&2; exit 1; }
@@ -499,7 +510,7 @@ env \
   FAKE_LITELLM_STORE="$LITELLM_STORE" \
   FAKE_LITELLM_LOG="$LITELLM_LOG" \
   FAKE_LITELLM_MASTER_KEY=sk-cogni-operator-master \
-  bash scripts/ci/secret-materialize.sh candidate-a node-template > "$TMPROOT/out-reconcile.txt" 2>&1 \
+  bash scripts/ci/secret-materialize.sh candidate-a operator > "$TMPROOT/out-reconcile.txt" 2>&1 \
   || { echo "stale-alias reconcile must succeed"; cat "$TMPROOT/out-reconcile.txt" >&2; exit 1; }
 grep -q '^delete ' "$LITELLM_LOG" \
   || { echo "stale alias was not deleted before re-registration" >&2; exit 1; }
@@ -528,7 +539,7 @@ env \
   FAKE_LITELLM_LOG="$LITELLM_LOG" \
   FAKE_LITELLM_MASTER_KEY=sk-cogni-operator-master \
   FAKE_LITELLM_FAIL=1 \
-  bash scripts/ci/secret-materialize.sh candidate-a node-template > "$TMPROOT/out-unavailable.txt" 2>&1
+  bash scripts/ci/secret-materialize.sh candidate-a operator > "$TMPROOT/out-unavailable.txt" 2>&1
 UNAVAILABLE_RC=$?
 set -e
 test "$UNAVAILABLE_RC" -ne 0 \
@@ -555,7 +566,7 @@ env \
   FAKE_LITELLM_LOG="$LITELLM_LOG" \
   FAKE_LITELLM_MASTER_KEY=sk-cogni-operator-master \
   FAKE_LITELLM_INVALID_INFO=1 \
-  bash scripts/ci/secret-materialize.sh candidate-a node-template > "$TMPROOT/out-invalid-info.txt" 2>&1
+  bash scripts/ci/secret-materialize.sh candidate-a operator > "$TMPROOT/out-invalid-info.txt" 2>&1
 INVALID_INFO_RC=$?
 set -e
 test "$INVALID_INFO_RC" -ne 0 \
@@ -583,7 +594,7 @@ env \
   FAKE_LITELLM_LOG="$LITELLM_LOG" \
   FAKE_LITELLM_MASTER_KEY=sk-cogni-operator-master \
   FAKE_LITELLM_INVALID_ALIAS_LIST=1 \
-  bash scripts/ci/secret-materialize.sh candidate-a node-template > "$TMPROOT/out-invalid-alias-list.txt" 2>&1
+  bash scripts/ci/secret-materialize.sh candidate-a operator > "$TMPROOT/out-invalid-alias-list.txt" 2>&1
 INVALID_ALIAS_LIST_RC=$?
 set -e
 test "$INVALID_ALIAS_LIST_RC" -ne 0 \
@@ -613,25 +624,20 @@ esac
 /bin/cat "$FAKE_PROBE_RECEIPT"
 EOF
 chmod +x "$FAKEBIN/cat" "$FAKEBIN/docker"
-PROBE_BANK="$BAO_ROOT/cogni/candidate-a/node-template-database-recovery-probe"
+PROBE_BANK="$BAO_ROOT/cogni/candidate-a/operator-database-recovery-probe"
 [ -s "$PROBE_BANK/DATABASE_RECOVERY_PROBE_PASSWORD" ] && [ -s "$PROBE_BANK/DATABASE_RECOVERY_PROBE_URL" ]
-[ ! -e "$BAO_ROOT/cogni/candidate-a/node-template/DATABASE_RECOVERY_PROBE_PASSWORD" ]
-[ ! -e "$BAO_ROOT/cogni/candidate-a/node-template/DATABASE_RECOVERY_PROBE_URL" ]
+[ ! -e "$BAO_ROOT/cogni/candidate-a/operator/DATABASE_RECOVERY_PROBE_PASSWORD" ]
+[ ! -e "$BAO_ROOT/cogni/candidate-a/operator/DATABASE_RECOVERY_PROBE_URL" ]
 cat > "$TMPROOT/probe.json" <<'JSON'
-{"database":"cogni_node_template","role":"probe_node_template","systemTenantExists":true,"serverAddress":"10.0.0.1","serverPort":5432,"systemIdentifier":"9876543210123456789","appRolesCanLogin":true,"runtimeRolesPresent":true,"runtimeRolesNoLogin":false,"activeRuntimeSessions":0,"observedAt":"2026-10-14T21:00:00.000+00:00","probeRoleIsolated":true}
+{"database":"cogni_operator","role":"probe_operator","systemTenantExists":true,"serverAddress":"10.0.0.1","serverPort":5432,"systemIdentifier":"9876543210123456789","appRolesCanLogin":true,"runtimeRolesPresent":true,"runtimeRolesNoLogin":false,"activeRuntimeSessions":0,"observedAt":"2026-10-14T21:00:00.000+00:00","probeRoleIsolated":true}
 JSON
-DB_READY_CATALOG="$TMPROOT/db-ready-catalog"
-mkdir -p "$DB_READY_CATALOG"
-cp "$REPO_ROOT"/infra/catalog/*.yaml "$DB_READY_CATALOG/"
-yq -i '.reliability.controller = false' "$DB_READY_CATALOG/operator.yaml"
-yq -i '.reliability.controller = true | .envs = ["candidate-a", "production"]' "$DB_READY_CATALOG/node-template.yaml"
 run_db_ready() {
   env VM_HOST=fake DOMAIN=test.cognidao.org SSH_OPTS="-i fake-key -o StrictHostKeyChecking=no" \
     SECRET_MATERIALIZE_SSH_BIN="$FAKEBIN/ssh" FAKE_REMOTE_PATH="$FAKEBIN" FAKE_BAO_ROOT="$BAO_ROOT" \
-    COGNI_CATALOG_ROOT="$DB_READY_CATALOG" SECRET_MATERIALIZE_PHASE=db-ready \
+    SECRET_MATERIALIZE_PHASE=db-ready \
     FAKE_PROBE_RECEIPT="$TMPROOT/probe.json" FAKE_PATCH_LOG="$TMPROOT/db-ready-writes" \
     FAKE_MACHINE_ID="${1:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" FAKE_LOCAL_SYSTEM_ID="${2:-9876543210123456789}" \
-    bash scripts/ci/secret-materialize.sh candidate-a node-template
+    bash scripts/ci/secret-materialize.sh candidate-a operator
 }
 # A missing cold component fails before sealing; pre-phase already minted it above.
 mv "$PROBE_BANK/DATABASE_RECOVERY_PROBE_PASSWORD" "$TMPROOT/cold-probe-password"
@@ -645,9 +651,9 @@ probe_password_before=$(cat "$PROBE_BANK/DATABASE_RECOVERY_PROBE_PASSWORD")
 : > "$TMPROOT/db-ready-writes"
 run_db_ready > "$TMPROOT/db-ready-out"
 BINDING_FILE="$BAO_ROOT/cogni/candidate-a/database-reliability-actuator/DATABASE_RECOVERY_PROBE_URLS_JSON"
-jq -e 'length == 2 and any(.[]; .databaseName == "cogni_node_template" and .probeRole == "probe_node_template" and .systemIdentifier == "9876543210123456789" and .substrateHost == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") and any(.[]; .nodeSlug == "other" and .environment == "preview")' "$BINDING_FILE" >/dev/null
+jq -e --arg nodeId "$NODE_ID" 'length == 2 and any(.[]; .nodeId == $nodeId and .nodeSlug == "operator" and .environment == "candidate-a" and .databaseName == "cogni_operator" and .probeRole == "probe_operator" and .systemIdentifier == "9876543210123456789" and .substrateHost == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") and any(.[]; .nodeSlug == "other" and .environment == "preview")' "$BINDING_FILE" >/dev/null
 [ "$(cat "$PROBE_BANK/DATABASE_RECOVERY_PROBE_PASSWORD")" = "$probe_password_before" ]
-[ ! -e "$BAO_ROOT/cogni/candidate-a/node-template/DATABASE_RECOVERY_PROBE_URLS_JSON" ]
+[ ! -e "$BAO_ROOT/cogni/candidate-a/operator/DATABASE_RECOVERY_PROBE_URLS_JSON" ]
 [ "$(wc -l < "$TMPROOT/db-ready-writes" | tr -d ' ')" = 1 ]
 : > "$TMPROOT/db-ready-writes"
 run_db_ready > "$TMPROOT/db-ready-out-repeat"
