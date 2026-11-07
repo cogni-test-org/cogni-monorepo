@@ -47,14 +47,17 @@ System setup installers were moved to `scripts/bootstrap/` and are out of scope 
 ## Public Surface
 
 - **Exports:**
+  - `node-deploy-sequencer.ts` (own process entry, bundled to `node-deploy-sequencer.mjs`, no exports) - Composition root for the blue/green node-deploy sequencer (task.5400): ActuatorPayer + operator Postgres + Cloudflare edge + K8s state secrets, single instance by Postgres advisory lock; env `POD_NAMESPACE`, `DEPLOY_ENVIRONMENT`, `AKASH_TX_ACTUATOR_URL`, `AKASH_CHAIN_OWNER`, `NODE_DEPLOY_EDGE_HOST_REGEX`, `NODE_DEPLOY_RETAIN_MS`; credentials as files under `/var/run/secrets/node-deploy-sequencer/`
   - `verifySystemTenant(serviceAccountService)` - Startup healthcheck: fails fast if cogni_system billing account missing (per SYSTEM_TENANT_STARTUP_CHECK)
   - `runGovernanceSchedulesSyncJob()` - Job: advisory lock + governance schedule sync via container
   - `runCatalogNodeRegistryReconcileJob()` - Job: App-read catalog projection into env-local Postgres + OpenFGA
   - `startCatalogRegistryReconcileOnBoot()`, `triggerCatalogRegistryReconcile()` - Immediate/poll registry trigger lifecycle
   - `getContainer()` - Singleton DI container with logger and config
+  - `getWorkItemSessionPort()` - Cached existing PostgreSQL session adapter without other providers
+  - `getRequestLoggingDependencies()` - Pure logger, clock, and error policy for explicitly opted-in operational routes
   - `resetContainer()` - Reset singleton (tests only)
   - `startOperatorPublishers(deps)` - Start health probe publisher (60s interval, publishes to node stream)
-  - `Container` interface - Ports + logger + config (includes accountsForUser(userId), serviceAccountService, metricsQuery, metricsCapability, repoCapability, toolSource, threadPersistenceForUser(userId), authorization, modelCatalog, providerResolver, nodeStream; no usageService)
+  - `Container` interface - Ports + logger + config (includes scheduleRunReader using the existing app-role Sql, accountsForUser(userId), serviceAccountService, metricsQuery, metricsCapability, repoCapability, toolSource, threadPersistenceForUser(userId), authorization, modelCatalog, providerResolver, nodeStream; no usageService)
   - `ContainerConfig` interface - Runtime config (unhandledErrorPolicy, rateLimitBypass, DEPLOY_ENVIRONMENT)
   - `UnhandledErrorPolicy` type - `"rethrow" | "respond_500"`
   - `getTemporalWorkflowClient()` - Process-wide Temporal WorkflowClient singleton (race-safe init, cleaned up by resetContainer)
@@ -64,7 +67,7 @@ System setup installers were moved to `scripts/bootstrap/` and are out of scope 
   - `runGraphWithScope({ executor, req, ctx?, billing, llmService, abortSignal? })` - App-local helper that seeds per-run ALS scope with resolved LlmService
   - `createAgentCatalog()`, `listAgentsForApi()` - Discovery factory (from `agent-discovery.ts`)
   - `resolveIdentityAttestationDependencies(signingKey)` - Identity issuer port composition; policy remains in the feature service
-  - `wrapRouteHandlerWithLogging()` - Route logging wrapper with metrics (from `http/`)
+  - `wrapRouteHandlerWithLogging()` - Route logging wrapper with metrics (from `http/`); an optional trusted dependency factory bypasses unrelated provider construction while preserving auth, metrics and error handling
   - `wrapPublicRoute()` - Lazy singleton wrapper for public routes with rate limiting (from `http/`)
   - `makeWrapPublicRoute()` - Pure factory for testing (from `http/wrapPublicRoute`)
   - `RateLimitBypassConfig` - Test bypass config type (from `http/wrapPublicRoute`)
@@ -78,6 +81,8 @@ System setup installers were moved to `scripts/bootstrap/` and are out of scope 
 - `capabilities/` - Capability factories (MetricsCapability, RepoCapability, WebSearchCapability)
 - `http/` - Route wrappers and rate limiting
 - `jobs/` - Job modules (advisory lock + container wiring for CLI-invoked tasks)
+
+- `composeNodeDeployLanes` (`node-deploy-lanes.ts`) wires the same recovery lanes with one explicit workload-zone binding. Missing/invalid zone or owner refuses fresh HTTP/DNS effects without stopping paid observation, cleanup or state reconciliation. Native clients, leadership and process lifecycle stay in `node-deploy-sequencer.ts`.
 
 ## Responsibilities
 
@@ -117,6 +122,8 @@ Bootstrap application runtime dependencies.
 - Bump **Last reviewed** date
 
 ## Notes
+
+- Work-item content uses `WorkItemsContentPort`; existing PostgreSQL coordination remains behind the separate lazy `getWorkItemSessionPort()`. Shared Dolt native admission never becomes the session authority.
 
 - System installers moved to scripts/bootstrap/
 - Focus on runtime composition only

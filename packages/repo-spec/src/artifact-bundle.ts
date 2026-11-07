@@ -229,7 +229,7 @@ export function buildNodeArtifactBundle(input: {
  * Exact service+artifact equality is checked before any workload assembly.
  */
 export function resolveNodeArtifactBundle(
-  spec: RepoSpec,
+  spec: Pick<RepoSpec, "node_id" | "deployment">,
   input: unknown,
   expected: ExpectedNodeArtifactBundleIdentity
 ): ResolvedNodeArtifactBundle {
@@ -315,9 +315,8 @@ export function resolveNodeArtifactBundle(
 
 /**
  * Resolve a bundle for ONE deployment environment, honoring the per-service `envs` gate
- * (story.5043) as a COMPLETE cascade so the rendered per-env manifest always satisfies the
- * XComputeWorkload XRD's two cross-reference invariants
- * (infra/crossplane/xcomputeworkload/xrd.yaml):
+ * (story.5043) as a COMPLETE cascade so the per-env bundle always satisfies the two
+ * cross-reference invariants (first stated by the retired XComputeWorkload XRD, task.5411):
  *
  *   - "every bundle artifact must be used by at least one service"
  *   - "every binding must target a different declared sibling service"

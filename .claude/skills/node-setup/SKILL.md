@@ -14,7 +14,7 @@ You are an infrastructure setup agent. Your job: take a fresh Cogni fork from cl
 - [SETUP_DESIGN.md](../../../scripts/setup/SETUP_DESIGN.md) — canonical secret list, personas, full setup flow
 - [ci-cd.md Axiom 23](../../../docs/spec/ci-cd.md) — `AKASH_IS_NODE_APP_TARGET` (gated north star): new node apps target Akash via the operator compute API; Cherry k3s = state substrate
 
-> ⚠️ Parts of this skill predate the k3s + Akash split (it references retired paths); verify against `docs/spec/cd-pipeline-e2e.md` before trusting a step.
+> ⚠️ Parts of this skill predate the k3s + Akash split (it references retired paths); verify against [cicd-e2e-required-sequence](https://cognidao.org/knowledge/cicd-e2e-required-sequence) before trusting a step.
 
 ## Pre-flight
 
@@ -50,7 +50,7 @@ Derive `REPO_SLUG` (e.g., `my-cogni-node`) and `REPO_SNAKE` (e.g., `my_cogni_nod
 - `.github/workflows/ci.yaml` → DB names (`REPO_SNAKE_test`)
 - `.env.local.example`, `.env.test.example` → DB names
 
-**Gate:** `pnpm check` passes.
+**Gate:** required CI (`unit`, `component`, `static`, `manifest`) is green on the PR.
 
 ### Phase 2: Local Environment
 
@@ -72,7 +72,7 @@ Derive `REPO_SLUG` (e.g., `my-cogni-node`) and `REPO_SNAKE` (e.g., `my_cogni_nod
 5. Provision database + run migrations: `pnpm dev:setup`
 6. Start dev server: `pnpm dev`
 
-**Gate:** `pnpm check` passes. App boots at http://localhost:3000 without DB errors.
+**Gate:** required CI (`unit`, `component`, `static`, `manifest`) is green on the PR. App boots at http://localhost:3000 without DB errors.
 
 ### Phase 3: Payment Activation (`payments.status: pending_activation`)
 

@@ -114,6 +114,10 @@ export const knowledge = pgTable(
     // automation (cron skips). v0 non-null value: 'agent'. Future kinds
     // (market:<id>, metric:<query>, http:<url>, deadline) add new values.
     resolutionStrategy: text("resolution_strategy"),
+    // Goal metrics (@cogni-dao/metrics 0.3.0): a `metric` row's definition and a
+    // goal/hypothesis's KPI bindings. Shapes are owned by the metrics package.
+    metricSpec: jsonb("metric_spec").$type<Record<string, unknown>>(),
+    kpiBindings: jsonb("kpi_bindings").$type<Record<string, unknown>[]>(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -275,6 +279,12 @@ export const workItems = pgTable(
     priority: integer("priority"),
     rank: integer("rank"),
     estimate: integer("estimate"),
+    // Do-it-now scores (story.5111): { "<axis id>": { v: 0–5, ev?: url } }.
+    // Axis ids are config (hub `work-item-scores-design`), so no column per axis.
+    // Recorded one-line literal port (hub `port-node-source-once`) of
+    // cogni-dao/node-template#198 packages/knowledge-base/src/schema.ts; bounds
+    // live in `parseWorkItemScores` (@cogni-dao/work-items 0.2.3).
+    scores: jsonb("scores"),
 
     // Free-text
     summary: text("summary"),

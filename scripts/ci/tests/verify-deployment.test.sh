@@ -6,8 +6,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-. "$SCRIPT_DIR/lib/catalog-input.sh"
-TEST_NODE="$(catalog_test_primary_node "$REPO_ROOT/infra/catalog")"
 cd "$REPO_ROOT"
 
 TMPROOT="$(mktemp -d -t verify-deployment.XXXXXX)"
@@ -44,16 +42,13 @@ export PATH="$TMPROOT:$PATH"
 export VERIFY_CURL_LOG="$TMPROOT/curl.log"
 
 DOMAIN=preview.cognidao.org \
-PROMOTED_APPS="$TEST_NODE" \
+PROMOTED_APPS=operator \
 MAX_ATTEMPTS=1 \
 SLEEP=0 \
   bash scripts/ci/verify-deployment.sh >"$TMPROOT/operator.out"
 
-grep -q "$TEST_NODE healthy" "$TMPROOT/operator.out"
-while read -r node; do
-  [ -n "$node" ] && [ "$node" != "$TEST_NODE" ] || continue
-  grep -q "$node readyz — not in PROMOTED_APPS=$TEST_NODE" "$TMPROOT/operator.out"
-done < <(yq -N 'select(.type == "node") | .name' infra/catalog/*.yaml)
+grep -q "operator healthy" "$TMPROOT/operator.out"
+grep -q "node-template readyz — not in PROMOTED_APPS=operator" "$TMPROOT/operator.out"
 [[ "$(wc -l <"$VERIFY_CURL_LOG" | tr -d ' ')" == "2" ]]
 grep -qx "https://preview.cognidao.org/readyz" "$VERIFY_CURL_LOG"
 grep -qx "https://preview.cognidao.org/livez" "$VERIFY_CURL_LOG"
@@ -81,7 +76,7 @@ fi
 grep -q "PROMOTED_APPS" "$TMPROOT/missing.out"
 [[ ! -s "$VERIFY_CURL_LOG" ]]
 
-for scope in unknown "$TEST_NODE,unknown" "$TEST_NODE,"; do
+for scope in unknown 'operator,unknown' 'operator,'; do
   if DOMAIN=preview.cognidao.org PROMOTED_APPS="$scope" MAX_ATTEMPTS=1 SLEEP=0 \
     bash scripts/ci/verify-deployment.sh >"$TMPROOT/invalid.out" 2>&1; then
     echo "FAIL: invalid scope succeeded: $scope" >&2; exit 1
@@ -91,18 +86,18 @@ for scope in unknown "$TEST_NODE,unknown" "$TEST_NODE,"; do
 done
 
 for body in '{"status":"degraded"}' '{"status":"alive"' '[]' 'null'; do
-  if DOMAIN=preview.cognidao.org PROMOTED_APPS="$TEST_NODE" VERIFY_LIVE_BODY="$body" \
+  if DOMAIN=preview.cognidao.org PROMOTED_APPS=operator VERIFY_LIVE_BODY="$body" \
     MAX_ATTEMPTS=1 SLEEP=0 bash scripts/ci/verify-deployment.sh >"$TMPROOT/bad-live.out" 2>&1; then
     echo "FAIL: invalid liveness succeeded: $body" >&2; exit 1
   fi
 done
 
-if DOMAIN=preview.cognidao.org PROMOTED_APPS="$TEST_NODE" VERIFY_LIVE_HTTP_FAILURE=true \
+if DOMAIN=preview.cognidao.org PROMOTED_APPS=operator VERIFY_LIVE_HTTP_FAILURE=true \
   MAX_ATTEMPTS=1 SLEEP=0 bash scripts/ci/verify-deployment.sh >"$TMPROOT/http.out" 2>&1; then
   echo "FAIL: liveness HTTP error succeeded" >&2; exit 1
 fi
 
-if DOMAIN=preview.cognidao.org PROMOTED_APPS="$TEST_NODE" VERIFY_READY_STATUS=503 \
+if DOMAIN=preview.cognidao.org PROMOTED_APPS=operator VERIFY_READY_STATUS=503 \
   MAX_ATTEMPTS=1 SLEEP=0 bash scripts/ci/verify-deployment.sh >"$TMPROOT/not-ready.out" 2>&1; then
   echo "FAIL: failed readiness succeeded" >&2; exit 1
 fi

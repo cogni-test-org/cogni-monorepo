@@ -12,6 +12,8 @@
  *   - AUTH_REQUIRED: Bearer token (machine agents) or SIWE session. No open access.
  *   - EXPLICIT_CALLER_AUTHORITY: This direct API is the authenticated, explicitly requested flight
  *     path. AI tool callers separately require getCiStatus.allGreen before invoking it.
+ *   - INDEPENDENT_WORKFLOW_AUTHORITY: remote overrides require target and operator flight grants;
+ *     the child source stays independent of reviewed parent workflow code.
  *   - ARTIFACT_GATE: Rejects before dispatch if the requested image tag is absent.
  *   - OPERATOR_DEPLOY_PLANE: Hosted flight dispatch goes through an operator-local port.
  *   - NODE_REF_CANDIDATE_ONLY: nodeRef dispatch targets candidate-a only; preview/prod promotion carries the resolved digest.
@@ -30,9 +32,11 @@ import { flightOperation } from "@cogni/node-contracts";
 import { eq } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { getSessionUser } from "@/app/_lib/auth/session";
+import { resolveNodeAndAuthorize } from "@/app/_lib/node-rbac";
 import { createOperatorDeployPlane } from "@/bootstrap/capabilities/operator-deploy-plane";
 import { getContainer, resolveServiceDb } from "@/bootstrap/container";
 import { wrapRouteHandlerWithLogging } from "@/bootstrap/http";
+import { refuseNodeOnFlightPromoteLane } from "@/features/compute/node-compute-api";
 import { nodeIdOrSlug } from "@/features/nodes/node-lookup";
 import type { DeployPlanePort, PreparedNodeRefCandidateFlight } from "@/ports";
 import { nodes } from "@/shared/db/nodes";
@@ -230,7 +234,7 @@ export const POST = wrapRouteHandlerWithLogging(
         return NextResponse.json({ error: "Invalid request" }, { status: 400 });
       }
 
-      const { nodeRef, workflowRef } = parsed.data;
+      const { nodeRef, workflowRef, workflowSha } = parsed.data;
       if (!nodeRef) {
         logTerminal({
           mode: "unknown",
@@ -260,6 +264,26 @@ export const POST = wrapRouteHandlerWithLogging(
         return NextResponse.json({ error: "not found" }, { status: 404 });
       }
 
+      // ONE_WRITER_PER_NODE_LANE (CD4, task.5411): only the operator still flights here; every
+      // other node is deployed by POST /api/v1/deploy/workloads. Refuse before any authz or dispatch.
+      const refusal = refuseNodeOnFlightPromoteLane({
+        slug: node.slug,
+        lane: "flight",
+        environment: "candidate-a",
+      });
+      if (refusal) {
+        logTerminal({
+          mode,
+          outcome: "error",
+          status: 409,
+          errorCode: refusal.errorCode,
+          targetNodeId: node.id,
+          slug: node.slug,
+          sourceSha8: nodeRef.sourceSha.slice(0, 8),
+        });
+        return NextResponse.json(refusal, { status: 409 });
+      }
+
       const authz = await authorizeNodeFlight({ sessionUser, node });
       if (!authz.ok) {
         logTerminal({
@@ -283,6 +307,32 @@ export const POST = wrapRouteHandlerWithLogging(
           },
           { status: authz.status }
         );
+      }
+
+      if (workflowSha !== undefined) {
+        const operatorAuthority = await resolveNodeAndAuthorize({
+          id: "operator",
+          userId: sessionUser.id,
+          action: "node.flight",
+        });
+        if (!operatorAuthority.ok) {
+          logTerminal({
+            mode,
+            outcome: "error",
+            status: operatorAuthority.status,
+            errorCode: operatorAuthority.errorCode,
+            targetNodeId: node.id,
+            slug: node.slug,
+            sourceSha8: nodeRef.sourceSha.slice(0, 8),
+          });
+          return NextResponse.json(
+            {
+              error: "operator workflow authority required",
+              errorCode: operatorAuthority.errorCode,
+            },
+            { status: operatorAuthority.status }
+          );
+        }
       }
 
       let deployPlane: DeployPlanePort;
@@ -368,6 +418,34 @@ export const POST = wrapRouteHandlerWithLogging(
         );
       }
 
+      const normalizedSourceRepo = prepared.sourceRepo
+        .replace(/\/$/, "")
+        .replace(/\.git$/i, "")
+        .toLowerCase();
+      if (
+        workflowSha !== undefined &&
+        normalizedSourceRepo ===
+          `https://github.com/${parentRepo.owner}/${parentRepo.repo}`.toLowerCase()
+      ) {
+        logTerminal({
+          mode,
+          outcome: "error",
+          status: 422,
+          errorCode: "independent_workflow_requires_remote_source",
+          targetNodeId: node.id,
+          slug: node.slug,
+          sourceSha8: nodeRef.sourceSha.slice(0, 8),
+        });
+        return NextResponse.json(
+          {
+            error:
+              "independent workflow identity requires a remote node source",
+            errorCode: "independent_workflow_requires_remote_source",
+          },
+          { status: 422 }
+        );
+      }
+
       // vnext: this records dispatch acceptance only. Workflow started/completed/failed
       // needs a GitHub Actions webhook or polling listener before those states are observable.
       try {
@@ -377,6 +455,7 @@ export const POST = wrapRouteHandlerWithLogging(
           slug: prepared.slug,
           sourceSha: prepared.sourceSha,
           ...(workflowRef ? { workflowRef } : {}),
+          ...(workflowSha ? { workflowSha } : {}),
         });
 
         const output = flightOperation.output.parse({
