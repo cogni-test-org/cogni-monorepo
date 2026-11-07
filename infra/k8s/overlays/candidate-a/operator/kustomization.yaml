@@ -53,7 +53,7 @@ transformers:
 images:
   - name: ghcr.io/cogni-dao/cogni-template
     newName: ghcr.io/cogni-dao/cogni-template
-    digest: "sha256:8e5176b0f0287ec675cab91793bf1c5d6b3cf269688e8426f824befe2dc3e063"
+    digest: "sha256:ff324603f261ca671857982eb246cb9bc23536868b1eb5df45119bd0c079b825"
 replacements:
   # task.5400 — the sequencer's secrets live in a DEDICATED namespace, not the wallet namespace
   # (cogni-candidate-a). The `namespace:` transformer above forces EVERYTHING it can into cogni-candidate-a, including
@@ -584,7 +584,3 @@ patches:
                     value: candidate-a
                   - name: FORK_DOMAIN_ROOT
                     value: cognidao.org
-  - target:
-      kind: Deployment
-      name: node-app
-    path: .prepare-init-compatibility.json
