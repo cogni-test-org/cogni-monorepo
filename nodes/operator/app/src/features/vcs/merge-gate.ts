@@ -34,7 +34,7 @@ export interface MergeGateRejection {
 
 /**
  * Pre-merge gate over a PR's CI/state. Returns `null` when the PR is mergeable,
- * or the first failing reason. Order: base → draft → green → mergeable.
+ * or the first failing reason. Checks run in this order: base → draft → green → mergeable.
  */
 export function evaluateMergeGate(
   ci: CiStatusResult
