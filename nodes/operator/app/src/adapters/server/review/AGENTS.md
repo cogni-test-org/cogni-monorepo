@@ -36,7 +36,7 @@ evidence + repo-spec/owning-node context, and GitHub App installation tokens.
 
 - **Exports:**
   - `createInstallationOctokit(installationId, appId, privateKeyBase64)` — JWT sign → installation token → authenticated Octokit (`github-auth.ts`)
-  - `createGithubReviewAdapter({ appId, privateKeyBase64, logger })` → `{ createCheckRun, updateCheckRun, postPrComment, fetchPrContext }` (`github-review.adapter.ts`)
+  - `createGithubReviewAdapter({ appId, privateKeyBase64, logger, buildSha? })` → `{ createCheckRun, updateCheckRun, postPrComment, fetchPrContext, resolvePullRequest }` (`github-review.adapter.ts`). story.5102: `resolvePullRequest` pins head/base SHAs for `POST /api/v1/vcs/review`; `createCheckRun` writes `external_id`; `fetchPrContext` reads config at the pinned base and reports `headMoved`; default model `deepseek-v4-flash`.
 - **Env/Config keys:** `GH_REVIEW_APP_ID`, `GH_REVIEW_APP_PRIVATE_KEY_BASE64` (via serverEnv)
 
 ## Ports
@@ -55,7 +55,7 @@ evidence + repo-spec/owning-node context, and GitHub App installation tokens.
   - Post PR comments with HEAD-SHA staleness guard (skip if SHA changed)
 - This directory **does not:**
   - Spend AI tokens / evaluate gates (the worker runs the pure domain eval; graph runs are a child workflow)
-  - Emit the `review.routed` log (the worker activity does, for the deploy_verified loop)
+  - Emit the `review.routed` log (the worker activity does, for the validate-candidate scorecard loop)
   - Manage webhook routing or signature verification
 
 ## Notes

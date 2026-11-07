@@ -31,6 +31,10 @@ export interface GovernanceSchedule {
   cron: string;
   timezone: string;
   entrypoint: string;
+  /** Namespaced graph id to run; absent → the sandbox agent (back-compat). */
+  graph?: string;
+  /** Platform model id for the `graph` run (set iff `graph` is set). */
+  model?: string;
 }
 
 export interface LedgerPoolConfig {
@@ -119,7 +123,7 @@ export interface NodeServiceConfig {
   /**
    * Per-service deployment-environment allow-list (story.5043). Absent = deploy to every
    * environment. When present, the manifest builder DROPS this service from any environment
-   * not listed here (see buildComputeWorkloadManifest).
+   * not listed here (see resolveNodeArtifactBundleForEnvironment).
    */
   readonly envs?: readonly ("candidate-a" | "preview" | "production")[];
   readonly runtimeProfile?: NodeServiceRuntimeProfileSpec;
@@ -139,7 +143,7 @@ export interface NodeServiceConfig {
 // ---------------------------------------------------------------------------
 
 /** Extract node_id from parsed repo-spec. */
-export function extractNodeId(spec: RepoSpec): string {
+export function extractNodeId(spec: Pick<RepoSpec, "node_id">): string {
   return spec.node_id;
 }
 
@@ -164,6 +168,22 @@ export function hasDeclaredNodeDeployment(spec: RepoSpec): boolean {
 }
 
 /**
+ * The node app's extra secret KEY names beyond the `cogni-node-app-v1` profile (story.5137 /
+ * task.5411). Source order: the top-level repo-spec `secret_refs` (the node-deploy shape) when
+ * present; otherwise the legacy `deployment.services[]` app service's `secret_refs`, kept so a
+ * node whose repo-spec was not yet migrated keeps its declared keys. Absent both, none.
+ */
+export function extractNodeAppSecretRefs(
+  spec: RepoSpec
+): readonly { readonly key: string }[] {
+  if (spec.secret_refs !== undefined) return spec.secret_refs;
+  const service = extractNodeServices(spec).find(
+    (s) => s.runtimeProfile === "cogni-node-app-v1"
+  );
+  return service?.secretRefs ?? [];
+}
+
+/**
  * Resolve the node's app-tier service declaration.
  *
  * Existing repo-specs intentionally need no migration: omission produces the
@@ -172,7 +192,7 @@ export function hasDeclaredNodeDeployment(spec: RepoSpec): boolean {
  * result to build off-cluster-compute desired state.
  */
 export function extractNodeServices(
-  spec: RepoSpec
+  spec: Pick<RepoSpec, "deployment">
 ): readonly NodeServiceConfig[] {
   const deployment = spec.deployment ?? LEGACY_DEFAULT_NODE_DEPLOYMENT;
   return deployment.services.map((service) => ({
@@ -318,7 +338,18 @@ export function extractGovernanceConfig(spec: RepoSpec): GovernanceConfig {
   const declared = spec.governance?.schedules ?? [];
   const ledger = extractLedgerConfig(spec);
 
-  const schedules = [...declared];
+  // Declared entries are copied field-by-field: an entry without `graph`/`model`
+  // keeps exactly the pre-task.5282 shape (sandbox agent, no new keys).
+  const schedules: GovernanceSchedule[] = declared.map((s) => ({
+    charter: s.charter,
+    cron: s.cron,
+    timezone: s.timezone,
+    entrypoint: s.entrypoint,
+    ...(s.graph !== undefined ? { graph: s.graph } : {}),
+    ...(s.model !== undefined ? { model: s.model } : {}),
+  }));
+  // LEDGER_PRESERVED: only a declared LEDGER_INGEST suppresses the synthesized one —
+  // adding any other charter (e.g. WORK_PRIORITIZER) never drops or alters it.
   const hasLedgerSchedule = declared.some(
     (s) => s.charter.toUpperCase() === LEDGER_INGEST_CHARTER
   );

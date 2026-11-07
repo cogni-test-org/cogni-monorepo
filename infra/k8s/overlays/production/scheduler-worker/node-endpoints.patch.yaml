@@ -14,5 +14,5 @@ kind: ConfigMap
 metadata:
   name: scheduler-worker-config
 data:
-  COGNI_NODE_ENDPOINTS: ""
+  COGNI_NODE_ENDPOINTS: "node-template=https://node-template.cognidao.org,b927a9dd-6132-4fc9-a51e-e3cee2568e3c=https://node-template.cognidao.org"
   TEMPORAL_CUSTODIED_NODE_ENDPOINTS: "{}"

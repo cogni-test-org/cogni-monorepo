@@ -8,8 +8,8 @@
  *   and a durable allocation ledger). This is the actuator's interface, NOT a controller:
  *   no watches, timers, finalizers, retry policy, or reconciliation live behind it (task.5095).
  * Scope: Interface + error-code definitions only. Generic reconciliation (retry, backoff,
- *   readiness gating, deletion policy, composition) belongs to Crossplane and is deliberately
- *   absent here.
+ *   readiness gating, deletion policy) belongs to the caller — today the node-deploy sequencer
+ *   (task.5400) — and is deliberately absent here.
  * Invariants:
  *   - KEY_IS_THE_IDEMPOTENCE_BOUNDARY: every mutation carries a caller-owned `cogniKey`;
  *     replaying a key never mints a second paid lease.
@@ -31,8 +31,8 @@
  *     workload with a bad or missing schema fails READINESS (bounded by the composite's boot
  *     SLO) instead of silently never being created — the toks5 failure mode, where a valid XR
  *     with a valid digest never reached the actuator and never existed in any environment.
- *   - REFUSAL_IS_OBSERVABLE: every code here is a stable string safe for logs, Events and
- *     Crossplane conditions — a refusal a caller cannot see is a bug (bug.5115 shape).
+ *   - REFUSAL_IS_OBSERVABLE: every code here is a stable string safe for logs, HTTP bodies and
+ *     release step reasons — a refusal a caller cannot see is a bug (bug.5115 shape).
  * Side-effects: none (types only)
  * Links: features/compute/akash-tx/akash-tx-actuator.ts,
  *   adapters/server/compute/akash-compute.adapter.ts, @shared/db/akash-tx-allocations,
@@ -68,7 +68,7 @@ export interface AkashTxWorkloadIdentity {
   readonly compositeGeneration: number;
 }
 
-/** Stable, redacted failure codes. Safe for HTTP bodies, logs, and XR conditions. */
+/** Stable, redacted failure codes. Safe for HTTP bodies, logs, and release step reasons. */
 export type AkashTxErrorCode =
   /** Another Cogni key holds the wallet-wide allocation slot; retry later. */
   | "wallet_allocation_blocked"
@@ -122,7 +122,15 @@ export class AkashTxError extends Error {
     public readonly code: AkashTxErrorCode,
     message: string,
     /** Owning key when the refusal names another allocation (blocked). */
-    public readonly ownerCogniKey?: string
+    public readonly ownerCogniKey?: string,
+    /**
+     * POSITIVE PROOF, never a default (bug.5569): true ONLY when this refusal leaves NOTHING
+     * billing under the key. Set where the create was refused before any deployment existed, or
+     * where the deployment it opened was closed AND re-read closed (`rolledBackDseq`). An error
+     * raised after a lease was allocated or recorded never carries it. Absent is the safe answer:
+     * the caller must then look for a lease before it gives up on the key.
+     */
+    public readonly nothingBilling = false
   ) {
     super(message);
     this.name = "AkashTxError";
@@ -191,13 +199,13 @@ export interface AkashTxCompositeVerdict {
 
 /**
  * The release-step seam. Structurally satisfied by `ComputeWorkloadMigrationPort`
- * (`KubernetesMigrationJobAdapter`), so the actuator and the frozen controller drive migration
- * currency with ONE implementation — including its `compute_workload_migration_job_infra_retry`
+ * (`KubernetesMigrationJobAdapter`), the ONE migration implementation — including its
+ * `compute_workload_migration_job_infra_retry`
  * reclassification of a `DeadlineExceeded` Job with no failed migrate container.
  */
 export type AkashTxMigrationPort = ComputeWorkloadMigrationPort;
 
-/** Provider-opaque view of one Akash workload. `externalName` is the Crossplane handle. */
+/** Provider-opaque view of one Akash workload. `externalName` is the opaque provider `leaseId`. */
 export interface AkashTxResource {
   readonly externalName: string;
   readonly state: ProvisionState;
@@ -233,9 +241,34 @@ export interface AkashTxCreateResult extends AkashTxResource {
 
 /**
  * The private, typed logical contract. Each method is ONE bounded attempt; the caller
- * (Crossplane) owns retry, backoff, and give-up policy.
+ * (the node-deploy sequencer) owns retry, backoff, and give-up policy.
  */
+/** Recovery references, never caller-supplied workload or money policy. */
+export interface AkashTxDatabaseCellRecoveryInput {
+  readonly cogniKey: string;
+  readonly environment: string;
+  readonly identity: AkashTxWorkloadIdentity;
+  readonly nodeSlug: string;
+  readonly recovery: {
+    readonly profileId: "pg15-cold-capacity-v1";
+    readonly sourceCogniKey: string;
+    readonly sourceExternalName: string;
+    readonly sourceSystemIdentifier: string;
+  };
+}
+
+/** Explicit operation-owned native policy; independent of legacy generic pricing. */
+export interface AkashTxAllocationPolicy {
+  readonly pricingDenom: "uact";
+  readonly pricingAmount: 100;
+  /** Requested legacy field only: Console ignores deposit and may auto-top-up. Not a spend limit. */
+  readonly initialEscrowUsd: 0.5;
+}
+
 export interface AkashTxActuatorPort {
+  createDatabaseCellRecovery?(
+    input: AkashTxDatabaseCellRecoveryInput
+  ): Promise<AkashTxCreateResult>;
   observe(input: {
     cogniKey: string;
     externalName?: string;
@@ -258,6 +291,13 @@ export interface AkashTxActuatorPort {
     environment: string;
     identity: AkashTxWorkloadIdentity;
     spec: ProvisionSpec;
+    /** Providers that must not win this create; unioned into the tried set, only ever narrows. */
+    excludeProviders?: readonly string[];
+    /**
+     * Providers this create may win (task.5405); intersected with the configured allowlist by the
+     * console client, so it can only narrow. An unsatisfiable list is refused before the claim.
+     */
+    allowProviders?: readonly string[];
   }): Promise<AkashTxCreateResult>;
   update(input: {
     cogniKey: string;
@@ -373,15 +413,23 @@ export interface AkashTxConsolePort {
   /** Create + screen + lease in one paid transaction. Returns when the lease exists. */
   allocateAndLease(input: {
     spec: ProvisionSpec;
+    allocationPolicy?: AkashTxAllocationPolicy;
     onAllocated?: (leaseId: string) => Promise<void>;
     /**
      * Providers to exclude from bid screening — the LEDGER-DERIVED tried set for this
-     * generation's attempt family (task.5153). Crossplane re-invokes create per recovery
+     * generation's attempt family (task.5153). The caller re-invokes create per recovery
      * ordinal, so an in-memory set is empty on every call and re-picks the same dead
      * provider forever; the caller derives this from durable allocation receipts instead.
      */
     excludedProviders?: ReadonlySet<string>;
+    /** Caller allowlist (task.5405), intersected with the client's configured allowlist. */
+    allowedProviders?: ReadonlySet<string>;
   }): Promise<{ leaseId: string; providerAccount: string }>;
+  /**
+   * Pre-spend refusal (task.5405): why a caller `allowProviders` can never be satisfied against the
+   * client's configured allowlist, or undefined. Optional so fakes without a pin need not implement it.
+   */
+  providerPinRefusal?(allow: ReadonlySet<string>): string | undefined;
   /**
    * Classify the wallet beyond a pre-transaction baseline into exactly one of three worlds:
    * `adopted` (one live allocation — it is ours), `settled` (no LIVE allocation beyond the
@@ -414,7 +462,10 @@ export interface AkashTxConsolePort {
    * options it needs stay inside the adapter and never cross the seam. The actuator compares it
    * to the receipt's `lastAppliedSdlHash` to no-op a byte-identical re-PUT (bug.5238).
    */
-  sdlHash(spec: ProvisionSpec): string;
+  sdlHash(
+    spec: ProvisionSpec,
+    allocationPolicy?: AkashTxAllocationPolicy
+  ): string;
   /** In-place SDL replacement on a known handle. Returns once the provider accepted it. */
   updateAllocated(input: {
     resourceId: string;
@@ -500,7 +551,7 @@ export interface AkashTxAllocationRecord {
   readonly providerAccount?: string;
   /**
    * sha256 hex of the SDL bytes last PUT to the provider for this receipt (bug.5238). Undefined
-   * until the first in-place update; the create path never sets it. The update path no-ops a
+   * until a successful create/update records it. The update path no-ops a
    * re-PUT when the desired SDL hashes to this value.
    */
   readonly lastAppliedSdlHash?: string;
@@ -616,8 +667,8 @@ export interface AkashTxAllocationLedgerPort {
    * Bounded enumeration of the wallet's LIVE paid leases: `state='allocated' AND
    * external_name IS NOT NULL` — receipts that bound a provider handle and have not been
    * released. Read-only, hard-limited, oldest-touched first — it decides nothing. This is the
-   * money-loop's SEE primitive (story.5039): what the Argo prune → Crossplane REMOVE →
-   * actuator delete chain is expected to close, enumerable BEFORE the close and provable
+   * money-loop's SEE primitive (story.5039): what the node-deploy verb's retire → actuator
+   * delete path is expected to close, enumerable BEFORE the close and provable
    * after (bug.5189: CLOSE→VERIFY→CLEAR; cluster state is never spend truth).
    *
    * `nodeId`/`environment` filters are OPTIONAL by design: the undetectable orphan is a lease
@@ -631,13 +682,10 @@ export interface AkashTxAllocationLedgerPort {
     limit: number;
   }): Promise<readonly AkashTxAllocationRecord[]>;
   /**
-   * Bounded enumeration of receipts in EVERY state for this wallet scope — the generation-
-   * derivation primitive (task.5132). `requiredLeaseGeneration` must see terminal receipts
-   * (`released`/`failed`): a terminal receipt permanently spends its generation for a re-added
-   * env (the recreated composite carries a new UID, so `claim`'s failed-no-handle re-claim can
-   * never match it — bug.5192's escape hatch does not apply across an XR recreation). The
-   * `listAllocated` view above deliberately hides those states; deriving from it made an ADD
-   * re-state a spent generation and the actuator refuse with `akash_tx_identity_conflict`.
+   * Bounded enumeration of receipts in EVERY state for this wallet scope (task.5132). Terminal
+   * receipts (`released`/`failed`) are visible here, unlike the `listAllocated` view above; the
+   * actuator's recovery tried-set and the deploy-state route read them. (The `lease_generation`
+   * derivation this was first built for was deleted with the Crossplane lane, task.5411.)
    * Read-only, hard-limited, oldest-touched first — it decides nothing.
    */
   listReceipts(input: {
@@ -655,7 +703,8 @@ export interface AkashTxAllocationLedgerPort {
    * before the pump ever sees it, so its container logs are lost with no evidence of WHY. This
    * view returns those live receipts (handle or not) so the lease-log pump can tail every
    * paying lease during the boot window and a handleless live receipt is loggable rather than
-   * silently skipped. Read-only, hard-limited, oldest-touched first — it decides nothing.
+   * silently skipped. Read-only, hard-limited, NEWEST-touched first (task.5420: oldest-first
+   * starved new leases behind dead rows) — it decides nothing.
    */
   listActive(input: {
     nodeId?: string;

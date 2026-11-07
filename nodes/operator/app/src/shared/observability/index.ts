@@ -14,6 +14,8 @@ import { EVENT_NAMES as NODE_SHARED_EVENT_NAMES } from "@cogni/node-shared";
 
 export const EVENT_NAMES = {
   ...NODE_SHARED_EVENT_NAMES,
+  FINANCE_REPORT_READ: "finance.report.read",
+  ADAPTER_GITHUB_NODE_CODE_ERROR: "adapter.github_node_code.error",
   ADAPTER_GITHUB_REPO_WRITE_ERROR: "adapter.github_repo_write.error",
   NODE_PUBLISH_SECRET_SHAPE_GENERATED:
     "feature.node_publish.secret_shape_generated",
@@ -24,10 +26,18 @@ export const EVENT_NAMES = {
   // `cogni-operator/node-env-<slug>-<env>` PR, including the no-dispatch outcomes. Adding a
   // PRE-PROD lane can dispatch a PRODUCTION promote (the custodian owns the lane's substrate),
   // so this name is how that is found in Loki — never a mystery deploy.
-  LANE_ONBOARD_COMPLETE: "feature.lane_onboard.complete",
+  DEPLOY_MAINTENANCE_CANCEL_COMPLETE: "deploy.maintenance_cancel_complete",
+  DEPLOY_MAINTENANCE_CANCEL_REFUSED: "deploy.maintenance_cancel_refused",
   DEPLOY_INFRA_RECONCILE_COMPLETE: "deploy.infra_reconcile.complete",
   NODE_SCHEDULES_SYNC_COMPLETE: "feature.node_schedules_sync.complete",
   NODE_RELIABILITY_STATUS_COMPLETE: "feature.node_reliability_status.complete",
+  // GET /api/v1/nodes/{id}/observability/health terminal event (bug.5528) — distinct from the
+  // actuator sweep's per-target NODE_RELIABILITY_STATUS_COMPLETE so route reads never inflate it.
+  NODE_OBSERVABILITY_HEALTH_COMPLETE:
+    "feature.node_observability_health.complete",
+  // POST readmission terminal event on the same route (bug.5528).
+  NODE_OBSERVABILITY_HEALTH_READMIT_COMPLETE:
+    "feature.node_observability_health.readmit_complete",
   NODE_RELIABILITY_TRANSITION: "feature.node_reliability.transition",
   NODE_RELIABILITY_SWEEP_STARTED: "feature.node_reliability.sweep_started",
   NODE_RELIABILITY_SWEEP_COMPLETE: "feature.node_reliability.sweep_complete",
@@ -59,6 +69,9 @@ export const EVENT_NAMES = {
   IDENTITY_BROKER_REJECTED: "feature.identity_broker.rejected",
   DNS_REVERSE_RECONCILE_SKIPPED: "dns.reverse_reconcile.skipped",
   DNS_FORWARD_RECONCILE_SKIPPED: "dns.forward_reconcile.skipped",
+  // Goal metrics (@cogni-dao/metrics, story.0021): one refresh tick and one goals read.
+  METRIC_REFRESH_COMPLETE: "metric.refresh_complete",
+  GOALS_PROGRESS_READ: "goals.progress_read",
 } as const;
 
 export type EventName = (typeof EVENT_NAMES)[keyof typeof EVENT_NAMES];
@@ -81,6 +94,7 @@ export {
   type PaymentsStatusReadEvent,
   type PaymentsVerifiedEvent,
   type RequestContext,
+  WORK_ITEMS_LIST_ERROR_CODES,
 } from "@cogni/node-shared";
 // --- App-local: server logger/metrics/redact (pino + prom-client runtime deps) ---
 export * from "./server";

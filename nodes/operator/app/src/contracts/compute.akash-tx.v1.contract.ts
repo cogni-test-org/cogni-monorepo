@@ -4,7 +4,9 @@
 /**
  * Module: `@contracts/compute.akash-tx.v1`
  * Purpose: Wire contract for the private Akash transaction actuator — the typed workload
- *   contract Crossplane's provider-http posts to for observe/create/update/delete (task.5095).
+ *   contract for observe/create/update/delete (task.5095). Its live caller is the node-deploy
+ *   sequencer's `ActuatorPayer` (create/observe/delete, task.5400); the Crossplane provider-http
+ *   caller it was first written for was deleted (task.5411).
  * Scope: Request/response schemas only. This surface is CLUSTER-PRIVATE: it is never mounted
  *   on the public operator app, and the public compute mutation routes stay tombstoned.
  * Invariants:
@@ -92,7 +94,7 @@ const BundleDigestSchema = z
 
 /**
  * THE RELEASE-SIDE MIGRATION STEP (task.5135). Stated on OBSERVE — the unpaid, level-triggered
- * tick Crossplane already runs on every reconcile — and NEVER on a paid mutation.
+ * tick the node-deploy sequencer runs on every reconcile — and NEVER on a paid mutation.
  *
  * The block's PRESENCE is the whole policy: a workload with a database sends it, one without
  * omits it. There is no `policy` discriminator here on purpose, because the only thing a policy
@@ -244,11 +246,29 @@ export const AkashTxObserveInputSchema = z.strictObject({
   composite: AkashTxCompositeVerdictSchema.optional(),
 });
 
+/** A bech32 Akash account address: `akash1` + 38 data characters. */
+const ProviderAccountSchema = z.string().regex(/^akash1[0-9a-z]{38}$/);
+
 export const AkashTxCreateInputSchema = z.strictObject({
   cogniKey: CogniKeySchema,
   environment: EnvironmentSchema,
   identity: AkashTxIdentitySchema,
   spec: AkashTxSpecSchema,
+  /**
+   * OPTIONAL providers that must not win THIS create (task.5400): the provider currently serving the
+   * blue lease, because two leases on one provider ingress cannot both claim one host. It can only
+   * NARROW the eligible bids: the actuator UNIONS it into its ledger-derived tried set (task.5153) and
+   * never replaces it. ABSENT is byte-identical to the pre-task.5400 wire and behaviour.
+   */
+  excludeProviders: z.array(ProviderAccountSchema).max(16).optional(),
+  /**
+   * OPTIONAL providers this create MAY win (task.5405): the interim set whose egress is admitted to
+   * the shared substrate. The actuator INTERSECTS it with its own configured allowlist and can only
+   * NARROW the eligible bids, never widen them; an empty intersection is refused BEFORE anything is
+   * paid. `min(1)`: an empty list is a typo, never "any provider" (omit the field for that). ABSENT is
+   * byte-identical to the pre-task.5405 wire and behaviour.
+   */
+  allowProviders: z.array(ProviderAccountSchema).min(1).max(16).optional(),
   /** DEPRECATED, parsed and ignored — see `AkashTxDeprecatedMigrationSchema`. */
   migration: AkashTxDeprecatedMigrationSchema.optional(),
 });
@@ -260,9 +280,20 @@ export const AkashTxCreateDatabaseCellInputSchema = z.strictObject({
   identity: AkashTxIdentitySchema,
   nodeSlug: ServiceNameSchema,
   budgetProfile: z.literal("dedicated-high-throughput-v1"),
+  recovery: z
+    .strictObject({
+      profileId: z.literal("pg15-cold-capacity-v1"),
+      sourceCogniKey: CogniKeySchema,
+      sourceExternalName: ExternalNameSchema,
+      sourceSystemIdentifier: z
+        .string()
+        .regex(/^[0-9]+$/)
+        .max(32),
+    })
+    .optional(),
 });
 export const AkashTxUpdateDatabaseCellInputSchema =
-  AkashTxCreateDatabaseCellInputSchema.extend({
+  AkashTxCreateDatabaseCellInputSchema.omit({ recovery: true }).extend({
     externalName: ExternalNameSchema,
   });
 export const AkashTxPrepareDatabaseCellDiagnosticInputSchema =
@@ -348,6 +379,11 @@ export const AkashTxErrorOutputSchema = z.strictObject({
   code: z.string(),
   message: z.string(),
   ownerCogniKey: z.string().optional(),
+  /**
+   * bug.5569: present (and `true`) ONLY when the actuator PROVED nothing bills under the key after
+   * this refusal. Absent means "a lease may exist": the caller must observe before it gives up.
+   */
+  nothingBilling: z.literal(true).optional(),
 });
 
 export type AkashTxMigrationStep = z.infer<typeof AkashTxMigrationStepSchema>;

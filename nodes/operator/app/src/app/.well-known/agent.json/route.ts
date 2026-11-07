@@ -22,11 +22,13 @@
 import {
   agentMeOperation,
   flightOperation,
+  reviewOperation,
   workItemsCreateOperation,
   workItemsPatchOperation,
 } from "@cogni/node-contracts";
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { LangfuseObservationQuerySchema } from "@/contracts/nodes.langfuse.observations.v1.contract";
 import {
   getNodeBrandColor,
   getNodeBrandIcon,
@@ -79,6 +81,24 @@ export async function GET(request: Request) {
     },
     registrationUrl: `${origin}/api/v1/agent/register`,
     auth: { type: "bearer", keyPrefix: "cogni_ag_sk_v1_" },
+    traceObservability: {
+      contractVersion: "langfuse-observations-v2.1",
+      querySchema: z.toJSONSchema(LangfuseObservationQuerySchema),
+      auth: "Cogni Bearer; node.flight developer permission",
+      nodeReference: "node UUID or slug",
+      operations: ["GET /api/public/v2/observations"],
+      applicationRootSelector:
+        "type=SPAN&traceId=<32-hex-trace-id>; exact app root only, independently verified from Loki creation/terminal receipts",
+      defaults: {
+        environment: "production",
+        limit: 50,
+        maxLimit: 100,
+        maxWindowHours: 24,
+      },
+      result: "Native Langfuse data/meta; scope and partiality in meta.cogni",
+      privacy:
+        "Allowlisted metadata; scrubbed bounded IO. Shared backend credentials stay server-side.",
+    },
     // Fleet identity (task.5024): public keys nodes use to verify operator-signed
     // identity attestations. Nodes start the round trip at `/identity/attest`, which
     // authenticates a GitHub account through this environment's OAuth client — no
@@ -94,27 +114,35 @@ export async function GET(request: Request) {
       workItemPr: `${origin}/api/v1/work/items/{id}/pr`,
       workItemCoordination: `${origin}/api/v1/work/items/{id}/coordination`,
       runs: `${origin}/api/v1/agent/runs`,
+      nodeTraceObservations: `${origin}/api/v1/nodes/{id}/observability/langfuse/api/public/v2/observations`,
       runStream: `${origin}/api/v1/agent/runs/{runId}/stream`,
       // Agent self-identity: one authed read for "am I live, who am I, when does
       // my key expire, what can I do". A 200 proves the key is live; a 401 proves
       // it is expired/invalid — unlike `users/me`, which is session-cookie-only
       // and 401s every agent key regardless of liveness. See `actions.agentMe`.
       agentIdentity: `${origin}/api/v1/agent/me`,
-      // CI/CD plane (see docs/spec/node-ci-cd-contract.md § Env-promotion).
-      // flight → candidate-a (node.flight/can_flight); promote → production
-      // (node.promote_production/can_promote_production). Both dispatch via the
-      // operator GitHub App — never a personal gh credential. Promotion is
-      // app-digest only; infraReconcile is the separate, operator-node-only
-      // production substrate lever. Grant the role via the access-request →
-      // owner-approve loop below.
+      // CI/CD plane. flight + promote are OPERATOR-ONLY (task.5411, CD4
+      // ONE_WRITER_PER_NODE_LANE): they deploy the operator control plane itself and
+      // refuse every other node with 409 `node_on_deploy_verb`. Every other node
+      // deploys through `deployWorkloads` below. infraReconcile is the separate,
+      // operator-node-only production substrate lever. Grant the role via the
+      // access-request → owner-approve loop below.
       flight: `${origin}/api/v1/vcs/flight`,
+      // Developer-requested PR review (story.5102) — the ONLY review trigger; no webhook starts one.
+      review: `${origin}/api/v1/vcs/review`,
       promote: `${origin}/api/v1/deploy/promote`,
+      // Node-deploy verb (task.5400): POST records intent to blue/green-deploy one declared
+      // workload at a sha; GET reads desired + releaseState (queued|deploying|active|parked|
+      // superseded|failed) + attempts with step timelines; `<this>/releases/{releaseId}?nodeId&env`
+      // follows one release; `/api/v1/nodes/{id}/observability/logs?service=deploy` is the node's own
+      // sequencer events. Same per-env gates as promote.
+      deployWorkloads: `${origin}/api/v1/deploy/workloads`,
       infraReconcile: `${origin}/api/v1/deploy/infra-reconcile`,
       openapi: `${origin}/openapi.json`,
       nodeAccessRequest: `${origin}/api/v1/nodes/{id}/access-requests`,
       nodeDevelopers: `${origin}/api/v1/nodes/{id}/developers`,
       // Cognition substrate: the session-start bundle (irreducible invariants +
-      // live skills index + domain pointers). A SessionStart hook fetches this
+      // live governing index + domain pointers). A SessionStart hook fetches this
       // and injects it — replaces git-synced AGENTS.md sprawl.
       cognition: `${origin}/api/v1/cognition`,
     },
@@ -133,12 +161,27 @@ export async function GET(request: Request) {
       flightCandidate: {
         method: "POST",
         endpoint: `${origin}/api/v1/vcs/flight`,
+        // Operator node only; any other node → 409 node_on_deploy_verb, use deployWorkloads.
+        scope: "operator",
         auth: {
           type: "bearer",
           capability: "node.flight",
         },
         inputSchema: z.toJSONSchema(flightOperation.input),
         outputSchema: z.toJSONSchema(flightOperation.output),
+      },
+      // REVIEW_IS_DEV_TRIGGERED (story.5102): a developer asks for a PR review; the requester is
+      // the run actor and pays. The check run carries `external_id = requestId` and its summary
+      // ends with one machine-readable block (marker `<!-- cogni-review-result v1 -->`).
+      requestReview: {
+        method: "POST",
+        endpoint: `${origin}/api/v1/vcs/review`,
+        auth: {
+          type: "bearer",
+          capability: "node.flight",
+        },
+        inputSchema: z.toJSONSchema(reviewOperation.input),
+        outputSchema: z.toJSONSchema(reviewOperation.output),
       },
       // WRITE_SEAM_IS_DISCOVERABLE: `endpoints.workItems` is only a URL — it cannot
       // tell an agent that the route accepts POST, what body it takes, or that the

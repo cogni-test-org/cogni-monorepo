@@ -12,20 +12,24 @@
  * Invariants: Protected route (server-side auth check); SSR_SEEDS_REACT_QUERY
  *   (loaders return the exact wire shape the client fetchers do, so
  *   initialData === post-hydration refetch — no hydration shift). Graph data is
- *   only pre-read on a `?mode=graph` deep-link; otherwise it stays deferred.
+ *   only pre-read on a `?mode=graph` deep-link; goal progress only on a
+ *   `?mode=goals` deep-link (parsed with the published GoalsProgressSchema, so a
+ *   malformed read degrades to the client fetch); otherwise both stay deferred.
  * Side-effects: IO (Doltgres reads via container port)
  * Links: [KnowledgeDashboardView](./view.tsx), ./_server/loaders.ts, docs/spec/knowledge-syntropy.md
  * @public
  */
 
+import { GoalsProgressSchema } from "@cogni-dao/metrics/contracts";
 import { redirect } from "next/navigation";
 
+import { loadGoalsProgress } from "@/app/_facades/metrics/goal-metrics.server";
 import { getContainer } from "@/bootstrap/container";
 import { getServerSessionUser } from "@/lib/auth/server";
 import {
   loadDomains,
-  loadKnowledgeGraph,
-  loadKnowledgeList,
+  loadKnowledgeGraphCached,
+  loadKnowledgeListCached,
 } from "./_server/loaders";
 import { KnowledgeDashboardView } from "./view";
 
@@ -54,23 +58,34 @@ export default async function KnowledgePage({
 
   const port = getContainer().knowledgeStorePort;
   const { mode } = await searchParams;
+  const goalsSeed =
+    mode === "goals"
+      ? safe(loadGoalsProgress()).then(
+          (d) => GoalsProgressSchema.safeParse(d).data
+        )
+      : Promise.resolve(undefined);
 
   const [initialList, initialDomains, initialGraph] = port
     ? await Promise.all([
-        // limit=500 matches the browse client fetcher (LIST_LIMIT_PARITY).
-        safe(loadKnowledgeList(port, { limit: 500 })),
+        // limit=500 + includeEdo match the browse client fetcher
+        // (LIST_LIMIT_PARITY); the chains tab filters EDO rows from this list.
+        // Cached reads keyed by the store revision (bug.5547): repeat refreshes
+        // are cache hits, not full re-materializations.
+        safe(loadKnowledgeListCached(port, { limit: 500, includeEdo: true })),
         safe(loadDomains(port)),
         mode === "graph"
-          ? safe(loadKnowledgeGraph(port))
+          ? safe(loadKnowledgeGraphCached(port))
           : Promise.resolve(undefined),
       ])
     : [undefined, undefined, undefined];
+  const initialGoals = await goalsSeed;
 
   return (
     <KnowledgeDashboardView
       initialList={initialList}
       initialDomains={initialDomains}
       initialGraph={initialGraph}
+      initialGoals={initialGoals}
     />
   );
 }

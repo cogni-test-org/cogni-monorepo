@@ -56,6 +56,12 @@ export {
 
 // Overlay components
 export {
+  brainLoading,
+  brainLoadingGraphic,
+  brainLoadingMark,
+  brainLoadingOrbit,
+  brainLoadingSpectrum,
+  brainLoadingTrack,
   chatContainer,
   chatDivider,
   chatForm,
@@ -87,5 +93,6 @@ export {
   paragraph,
   prompt,
   prose,
+  reportText,
   textAccent,
 } from "./typography";
