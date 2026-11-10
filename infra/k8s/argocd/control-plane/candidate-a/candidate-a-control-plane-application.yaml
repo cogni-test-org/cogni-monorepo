@@ -25,8 +25,9 @@
 #   must preserve that repository and ref after adopting the seed. Pointing back to the
 #   canonical deploy ref makes Argo immediately overwrite the test-owned root.
 #
-# directory.recurse: false — own only the manifests directly in control-plane/candidate-a/,
-#   never descend. repoURL is the LITERAL upstream: the bootstrap apply path does NO envsubst,
+# No spec.source.directory block: Argo is non-recursive by default and drops a default-valued
+#   `directory: {recurse: false}` from the live object, so declaring it kept this self-managed
+#   app OutOfSync and re-syncing every ~2.7 min into kine (bug.5613). repoURL is the LITERAL upstream: the bootstrap apply path does NO envsubst,
 #   so this cannot use ${FORK_REPO}.
 #
 # Scope: this root owns ONLY the app-of-apps under control-plane/candidate-a/ (plus itself).
@@ -49,8 +50,6 @@ spec:
     repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
     targetRevision: main
     path: infra/k8s/argocd/control-plane/candidate-a
-    directory:
-      recurse: false
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd
