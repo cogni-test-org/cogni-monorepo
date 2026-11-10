@@ -44,8 +44,9 @@
 #   deliberately NOT included: their repoURL is shell-substituted at provision time and Argo
 #   cannot do that substitution, so they remain apply-once until that templating is solved.
 #
-# directory.recurse: false — apply only the manifests directly in control-plane/candidate-a/,
-#   never descend. repoURL is the LITERAL upstream (the bootstrap apply path does NO envsubst).
+# No spec.source.directory block: Argo is non-recursive by default and drops a default-valued
+#   `directory: {recurse: false}` from the live object, so declaring it kept this self-managed
+#   app OutOfSync and re-syncing every ~2.7 min into kine (bug.5613). repoURL is the LITERAL upstream (the bootstrap apply path does NO envsubst).
 #
 # KEEP THE OBJECT BELOW IDENTICAL TO THE SELF-MANAGING COPY. Drift makes Argo fight its own
 # seed. tests/ci-invariants/candidate-control-plane-self-management.spec.ts pins the
@@ -64,8 +65,6 @@ spec:
     repoURL: https://github.com/cogni-test-org/cogni-monorepo.git
     targetRevision: main
     path: infra/k8s/argocd/control-plane/candidate-a
-    directory:
-      recurse: false
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd
