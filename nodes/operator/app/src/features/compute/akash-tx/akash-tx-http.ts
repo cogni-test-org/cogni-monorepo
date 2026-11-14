@@ -4,7 +4,8 @@
 /**
  * Module: `@features/compute/akash-tx/akash-tx-http`
  * Purpose: The private ClusterIP surface of the Akash transaction actuator — four typed
- *   logical operations Crossplane's provider-http calls, plus liveness. Pure dispatch over
+ *   logical operations (the node-deploy sequencer's `ActuatorPayer` calls create/observe/delete),
+ *   plus liveness. Pure dispatch over
  *   the actuator; it adds no policy of its own (task.5095).
  * Scope: Request validation, bearer authentication, and stable code→status mapping. Does NOT
  *   retry, queue, schedule, or hold state. The node:http server factory here is a binding
@@ -224,6 +225,8 @@ function errorResponse(error: AkashTxError): AkashTxHttpResponse {
       code: error.code,
       message: error.message,
       ...(error.ownerCogniKey ? { ownerCogniKey: error.ownerCogniKey } : {}),
+      // bug.5569: sent only on positive proof; absent stays byte-identical to the old wire.
+      ...(error.nothingBilling ? { nothingBilling: true } : {}),
     },
   };
 }
@@ -306,6 +309,20 @@ export function createAkashTxDispatcher(
         }
         case "/v1/akash/create-database-cell": {
           const input = AkashTxCreateDatabaseCellInputSchema.parse(payload);
+          if (input.recovery) {
+            if (!deps.actuator.createDatabaseCellRecovery)
+              throw new AkashTxError(
+                "ledger_unavailable",
+                "retained recovery allocation unavailable"
+              );
+            return {
+              status: 200,
+              body: await deps.actuator.createDatabaseCellRecovery({
+                ...input,
+                recovery: input.recovery,
+              }),
+            };
+          }
           if (!deps.databaseCellSpec) {
             throw new AkashTxError(
               "ledger_unavailable",
@@ -469,6 +486,12 @@ export function createAkashTxDispatcher(
               environment: input.environment,
               identity: input.identity,
               spec: toSpec(input.spec),
+              ...(input.excludeProviders
+                ? { excludeProviders: input.excludeProviders }
+                : {}),
+              ...(input.allowProviders
+                ? { allowProviders: input.allowProviders }
+                : {}),
             }),
           };
         }
@@ -521,6 +544,7 @@ export function createAkashTxDispatcher(
             ...(error.ownerCogniKey
               ? { ownerCogniKey: error.ownerCogniKey }
               : {}),
+            ...(error.nothingBilling ? { nothingBilling: true } : {}),
           },
           "akash_tx_http_op_failed"
         );

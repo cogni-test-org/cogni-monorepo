@@ -26,6 +26,7 @@ import { rootCertificates } from "node:tls";
 
 import type { ProvisionOutput, ProvisionSpec } from "@cogni/ai-tools";
 import { describe, expect, it } from "vitest";
+import { parse as parseYaml } from "yaml";
 
 import type {
   AkashAllocationProbe,
@@ -44,12 +45,19 @@ import type {
   RecordNodeMigrationReportInput,
 } from "@/ports";
 import { AkashTxError } from "@/ports";
+import type { DatabaseCellAppliedCustody } from "@/types/database-cell";
 
 import {
   AkashTxActuator,
+  type AkashTxActuatorDeps,
   type AkashTxLogger,
   mapConsoleFailure,
 } from "./akash-tx-actuator";
+import { createAkashTxDispatcher } from "./akash-tx-http";
+import {
+  DatabaseCellRecoveryProfileSchema,
+  databaseCellRecoveryIntent,
+} from "./database-cell-recovery";
 
 const SPEC: ProvisionSpec = {
   name: "toks9",
@@ -299,7 +307,9 @@ class FakeLedger implements AkashTxAllocationLedgerPort {
 
   async markReleased(input: { cogniKey: string }) {
     const row = this.rows.get(input.cogniKey);
-    if (row) this.rows.set(input.cogniKey, { ...row, state: "released" });
+    // Same WHERE as the Drizzle ledger: `state in ('allocated', 'released')`.
+    if (row && (row.state === "allocated" || row.state === "released"))
+      this.rows.set(input.cogniKey, { ...row, state: "released" });
   }
 
   async read(input: { cogniKey: string }) {
@@ -343,13 +353,19 @@ class FakeLedger implements AkashTxAllocationLedgerPort {
       .slice(0, input.limit);
   }
 
+  /** Limits `listActive` was called with, in call order (task.5420). */
+  listActiveLimits: number[] = [];
+
+  /** Newest-touched first like the adapter: the last-seeded row is the newest. */
   async listActive(input: {
     nodeId?: string;
     environment?: string;
     limit: number;
   }) {
     if (this.failReads) throw new Error("ledger down");
+    this.listActiveLimits.push(input.limit);
     return [...this.rows.values()]
+      .reverse()
       .filter(
         (row) =>
           (row.state === "preparing" || row.state === "allocated") &&
@@ -487,6 +503,12 @@ interface FakeConsoleOptions {
   /** Simulate a lost response: the lease IS created, then the call throws. */
   loseResponseAfterAllocation?: boolean;
   allocateError?: Error;
+  /** Throw `allocateError` AFTER the handle was published (a deployment exists), as the real client does. */
+  allocateErrorAfterAllocation?: boolean;
+  /** Fail every Console status read (bug.5569: a read-back failure after a lease exists). */
+  statusError?: Error;
+  /** Deployments Console reads back as `closed` (bug.5569: a rolled-back create). */
+  closedDseqs?: readonly string[];
   recovered?: ProvisionOutput | null;
   /** Several live allocations beyond the baseline: adoption is undecidable. */
   ambiguous?: readonly string[];
@@ -530,6 +552,13 @@ class FakeConsole implements AkashTxConsolePort {
     onAllocated?: (leaseId: string) => Promise<void>;
   }): Promise<{ leaseId: string; providerAccount: string }> {
     this.allocateCalls += 1;
+    if (
+      this.options.allocateError &&
+      this.options.allocateErrorAfterAllocation
+    ) {
+      await input.onAllocated?.(this.nextLeaseId);
+      throw this.options.allocateError;
+    }
     if (this.options.allocateError) throw this.options.allocateError;
     if (this.loseResponse) {
       // The transaction succeeded on-chain; only the response was lost, so the
@@ -554,10 +583,13 @@ class FakeConsole implements AkashTxConsolePort {
 
   async status(input: { leaseId: string }): Promise<ProvisionOutput> {
     this.statusCalls += 1;
+    if (this.options.statusError) throw this.options.statusError;
     return {
       provider: "akash",
       leaseId: input.leaseId,
-      state: "active",
+      state: this.options.closedDseqs?.includes(input.leaseId)
+        ? "closed"
+        : "active",
       endpoints: [`https://${input.leaseId}.example.net`],
     };
   }
@@ -613,8 +645,13 @@ function recordingLogger(): AkashTxLogger & {
   };
 }
 
-function build(consoleOptions: FakeConsoleOptions = {}) {
-  const ledger = new FakeLedger();
+function build(
+  consoleOptions: FakeConsoleOptions = {},
+  recoveryProfile?: unknown,
+  sharedLedger?: FakeLedger,
+  appliedCellCustody?: AkashTxActuatorDeps["appliedCellCustody"]
+) {
+  const ledger = sharedLedger ?? new FakeLedger();
   const api = new FakeConsole(consoleOptions);
   const log = recordingLogger();
   const migration = new FakeMigration();
@@ -623,6 +660,8 @@ function build(consoleOptions: FakeConsoleOptions = {}) {
     console: api,
     ledger,
     log,
+    recoveryProfile: async () => recoveryProfile,
+    ...(appliedCellCustody ? { appliedCellCustody } : {}),
     migration,
     costEvidence: costs.costEvidence,
     costStore: costs.costStore,
@@ -634,8 +673,11 @@ function build(consoleOptions: FakeConsoleOptions = {}) {
 describe("qualified cell app releases", () => {
   const qualifiedSha = "a".repeat(40);
   const otherSha = "b".repeat(40);
-  function withCell() {
-    const context = build();
+  function withCell(
+    recoveryProfile?: unknown,
+    appliedCellCustody?: AkashTxActuatorDeps["appliedCellCustody"]
+  ) {
+    const context = build({}, recoveryProfile, undefined, appliedCellCustody);
     const provider = `akash1${"a".repeat(38)}`;
     context.ledger.rows.set("cell", {
       receiptId: "22222222-2222-4222-8222-222222222222",
@@ -690,6 +732,310 @@ describe("qualified cell app releases", () => {
     });
     return context;
   }
+  const recoveryProfile = {
+    enabled: true,
+    funding_status: "qualified",
+    cpu_units: 4,
+    memory_mib: 16384,
+    ephemeral_size_mib: 1024,
+    persistent_size_mib: 204800,
+    postgres_major: 15,
+    image:
+      "postgres:15@sha256:1b92e7a80c021647bf70f5d3eb66066a998e4f5cf43c07bb9dc9f729782cf88e",
+    command: ["sleep"],
+    args: ["infinity"],
+    volume_name: "database",
+    mount_path: "/var/lib/postgresql/data",
+    pgdata: "/var/lib/postgresql/data/pgdata",
+    volume_tier: "nvme",
+    pricing_denom: "uact",
+    max_price_per_block: "100",
+    initial_escrow_usd: "0.5",
+  };
+  function recoveryRequest(context: ReturnType<typeof withCell>) {
+    const source = context.ledger.rows.get("cell");
+    if (!source) throw new Error("missing source");
+    context.ledger.rows.set("cell", { ...source, retentionPolicy: "retain" });
+    const reference = {
+      environment: "production",
+      identity: IDENTITY,
+      nodeSlug: "toks9",
+      recovery: {
+        profileId: "pg15-cold-capacity-v1" as const,
+        sourceCogniKey: "cell",
+        sourceExternalName: "9001",
+        sourceSystemIdentifier: "123",
+      },
+    };
+    const intent = databaseCellRecoveryIntent(
+      reference,
+      source,
+      DatabaseCellRecoveryProfileSchema.parse(recoveryProfile)
+    );
+    return { ...reference, cogniKey: intent.key };
+  }
+  it("allocates source-qualified cold recovery through the same receipt and keeps ordinary app admission", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).resolves.toMatchObject({ externalName: "7001" });
+    expect(context.api.allocateCalls).toBe(1);
+    expect(context.ledger.rows.get(input.cogniKey)).toMatchObject({
+      state: "allocated",
+      retentionPolicy: "retain",
+      allocationCursor: "7000",
+    });
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).resolves.toMatchObject({ replayed: true });
+    expect(context.api.allocateCalls).toBe(1);
+    await expect(
+      context.actuator.create({
+        cogniKey: "disguised",
+        environment: "production",
+        identity: IDENTITY,
+        spec: { ...SPEC, retentionPolicy: "retain" },
+      })
+    ).rejects.toMatchObject({ code: "identity_conflict" });
+  });
+  it("refuses disabled, changed-key, foreign and wrong-system recovery before a paid transaction", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    for (const bad of [
+      { ...input, cogniKey: `${input.cogniKey.slice(0, -1)}z` },
+      { ...input, identity: OTHER_IDENTITY },
+      {
+        ...input,
+        recovery: { ...input.recovery, sourceSystemIdentifier: "999" },
+      },
+    ]) {
+      await expect(
+        context.actuator.createDatabaseCellRecovery(bad)
+      ).rejects.toBeInstanceOf(AkashTxError);
+    }
+    const disabled = withCell({ ...recoveryProfile, enabled: false });
+    const disabledInput = recoveryRequest(disabled);
+    await expect(
+      disabled.actuator.createDatabaseCellRecovery(disabledInput)
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(disabled.log.lines).toContainEqual({
+      level: "warn",
+      marker: "akash_tx_database_cell_recovery_refused",
+      fields: {
+        cogniKey: disabledInput.cogniKey,
+        nodeId: IDENTITY.nodeId,
+        environment: "production",
+        profileId: "pg15-cold-capacity-v1",
+        reasonCode: "profile_disabled",
+      },
+    });
+    expect(disabled.ledger.rows.size).toBe(1);
+    expect(context.api.allocateCalls).toBe(0);
+  });
+  it("refuses another retained target in the same source family and clears only the unused claim", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    const prefix = input.cogniKey.slice(0, -64);
+    const source = context.ledger.rows.get("cell");
+    if (!source) throw new Error("missing source");
+    context.ledger.rows.set(prefix + "f".repeat(64), {
+      ...source,
+      cogniKey: prefix + "f".repeat(64),
+      receiptId: "other",
+      externalName: "8001",
+      appliedDatabaseCellBinding: [],
+    });
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).rejects.toMatchObject({ code: "identity_conflict" });
+    expect(context.api.allocateCalls).toBe(0);
+    expect(context.ledger.rows.get(input.cogniKey)?.state).toBe("failed");
+    expect(context.ledger.rows.get("cell")?.state).toBe("allocated");
+  });
+  it("fails a truncated family scan without stranding the unused wallet claim", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    const source = context.ledger.rows.get("cell");
+    if (!source) throw new Error("missing source");
+    for (let i = 0; i < 98; i++)
+      context.ledger.rows.set(`other-${i}`, {
+        ...source,
+        cogniKey: `other-${i}`,
+        receiptId: `other-${i}`,
+        externalName: String(10000 + i),
+        appliedDatabaseCellBinding: [],
+      });
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).rejects.toMatchObject({ code: "identity_conflict" });
+    expect(context.ledger.rows.get(input.cogniKey)?.state).toBe("failed");
+    expect(context.api.cursorCalls).toBe(0);
+    expect(context.api.allocateCalls).toBe(0);
+  });
+  it("concurrent changed recovery keys cannot purchase another target", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    const results = await Promise.allSettled([
+      context.actuator.createDatabaseCellRecovery(input),
+      context.actuator.createDatabaseCellRecovery({
+        ...input,
+        cogniKey: input.cogniKey.slice(0, -64) + "f".repeat(64),
+      }),
+    ]);
+    expect(results.map((result) => result.status).sort()).toEqual([
+      "fulfilled",
+      "rejected",
+    ]);
+    expect(context.api.allocateCalls).toBe(1);
+  });
+  it("keeps recovery reference-only and the existing fresh branch unchanged", async () => {
+    const context = withCell({ ...recoveryProfile, enabled: false });
+    let freshCalls = 0;
+    const dispatch = createAkashTxDispatcher({
+      token: "fixture",
+      actuator: context.actuator,
+      databaseCellSpec: () => {
+        freshCalls++;
+        return SPEC;
+      },
+    });
+    const input = {
+      ...recoveryRequest(context),
+      budgetProfile: "dedicated-high-throughput-v1",
+    };
+    const request = (body: unknown) =>
+      dispatch({
+        method: "POST",
+        path: "/v1/akash/create-database-cell",
+        authorization: "Bearer fixture",
+        body: JSON.stringify(body),
+      });
+    expect((await request(input)).status).toBe(400);
+    expect(freshCalls).toBe(0);
+    expect(
+      (
+        await request({
+          ...input,
+          recovery: { ...input.recovery, pricingAmount: 10000 },
+        })
+      ).status
+    ).toBe(400);
+    const { recovery: _recovery, ...fresh } = input;
+    await request(fresh);
+    expect(freshCalls).toBe(1);
+    expect(context.api.allocateCalls).toBe(0);
+  });
+  it("refuses unqualified funding even if a future recipe is enabled", async () => {
+    const context = withCell({
+      ...recoveryProfile,
+      enabled: true,
+      funding_status: "unqualified",
+    });
+    const input = recoveryRequest(context);
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(context.log.lines).toContainEqual({
+      level: "warn",
+      marker: "akash_tx_database_cell_recovery_refused",
+      fields: {
+        cogniKey: input.cogniKey,
+        nodeId: IDENTITY.nodeId,
+        environment: "production",
+        profileId: "pg15-cold-capacity-v1",
+        reasonCode: "funding_unqualified",
+      },
+    });
+    expect(context.ledger.rows.size).toBe(1);
+    expect(context.api.cursorCalls).toBe(0);
+    expect(context.api.allocateCalls).toBe(0);
+  });
+  it("two actuator instances cannot both spend under the same preparing recovery key", async () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    const other = build({}, recoveryProfile, context.ledger);
+    let signalEntered = () => {};
+    let resume = () => {};
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    context.api.allocationCursor = async () => {
+      context.api.cursorCalls++;
+      signalEntered();
+      await gate;
+      return "7000";
+    };
+    const first = context.actuator.createDatabaseCellRecovery(input);
+    await entered;
+    await expect(
+      other.actuator.createDatabaseCellRecovery(input)
+    ).rejects.toMatchObject({ code: "wallet_allocation_blocked" });
+    expect(other.api.cursorCalls).toBe(0);
+    expect(other.api.allocateCalls).toBe(0);
+    expect(context.ledger.rows.get(input.cogniKey)?.state).toBe("preparing");
+    resume();
+    await first;
+    await expect(
+      other.actuator.createDatabaseCellRecovery(input)
+    ).resolves.toMatchObject({ externalName: "7001", replayed: true });
+    expect(context.api.allocateCalls + other.api.allocateCalls).toBe(1);
+  });
+  it("uses the packaged cold profile through the retained recovery writer", async () => {
+    const file = path.resolve(
+      __dirname,
+      "../../../../../../../infra/database-budget-profiles.yaml"
+    );
+    const document = parseYaml(readFileSync(file, "utf8")) as {
+      recovery_profiles: Record<string, unknown>;
+    };
+    const packaged = DatabaseCellRecoveryProfileSchema.parse(
+      document.recovery_profiles["pg15-cold-capacity-v1"]
+    );
+    expect(packaged).toEqual(recoveryProfile);
+    const context = withCell(packaged);
+    const input = recoveryRequest(context);
+    const retainedSource = structuredClone(context.ledger.rows.get("cell"));
+    await expect(
+      context.actuator.createDatabaseCellRecovery(input)
+    ).resolves.toMatchObject({ externalName: "7001" });
+    expect(context.api.allocateCalls).toBe(1);
+    expect(context.ledger.rows.get(input.cogniKey)).toMatchObject({
+      state: "allocated",
+      retentionPolicy: "retain",
+    });
+    expect(context.ledger.rows.get("cell")).toEqual(retainedSource);
+  });
+  it("cold recipe and key are bounded and contain no database initialization or credentials", () => {
+    const context = withCell(recoveryProfile);
+    const input = recoveryRequest(context);
+    const source = context.ledger.rows.get("cell");
+    if (!source) throw new Error("missing source");
+    const intent = databaseCellRecoveryIntent(
+      input,
+      source,
+      DatabaseCellRecoveryProfileSchema.parse(recoveryProfile)
+    );
+    expect(intent.key).toHaveLength(191);
+    expect(intent.key).toMatch(/^[A-Za-z0-9._:/-]+$/);
+    expect(intent.spec.services[0]).toMatchObject({
+      command: ["sleep"],
+      args: ["infinity"],
+      cpuUnits: 4,
+      memoryMi: 16384,
+      env: { PGDATA: "/var/lib/postgresql/data/pgdata" },
+      volumes: [{ sizeMi: 204800 }],
+    });
+    expect(Object.keys(intent.spec.services[0]?.env ?? {})).toEqual(["PGDATA"]);
+    expect(intent.policy).toEqual({
+      pricingDenom: "uact",
+      pricingAmount: 100,
+      initialEscrowUsd: 0.5,
+    });
+  });
   const specAt = (sha: string): ProvisionSpec => ({
     ...SPEC,
     services: SPEC.services.map((service) => ({
@@ -697,8 +1043,44 @@ describe("qualified cell app releases", () => {
       env: { COGNI_REPO_SHA: sha },
     })),
   });
-  function withBoundedManualCell() {
-    const context = withCell();
+  function withBoundedManualCell(
+    resolve?: AkashTxActuatorDeps["appliedCellCustody"]
+  ) {
+    const custody: { value: DatabaseCellAppliedCustody } = {
+      value: {
+        version: 1,
+        nodeId: IDENTITY.nodeId,
+        nodeSlug: SPEC.name,
+        environment: "production",
+        manualProvenance: {
+          kind: "manual-observed",
+          postgresImageDigest: `sha256:${"1".repeat(64)}`,
+          managedSdlSha256: "d".repeat(64),
+          qualificationArtifactSha256: "2".repeat(64),
+          qualifiedAt: "2026-10-15T00:00:00Z",
+        },
+        targetBuildSha: qualifiedSha,
+        canonicalEndpointHost: "owned.example",
+        databaseName: "cogni_toks9",
+        appRole: "app_toks9",
+        serviceRole: "service_toks9",
+        budgetProfile: "dedicated-high-throughput-v1",
+        runtimePoolLimits: { replicaCount: 1, app: 3, service: 4, read: 2 },
+        budget: { kind: "preserved-role-bounds", roles: [] },
+        tlsCertificate: rootCertificates[0] ?? "",
+        tls: { kind: "system" },
+        app: {
+          dsn: appDsn,
+          custody: { service: "toks9", key: "DATABASE_URL" },
+        },
+        service: {
+          dsn: serviceDsn,
+          custody: { service: "toks9", key: "DATABASE_SERVICE_URL" },
+        },
+        migration: { kind: "app-database-url" },
+      },
+    };
+    const context = withCell(undefined, resolve ?? (async () => custody.value));
     const receipt =
       context.ledger.rows.get("cell")?.appliedDatabaseCellBinding?.[0];
     if (!receipt) throw new Error("missing cell fixture");
@@ -729,12 +1111,12 @@ describe("qualified cell app releases", () => {
       runtimePoolLimits: { replicaCount: 1, app: 3, service: 4, read: 2 },
       registeredAt: "2026-10-15T00:00:00Z",
     };
-    return context;
+    return { ...context, custody };
   }
   const appDsn =
-    "postgresql://app:fixture@owned.example/cogni_toks9?sslmode=verify-full";
+    "postgresql://app_toks9:fixture@owned.example:30349/cogni_toks9?sslmode=verify-full";
   const serviceDsn =
-    "postgresql://service:fixture@owned.example/cogni_toks9?sslmode=verify-full";
+    "postgresql://service_toks9:fixture@owned.example:30349/cogni_toks9?sslmode=verify-full";
   const boundedSpecAt = (sha: string): ProvisionSpec => ({
     ...specAt(sha),
     services: specAt(sha).services.map((service) => ({
@@ -779,6 +1161,149 @@ describe("qualified cell app releases", () => {
     expect(migration.calls).toHaveLength(1);
     expect(ledger.rows.get("cell")).toEqual(admission);
     expect(ledger.rows.get("app")?.externalName).toBe("7001");
+  });
+  const moveCustody = (
+    custody: { value: DatabaseCellAppliedCustody },
+    port: string
+  ) => {
+    const moved = (dsn: string) => {
+      const url = new URL(dsn);
+      url.port = port;
+      return url.toString();
+    };
+    custody.value = {
+      ...custody.value,
+      app: { ...custody.value.app, dsn: moved(custody.value.app.dsn) },
+      service: {
+        ...custody.value.service,
+        dsn: moved(custody.value.service.dsn),
+      },
+    };
+  };
+  const specForCustody = (
+    custody: { value: DatabaseCellAppliedCustody },
+    sha: string
+  ): ProvisionSpec => {
+    const spec = boundedSpecAt(sha);
+    return {
+      ...spec,
+      services: spec.services.map((service) => ({
+        ...service,
+        env: {
+          ...service.env,
+          DATABASE_URL: custody.value.app.dsn,
+          DATABASE_SERVICE_URL: custody.value.service.dsn,
+        },
+      })),
+    };
+  };
+  it("releases at the current owned port without rewriting historical DSN hashes", async () => {
+    const { actuator, custody, ledger, api, migration } =
+      withBoundedManualCell();
+    const admission = structuredClone(ledger.rows.get("cell"));
+    moveCustody(custody, "32728");
+    await actuator.create({
+      cogniKey: "app",
+      environment: "production",
+      identity: IDENTITY,
+      spec: specForCustody(custody, qualifiedSha),
+    });
+    await actuator.observe({
+      cogniKey: "app",
+      workload: SPEC.name,
+      environment: "production",
+      migration: STEP,
+      expectedSourceSha: otherSha,
+    });
+    await actuator.update({
+      cogniKey: "app",
+      externalName: "7001",
+      environment: "production",
+      identity: { ...IDENTITY, compositeGeneration: 4 },
+      spec: specForCustody(custody, otherSha),
+    });
+    expect(api.allocateCalls).toBe(1);
+    expect(api.updateCalls).toBe(1);
+    expect(migration.calls).toHaveLength(1);
+    expect(ledger.rows.get("cell")).toEqual(admission);
+  });
+  it("rereads custody and refuses stale endpoint bytes before an update", async () => {
+    const { actuator, custody, api } = withBoundedManualCell();
+    await actuator.create({
+      cogniKey: "app",
+      environment: "production",
+      identity: IDENTITY,
+      spec: boundedSpecAt(qualifiedSha),
+    });
+    moveCustody(custody, "32728");
+    const input = {
+      cogniKey: "app",
+      externalName: "7001",
+      environment: "production",
+      identity: { ...IDENTITY, compositeGeneration: 4 },
+    };
+    await expect(
+      actuator.update({ ...input, spec: boundedSpecAt(otherSha) })
+    ).rejects.toMatchObject({ code: "identity_conflict" });
+    expect(api.updateCalls).toBe(0);
+    await actuator.update({
+      ...input,
+      spec: specForCustody(custody, otherSha),
+    });
+    expect(api.updateCalls).toBe(1);
+  });
+  it("refuses absent custody even when the request matches historical hashes", async () => {
+    const original = withBoundedManualCell();
+    const { actuator, api, ledger } = build({}, undefined, original.ledger);
+    await expect(
+      actuator.create({
+        cogniKey: "app",
+        environment: "production",
+        identity: IDENTITY,
+        spec: boundedSpecAt(qualifiedSha),
+      })
+    ).rejects.toMatchObject({ code: "ledger_unavailable" });
+    expect(api.allocateCalls).toBe(0);
+    expect(ledger.rows.has("app")).toBe(false);
+  });
+  it.each([
+    { nodeId: "foreign-node" },
+    { nodeSlug: "foreign" },
+    { environment: "preview" },
+    { databaseName: "foreign" },
+    { appRole: "foreign" },
+    { serviceRole: "foreign" },
+    { canonicalEndpointHost: "foreign.example" },
+    { runtimePoolLimits: { replicaCount: 1, app: 30, service: 4, read: 2 } },
+  ])("refuses foreign custody before allocation: %j", async (change) => {
+    const { actuator, custody, api } = withBoundedManualCell();
+    Object.assign(custody.value, change);
+    await expect(
+      actuator.create({
+        cogniKey: "app",
+        environment: "production",
+        identity: IDENTITY,
+        spec: boundedSpecAt(qualifiedSha),
+      })
+    ).rejects.toMatchObject({ code: "identity_conflict" });
+    expect(api.allocateCalls).toBe(0);
+  });
+  it("redacts custody read failures before allocating", async () => {
+    const { actuator, api } = withBoundedManualCell(async () => {
+      throw new Error("postgresql://secret:password@private.example/db");
+    });
+    await expect(
+      actuator.create({
+        cogniKey: "app",
+        environment: "production",
+        identity: IDENTITY,
+        spec: boundedSpecAt(qualifiedSha),
+      })
+    ).rejects.toMatchObject({
+      code: "ledger_unavailable",
+      message: "current database cell custody unavailable",
+    });
+    expect(api.allocateCalls).toBe(0);
   });
   it.each([
     { DB_POOL_MAX: "30" },
@@ -848,10 +1373,18 @@ describe("qualified cell app releases", () => {
     expect(api.allocateCalls).toBe(1);
   });
   it("preserves private CA bytes across releases and refuses a replacement before provider mutation", async () => {
-    const { actuator, ledger, api } = withBoundedManualCell();
+    const { actuator, ledger, api, custody } = withBoundedManualCell();
     const receipt = ledger.rows.get("cell")?.appliedDatabaseCellBinding?.[0];
     const ca = rootCertificates[0];
     if (!receipt?.registration || !ca) throw new Error("missing TLS fixture");
+    custody.value = {
+      ...custody.value,
+      tls: {
+        kind: "private-ca",
+        caCertificate: ca,
+        custody: { service: "toks9", key: "DATABASE_SSL_CA_CERT" },
+      },
+    };
     receipt.registration = {
       ...receipt.registration,
       tlsTrustKind: "private-ca",
@@ -1369,6 +1902,214 @@ describe("AkashTxActuator.create", () => {
     ).rejects.toMatchObject({ code: "ledger_unavailable" });
     expect(api.cursorCalls).toBe(0);
     expect(api.allocateCalls).toBe(0);
+  });
+
+  describe("bug.5569: nothingBilling is set only on positive proof", () => {
+    const call = {
+      cogniKey: "k1",
+      environment: "candidate-a",
+      identity: IDENTITY,
+      spec: SPEC,
+    };
+    const refusal = async (options: FakeConsoleOptions) => {
+      const { actuator, ledger } = build(options);
+      const error = (await actuator
+        .create(call)
+        .catch((e: unknown) => e)) as AkashTxError;
+      return { error, ledger };
+    };
+    const rolledBack = (code: string, dseq: string) =>
+      Object.assign(consoleError(code), { rolledBackDseq: dseq });
+
+    const secondKey = {
+      ...call,
+      cogniKey: "k2",
+      identity: { ...OTHER_IDENTITY, compositeUid: "uid-2" },
+    };
+
+    it("(a) chain: a pre-deployment 4xx is nothingBilling; the sequencer's observe settles the receipt `failed`, the slot is free and a second key is not blocked", async () => {
+      const { actuator, ledger, api } = build({
+        allocateError: consoleError("HTTP_ERROR", 422),
+      });
+      const error = (await actuator
+        .create(call)
+        .catch((e: unknown) => e)) as AkashTxError;
+      expect(error).toMatchObject({
+        code: "provider_rejected",
+        nothingBilling: true,
+      });
+      // the sequencer's failAttempt observes by key (ORPHAN_GUARD): resolveUncertain proves nothing
+      // past the cursor and settles the receipt, so observe answers found:false
+      await expect(actuator.observe({ cogniKey: "k1" })).resolves.toEqual({
+        found: false,
+      });
+      expect(api.recoverCalls).toBe(1);
+      expect(ledger.rows.get("k1")?.state).toBe("failed");
+      expect(
+        [...ledger.rows.values()].filter((r) => r.state === "preparing")
+      ).toEqual([]);
+      // the provider heals; the second key must reach allocation, not `wallet_allocation_blocked`
+      delete (api as unknown as { options: FakeConsoleOptions }).options
+        .allocateError;
+      const second = await actuator.create(secondKey);
+      expect(second.externalName).toBe("7001");
+      expect(api.allocateCalls).toBe(2);
+    });
+
+    it("(b) chain: NO_ELIGIBLE_BIDS after a deployment opened and was rolled back ends `released`, never a phantom `allocated`; observe reads it closed even though its cost read throws; a second key is not blocked", async () => {
+      const { actuator, ledger, api, cost, log } = build({
+        allocateError: rolledBack("NO_ELIGIBLE_BIDS", "7001"),
+        allocateErrorAfterAllocation: true,
+        closedDseqs: ["7001"],
+      });
+      // a rolled-back deployment has no lease: its cost read throws (`did not identify exactly one lease`)
+      cost.failEvidence = true;
+      const error = (await actuator
+        .create(call)
+        .catch((e: unknown) => e)) as AkashTxError;
+      expect(error).toMatchObject({
+        code: "provider_rejected",
+        nothingBilling: true,
+      });
+      // onAllocated moved the row to `allocated`; the proven rollback releases it (fail() would no-op)
+      expect(ledger.rows.get("k1")).toMatchObject({
+        state: "released",
+        externalName: "7001",
+      });
+      expect(
+        log.lines.find((l) => l.marker === "akash_tx_allocation_rolled_back")
+          ?.fields.ledgerState
+      ).toBe("released");
+      expect(
+        await ledger.listAllocated({ environment: "candidate-a", limit: 100 })
+      ).toEqual([]);
+      // the sequencer's chain: observe by key finds the closed lease (no ledger_unavailable) ...
+      const found = await actuator.observe({ cogniKey: "k1" });
+      expect(found).toMatchObject({
+        found: true,
+        resource: { externalName: "7001", state: "closed" },
+      });
+      // ... binds it, closes it and confirms the close
+      await actuator.delete({ cogniKey: "k1", externalName: "7001" });
+      await expect(
+        actuator.observe({ cogniKey: "k1", externalName: "7001" })
+      ).resolves.toMatchObject({ resource: { state: "closed" } });
+      expect(ledger.rows.get("k1")?.state).toBe("released");
+      cost.failEvidence = false;
+      // the provider heals; the second key must reach allocation, not `wallet_allocation_blocked`
+      delete (api as unknown as { options: FakeConsoleOptions }).options
+        .allocateError;
+      api.nextLeaseId = "7002";
+      const second = await actuator.create(secondKey);
+      expect(second.state).toBe("active");
+      expect(api.allocateCalls).toBe(2);
+    });
+
+    it("settleRollback reports a settle ONLY when the row now reads failed or released (a no-op write is not a settle)", async () => {
+      const { actuator, ledger, log } = build({
+        allocateError: rolledBack("NO_ELIGIBLE_BIDS", "7001"),
+        allocateErrorAfterAllocation: true,
+      });
+      ledger.markReleased = async () => {};
+      await actuator.create(call).catch(() => undefined);
+      expect(ledger.rows.get("k1")?.state).toBe("allocated");
+      expect(
+        log.lines.some((l) => l.marker === "akash_tx_allocation_rolled_back")
+      ).toBe(false);
+      expect(
+        log.lines.find(
+          (l) => l.marker === "akash_tx_allocation_rollback_unsettled"
+        )?.fields.ledgerState
+      ).toBe("allocated");
+    });
+
+    it("cost evidence never decides observe: a key whose deployment CLOSED, with cost evidence throwing AkashComputeError, observes closed (no ledger_unavailable); an active lease's cost failure is a warn", async () => {
+      // prod shape: the receipt still reads `allocated` (main's rollback never released it)
+      const { actuator, ledger, cost, log } = build({ closedDseqs: ["7001"] });
+      await actuator.create(call);
+      expect(ledger.rows.get("k1")?.state).toBe("allocated");
+      cost.observeCost = async () => {
+        throw consoleError("UNEXPECTED_SHAPE"); // "did not identify exactly one lease"
+      };
+      await expect(actuator.observe({ cogniKey: "k1" })).resolves.toMatchObject(
+        { found: true, resource: { externalName: "7001", state: "closed" } }
+      );
+      await expect(
+        actuator.observe({ cogniKey: "k1", externalName: "7001" })
+      ).resolves.toMatchObject({ resource: { state: "closed" } });
+      expect(
+        log.lines.some((l) => l.marker === "compute_cost_unavailable")
+      ).toBe(false);
+
+      // an ACTIVE lease whose cost read fails still observes; the failure is a warn, not a refusal
+      const live = build();
+      await live.actuator.create(call);
+      live.cost.observeCost = async () => {
+        throw consoleError("UNEXPECTED_SHAPE");
+      };
+      await expect(
+        live.actuator.observe({ cogniKey: "k1" })
+      ).resolves.toMatchObject({ found: true, resource: { state: "active" } });
+      expect(
+        live.log.lines.find(
+          (l) => l.marker === "compute_cost_observation_failed"
+        )
+      ).toMatchObject({ level: "warn" });
+      // the underlying cause is still named, on observeCost's own line
+      expect(
+        live.log.lines.find((l) => l.marker === "compute_cost_unavailable")
+          ?.fields.causeType
+      ).toBe("provider_evidence_error");
+    });
+
+    it("a screening refusal whose deployment was closed AND re-read closed proves nothing bills", async () => {
+      const { error } = await refusal({
+        allocateError: rolledBack("NO_ELIGIBLE_BIDS", "7001"),
+        allocateErrorAfterAllocation: true,
+      });
+      expect(error).toMatchObject({
+        code: "provider_rejected",
+        nothingBilling: true,
+      });
+    });
+
+    it("a screening refusal after a deployment opened WITHOUT a verified close proves nothing", async () => {
+      const { error } = await refusal({
+        allocateError: consoleError("NO_BIDS"),
+        allocateErrorAfterAllocation: true,
+      });
+      expect(error.code).toBe("provider_rejected");
+      expect(error.nothingBilling).toBe(false);
+    });
+
+    it("a Console 502 on the read-back after the lease is allocated and recorded is outcome_unknown, never a nothing-billing refusal", async () => {
+      const { error, ledger } = await refusal({
+        statusError: consoleError("HTTP_ERROR", 502),
+      });
+      expect(error).toBeInstanceOf(AkashTxError);
+      expect(error.code).toBe("outcome_unknown");
+      expect(error.nothingBilling).toBe(false);
+      expect(error.message).toMatch(/lease 7001 allocated; read-back failed/);
+      // the lease bills under the key, and the receipt says so
+      expect(ledger.rows.get("k1")?.externalName).toBe("7001");
+      // pre-fix this exact read failure mapped to provider_rejected
+      expect(
+        mapConsoleFailure(consoleError("HTTP_ERROR", 502), { mutating: false })
+          .code
+      ).toBe("provider_rejected");
+    });
+
+    it("a failed read-back on a replayed (settled, handle-bound) key is outcome_unknown, never nothing-billing", async () => {
+      const { actuator, api } = build();
+      await actuator.create(call);
+      (api as unknown as { options: FakeConsoleOptions }).options.statusError =
+        consoleError("HTTP_ERROR", 502);
+      const error = (await actuator
+        .create(call)
+        .catch((e: unknown) => e)) as AkashTxError;
+      expect(error.code).toBe("outcome_unknown");
+      expect(error.nothingBilling).toBe(false);
+    });
   });
 
   it("maps a screening rejection to a terminal provider_rejected", async () => {
@@ -1979,6 +2720,129 @@ describe("AkashTxActuator.update / delete", () => {
 });
 
 describe("AkashTxActuator cost attribution (task.5071)", () => {
+  it.each([
+    "bind",
+    "evidence",
+    "store",
+  ] as const)("cursor observation returns durable native discovery when cost %s fails", async (failure) => {
+    const native: ProvisionOutput = {
+      provider: "akash",
+      leaseId: "7901",
+      state: "active",
+      endpoints: ["https://recovered.example.net"],
+    };
+    const { actuator, api, ledger, cost, log } = build({ recovered: native });
+    await ledger.claim({
+      cogniKey: "k1",
+      workload: "operator",
+      environment: "candidate-a",
+      identity: IDENTITY,
+    });
+    await ledger.prepare({ cogniKey: "k1", allocationCursor: "7900" });
+    cost.failBind = failure === "bind";
+    cost.failEvidence = failure === "evidence";
+    cost.failObserve = failure === "store";
+    cost.failureMessage = "secret-like-cost-body";
+    await expect(actuator.observe({ cogniKey: "k1" })).resolves.toEqual({
+      found: true,
+      recovered: true,
+      resource: {
+        externalName: native.leaseId,
+        state: native.state,
+        endpoints: native.endpoints,
+      },
+    });
+    expect(ledger.rows.get("k1")).toMatchObject({
+      receiptId: "receipt-k1",
+      identity: IDENTITY,
+      externalName: native.leaseId,
+      allocationCursor: "7900",
+    });
+    expect(api.recoverCalls).toBe(1);
+    expect(api.allocateCalls).toBe(0);
+    expect(api.releaseCalls).toEqual([]);
+    expect(log.lines).toContainEqual({
+      level: "warn",
+      marker: "compute_cost_observation_failed",
+      fields: expect.objectContaining({
+        cogniKey: "k1",
+        nodeId: IDENTITY.nodeId,
+        externalName: native.leaseId,
+      }),
+    });
+    expect(JSON.stringify(log.lines)).not.toContain("secret-like-cost-body");
+    // A subsequent observe uses the attributed handle, never another discovery/create.
+    await expect(actuator.observe({ cogniKey: "k1" })).resolves.toMatchObject({
+      found: true,
+      resource: { externalName: native.leaseId },
+    });
+    expect(api.recoverCalls).toBe(1);
+    expect(api.allocateCalls).toBe(0);
+  });
+
+  it("cursor recovery of a non-active allocation requires no cost IO", async () => {
+    const native: ProvisionOutput = {
+      provider: "akash",
+      leaseId: "7902",
+      state: "closed",
+      endpoints: [],
+    };
+    const { actuator, api, ledger, cost, log } = build({ recovered: native });
+    await ledger.claim({
+      cogniKey: "k1",
+      workload: "operator",
+      environment: "candidate-a",
+      identity: IDENTITY,
+    });
+    await ledger.prepare({ cogniKey: "k1", allocationCursor: "7900" });
+    cost.failBind = true;
+    cost.failEvidence = true;
+    cost.failObserve = true;
+    await expect(actuator.observe({ cogniKey: "k1" })).resolves.toMatchObject({
+      found: true,
+      recovered: true,
+      resource: { externalName: "7902", state: "closed", endpoints: [] },
+    });
+    expect(ledger.rows.get("k1")).toMatchObject({
+      identity: IDENTITY,
+      externalName: "7902",
+    });
+    expect(api.allocateCalls).toBe(0);
+    expect(cost.binds).toEqual([]);
+    expect(cost.observations).toEqual([]);
+    // Fail flags would emit this marker on any accounting invocation, before they throw.
+    expect(
+      log.lines.some((line) => line.marker === "compute_cost_unavailable")
+    ).toBe(false);
+  });
+
+  it("cursor discovery cannot bypass failure to persist allocation ownership", async () => {
+    const { actuator, api, ledger, cost } = build({
+      recovered: {
+        provider: "akash",
+        leaseId: "7903",
+        state: "active",
+        endpoints: [],
+      },
+    });
+    await ledger.claim({
+      cogniKey: "k1",
+      workload: "operator",
+      environment: "candidate-a",
+      identity: IDENTITY,
+    });
+    await ledger.prepare({ cogniKey: "k1", allocationCursor: "7900" });
+    ledger.recordAllocation = async () => {
+      throw new Error("allocation ledger unavailable");
+    };
+    await expect(actuator.observe({ cogniKey: "k1" })).rejects.toThrow(
+      "allocation ledger unavailable"
+    );
+    expect(ledger.rows.get("k1")?.externalName).toBeUndefined();
+    expect(cost.binds).toEqual([]);
+    expect(api.allocateCalls).toBe(0);
+  });
+
   it("binds and observes the paid handle against the allocation receipt", async () => {
     const { actuator, cost } = build();
     await actuator.create({
@@ -2741,6 +3605,55 @@ describe("AkashTxActuator.leaseLogSources", () => {
     ).toBe(true);
   });
 
+  it("never returns a closed lease as a source, and names it once (task.5420)", async () => {
+    const { actuator, ledger, api, log } = build();
+    seedAllocated(ledger, "k-dead", "7001"); // a refused create or closed lease kept its dseq
+    seedAllocated(ledger, "k-live", "7002");
+    api.logDescriptors.set("7001", { ...DESCRIPTOR, state: "closed" });
+    api.logDescriptors.set("7002", { ...DESCRIPTOR });
+
+    const first = await actuator.leaseLogSources({});
+    const second = await actuator.leaseLogSources({});
+
+    expect(first.sources.map((s) => s.dseq)).toEqual(["7002"]);
+    expect(second.sources.map((s) => s.dseq)).toEqual(["7002"]);
+    const closed = log.lines.filter(
+      (l) => l.marker === "akash_tx_lease_log_source_closed"
+    );
+    // Once per process, not once per pump poll.
+    expect(closed).toHaveLength(1);
+    expect(closed[0]?.level).toBe("info");
+  });
+
+  it("reads receipts wide and newest-first, capping SOURCES (not receipts) at 64 (task.5420)", async () => {
+    const { actuator, ledger, api } = build();
+    // 20 dead rows that are older than every live lease, then 70 live leases.
+    for (let i = 0; i < 20; i += 1) {
+      seedAllocated(ledger, `k-dead-${i}`, `${8000 + i}`);
+      api.logDescriptors.set(`${8000 + i}`, { ...DESCRIPTOR, state: "closed" });
+    }
+    for (let i = 0; i < 70; i += 1) {
+      seedAllocated(ledger, `k-live-${i}`, `${9000 + i}`);
+      api.logDescriptors.set(`${9000 + i}`, { ...DESCRIPTOR });
+    }
+
+    const result = await actuator.leaseLogSources({});
+
+    // Before: listActive(limit 32) oldest-first returned 20 dead rows + 12 live, so most
+    // live leases were never tailed. After: the read is wide and the cap is on sources.
+    expect(ledger.listActiveLimits).toEqual([500]);
+    expect(result.sources).toHaveLength(64);
+    // Newest first: the newest live lease is a source, the 6 oldest live leases fall past the cap.
+    expect(result.sources[0]?.dseq).toBe("9069");
+    expect(result.sources.some((s) => s.dseq === "9005")).toBe(false);
+    expect(result.sources.every((s) => Number(s.dseq) >= 9000)).toBe(true);
+
+    // A caller's smaller limit still bounds the sources.
+    expect((await actuator.leaseLogSources({ limit: 3 })).sources).toHaveLength(
+      3
+    );
+  });
+
   it("returns an empty snapshot without minting when nothing is active", async () => {
     const { actuator, api } = build();
     const result = await actuator.leaseLogSources({});
@@ -2939,6 +3852,58 @@ describe("AkashTxActuator provider strikes (task.5153)", () => {
     ).toBe(true);
   });
 
+  it("caller excludeProviders (task.5400) reach the screening tried set; absent passes none", async () => {
+    const blue = "akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+    const outcomes = new FakeOutcomes();
+    const first = strikeBuild(outcomes);
+    await first.actuator.create({
+      cogniKey: `${BASE_KEY}x`,
+      environment: "preview",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    expect(first.api.lastExcluded).toBeUndefined(); // absent = old behaviour
+
+    const second = strikeBuild(outcomes);
+    await second.actuator.create({
+      cogniKey: `${BASE_KEY}y`,
+      environment: "preview",
+      identity: IDENTITY,
+      spec: SPEC,
+      excludeProviders: [blue],
+    });
+    expect([...(second.api.lastExcluded ?? [])]).toEqual([blue]);
+    expect(
+      second.log.lines.some(
+        (l) => l.marker === "akash_tx_caller_provider_exclusions"
+      )
+    ).toBe(true);
+  });
+
+  it("caller excludeProviders are UNIONED with the ledger-derived tried set, never replacing it", async () => {
+    const blue = "akash1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+    const outcomes = new FakeOutcomes();
+    const ledger = new FakeLedger();
+    const first = strikeBuild(outcomes, ledger);
+    await first.actuator.create({
+      cogniKey: BASE_KEY,
+      environment: "preview",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    const second = strikeBuild(outcomes, ledger);
+    await second.actuator.create({
+      cogniKey: `${BASE_KEY}:recover:1`,
+      environment: "preview",
+      identity: IDENTITY,
+      spec: SPEC,
+      excludeProviders: [blue],
+    });
+    expect([...(second.api.lastExcluded ?? [])].sort()).toEqual(
+      ["akash1provider", blue].sort()
+    );
+  });
+
   it("records boot_ok once per lease on a positive serving proof", async () => {
     const outcomes = new FakeOutcomes();
     const ledger = new FakeLedger();
@@ -2977,6 +3942,91 @@ describe("AkashTxActuator provider strikes (task.5153)", () => {
         leaseId: "7001",
       }),
     ]);
+  });
+});
+
+describe("AkashTxActuator caller allowProviders (task.5405)", () => {
+  const A = "akash1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const B = "akash1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const KEY = "xcw:cogni-preview:node-9:7";
+
+  class PinConsole extends FakeConsole {
+    lastAllowed: ReadonlySet<string> | undefined;
+    constructor(private readonly configured: readonly string[] | undefined) {
+      super();
+    }
+    override async allocateAndLease(input: {
+      spec: ProvisionSpec;
+      onAllocated?: (leaseId: string) => Promise<void>;
+      allowedProviders?: ReadonlySet<string>;
+    }): Promise<{ leaseId: string; providerAccount: string }> {
+      this.lastAllowed = input.allowedProviders;
+      return super.allocateAndLease(input);
+    }
+    /** Stands in for the real client's intersection (covered in akash-provider-screen.test.ts). */
+    providerPinRefusal(allow: ReadonlySet<string>): string | undefined {
+      if (!this.configured || this.configured.length === 0) return undefined;
+      return [...allow].some((p) => this.configured?.includes(p))
+        ? undefined
+        : "allowProviders and the configured allowlist share no provider";
+    }
+  }
+
+  function build(configured: readonly string[] | undefined) {
+    const api = new PinConsole(configured);
+    const ledger = new FakeLedger();
+    const costs = costDeps();
+    const actuator = new AkashTxActuator({
+      console: api,
+      ledger,
+      log: recordingLogger(),
+      costEvidence: costs.costEvidence,
+      costStore: costs.costStore,
+      providerConsumerAccountId: costs.providerConsumerAccountId,
+    });
+    return { api, ledger, actuator };
+  }
+
+  it("absent: the console receives no allowedProviders (byte-identical to before)", async () => {
+    const { api, actuator } = build([A]);
+    await actuator.create({
+      cogniKey: KEY,
+      environment: "preview",
+      identity: IDENTITY,
+      spec: SPEC,
+    });
+    expect(api.lastAllowed).toBeUndefined();
+  });
+
+  it("present and satisfiable: the console receives the caller set (it intersects with its own pin)", async () => {
+    const { api, actuator } = build([A, B]);
+    await actuator.create({
+      cogniKey: KEY,
+      environment: "preview",
+      identity: IDENTITY,
+      spec: SPEC,
+      allowProviders: [A],
+    });
+    expect([...(api.lastAllowed ?? [])]).toEqual([A]);
+  });
+
+  it("an empty intersection is refused BEFORE the wallet slot is claimed or anything is paid", async () => {
+    const { api, ledger, actuator } = build([B]);
+    await expect(
+      actuator.create({
+        cogniKey: KEY,
+        environment: "preview",
+        identity: IDENTITY,
+        spec: SPEC,
+        allowProviders: [A],
+      })
+    ).rejects.toMatchObject({
+      code: "provider_rejected",
+      message: expect.stringContaining("share no provider"),
+    });
+    expect(api.allocateCalls).toBe(0);
+    expect(api.cursorCalls).toBe(0);
+    expect(ledger.rows.size).toBe(0);
   });
 });
 

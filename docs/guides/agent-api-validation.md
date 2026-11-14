@@ -14,6 +14,15 @@ tags: [agent-api, validation, candidate-a, billing]
 
 # Agent-First API Validation (Candidate-A + Local)
 
+> Local development is being consolidated into the [portable startup and E2E guide
+> (review draft)](https://cognidao.org/knowledge/inbox/contrib-flock-leader-conductor-469da024).
+> Use the target node's current discovery and OpenAPI schemas. The historical
+> node-local lease/delete examples below do not describe current v2 leases or
+> retired DELETE routes. Bearer authentication now works on the normal ai/chat
+> and agent-discovery routes. For LangGraph dev, use the stateful ai/chat path;
+> the completions example does not supply its required state key.
+> This source remains during human review of the hub replacement.
+
 This guide is a **route exercise recipe**, not the full contribution lifecycle.
 For the lifecycle, use [`docs/spec/development-lifecycle.md`](../spec/development-lifecycle.md).
 For post-flight PR validation, use [`.claude/skills/validate-candidate`](../../.claude/skills/validate-candidate/SKILL.md); it owns the scorecard and Loki evidence format.
@@ -170,13 +179,18 @@ curl -fsS -X POST "$BASE/api/v1/work/items/$ID/heartbeat" \
 curl -fsS -X PATCH "$BASE/api/v1/work/items/$ID" \
   -H "Authorization: Bearer $API_KEY" \
   -H "content-type: application/json" \
-  -d '{"set":{"summary":"Node-local PATCH readback passed."}}' \
+  -d '{"reason":"Record the readback summary","set":{"summary":"Node-local PATCH readback passed."}}' \
   | jq -e --arg id "$ID" '.id == $id and .summary == "Node-local PATCH readback passed."'
 
 curl -fsS -X PATCH "$BASE/api/v1/work/items/$ID" \
   -H "Authorization: Bearer $API_KEY" \
   -H "content-type: application/json" \
-  -d '{"set":{"status":"done"}}' >/dev/null
+  -d '{"reason":"Close after the readback passed","set":{"status":"done"}}' >/dev/null
+
+# Optional (story.0033): name the metrics the item moves. Send `{ metricId, direction }` only; the server
+# resolves each new metric id and pins its baseline once. `[]` means the item moves no metric.
+# curl -fsS -X PATCH "$BASE/api/v1/work/items/$ID" ... -d '{"reason":"This raises the ratio","set":{"moves":[{"metricId":"convergence-ratio","direction":"up"}]}}'
+# A single-item GET then returns each move with its baseline, current reading and `moved`.
 
 # Independently read back the exact durable item state.
 curl -fsS "$BASE/api/v1/work/items/$ID" \

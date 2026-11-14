@@ -4,8 +4,11 @@
 /**
  * Module: `@app/api/v1/work/items/[id]/route`
  * Purpose: HTTP endpoints for getting, patching, and deleting a single work item by ID.
- * Scope: Auth-protected GET (markdown ∪ Doltgres routed by ID range), PATCH (Doltgres only), and DELETE (Doltgres hard-delete with dolt_log audit).
- * Invariants: VALIDATE_IO, CONTRACTS_ARE_TRUTH, AUTH_VIA_GETSESSIONUSER, PATCH_ALLOWLIST, HARD_DELETE_RECOVERABLE_VIA_DOLT_REVERT, CODED_WRITE_ERRORS.
+ * Scope: Auth-protected GET/PATCH and retired DELETE response; does not implement persistence or allow hard deletion.
+ * Invariants: VALIDATE_IO, CONTRACTS_ARE_TRUTH, AUTH_VIA_GETSESSIONUSER, PATCH_ALLOWLIST, DURABLE_IDENTITY_NEVER_REUSED, CODED_WRITE_ERRORS.
+ * Reason + cites (task.0086): a missing or over-cap reason is HTTP 400 `invalid input` with an issue at `reason`; an unknown cite id or a closed inbox is HTTP 400 `cite_unresolved`; cites with no resolver wired is HTTP 400 `cites_unsupported`; a resolver failure is HTTP 503. Nothing is written in each case.
+ * Moves (story.0033): `set.moves` with an unknown or deprecated metric id is HTTP 400 `cite_unresolved` with an issue at `set.moves`; a bad list is HTTP 400 `moves_invalid`; a non-empty list with no metric wiring is HTTP 400 `moves_unsupported`; a baseline failure is HTTP 503 `metric_baseline_unavailable`. The client never sets a baseline: the server pins it. The GET, PATCH response adds each move's baseline, current reading and verdict.
+ * Envelope (task.0118): GET returns each `moves` entry with its metric, KPI and goal; `?include=links` adds the first page of citation links (same read as /api/v1/citations/{id}); an unknown include is HTTP 400.
  * Side-effects: IO (HTTP response, filesystem read via port, Doltgres read/write/delete)
  * Links: contracts/work.items.{get,patch,delete}.v1.contract
  * @public
@@ -39,11 +42,30 @@ export const GET = wrapRouteHandlerWithLogging<{
   params: Promise<{ id: string }>;
 }>(
   { routeId: "work.items.get", auth: { mode: "required", getSessionUser } },
-  async (ctx, _request, _sessionUser, context) => {
+  async (ctx, request, _sessionUser, context) => {
     if (!context) throw new Error("context required for dynamic routes");
     const { id } = await context.params;
 
-    const item = await getWorkItem(id);
+    // `?include=links` (comma list): optional envelope parts. Unknown parts are a 400, not ignored.
+    const requested = new URL(request.url).searchParams
+      .getAll("include")
+      .flatMap((value) => value.split(","))
+      .filter(Boolean);
+    const input = workItemsGetOperation.input.safeParse({
+      id,
+      ...(requested.length && { include: requested }),
+    });
+    if (!input.success) {
+      return NextResponse.json(
+        { error: "invalid input", issues: input.error.issues },
+        { status: 400 }
+      );
+    }
+
+    const item = await getWorkItem(id, {
+      signal: request.signal,
+      includeLinks: input.data.include?.includes("links") ?? false,
+    });
 
     if (!item) {
       return NextResponse.json(
@@ -61,8 +83,10 @@ export const GET = wrapRouteHandlerWithLogging<{
 /**
  * PATCH /api/v1/work/items/:id — Patch a work item (Doltgres only).
  *
- * v0 trusts the bearer of a valid token (no expectedRevision, no transition
- * state-machine — see PATCH_ALLOWLIST). Author embedded in dolt_log.
+ * Trusts the bearer of a valid token; the author is recorded for attribution,
+ * not used as a gate (bug.5619). No transition state-machine — see
+ * PATCH_ALLOWLIST. Optional top-level `expectedRevision` is compare-and-set: a moved row answers 409
+ * `revision_conflict` with `currentRevision`. Author embedded in dolt_log.
  */
 export const PATCH = wrapRouteHandlerWithLogging<{
   params: Promise<{ id: string }>;
@@ -99,11 +123,16 @@ export const PATCH = wrapRouteHandlerWithLogging<{
         id: sessionUser.id,
         displayName: sessionUser.displayName,
       });
-      ctx.log.info({ workItemId: id }, "work.items.patch_success");
+      ctx.log.info(
+        { workItemId: id, citeCount: parseResult.data.cites?.length ?? 0 },
+        "work.items.patch_success"
+      );
       return NextResponse.json(workItemsPatchOperation.output.parse(patched));
     } catch (e) {
-      // Coded responses: 403 authz_denied (permanent), 503 work_items_busy
-      // (retryable), 503 not-ready, 404 missing. Anything unrecognized rethrows
+      // Coded responses: 400 work_item_scores_invalid (story.5111), 403
+      // authz_denied (permanent), 409 revision_conflict
+      // (CAS lost, nothing written), 503 work_items_busy (retryable), 503
+      // not-ready, 404 missing. Anything unrecognized rethrows
       // to the wrapper's 500 — the catch is NOT broadened (bug.5408).
       const coded = workItemsWriteErrorResponse(ctx, e);
       if (coded) return coded;
@@ -113,11 +142,10 @@ export const PATCH = wrapRouteHandlerWithLogging<{
 );
 
 /**
- * DELETE /api/v1/work/items/:id — Hard-delete a work item from Doltgres.
+ * DELETE /api/v1/work/items/:id — Retired by the shared content adapter.
  *
- * The deletion is captured as a dolt_log commit; recovery via dolt_revert
- * remains available. Idempotent at the contract level: a missing id returns 404,
- * not 500. Returns `{id, deleted: true}` on success.
+ * Returns a coded 410 directing callers to PATCH status=cancelled. The shared
+ * adapter refuses before SQL, preserving durable item identity and provenance.
  */
 export const DELETE = wrapRouteHandlerWithLogging<{
   params: Promise<{ id: string }>;

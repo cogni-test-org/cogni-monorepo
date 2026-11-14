@@ -8,20 +8,15 @@ namespace: cogni-candidate-a
 resources:
   - ../../../base/node-app
   - ../../../base/openfga-external
-  # story.5016 step 9 — the legacy ComputeWorkload controller is REMOVED from
-  # candidate-a so exactly ONE writer reaches the Akash wallet here: the private
-  # transaction actuator below, driven by Crossplane. ONE_WALLET_ONE_ACTIVE_WRITER.
-  # Preview installs the same control plane but pins NO wallet (dormant/unfunded),
-  # so candidate-a is the sole active writer on the shared test wallet; production
-  # already carries the rail on its own dedicated wallet. Per-row catalog selection
-  # remains the atomic authority cutover, with no compatibility layer or
-  # dual-writer period.
-  # task.5102 — the private Akash transaction actuator Crossplane calls. Each environment
-  # that HOSTS A WRITER has its own actuator and credential-delivery path; candidate-a holds
-  # the managed test account, preview hosts no writer, and production is isolated on a
-  # dedicated account. The reviewed map is CROSSPLANE_ACTUATOR_WRITERS in
-  # nodes/operator/app/src/shared/node-registry/crossplane-control-plane.ts — `account ->
-  # writer` is injective, `writer -> envs` deliberately is not (bug.5187).
+  # Exactly ONE writer reaches the Akash wallet here: the private transaction actuator
+  # below, called by the node-deploy sequencer (task.5400). ONE_WALLET_ONE_ACTIVE_WRITER.
+  # Preview pins NO wallet, so candidate-a is the sole active writer on the shared test
+  # wallet; production carries the rail on its own dedicated wallet.
+  # task.5102 — each environment that HOSTS A WRITER has its own actuator and
+  # credential-delivery path; candidate-a holds the managed test account, preview hosts no
+  # writer, and production is isolated on a dedicated account. `account -> writer` is
+  # injective (bug.5187); tests/ci-invariants/akash-tx-actuator-runtime.spec.ts pins the
+  # funded set (ACTUATOR_ENVIRONMENTS) and each writer's own OpenBao path.
   - ../../../base/akash-tx-actuator
   - external-secret.yaml
   - ../../../base/operator-migration-external-secret
@@ -30,20 +25,27 @@ resources:
   # SECOND ExternalSecret rather than more keys in external-secret.yaml above: that one is
   # extracted wholesale into the public operator app's envFrom.
   - ./akash-tx-actuator-external-secret.yaml
-  - ./akash-tx-actuator-auth-external-secret.yaml
   # bug.5240 — the keyless lease-log pump rides wherever an actuator runs: it enumerates the
   # actuator's ledger (read-only op) and ships every live lease's logs to Loki.
   - ../../../base/lease-log-pump
+  # task.5400 — the node-deploy sequencer (blue/green deploy verb) rides wherever an actuator runs: it
+  # PAYS only through that actuator and holds no Console key. Single instance by advisory lock.
+  - ../../../base/node-deploy-sequencer
+  - ./node-deploy-secrets-namespace.yaml
   # task.5247 — private read-only database status observation.
   - ../../../base/database-reliability-actuator
   - ./database-reliability-actuator-external-secret.yaml
   - ./secrets-writer-sa.yaml
-  - ./compute-workload-platform-application.yaml
 
 namePrefix: operator-
 
+# task.5428 — the mesh coordinators (one Headscale container + PVC + socket volume + client NodePort
+# per tailnet) ride beside their one writer: this TEST operator's sequencer serves its own candidate-a lanes (test-org fixture nodes) on its own tailnet, with no production identity (test-fleet parity).
+components:
+  - ../../../base/node-deploy-mesh/tailnets/test-candidate-a
+
 # Runs AFTER the built-in namePrefix transformer and restores the actuator Service's
-# name to the bare `akash-tx-actuator` the Crossplane Composition dials. See
+# name to the bare `akash-tx-actuator` its callers dial. See
 # ../../../base/akash-tx-actuator-service-name for why the prefix is what gives.
 transformers:
   - ../../../base/akash-tx-actuator-service-name
@@ -54,12 +56,21 @@ images:
     digest: "sha256:0250cc2e6c01a80172d19b00583b65c50990b27849ca16815e75d2d899511b53"
 
 replacements:
+  # task.5400 — the sequencer's secrets live in a DEDICATED namespace, not the wallet namespace
+  # (cogni-candidate-a). The `namespace:` transformer above forces EVERYTHING it can into cogni-candidate-a, including
+  # the name of a Namespace object, so this replacement puts them back. ONE source of truth: the env
+  # value the sequencer itself reads (patched BY NAME below), copied onto the Namespace's name and the
+  # Role/RoleBinding's namespace, so the process, the Namespace and the RBAC can never disagree.
   - source:
-      kind: Application
-      name: compute-workload-platform
-      fieldPath: spec.destination.namespace
+      kind: Deployment
+      name: node-deploy-sequencer
+      fieldPath: spec.template.spec.containers.[name=sequencer].env.[name=NODE_DEPLOY_SECRETS_NAMESPACE].value
     targets:
-      - select: { kind: Application, name: compute-workload-platform }
+      - select: { kind: Namespace, name: cogni-node-deploy-candidate-a }
+        fieldPaths: [metadata.name]
+      - select: { kind: Role, name: node-deploy-sequencer }
+        fieldPaths: [metadata.namespace]
+      - select: { kind: RoleBinding, name: node-deploy-sequencer }
         fieldPaths: [metadata.namespace]
 
 patches:
@@ -88,6 +99,27 @@ patches:
                     value: candidate-a
                   - name: FORK_DOMAIN_ROOT
                     value: cognidao.org
+  # bug.5546: the operator serving container ran at base tier (512Mi limit /
+  # 384MB V8 heap = 128MB non-heap headroom). A heavy /knowledge|/graph SSR
+  # refresh hit V8's 384MB old-space ceiling -> FATAL JS heap OOM -> in-place
+  # restart -> 502. Operator is hand-authored (generator-exempt), so this is a
+  # per-node bump: 1Gi container limit + matching --max-old-space-size=768
+  # (256MB non-heap margin). requests + cpu limit are left unchanged (no QoS /
+  # scheduling / surge change). A larger per-env operator-control tier is a
+  # tracked follow-up; see .context/compute-sizing-design.md.
+  - target:
+      kind: Deployment
+      name: node-app
+    # JSON6902 (not strategic-merge): operator-rollout-strategy.test.sh parses
+    # every node-app patch as an op-list. Base env[0] is NODE_OPTIONS; the
+    # overlay only appends env, so index 0 is stable.
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: "1Gi"
+      - op: replace
+        path: /spec/template/spec/containers/0/env/0/value
+        value: "--max-old-space-size=768"
   - target:
       kind: Deployment
       name: node-app
@@ -147,7 +179,10 @@ patches:
                     # per node by `required_placement_countries.<env>`, which filters bids
                     # fail-closed. tests/ci-invariants/overlay-behavior-parity.spec.ts fails
                     # if this value drifts from production's.
-                    value: akash16yr3wxt97ae045a06kr3ycde9srcgpg8syjxxm,akash1hgulk6aekakqzc0v6wukrd3dy9n90f5gkl4ezk,akash1aaul837r7en7hpk9wv2svg8u78fdq0t2j2e82z,akash19tp6w64zvdvdh26pv5lyf4f40llnqthgfy0t48,akash1z9nr23cgweu45g2jktfx95v7g2xp8qlsa3ys2x,akash1svfr9xarfkcxwdnx32nvl8cs9rfruu4nd56c4f,akash1s3hq36mpas4nmkqasn7fgwhs9968cgl3u5esnw,akash1cvcfyadrm6gcghzspyhacw924c90lwnjkhcglm,akash1rja3y2ctj3tzmesvh0zfhzzx95rfjw405hwt8d,akash1v0f04wr3tkh9uf43q9eqfd0whpfeu8qevlq99h,akash127x6cuk44ul3azferg8wy9fju686kcf6x2dhz7,akash15pkdkewzarpsx42t98vzf45h42hlq6ra8w96hr
+                    value: ""
+                    # bug.5582: no provider pin. 10 of the 12 pinned providers run Akash < v0.16.7
+                    # and stopped bidding on ACT-priced orders, so the pin refused every live bidder
+                    # fleet-wide. Placement is screened on policy alone (countries, quality, strikes).
                   # HUMAN GATE (story.5016 secret-boundary amendment 3). The PUBLIC Akash
                   # account/wallet address the actuator is authorized to spend from — pinned
                   # here as plain config because it is not a secret and must be reviewable in
@@ -186,6 +221,91 @@ patches:
                 env:
                   - name: DEPLOY_ENVIRONMENT
                     value: candidate-a
+  # task.5400 — the RoleBinding lives in the dedicated secrets namespace (see `replacements`), so the
+  # `namespace:`/`namePrefix:` transformers no longer rewrite its ServiceAccount subject: state it.
+  - target:
+      kind: RoleBinding
+      name: node-deploy-sequencer
+    patch: |
+      - op: replace
+        path: /subjects/0
+        value:
+          kind: ServiceAccount
+          name: operator-node-deploy-sequencer
+          namespace: cogni-candidate-a
+  # task.5405 — the admission bound on the sequencer's ExternalSecrets applies to THIS env's dedicated
+  # namespace only (base/node-deploy-sequencer/admission-policy.yaml).
+  - target:
+      kind: ValidatingAdmissionPolicyBinding
+      name: node-deploy-sequencer-externalsecrets
+    patch: |
+      - op: replace
+        path: /spec/matchResources/namespaceSelector/matchExpressions/0/values
+        value: [cogni-node-deploy-candidate-a]
+  # task.5400 — same BY-NAME env rule as the actuator and pump patches.
+  - target:
+      kind: Deployment
+      name: node-deploy-sequencer
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: node-deploy-sequencer
+      spec:
+        template:
+          spec:
+            containers:
+              - name: sequencer
+                env:
+                  - name: DEPLOY_ENVIRONMENT
+                    value: candidate-a
+                  - name: NODE_DEPLOY_OPERATOR_DOMAIN_ROOT
+                    value: cognidao.org
+                  - name: NODE_DEPLOY_SECRETS_NAMESPACE
+                    value: cogni-node-deploy-candidate-a
+                  - name: AKASH_CHAIN_OWNER
+                    value: "akash12eh8xgpeyumar3sk6wp94y0tq9uh62mkezxjmt"
+                  # task.5405 — a node APP gets the same runtime env the Crossplane lane gave it. Its
+                  # secrets arrive through the EXISTING custody path (OpenBao -> ESO eso-reader -> a
+                  # Secret in NODE_DEPLOY_SECRETS_NAMESPACE): no new OpenBao role, no projected token.
+                  # `vm_host_for_env`: the environment VM's published alias the shared substrate
+                  # (Temporal 7233, Redis 6379, LiteLLM 4000, worker health 30900) answers on.
+                  - name: NODE_DEPLOY_SUBSTRATE_HOST
+                    value: cogni-candidate-a.vm.cognidao.org
+                  # The test operator's fleet: the org that owns its nodes' source repos. Same value as
+                  # NODE_SUBMODULE_PARENT_OWNER, which the route uses; unset admits no remote-source node, so the
+                  # sequencer's edge guard would refuse every test node's host (story.5137 test lane).
+                  - name: NODE_DEPLOY_FLEET_OWNER
+                    valueFrom:
+                      configMapKeyRef:
+                        name: node-app-config
+                        key: NODE_SUBMODULE_PARENT_OWNER
+                        optional: true
+                  - name: NODE_DEPLOY_WORKLOAD_ZONE
+                    valueFrom:
+                      configMapKeyRef:
+                        name: node-app-config
+                        key: NODE_DEPLOY_WORKLOAD_ZONE
+                        optional: true
+                  # story.5137 — this TEST operator's node hosts live in the isolated test zone, not in
+                  # cognidao.org (hub test-fleet-parity-boundary; dns-ops skill). Its Cloudflare token
+                  # (OpenBao cogni/candidate-a/operator/CLOUDFLARE_API_TOKEN) is scoped to this zone only,
+                  # so the sequencer resolves the zone id BY NAME with that token. The operator endpoint
+                  # (test.cognidao.org) and the substrate host above stay in cognidao.org. Production sets
+                  # cognidao.org explicitly; preview has no local binding.
+                  # task.5428 — the test tailnet's DNS-only hosts live in this test zone, so THIS sequencer
+                  # (the only holder of the test-zone token) is their one writer: a CNAME to the candidate-a
+                  # VM alias, proxied=false, read back every 10 minutes (features/node-deploy/mesh-dns.ts).
+                  # Pinned equal to scripts/ci/lib/mesh-plane.sh by node-deploy-mesh-coordinators.spec.ts.
+                  - name: NODE_DEPLOY_MESH_DNS_RECORDS
+                    value: mesh-test-candidate-a=cogni-candidate-a.vm.cognidao.org,derp-test-candidate-a=cogni-candidate-a.vm.cognidao.org
+                  # task.5428 — the test operator's candidate-a lane reaches the substrate over its OWN tailnet
+                  # (test-fleet parity): its node apps get a per-attempt mesh key, the socket
+                  # /var/run/headscale/test-candidate-a/headscale.sock and the control URL
+                  # https://mesh-test-candidate-a.cogni-testing.org (env-lanes.ts). The production operator's
+                  # canonical lanes flip in its own overlay.
+                  - name: NODE_DEPLOY_SUBSTRATE_TRANSPORTS
+                    value: candidate-a=mesh:test-candidate-a
   - target:
       kind: ConfigMap
       name: node-app-config
@@ -214,11 +334,10 @@ patches:
         value: "cogni-testing.org"
       # PUBLIC, non-secret Akash account the actuator spends from (same value pinned on the
       # akash-tx-actuator container above). The OPERATOR APP needs it too: the env-membership
-      # verb (`POST /api/v1/nodes/{id}/envs`) derives lease_generation by reading the allocation
-      # ledger through createLeaseReadCapability (compute-leases.ts), which returns undefined —
-      # and the ADD verb 503s `generation_evidence_unavailable` (EVIDENCE_OR_REFUSE, task.5132) —
-      # unless AKASH_ACTUATOR_ACCOUNT_ID is on the app runtime. Without this the whole
-      # env-manager test-org deploy e2e (task.5141/story.5039) is blocked at the verb layer.
+      # verb's remove (`POST /api/v1/nodes/{id}/envs`) and the deploy-state route read the
+      # allocation ledger through createLeaseReadCapability (compute-leases.ts), which returns
+      # undefined unless AKASH_ACTUATOR_ACCOUNT_ID is on the app runtime. (The lease_generation
+      # derivation this was first added for was deleted, task.5411.)
       - op: add
         path: /data/AKASH_ACTUATOR_ACCOUNT_ID
         value: "akash12eh8xgpeyumar3sk6wp94y0tq9uh62mkezxjmt"
@@ -260,6 +379,9 @@ patches:
         path: /data/KNOWLEDGE_DOLTHUB_REMOTE_URL
         value: "https://doltremoteapi.dolthub.com/cogni-dao/knowledge-operator-candidate-a"
       # Submodule pin-PR target: candidate-a uses the throwaway org mirror.
+      - op: add
+        path: /data/NODE_DEPLOY_WORKLOAD_ZONE
+        value: "cogni-testing.org"
       - op: add
         path: /data/NODE_SUBMODULE_PARENT_OWNER
         value: "cogni-test-org"
@@ -346,6 +468,10 @@ patches:
       kind: Deployment
       name: node-app
     patch: |
+      # One-time legacy writer cutover; restore RollingUpdate after all operator lanes prove v2.
+      - op: replace
+        path: /spec/strategy
+        value: {type: Recreate}
       - op: add
         path: /spec/template/spec/initContainers/-
         value:
@@ -354,7 +480,7 @@ patches:
           command:
             - /bin/sh
             - -c
-            - exec node /app/nodes/$(NODE_NAME)/app/migrate-doltgres.mjs /app/nodes/$(NODE_NAME)/app/doltgres-migrations
+            - exec node --input-type=module -e 'import { migrateOperatorAfterNativeDrain } from "/app/nodes/operator/app/migrate-doltgres.mjs"; await migrateOperatorAfterNativeDrain("/app/nodes/operator/app/doltgres-migrations")'
           envFrom:
             - configMapRef:
                 name: operator-node-app-config

@@ -76,22 +76,26 @@ GitHub Environment secrets are not the live source for ESO-backed pods. They
 carry CI-only/bootstrap access credentials or sealed staging values for a
 workflow that writes OpenBao.
 
-## Runtime Path — off-cluster (Akash): the key MUST be declared in `secret_refs`
+## Runtime Path — off-cluster (Akash): declare the key once, in the secrets catalog
 
 The ESO `envFrom` flow above is the **k3s** lane. On **Akash / off-cluster
 compute the value in OpenBao is not enough** — the workload only receives the
-secret keys its service explicitly lists, so writing the value is **two-part**:
+secret keys the node declares for it, so adding a secret is **two-part**:
 
 ```text
-1. DECLARE the key  ->  nodes/<node>/.cogni/repo-spec.yaml
-                        deployment.services[].secret_refs: [{ key: <KEY> }]
-                        (this is what maps the key into the Akash container env)
+1. DECLARE the key  ->  <node repo>/.cogni/secrets-catalog.yaml
+                        one entry: name, source, and `workloads: [<service>]`
+                        (`workloads` names the repo-spec services that receive the key)
 2. WRITE the value  ->  OpenBao cogni/<env>/<node>/<KEY>   (the rest of this guide)
+                        A `source: agent` entry with `generate` needs no manual write:
+                        the operator mints it once when the release is recorded.
 ```
 
-Miss step 1 and the value sits in the vault forever while the pod boots without
-it — a **silent no-op**, not an error (the class that stalled poly's copy-trade:
-`PAPER_ENFORCE_MODE` was in the vault but absent from `secret_refs`).
+The catalog is the only declaration. The repo-spec carries no secret list:
+`secret_refs` is retired, and the operator refuses a repo-spec that still has it
+(bug.5254). Miss `workloads` and the value sits in the vault while the pod boots
+without it (the class that stalled poly's copy-trade: `PAPER_ENFORCE_MODE` was in
+the vault but never projected).
 
 Which keys you must declare:
 
@@ -100,30 +104,31 @@ Which keys you must declare:
   boot-contract keys (`AUTH_SECRET`, `DATABASE_URL`, `DATABASE_SERVICE_URL`,
   `EVM_RPC_URL`, `LITELLM_VIRTUAL_KEY`, `SCHEDULER_API_TOKEN`,
   `BILLING_INGEST_TOKEN`) — the operator unions them in at build time
-  (`resolveRuntimeProfileSecretRefs`, `@cogni/repo-spec`). Re-listing them is
-  redundant and was pruned fleet-wide (cogni #2401).
+  (`resolveRuntimeProfileSecretRefs`, `@cogni/repo-spec`).
 - **Node-specific keys you MUST declare** — anything beyond the profile
-  (paper-trading flags, wallet creds, CLOB/mirror keys, a node's own vendor
-  token) only reaches the pod if it appears in that service's `secret_refs`.
+  (wallet creds, CLOB/mirror keys, a node's own vendor token) only reaches the
+  pod if a catalog entry's `workloads` names that service. Non-secret feature
+  flags belong in config, not the catalog.
 
-The set a flight actually projects is logged (names only, never values) as
-`compute.workload.secret_refs_resolved` on stderr of `materialize-compute-workload`
-— read it in the flight log to confirm your key is in the mounted set.
+The node-deploy verb projects exactly the catalog keys that name the workload's
+service from OpenBao (names only in logs, never values). Read the release steps from
+`GET /api/v1/deploy/workloads/releases/{id}` to confirm the release went live.
 
-`secret_refs` carries **key names only, never values** — values live in OpenBao
-(§ Runtime Path, above). See [`packages/repo-spec/src/node-app-deployment.ts`](../../packages/repo-spec/src/node-app-deployment.ts)
+The catalog carries **key names only, never values** — values live in OpenBao
+(§ Runtime Path, above). See the published `@cogni-dao/node-declarations` package (`secrets-catalog`, re-exported by `@cogni/repo-spec`)
+for the entry schema and [`packages/repo-spec/src/node-app-deployment.ts`](../../packages/repo-spec/src/node-app-deployment.ts)
 for the profile contract.
 
 ## Known shortcoming — on Akash, a changed value is inert until a redeploy (no Reloader)
 
-Declaring the ref and writing the value gets the secret to the pod **at boot**.
+Declaring the key and writing the value gets the secret to the pod **at boot**.
 But **changing** a value later (a day-2 write, a rotation) does **not** reach a
 **running Akash pod on its own** — there is no Reloader on the Akash lane:
 
-| Lane      | Secret value change → running pod picks it up?                                                                                                                                                         |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **k3s**   | **Automatic.** ESO syncs the k8s Secret, Stakater Reloader rolling-restarts the pod (`secrets-management.md` Invariant 11). Zero action.                                                               |
-| **Akash** | **No.** The pod is a lease reconciled by Argo CD off the `deploy/<env>-<node>` head (`BRANCH_HEAD_IS_LEASE`, `ci-cd.md` Axiom 18). Reloader does not watch leases — the running pod keeps its old env. |
+| Lane      | Secret value change → running pod picks it up?                                                                                                                                                                                                                                                            |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **k3s**   | **Automatic.** ESO syncs the k8s Secret, Stakater Reloader rolling-restarts the pod (`secrets-management.md` Invariant 11). Zero action.                                                                                                                                                                  |
+| **Akash** | **No.** The app is an Akash lease. Reloader does not watch leases, so the running app keeps its old env. Deploy again with `POST /api/v1/deploy/workloads` to start a release that reads the new secret values ([deploy-a-declared-workload](https://cognidao.org/knowledge/deploy-a-declared-workload)). |
 
 So after `POST /api/v1/nodes/<id>/secrets` (or any rotation) on an Akash node the
 value is stored but **inert** until the deploy-branch head moves. A same-SHA

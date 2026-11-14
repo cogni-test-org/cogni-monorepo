@@ -18,7 +18,6 @@ AI service adapters including LiteLLM completion/streaming, usage telemetry, age
 - [GraphExecutorPort](../../../../../../packages/graph-execution-core/src/graph-executor.port.ts)
 - [Agent Discovery Design](../../../../../../docs/spec/agent-discovery.md)
 - [LiteLLM configuration](../../../../../../infra/compose/runtime/configs/)
-- [Activity Metrics Design](../../../../../../docs/spec/activity-metrics.md)
 - [Graph Execution Design](../../../../../../docs/spec/graph-execution.md)
 - [LangGraph Server Design](../../../../../../docs/spec/langgraph-server.md)
 - [Thread Persistence Spec](../../../../../../docs/spec/thread-persistence.md)
@@ -62,7 +61,7 @@ pnpm test tests/component/ai/
 ## Standards
 
 - Never logs prompts or API keys for security
-- Enforces 15s connect timeout for streaming (fetch TTFB only)
+- Streaming: a 60s connect/TTFB guard (fetch→headers only, cleared in finally) combined with any caller abortSignal; a fired guard reports kind "timeout"; stream duration stays unbounded. No app-side run budget exists yet for scheduled runs (follow-up).
 - Handles provider-specific response formatting
 - Streaming malformed SSE chunks logged as warnings without failing stream
 - Promise settlement guaranteed exactly once via defer helper

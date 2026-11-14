@@ -4,8 +4,13 @@
 /**
  * Module: `@adapters/server/db/doltgres/client`
  * Purpose: Lazy operator-Doltgres `Sql` singleton + adapter wiring for the work_items API.
- * Scope: Builds a postgres.js client and a `DoltgresWorkItemAdapter`. Mirrors `drizzle.client.ts` shape.
- * Invariants: One serialized connection per process (`max: 1`); lazy initialization; throws `DoltgresNotConfiguredError` when `DOLTGRES_URL` is unset.
+ * Evaluation: the released work-items parser accepts any safe HTTPS source without host configuration.
+ * Scope: Builds the injected Dolt content adapter; does not construct PostgreSQL coordination sessions.
+ * Invariants: One writer; reader width two and generation budget four; lazy construction.
+ *   CITE_READS_OFF_THE_WRITER (task.0086): cited atoms resolve on a separate lazy width-one pool.
+ *   MOVES_BASELINE_IS_INJECTED (story.0033): the metric baseline port comes from the caller (the container binds it
+ *   to the goal-metric service); this module never imports the metrics package.
+ *   Missing DOLTGRES_URL throws DoltgresNotConfiguredError.
  *   OPERATOR_KEEPS_THE_5000_FLOOR: operator's store holds its imported pre-API
  *   markdown corpus below 5000, so its allocator must clear it. Nodes booting an
  *   empty store take the package default and start at 1.
@@ -15,6 +20,8 @@
  */
 
 import { buildDoltgresClient } from "@cogni/knowledge-store/adapters/doltgres";
+import { createDoltgresEntryResolver } from "@cogni/shared-knowledge-store/adapters/doltgres";
+import type { MetricBaselinePort } from "@cogni/work-items";
 import {
   DoltgresWorkItemAdapter,
   OPERATOR_ID_FLOOR,
@@ -35,6 +42,7 @@ export class DoltgresNotConfiguredError extends Error {
 
 let _sql: Sql | null = null;
 let _readSql: Sql | null = null;
+let _citesSql: Sql | null = null;
 let _adapter: DoltgresWorkItemAdapter | null = null;
 
 function createSql(): Sql {
@@ -79,13 +87,34 @@ function createReadSql(): Sql {
   return buildDoltgresClient({
     connectionString: env.DOLTGRES_URL,
     applicationName: `cogni_work_items_read_${env.SERVICE_NAME ?? "app"}`,
-    max: 4,
+    max: 2,
   });
 }
 
 function getDoltgresReadSql(): Sql {
   if (!_readSql) _readSql = createReadSql();
   return _readSql;
+}
+
+/**
+ * CITE_READS_OFF_THE_WRITER (task.0086): the entry resolver pins a patch's cites with `AS OF`
+ * reads and never checks out a branch, so it runs on its own pool and never waits on the writer
+ * lock a patch holds. Width one: a patch carries at most eight cites, resolved in a few reads.
+ * Lazy: the client is built on the first cited patch, so a patch without cites costs no connection.
+ */
+function getDoltgresCitesSql(): Sql {
+  if (!_citesSql) {
+    const env = serverEnv();
+    if (!env.DOLTGRES_URL) {
+      throw new DoltgresNotConfiguredError();
+    }
+    _citesSql = buildDoltgresClient({
+      connectionString: env.DOLTGRES_URL,
+      applicationName: `cogni_work_items_cites_${env.SERVICE_NAME ?? "app"}`,
+      max: 1,
+    });
+  }
+  return _citesSql;
 }
 
 // NODE_IDENTITY_IS_THE_APP'S, NOT THIS MODULE'S. Work items are node-sovereign:
@@ -106,11 +135,14 @@ function getDoltgresReadSql(): Sql {
 // TARGET node and which then leaks an operator line into that node's per-node
 // log view.
 export function getDoltgresWorkItemsAdapter(
-  logger?: Logger
+  logger?: Logger,
+  deps: { readonly metricBaseline?: MetricBaselinePort } = {}
 ): DoltgresWorkItemAdapter {
   if (!_adapter)
     _adapter = new DoltgresWorkItemAdapter(getDoltgresSql(), {
       idFloor: OPERATOR_ID_FLOOR,
+      writerLockProtocol: "database",
+      readConnectionBudget: 4,
       readClient: getDoltgresReadSql(),
       recreateReadClient: createReadSql,
       // Conditional spread, not `logger?.child(...)`: `exactOptionalPropertyTypes`
@@ -123,6 +155,13 @@ export function getDoltgresWorkItemsAdapter(
       // the adapter stays latched on a dead pool — the 2026-10-03 poly incident
       // (bug.5358). The factory is the same one the singleton was built from.
       recreateClient: createSql,
+      // task.0086: pins a patch's cites to commits with lock-free reads, never on the writer connection.
+      entryResolver: createDoltgresEntryResolver({
+        unsafe: (query) => getDoltgresCitesSql().unsafe(query),
+      }),
+      // story.0033: a `moves` entry pins the metric's latest good observation as its baseline.
+      // Absent ⇒ a non-empty `moves` write is refused (`MovesUnsupportedError`), nothing written.
+      ...(deps.metricBaseline ? { metricBaseline: deps.metricBaseline } : {}),
     });
   return _adapter;
 }

@@ -17,16 +17,42 @@
 # those values from the same catalog helpers for atomic reload of a running
 # Caddy; no fresh container environment is then required (bug.5133).
 #
+# task.5428 — `--domain` also renders the env VM's mesh-plane sites from the one tailnet table
+# (scripts/ci/lib/mesh-plane.sh), for every tailnet whose relay + substrate-gw run on this VM: one relay
+# site per tailnet (`derp-<tailnet>.<zone>`, in that tailnet's own DNS zone -> its derper NodePort) and one enrollment
+# publish path per tailnet on the VM's DNS-only alias (`/.well-known/cogni-mesh/<tailnet>/...`). These
+# hosts are DNS-only, so each site overrides the global `local_certs` with a publicly trusted ACME
+# issuer; every proxied host keeps `local_certs`. It also renders one coordinator site
+# `mesh-<tailnet>.<zone>` per tailnet whose Headscale this env's operator sequencer runs (production: the
+# canonical tailnets; candidate-a: the test operator's own), forwarding only the Tailscale client paths
+# and derper's /verify to that coordinator's NodePort (no /api, /register or /swagger). This script is
+# the VM's ONE Caddyfile writer, and it fails if any tailnet of this env lacks its relay site, its
+# publish path or its coordinator site. The env is the one whose operator domain equals `--domain`
+# (cogni_operator_domain_for_env), or `--env` when given.
+#
+# story.5148 — every site block imports `cogni_catch_all` (our own 503 page/JSON and the
+# `X-Cogni-Edge: caught` marker for Caddy-generated 502/503/504), and application sites also import
+# `cogni_edge_canary` (`/-/edge-probe`). Both snippets live in the static
+# infra/compose/edge/configs/catch-all.caddy, which this script only `cat`s once into the output; it is
+# embedded (not mounted) so the hash-gated stdin reload of the running Caddy needs no new container mount.
+# Application sites also proxy with response_header_timeout 90s (under Cloudflare's 100s, so a hung origin
+# is caught as our 503 instead of Cloudflare's 524); `/api/v1/public/*` keeps its 10s.
+#
 # Usage: render-caddyfile.sh            # write canonical template to stdout
 #        render-caddyfile.sh --check    # diff stdout against the committed file
-#        render-caddyfile.sh --domain <base-domain>  # concrete runtime config
+#        render-caddyfile.sh --domain <base-domain> [--env <env>]  # concrete runtime config
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/ci/lib/image-tags.sh
 source "${SCRIPT_DIR}/lib/image-tags.sh"
+# shellcheck source=scripts/ci/lib/mesh-plane.sh
+source "${SCRIPT_DIR}/lib/mesh-plane.sh"
+# shellcheck source=scripts/setup/lib/cogni-deployment-identity.sh
+source "${SCRIPT_DIR}/../setup/lib/cogni-deployment-identity.sh"
 
 CADDYFILE_PATH="${SCRIPT_DIR}/../../infra/compose/edge/configs/Caddyfile.tmpl"
+CATCH_ALL_PATH="${SCRIPT_DIR}/../../infra/compose/edge/configs/catch-all.caddy"
 
 slug_for_node() { echo "$1" | tr '[:lower:]-' '[:upper:]_'; }
 
@@ -52,6 +78,8 @@ emit_site_block() {
   cat <<BLOCK
 ${host} {
   encode zstd gzip
+  import cogni_catch_all
+  import cogni_edge_canary
 
   @public path /api/v1/public/*
   handle @public {
@@ -63,7 +91,11 @@ ${host} {
     }
   }
 
-  reverse_proxy ${upstream}
+  reverse_proxy ${upstream} {
+    transport http {
+      response_header_timeout 90s
+    }
+  }
 
   log {
     format json
@@ -73,13 +105,165 @@ ${host} {
 BLOCK
 }
 
+# A DNS-only mesh relay site: public ACME certificate, only DERP paths reach the tailnet's derper.
+emit_mesh_relay_site() {
+  local host="$1" upstream="$2"
+  cat <<BLOCK
+${host} {
+  tls {
+    issuer acme
+  }
+  import cogni_catch_all
+
+  @mesh path /derp /derp/* /generate_204
+  handle @mesh {
+    reverse_proxy ${upstream}
+  }
+
+  handle {
+    respond 404
+  }
+
+  log {
+    format json
+    output stdout
+  }
+}
+BLOCK
+}
+
+# The VM alias site: one enrollment publish path per tailnet, nothing else.
+#   emit_mesh_publish_site <vm-host> <tailnet>=<nodeport>...
+emit_mesh_publish_site() {
+  local host="$1" pair tailnet port
+  shift
+  printf '%s {\n  tls {\n    issuer acme\n  }\n  import cogni_catch_all\n' "$host"
+  for pair in "$@"; do
+    tailnet="${pair%%=*}"
+    port="${pair#*=}"
+    cat <<BLOCK
+
+  handle /.well-known/cogni-mesh/${tailnet}/substrate-gw.json {
+    @write-${tailnet} not method GET HEAD
+    respond @write-${tailnet} 405
+    rewrite * /substrate-gw.json
+    reverse_proxy host.docker.internal:${port}
+  }
+BLOCK
+  done
+  cat <<'BLOCK'
+
+  handle {
+    respond 404
+  }
+
+  log {
+    format json
+    output stdout
+  }
+}
+BLOCK
+}
+
+# A DNS-only coordinator site: public ACME certificate, only the Tailscale client paths and derper's
+# /verify reach Headscale; every other path (the /api surface included) is refused.
+emit_mesh_control_site() {
+  local host="$1" upstream="$2"
+  cat <<BLOCK
+${host} {
+  tls {
+    issuer acme
+  }
+  import cogni_catch_all
+
+  @mesh path /ts2021 /key /machine/* /verify
+  handle @mesh {
+    reverse_proxy ${upstream}
+  }
+
+  handle {
+    respond 404
+  }
+
+  log {
+    format json
+    output stdout
+  }
+}
+BLOCK
+}
+
+# task.5428 — the coordinator sites this env's edge fronts (see header).
+emit_mesh_control_sites() {
+  local env="$1" tailnet
+  while read -r tailnet; do
+    [ -n "$tailnet" ] || continue
+    echo
+    echo "# ── mesh coordinator ${tailnet} (DNS-only, public ACME) → k3s NodePort $(mesh_tailnet_field "$tailnet" coordinator_np) ──"
+    emit_mesh_control_site "$(mesh_host "$tailnet" control)" \
+      "host.docker.internal:$(mesh_tailnet_field "$tailnet" coordinator_np)"
+  done < <(mesh_coordinator_tailnets "$env")
+}
+
+# The env whose operator domain is DOMAIN under the deployment root, or empty (a fork/local domain).
+env_for_domain() {
+  local domain="$1" root candidate
+  root="${FORK_DOMAIN_ROOT:-$(cogni_domain_root)}"
+  for candidate in production preview candidate-a; do
+    if [[ "$(cogni_operator_domain_for_env "$candidate" "$root" 2>/dev/null)" == "$domain" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+}
+
+# task.5428 — every mesh site of this env's edge (see header): relay + publish for the tailnets on this
+# VM, then a coordinator site for each tailnet this env's sequencer runs. Nothing for an env with neither.
+emit_mesh_vm_sites() {
+  local env="$1" root slug tailnet pairs=() out
+  root="${FORK_DOMAIN_ROOT:-$(cogni_domain_root)}"
+  slug="$(cogni_deployment_slug)"
+  while read -r tailnet; do
+    [ -n "$tailnet" ] || continue
+    echo
+    echo "# ── mesh relay ${tailnet} (DNS-only, public ACME) → k3s NodePort $(mesh_tailnet_field "$tailnet" relay_np) ──"
+    emit_mesh_relay_site "$(mesh_host "$tailnet" relay)" \
+      "host.docker.internal:$(mesh_tailnet_field "$tailnet" relay_np)"
+    pairs+=("${tailnet}=$(mesh_tailnet_field "$tailnet" publish_np)")
+  done < <(mesh_vm_tailnets "$env")
+  if [ "${#pairs[@]}" -gt 0 ]; then
+    echo
+    echo "# ── mesh enrollment publish, one path per tailnet (DNS-only VM alias, public ACME) ──"
+    emit_mesh_publish_site "$(cogni_vm_host_for_env "$env" "$root" "$slug")" "${pairs[@]}"
+  fi
+  emit_mesh_control_sites "$env"
+}
+
+# Fail when any tailnet of ENV's VM lacks its relay site or its publish path, or any tailnet ENV's
+# sequencer runs lacks its coordinator site (one writer, all routes).
+assert_mesh_vm_sites() {
+  local env="$1" rendered="$2" tailnet
+  while read -r tailnet; do
+    [ -n "$tailnet" ] || continue
+    grep -Fqx "$(mesh_host "$tailnet" relay) {" <<<"$rendered" \
+      || { echo "[ERROR] render-caddyfile: relay site for tailnet '$tailnet' missing" >&2; return 1; }
+    grep -Fq "handle /.well-known/cogni-mesh/${tailnet}/substrate-gw.json {" <<<"$rendered" \
+      || { echo "[ERROR] render-caddyfile: publish path for tailnet '$tailnet' missing" >&2; return 1; }
+  done < <(mesh_vm_tailnets "$env")
+  while read -r tailnet; do
+    [ -n "$tailnet" ] || continue
+    grep -Fqx "$(mesh_host "$tailnet" control) {" <<<"$rendered" \
+      || { echo "[ERROR] render-caddyfile: coordinator site for tailnet '$tailnet' missing" >&2; return 1; }
+  done < <(mesh_coordinator_tailnets "$env")
+}
+
 render() {
-  local domain="${1:-}"
+  local domain="${1:-}" env="${2:-}"
   cat <<'HEADER'
 # GENERATED by scripts/ci/render-caddyfile.sh from infra/catalog/*.yaml —
 # DO NOT EDIT BY HAND. Add a node = add its catalog entry (with node_port) and
 # run `pnpm gen:caddyfile`. CI (`scripts/ci/render-caddyfile.sh --check`) fails
-# if this file drifts from the catalog. See docs/guides/create-node.md.
+# if this file drifts from the catalog. See docs/guides/node-formation-guide.md.
 {
   # Cloudflare terminates public TLS and connects to this origin in Full mode.
   # Keep origin certificates local: public ACME challenges cannot reliably reach
@@ -94,6 +278,13 @@ render() {
 }
 
 HEADER
+
+  # story.5148 — the edge catch-all snippet is one static file (all logic lives there); each site
+  # block below carries `import cogni_catch_all`. It is embedded here, not mounted, so the
+  # hash-gated native reload of the running Caddy needs no new container mount.
+  echo "# ── edge catch-all snippet (verbatim from infra/compose/edge/configs/catch-all.caddy) ──"
+  cat "$CATCH_ALL_PATH"
+  echo
 
   echo "# Redirect www to non-www (canonical operator domain)"
   if [[ -n "$domain" ]]; then
@@ -138,6 +329,13 @@ HEADER
         "{\$${slug}_UPSTREAM:host.docker.internal:${port}}"
     fi
   done
+
+  if [[ -n "$env" ]]; then
+    local mesh
+    mesh="$(emit_mesh_vm_sites "$env")"
+    assert_mesh_vm_sites "$env" "$mesh"
+    [ -z "$mesh" ] || printf '%s\n' "$mesh"
+  fi
 }
 
 case "${1:-}" in
@@ -152,11 +350,17 @@ case "${1:-}" in
     echo "Caddyfile.tmpl is in sync with the catalog."
     ;;
   --domain)
-    if [[ $# -ne 2 ]] || ! is_valid_domain "$2"; then
-      echo "[ERROR] --domain requires one DNS base domain (got: '${2:-<missing>}')" >&2
+    if { [[ $# -ne 2 ]] && [[ $# -ne 4 || "${3:-}" != "--env" ]]; } || ! is_valid_domain "${2:-}"; then
+      echo "[ERROR] --domain requires one DNS base domain, optionally followed by --env <env> (got: '${2:-<missing>}')" >&2
       exit 2
     fi
-    render "$2"
+    if [[ $# -eq 4 ]]; then
+      case "$4" in
+        candidate-a | preview | production | candidate-*) ;;
+        *) echo "[ERROR] --env must be candidate-a, candidate-*, preview or production (got: '$4')" >&2; exit 2 ;;
+      esac
+    fi
+    render "$2" "${4:-$(env_for_domain "$2")}"
     ;;
   *) echo "[ERROR] unknown argument: $1" >&2; exit 2 ;;
 esac

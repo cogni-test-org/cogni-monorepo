@@ -28,7 +28,10 @@ export { UserDrizzleAccountService } from "./accounts/drizzle.adapter";
 export type { AgentCatalogProvider } from "./ai/agent-catalog.provider";
 // Agent discovery infrastructure
 export { AggregatingAgentCatalog } from "./ai/aggregating-agent-catalog";
-export type { ExecutionScope } from "./ai/execution-scope";
+export type {
+  ExecutionCodeSubject,
+  ExecutionScope,
+} from "./ai/execution-scope";
 // Execution scope (ALS) — per-run billing + actor context for tools
 export { getExecutionScope, runInScope } from "./ai/execution-scope";
 export {
@@ -81,6 +84,7 @@ export {
   AkashComputeError,
   type AkashComputeErrorCode,
 } from "./compute/akash-compute.adapter";
+export { AkashNativeStateReader } from "./compute/akash-native-state.adapter";
 export { DrizzleAkashTxAllocationLedger } from "./compute/akash-tx-allocation-ledger.adapter";
 export { AkashTxSourcesClient } from "./compute/akash-tx-sources.client";
 export {
@@ -91,7 +95,6 @@ export {
 } from "./compute/cherry-compute.adapter";
 export { DrizzleComputeCostStore } from "./compute/compute-cost-store.adapter";
 export {
-  DormantComputeWorkloadMigrationAdapter,
   KubernetesMigrationJobAdapter,
   migrationJobName,
 } from "./compute/kubernetes-migration-job.adapter";
@@ -164,6 +167,26 @@ export {
   TemplateQueryError,
   type TemplateQueryErrorCode,
 } from "./metrics/mimir.adapter";
+export { ActuatorPayer } from "./node-deploy/actuator-payer.adapter";
+export { AdvisoryLeader } from "./node-deploy/advisory-leader.adapter";
+export { AkashChainTruth } from "./node-deploy/akash-chain-truth.adapter";
+export {
+  CloudflareDnsRecords,
+  resolveCloudflareZoneId,
+} from "./node-deploy/cloudflare-dns.adapter";
+export { DeliveryKpiSource } from "./node-deploy/delivery-kpi-source.adapter";
+export { FleetObservationReader } from "./node-deploy/fleet-observation-reader.adapter";
+export { HttpProbe } from "./node-deploy/http-probe.adapter";
+export { ImageCatalogNodes } from "./node-deploy/image-catalog.adapter";
+export { ImageCatalogNodeSource } from "./node-deploy/image-catalog-source.adapter";
+export { KubernetesMeshKeys } from "./node-deploy/mesh-keys.adapter";
+export { EsoNodeRuntimeSecrets } from "./node-deploy/node-runtime-secrets.adapter";
+export { PostgresNodeDeployStore } from "./node-deploy/postgres-store.adapter";
+// DEV-ONLY adapters (ConsolePayer pays straight from a Console key; FileStatePasswords writes secrets
+// to disk) are deliberately NOT exported here: the production sequencer bootstrap imports this barrel,
+// and a dev payer must be unreachable from it. Only `scripts/node-deploy-local.ts` imports them, by path.
+export { KubernetesStatePasswords } from "./node-deploy/state-secrets.adapter";
+export { HttpsSubstrateRequestSource } from "./node-deploy/substrate-request.adapter";
 export {
   GitHubNodeDeploymentTopologyAdapter,
   type NodeDeploymentFileReader,
@@ -182,9 +205,13 @@ export {
   resolveNodeLiveness,
 } from "./node-registry/prod-liveness";
 export { DrizzleNodeMigrationReportStore } from "./observability/drizzle-node-migration-report.adapter";
+export { HttpLangfuseGatewayReceiptVerifier } from "./observability/langfuse-gateway-receipt.adapter";
+export { HttpLangfuseOwnershipVerifier } from "./observability/langfuse-ownership.adapter";
 export { HttpLangfuseReader } from "./observability/langfuse-reader.adapter";
+export { HttpLangfuseRootOwnershipVerifier } from "./observability/langfuse-root-ownership.adapter";
 export { HttpLokiPusher } from "./observability/loki-push.adapter";
 export { HttpLokiReader } from "./observability/loki-reader.adapter";
+export { GhcrBuiltImageResolver } from "./oci/ghcr-built-image.adapter";
 export { ViemEvmOnchainClient } from "./onchain/viem-evm-onchain-client.adapter";
 export { ViemTreasuryAdapter } from "./onchain/viem-treasury.adapter";
 export { UserDrizzlePaymentAttemptRepository } from "./payments/drizzle-payment-attempt.adapter";
@@ -200,9 +227,11 @@ export {
 } from "./repo";
 // Review GitHub plane (worker-delegated PR review — bug.5000)
 export {
+  CHECK_RUN_NAME as REVIEW_CHECK_RUN_NAME,
   createGithubReviewAdapter,
   type GithubReviewAdapter,
 } from "./review/github-review.adapter";
+export { GitHubReviewKpiSource } from "./review/review-kpi-source.adapter";
 // Node self-serve secrets — OpenBao writer adapter (design.node-self-serve-secrets).
 export {
   OpenBaoSecretsAdapter,
@@ -219,16 +248,25 @@ export {
   type TemporalScheduleControlConfig,
 } from "./temporal";
 export { SystemClock } from "./time/system.adapter";
+export {
+  AppOrPublicDeclarationReader,
+  GitHubPublicReader,
+} from "./vcs/github-declaration-reader.adapter";
+// VCS capability (GitHub App adapter)
+export {
+  type NodeCodeAdmissionPolicy,
+  REVIEW_NODE_CODE_POLICY,
+} from "./vcs/github-node-code.adapter";
 // Operator-only GitHub-App repo writer — node formation + candidate-flight prep.
 export {
   type ForkFromTemplateInput,
   GitHubRepoWriter,
   type GitHubRepoWriterConfig,
+  listCatalogNodesVia,
   type OpenNodeAppPrInput,
   type OpenNodeAppPrResult,
   type PackageImageTagExistsInput,
 } from "./vcs/github-repo-write";
-// VCS capability (GitHub App adapter)
 export {
   GitHubVcsAdapter,
   type GitHubVcsAdapterConfig,
@@ -241,3 +279,22 @@ export { observeAppliedCellManaged } from "./compute/database-cell-applied-manag
 export { ReadOnlyAppliedDatabaseCellObserver } from "./compute/database-cell-applied-observer.adapter";
 export { DrizzleDatabaseCellBindingStore } from "./compute/database-cell-binding-store.adapter";
 export { PostgresDatabaseCellObserver } from "./compute/database-cell-observer.adapter";
+
+export {
+  AKASH_PRODUCTION_OWNER,
+  akashCreditReader,
+  readAkashBlocksPerDay,
+} from "./finance/akash-credit.reader";
+export { cherryFinanceReader } from "./finance/cherry-finance.reader";
+export {
+  CREDITED_STATUS,
+  creditedPurchasesQuery,
+} from "./finance/credit-purchase-income.query";
+export { domainExpiryReader } from "./finance/domain-expiry.reader";
+export { grafanaOverageReader } from "./finance/grafana-overage.reader";
+export {
+  akashHostingReaders,
+  collapseAkash,
+  readAkashReports,
+  unavailableFinanceReader,
+} from "./finance/operator-finance.adapter";

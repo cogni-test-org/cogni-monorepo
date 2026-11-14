@@ -17,6 +17,8 @@
  *     that wants a second attempt makes a second call.
  *   - RECEIPT_BEFORE_TRANSACTION: the pre-POST cursor is durable before any Console POST, so a
  *     lost response leaves recoverable evidence rather than an orphan paid lease.
+ *   - COST_NEVER_DECIDES_OBSERVE: native discovery/handle observations survive accounting faults;
+ *     recovered ownership is durable first. Pre-mutation accounting remains authoritative.
  *   - IDENTITY_BEFORE_TRANSACTION: the SAME receipt binds {nodeId, environment, composite
  *     uid/generation, cogniKey}, and it is bound by the claiming INSERT — before the allocation
  *     cursor is even read, let alone posted. Identity arrives EXPLICITLY on the wire from the
@@ -73,7 +75,7 @@
  * @internal
  */
 
-import { createHash, X509Certificate } from "node:crypto";
+import { X509Certificate } from "node:crypto";
 import { rootCertificates } from "node:tls";
 
 import type { ProvisionOutput, ProvisionSpec } from "@cogni/ai-tools";
@@ -82,10 +84,12 @@ import {
   type AkashAllocationProbe,
   type AkashTxActuatorPort,
   type AkashTxAllocationLedgerPort,
+  type AkashTxAllocationPolicy,
   type AkashTxAllocationRecord,
   type AkashTxCompositeVerdict,
   type AkashTxConsolePort,
   type AkashTxCreateResult,
+  type AkashTxDatabaseCellRecoveryInput,
   AkashTxError,
   type AkashTxErrorCode,
   type AkashTxLeaseLogSource,
@@ -103,8 +107,12 @@ import {
   type ComputeCostStorePort,
   type NodeMigrationReportStorePort,
 } from "@/ports";
-
+import type { DatabaseCellAppliedCustody } from "@/types/database-cell";
 import { runMigrationStep } from "./akash-tx-migration-step";
+import {
+  DatabaseCellRecoveryProfileSchema,
+  databaseCellRecoveryIntent,
+} from "./database-cell-recovery";
 
 /** Structural pino subset. Fields first, stable marker second. */
 export interface AkashTxLogger {
@@ -154,6 +162,12 @@ export interface AkashTxActuatorDeps {
    * whatever history exists, but recovery attempts record nothing (test/degraded mode).
    */
   readonly outcomes?: AkashTxProviderOutcomesPort;
+  readonly recoveryProfile?: () => Promise<unknown>;
+  /** Read current private custody afresh; historical DSN hashes are not release pins. */
+  readonly appliedCellCustody?: (
+    nodeId: string,
+    environment: "production"
+  ) => Promise<DatabaseCellAppliedCustody>;
 }
 
 const SYSTEM_ROOT_FINGERPRINTS = new Set(
@@ -250,6 +264,24 @@ export function mapConsoleFailure(
 }
 
 /**
+ * bug.5569: a Console READ that fails while a lease under this key MAY exist (just allocated,
+ * replayed from a settled receipt, or being recovered from a cursor) proves nothing about billing.
+ * `mapConsoleFailure(..., {mutating:false})` answers `provider_rejected` / `not_found` for such a
+ * failure (a Console 502 included), and on a create that reads as "refused, nothing bills". Those
+ * two are rewritten to `outcome_unknown`, so every caller resolves the key instead of abandoning a
+ * live lease. Every other code (ledger, ambiguity) is already a "may exist" answer and passes through.
+ */
+function unknownWhileLeaseMayExist(
+  error: unknown,
+  context: string
+): AkashTxError {
+  const mapped = mapConsoleFailure(error, { mutating: false });
+  return mapped.code === "provider_rejected" || mapped.code === "not_found"
+    ? new AkashTxError("outcome_unknown", `${context}: ${mapped.message}`)
+    : mapped;
+}
+
+/**
  * The single `failure_code` written by every rollback path. One string so a settled-by-recovery
  * receipt is one grep away from the incident that produced it, in logs and in Postgres alike.
  */
@@ -260,6 +292,17 @@ const ROLLED_BACK_FAILURE_CODE = "allocation_rolled_back";
  * cover a full pump poll cycle with margin, short enough that a leaked token dies in minutes.
  */
 const LEASE_LOG_TOKEN_TTL_SECONDS = 300;
+
+/**
+ * Lease-log bounds (task.5420). The cap is on SOURCES returned (64, the wire contract max),
+ * never on receipts read: dead receipts (refused creates, closed leases) sit in the live set
+ * until a sweep settles them, so a receipt cap of 32 filled with dead rows and starved every
+ * newer lease. The receipt read is wide and newest-first; the source cap bounds the answer.
+ */
+const LEASE_LOG_RECEIPT_SCAN_LIMIT = 500;
+const LEASE_LOG_SOURCE_MAX = 64;
+/** Bound on the per-process "already logged as closed" set; cleared when full. */
+const LEASE_LOG_CLOSED_MEMO_MAX = 1_000;
 
 /**
  * The dseq a failed create is PROVEN to have closed, if the client proved it.
@@ -351,11 +394,18 @@ export class AkashTxActuator implements AkashTxActuatorPort {
   private readonly costStore: ComputeCostStorePort;
   private readonly providerConsumerAccountId: string;
   private readonly outcomes?: AkashTxProviderOutcomesPort;
+  private readonly recoveryProfile?: () => Promise<unknown>;
+  private readonly appliedCellCustody?: AkashTxActuatorDeps["appliedCellCustody"];
   /**
    * Per-process load-shed for boot_ok writes on every observe tick — correctness comes
    * from the DB's unique (lease_id, outcome), never from this cache (task.5153).
    */
   private readonly bootOkRecorded = new Set<string>();
+  /**
+   * Per-process log dedupe for `akash_tx_lease_log_source_closed`: a dead receipt is read on
+   * every pump poll until a sweep settles it, so it is named once, not once per poll.
+   */
+  private readonly closedLeaseLogSources = new Set<string>();
 
   constructor(deps: AkashTxActuatorDeps) {
     this.console = deps.console;
@@ -368,6 +418,9 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     this.costStore = deps.costStore;
     this.providerConsumerAccountId = deps.providerConsumerAccountId;
     if (deps.outcomes) this.outcomes = deps.outcomes;
+    if (deps.recoveryProfile) this.recoveryProfile = deps.recoveryProfile;
+    if (deps.appliedCellCustody)
+      this.appliedCellCustody = deps.appliedCellCustody;
   }
 
   async observe(input: {
@@ -471,7 +524,27 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     environment: string;
     identity: AkashTxWorkloadIdentity;
     spec: ProvisionSpec;
+    excludeProviders?: readonly string[];
+    allowProviders?: readonly string[];
   }): Promise<AkashTxCreateResult> {
+    // task.5405: a caller allowlist that can never be satisfied is refused BEFORE the wallet slot is
+    // claimed or any escrow opens, with the reason (never a silent widen to the configured set).
+    if (input.allowProviders && input.allowProviders.length > 0) {
+      const refusal = this.console.providerPinRefusal?.(
+        new Set(input.allowProviders)
+      );
+      if (refusal) {
+        this.log.warn(
+          {
+            cogniKey: input.cogniKey,
+            allowedCount: input.allowProviders.length,
+          },
+          "akash_tx_caller_provider_allowlist_refused"
+        );
+        // Refused before the wallet slot is claimed: nothing exists to bill (bug.5569).
+        throw new AkashTxError("provider_rejected", refusal, undefined, true);
+      }
+    }
     await this.requireQualifiedCellRelease({
       cogniKey: input.cogniKey,
       environment: input.environment,
@@ -484,6 +557,97 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       ),
       spec: input.spec,
     });
+    return this.allocate(input);
+  }
+
+  /** References only: applied source identity admits capacity, never an app release. */
+  async createDatabaseCellRecovery(
+    input: AkashTxDatabaseCellRecoveryInput
+  ): Promise<AkashTxCreateResult> {
+    const parsed = DatabaseCellRecoveryProfileSchema.safeParse(
+      await this.recoveryProfile?.()
+    );
+    if (
+      !parsed.success ||
+      !parsed.data.enabled ||
+      parsed.data.funding_status !== "qualified"
+    ) {
+      const reasonCode = !parsed.success
+        ? "profile_unavailable"
+        : !parsed.data.enabled
+          ? "profile_disabled"
+          : "funding_unqualified";
+      this.log.warn(
+        {
+          cogniKey: input.cogniKey,
+          nodeId: input.identity.nodeId,
+          environment: input.environment,
+          profileId: "pg15-cold-capacity-v1",
+          reasonCode,
+        },
+        "akash_tx_database_cell_recovery_refused"
+      );
+      throw new AkashTxError(
+        "invalid_request",
+        "cold recovery profile unavailable, disabled or funding unqualified"
+      );
+    }
+    const source = await this.readLedger(input.recovery.sourceCogniKey);
+    const bindings =
+      source?.appliedDatabaseCellBinding?.filter(
+        ({ binding }) =>
+          binding.phase === "applied" &&
+          binding.nodeId === input.identity.nodeId &&
+          binding.nodeSlug === input.nodeSlug &&
+          binding.environment === input.environment &&
+          binding.receiptId === source.receiptId &&
+          binding.cogniKey === source.cogniKey &&
+          source.providerAccount !== undefined &&
+          binding.providerAccount === source.providerAccount &&
+          binding.dseq === input.recovery.sourceExternalName &&
+          binding.systemIdentifier === input.recovery.sourceSystemIdentifier
+      ) ?? [];
+    if (
+      !source ||
+      source.state !== "allocated" ||
+      source.retentionPolicy !== "retain" ||
+      source.identity.nodeId !== input.identity.nodeId ||
+      source.environment !== input.environment ||
+      source.externalName !== input.recovery.sourceExternalName ||
+      bindings.length !== 1 ||
+      input.cogniKey === source.cogniKey ||
+      input.recovery.profileId !== "pg15-cold-capacity-v1"
+    )
+      throw new AkashTxError(
+        "identity_conflict",
+        "recovery source lacks one owned retained applied binding"
+      );
+    const intent = databaseCellRecoveryIntent(input, source, parsed.data);
+    if (input.cogniKey !== intent.key)
+      throw new AkashTxError(
+        "identity_conflict",
+        "recovery key differs from immutable source and policy"
+      );
+    return this.allocate({
+      ...input,
+      spec: intent.spec,
+      allocationPolicy: intent.policy,
+      recoveryFamilyPrefix: intent.familyPrefix,
+    });
+  }
+
+  private async allocate(input: {
+    cogniKey: string;
+    environment: string;
+    identity: AkashTxWorkloadIdentity;
+    spec: ProvisionSpec;
+    allocationPolicy?: AkashTxAllocationPolicy;
+    recoveryFamilyPrefix?: string;
+    /** Caller-supplied exclusions (task.5400). UNIONED with the ledger-derived tried set. */
+    excludeProviders?: readonly string[];
+    /** Caller-supplied allowlist (task.5405). INTERSECTED with the configured one by the console client. */
+    allowProviders?: readonly string[];
+  }): Promise<AkashTxCreateResult> {
     // The claim IS the receipt, and it is the FIRST mutation this method does: its INSERT carries
     // {nodeId, environment, compositeUid, compositeGeneration, cogniKey}. Everything below this
     // line — the cursor read and the paid POST — happens strictly after that row is durable.
@@ -533,6 +697,15 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       );
     }
 
+    // A preparing receipt is not transferable request ownership. Another pod may
+    // still be executing it; only observe/sweeper may resolve abandoned custody.
+    if (input.recoveryFamilyPrefix && claim.state === "owned")
+      throw new AkashTxError(
+        "wallet_allocation_blocked",
+        "recovery receipt already preparing; observe its durable outcome",
+        input.cogniKey
+      );
+
     if (claim.state === "settled") {
       if (claim.record.externalName) {
         this.log.info(
@@ -542,11 +715,20 @@ export class AkashTxActuator implements AkashTxActuatorPort {
           },
           "akash_tx_create_replayed"
         );
-        const resource = await this.describe(
-          claim.record.externalName,
-          claim.record.providerAccount,
-          claim.record
-        );
+        let resource: AkashTxResource;
+        try {
+          resource = await this.describe(
+            claim.record.externalName,
+            claim.record.providerAccount,
+            claim.record
+          );
+        } catch (error) {
+          // A lease is recorded under this key: a failed read-back is never a refusal (bug.5569).
+          throw unknownWhileLeaseMayExist(
+            error,
+            `replayed lease ${claim.record.externalName} read-back failed`
+          );
+        }
         return { ...resource, replayed: true, recovered: false };
       }
       // Terminally settled with no resource. Re-spending under a key that already has a
@@ -555,6 +737,8 @@ export class AkashTxActuator implements AkashTxActuatorPort {
         { cogniKey: input.cogniKey, ledgerState: claim.record.state },
         "akash_tx_create_refused_settled_key"
       );
+      // NOT `nothingBilling` (bug.5569): a handle-less `failed` receipt re-claims above, so a row
+      // that reaches here is anomalous and proves nothing; the caller observes before giving up.
       throw new AkashTxError(
         "provider_rejected",
         "cogniKey already settled without an allocation; a replacement needs a new key"
@@ -574,6 +758,43 @@ export class AkashTxActuator implements AkashTxActuatorPort {
         "allocation_rolled_back",
         "the previous attempt under this key is proven closed; its receipt was settled — retry with the same key"
       );
+    }
+
+    const recoveryFamilyPrefix = input.recoveryFamilyPrefix;
+    if (recoveryFamilyPrefix) {
+      try {
+        const receipts = await this.ledger.listReceipts({
+          nodeId: input.identity.nodeId,
+          environment: input.environment,
+          limit: 100,
+        });
+        if (
+          receipts.length >= 100 ||
+          receipts.some(
+            (record) =>
+              record.cogniKey !== input.cogniKey &&
+              record.cogniKey.startsWith(recoveryFamilyPrefix)
+          )
+        )
+          throw new AkashTxError(
+            "identity_conflict",
+            "recovery family already has a target or receipt scan is truncated"
+          );
+      } catch (error) {
+        // No cursor/handle and no provider IO: only this unused claim is safe to fail.
+        const current = await this.readLedger(input.cogniKey);
+        if (
+          current?.state === "preparing" &&
+          !current.externalName &&
+          !current.allocationCursor
+        )
+          await this.ledger.fail({
+            cogniKey: input.cogniKey,
+            failureCode: "recovery_family_refused",
+          });
+        if (error instanceof AkashTxError) throw error;
+        throw this.ledgerUnavailable(error, input.cogniKey, "recovery family");
+      }
     }
 
     // task.5153 — LEDGER-DERIVED TRIED SET + STRIKE ON RECOVERY ENTRY. Crossplane
@@ -641,6 +862,23 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       }
     }
 
+    // task.5400 — caller exclusions (the provider serving blue). A UNION with the ledger-derived set
+    // above, never a replacement: it can only remove providers from the eligible bids.
+    if (input.excludeProviders && input.excludeProviders.length > 0) {
+      excludedProviders = new Set([
+        ...(excludedProviders ?? []),
+        ...input.excludeProviders,
+      ]);
+      this.log.info(
+        {
+          cogniKey: input.cogniKey,
+          callerExcluded: input.excludeProviders.length,
+          excludedCount: excludedProviders.size,
+        },
+        "akash_tx_caller_provider_exclusions"
+      );
+    }
+
     const cursor = await this.readCursor();
     await this.prepare(input.cogniKey, cursor);
     this.log.info(
@@ -654,15 +892,25 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     );
 
     let allocated: { leaseId: string; providerAccount: string };
+    // bug.5569: true once Console handed back a dseq (a deployment exists and its escrow is open).
+    // Until then a refusal provably opened nothing; after it only a VERIFIED close proves that.
+    let deploymentOpened = false;
     try {
       allocated = await this.console.allocateAndLease({
         spec: input.spec,
+        ...(input.allocationPolicy
+          ? { allocationPolicy: input.allocationPolicy }
+          : {}),
         ...(excludedProviders && excludedProviders.size > 0
           ? { excludedProviders }
+          : {}),
+        ...(input.allowProviders && input.allowProviders.length > 0
+          ? { allowedProviders: new Set(input.allowProviders) }
           : {}),
         // Durability of the handle is a precondition of every later step: the client closes
         // the deployment if this throws, because an unrecorded dseq is a lease nobody can find.
         onAllocated: async (leaseId) => {
+          deploymentOpened = true;
           await this.ledger.recordAllocation({
             cogniKey: input.cogniKey,
             externalName: leaseId,
@@ -698,6 +946,22 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       // and the stale-allocation sweeper is the backstop for exactly that case.
       if (rolledBackDseq)
         await this.settleRollback(input.cogniKey, rolledBackDseq);
+      // NOTHING_BILLING_IS_PROVEN (bug.5569): a refusal says "nothing bills" ONLY when no deployment
+      // was ever opened (a Console 4xx on the deployment POST, an unsatisfiable pin) or the one it
+      // opened was closed AND re-read closed (`rolledBackDseq`). The caller uses it ONLY to skip its
+      // in-flight grace; it still observes the key, and that observe is what settles a `preparing`
+      // receipt (resolveUncertain) or reads the released one. A "close UNVERIFIED" refusal, and every
+      // non-refusal code, carry no such proof.
+      if (
+        mapped.code === "provider_rejected" &&
+        (rolledBackDseq !== undefined || !deploymentOpened)
+      )
+        throw new AkashTxError(
+          mapped.code,
+          mapped.message,
+          mapped.ownerCogniKey,
+          true
+        );
       throw mapped;
     }
 
@@ -708,7 +972,7 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     });
     await this.ledger.recordAppliedSdlHash({
       cogniKey: input.cogniKey,
-      sdlHash: this.console.sdlHash(input.spec),
+      sdlHash: this.console.sdlHash(input.spec, input.allocationPolicy),
     });
     const allocationRecord = await this.requireStoredHandle(
       input.cogniKey,
@@ -716,11 +980,21 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       "create"
     );
     await this.bindCost(allocationRecord, allocated.leaseId);
-    const resource = await this.describe(
-      allocated.leaseId,
-      allocated.providerAccount,
-      allocationRecord
-    );
+    let resource: AkashTxResource;
+    try {
+      resource = await this.describe(
+        allocated.leaseId,
+        allocated.providerAccount,
+        allocationRecord
+      );
+    } catch (error) {
+      // The lease is allocated and recorded, so it bills: a failed read-back is never a refusal
+      // (bug.5569). The caller resolves the key through observe; a retry replays the receipt.
+      throw unknownWhileLeaseMayExist(
+        error,
+        `lease ${allocated.leaseId} allocated; read-back failed`
+      );
+    }
     this.log.info(
       {
         cogniKey: input.cogniKey,
@@ -1001,7 +1275,7 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     );
   }
 
-  /** Initial admission stays immutable; app releases preserve its consumer/pool boundary. */
+  /** App releases use current owned credentials; retained-cell recovery keeps its own guards. */
   private async requireQualifiedCellRelease(input: {
     cogniKey: string;
     environment: string;
@@ -1086,22 +1360,60 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       const consumer = consumers[0];
       const env = consumer?.env;
       // provider-http resolves the owned references before this private wire call.
-      // Compare the actual credentials with their immutable audited digests.
-      const digest = (value: string | undefined) =>
-        value === undefined
-          ? undefined
-          : createHash("sha256").update(value).digest("hex");
+      // A moved endpoint or rotated password must not require rewriting a cutover receipt.
+      let custody: DatabaseCellAppliedCustody;
+      let app: URL;
+      let service: URL;
+      try {
+        if (!this.appliedCellCustody) throw new Error();
+        custody = await this.appliedCellCustody(
+          cell.binding.nodeId,
+          input.environment
+        );
+        app = new URL(custody.app.dsn);
+        service = new URL(custody.service.dsn);
+      } catch {
+        throw new AkashTxError(
+          "ledger_unavailable",
+          "current database cell custody unavailable"
+        );
+      }
+      const ownedConsumers = [
+        { url: app, role: cell.binding.appRole },
+        { url: service, role: cell.binding.serviceRole },
+      ].every(
+        ({ url, role }) =>
+          url.protocol === "postgresql:" &&
+          url.hostname === custody.canonicalEndpointHost &&
+          url.port !== "" &&
+          url.port === app.port &&
+          url.username === role &&
+          url.pathname === `/${cell.binding.databaseName}` &&
+          url.searchParams.get("sslmode") === "verify-full"
+      );
       const ca = env?.DATABASE_SSL_CA_CERT?.replaceAll("\\n", "\n");
       const tlsMatches =
-        cell.registration?.tlsTrustKind === "system"
+        custody.tls.kind === "system"
           ? usesSystemTrust(ca)
-          : ca !== undefined && digest(ca) === cell.registration?.tlsCaSha256;
+          : ca?.trim() ===
+            custody.tls.caCertificate.replaceAll("\\n", "\n").trim();
+      const currentPools = custody.runtimePoolLimits;
       if (
         consumers.length !== 1 ||
         !env ||
-        digest(env.DATABASE_URL) !== cell.registration?.appDsnSha256 ||
-        digest(env.DATABASE_SERVICE_URL) !==
-          cell.registration?.serviceDsnSha256 ||
+        custody.nodeId !== cell.binding.nodeId ||
+        custody.nodeSlug !== input.workload ||
+        custody.environment !== input.environment ||
+        custody.databaseName !== cell.binding.databaseName ||
+        custody.appRole !== cell.binding.appRole ||
+        custody.serviceRole !== cell.binding.serviceRole ||
+        !ownedConsumers ||
+        currentPools?.replicaCount !== pools.replicaCount ||
+        currentPools.app !== pools.app ||
+        currentPools.service !== pools.service ||
+        currentPools.read !== pools.read ||
+        env.DATABASE_URL !== custody.app.dsn ||
+        env.DATABASE_SERVICE_URL !== custody.service.dsn ||
         !tlsMatches ||
         env.COGNI_REPO_SHA !== input.requestedShas[0] ||
         env.DB_POOL_MAX !== String(pools.app) ||
@@ -1321,7 +1633,11 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     try {
       probe = await this.console.findAllocationSince(allocationCursor);
     } catch (error) {
-      const mapped = mapConsoleFailure(error, { mutating: false });
+      // A cursor is durable: the transaction may have landed, so a failed probe is never a refusal.
+      const mapped = unknownWhileLeaseMayExist(
+        error,
+        `allocation recovery since ${allocationCursor} failed`
+      );
       this.log.error(
         { cogniKey, allocationCursor, code: mapped.code },
         "akash_tx_allocation_recovery_failed"
@@ -1358,8 +1674,10 @@ export class AkashTxActuator implements AkashTxActuatorPort {
       adopted.leaseId,
       "create"
     );
-    await this.bindCost(record, adopted.leaseId);
-    await this.observeCost(record, adopted.leaseId);
+    // Discovery and its durable handle are authoritative even when accounting is unavailable.
+    // Recovery observes an existing effect; it grants no new paid mutation.
+    if (adopted.state === "active")
+      await this.observeCostBestEffort(record, adopted.leaseId);
     this.log.warn(
       { cogniKey, allocationCursor, externalName: adopted.leaseId },
       "akash_tx_allocation_recovered"
@@ -1375,6 +1693,12 @@ export class AkashTxActuator implements AkashTxActuatorPort {
    * Best-effort on purpose. The dominant cause of a stuck receipt is the ledger itself being
    * unavailable — the very write that would settle it is the write that failed. A failure here
    * is logged and swallowed so it never masks the original error; the sweeper picks it up.
+   *
+   * bug.5569: a create that published its dseq (`onAllocated`) already moved the receipt to
+   * `allocated`, and `fail()` only settles a handle-less `preparing` row. So a rollback proven
+   * closed for THAT dseq marks it `released` instead; otherwise the record stays a phantom open
+   * lease (counted by `listAllocated`, never closed by anyone). The verdict is read back: this
+   * returns true ONLY when the row now reads `failed` or `released`, never on a no-op write.
    */
   private async settleRollback(
     cogniKey: string,
@@ -1382,18 +1706,31 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     allocationCursor?: string
   ): Promise<boolean> {
     try {
-      await this.ledger.fail({
-        cogniKey,
-        failureCode: ROLLED_BACK_FAILURE_CODE,
-      });
-      this.log.warn(
-        {
+      const before = await this.ledger.read({ cogniKey });
+      if (
+        rolledBackDseq !== undefined &&
+        before?.state === "allocated" &&
+        before.externalName === rolledBackDseq
+      )
+        await this.ledger.markReleased({ cogniKey });
+      else
+        await this.ledger.fail({
           cogniKey,
-          ...(rolledBackDseq ? { rolledBackDseq } : {}),
-          ...(allocationCursor ? { allocationCursor } : {}),
-        },
-        "akash_tx_allocation_rolled_back"
-      );
+          failureCode: ROLLED_BACK_FAILURE_CODE,
+        });
+      const after = await this.ledger.read({ cogniKey });
+      const settled = after?.state === "failed" || after?.state === "released";
+      const fields = {
+        cogniKey,
+        ...(rolledBackDseq ? { rolledBackDseq } : {}),
+        ...(allocationCursor ? { allocationCursor } : {}),
+        ledgerState: after?.state ?? "absent",
+      };
+      if (!settled) {
+        this.log.error(fields, "akash_tx_allocation_rollback_unsettled");
+        return false;
+      }
+      this.log.warn(fields, "akash_tx_allocation_rolled_back");
       return true;
     } catch (error) {
       this.log.error(
@@ -1484,15 +1821,19 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     environment?: string;
     limit?: number;
   }): Promise<AkashTxLeaseLogSources> {
-    const limit = Math.min(Math.max(input.limit ?? 32, 1), 64);
+    const maxSources = Math.min(
+      Math.max(input.limit ?? LEASE_LOG_SOURCE_MAX, 1),
+      LEASE_LOG_SOURCE_MAX
+    );
     let records: readonly AkashTxAllocationRecord[];
     try {
       // bug.5264: enumerate every LIVE (non-terminal) receipt, not only `allocated` ones — a
       // lease that boots but never serves is closed on its BootDeadline before its receipt ever
       // flips past `preparing`, so tailing only `allocated` loses exactly the boot logs we need.
+      // task.5420: newest-first and wide; the cap applies to sources below, not to receipts.
       records = await this.ledger.listActive({
         ...(input.environment ? { environment: input.environment } : {}),
-        limit,
+        limit: LEASE_LOG_RECEIPT_SCAN_LIMIT,
       });
     } catch (error) {
       throw this.ledgerUnavailable(error, "*", "listActive");
@@ -1500,6 +1841,7 @@ export class AkashTxActuator implements AkashTxActuatorPort {
 
     const sources: AkashTxLeaseLogSource[] = [];
     for (const record of records) {
+      if (sources.length >= maxSources) break;
       if (!record.externalName) {
         // A live receipt with no provider handle is unpumpable — but SILENCE here is the very
         // failure bug.5264 is about, so name it: a booting lease stuck before its handle bound
@@ -1519,6 +1861,28 @@ export class AkashTxActuator implements AkashTxActuatorPort {
         const descriptor = await this.console.leaseLogDescriptor({
           leaseId: record.externalName,
         });
+        if (descriptor.state !== "active") {
+          // ACTIVE_LEASE_ONLY (task.5420): a receipt with no active lease (a refused create that
+          // kept its dseq, or a closed lease) is never a source. Named once per process: it is
+          // expected residue for a sweep to settle, not an error.
+          if (!this.closedLeaseLogSources.has(record.externalName)) {
+            if (this.closedLeaseLogSources.size >= LEASE_LOG_CLOSED_MEMO_MAX) {
+              this.closedLeaseLogSources.clear();
+            }
+            this.closedLeaseLogSources.add(record.externalName);
+            this.log.info(
+              {
+                cogniKey: record.cogniKey,
+                externalName: record.externalName,
+                environment: record.environment,
+                receiptState: record.state,
+                leaseState: descriptor.state,
+              },
+              "akash_tx_lease_log_source_closed"
+            );
+          }
+          continue;
+        }
         const providerAccount =
           descriptor.providerAccount ?? record.providerAccount;
         if (!providerAccount || !descriptor.providerHostUri) {
@@ -1581,13 +1945,38 @@ export class AkashTxActuator implements AkashTxActuatorPort {
     providerAccount?: string,
     record?: AkashTxAllocationRecord
   ): Promise<AkashTxResource> {
+    let output: ProvisionOutput;
     try {
-      const output = await this.console.status({ leaseId: externalName });
-      if (record) await this.observeCost(record, externalName);
-      return resourceFrom(output, providerAccount);
+      output = await this.console.status({ leaseId: externalName });
     } catch (error) {
       throw mapConsoleFailure(error, { mutating: false });
     }
+    // COST_NEVER_DECIDES_OBSERVE (bug.5569): cost evidence is read only while Console says the lease
+    // is active (billing), and its failure is logged, never thrown. A closed or rolled-back deployment
+    // has no lease, so its cost read threw `ledger_unavailable` on EVERY observe: prod logged 2000+
+    // `compute_cost_unavailable` (operation=observe) and every refused release sat ~13 min in
+    // `observe_unavailable` before `orphan_suspect`. Same pattern as delete's `.catch`.
+    if (record && output.state === "active")
+      await this.observeCostBestEffort(record, externalName);
+    return resourceFrom(output, providerAccount);
+  }
+
+  /** Accounting cannot suppress native truth on either handle-bound or cursor observation. */
+  private async observeCostBestEffort(
+    record: AkashTxAllocationRecord,
+    externalName: string
+  ): Promise<void> {
+    await this.observeCost(record, externalName).catch((error: unknown) => {
+      this.log.warn(
+        {
+          cogniKey: record.cogniKey,
+          nodeId: record.identity.nodeId,
+          externalName,
+          causeType: costFailureType(error),
+        },
+        "compute_cost_observation_failed"
+      );
+    });
   }
 
   private async withServing(

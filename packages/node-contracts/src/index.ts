@@ -13,6 +13,7 @@
  * @public
  */
 
+export * from "./agent.credentials.v1.contract";
 export * from "./agent.me.v1.contract";
 export * from "./agent.register.v1.contract";
 // ── AI contracts ────────────────────────────────────────────────────────────
@@ -69,6 +70,7 @@ export * from "./graph-runs.create.internal.v1.contract";
 export * from "./graph-runs.update.internal.v1.contract";
 export * from "./graphs.run.internal.v1.contract";
 // ── HTTP (ts-rest router + OpenAPI) ─────────────────────────────────────────
+export * from "./history.v1.contract";
 export * from "./http/openapi.v1";
 export * from "./http/router.v1";
 export * from "./identity.attestation.v1.contract";
@@ -110,6 +112,7 @@ export * from "./users.ownership.v1.contract";
 export * from "./users.profile.v1.contract";
 export * from "./vcs.flight.v1.contract";
 export * from "./vcs.merge.v1.contract";
+export * from "./vcs.review.v1.contract";
 // ── VCS ─────────────────────────────────────────────────────────────────────
 export * from "./vcs.run-ci.v1.contract";
 export * from "./work.items.create.v1.contract";

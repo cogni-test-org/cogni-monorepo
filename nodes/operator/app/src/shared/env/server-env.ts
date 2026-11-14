@@ -80,8 +80,7 @@ export const serverSchema = z.object({
   APP_ENV: z.enum(["test", "production"]),
   APP_BASE_URL: z.string().url().optional(),
   DOMAIN: z.string().optional(),
-  // Public workload zone owned by this fleet. Canonical deployments omit it and keep cognidao.org;
-  // the isolated test operator sets cogni-testing.org for generated node routes and overlays.
+  // Shared substrate root. Keep this distinct from NODE_DEPLOY_WORKLOAD_ZONE and auth DOMAIN.
   FORK_DOMAIN_ROOT: z.string().min(1).optional(),
 
   // Deployment environment (for observability labels and analytics filtering)
@@ -93,6 +92,12 @@ export const serverSchema = z.object({
   // (e.g. cogni-test-org) sets this to its own control env (candidate-a) so the env-membership
   // verb's PR-authoring targets appsets/<control-env>/ instead of the nonexistent appsets/production/.
   FLEET_CONTROL_ENV: z.string().optional(),
+
+  // Envs this deployment's node-deploy sequencer serves (comma-separated; story.5137 ONE FRONT DOOR). The
+  // production operator serves `candidate-a,preview,production`. Unset => only DEPLOY_ENVIRONMENT.
+  NODE_DEPLOY_ENVS: z.string().optional(),
+  // Explicit fleet-owned workload DNS zone. Never DOMAIN (auth) or FORK_DOMAIN_ROOT (substrate).
+  NODE_DEPLOY_WORKLOAD_ZONE: z.string().optional(),
 
   // Build SHA for observability (canonical source for /metrics, /readyz, agent.json)
   APP_BUILD_SHA: z.string().optional(),
@@ -221,6 +226,7 @@ export const serverSchema = z.object({
   NODE_SUBMODULE_PARENT_REPO: optionalString,
   // Which repo's infra/catalog/ defines this env's nodes. Defaults to the submodule
   // parent; set separately where the pin-PR target is a throwaway org (bug.5073).
+  NODE_REGISTRY_WORKLOAD_ZONE: z.string().optional(),
   NODE_REGISTRY_CATALOG_OWNER: optionalString,
   NODE_REGISTRY_CATALOG_REPO: optionalString,
 
@@ -262,6 +268,9 @@ export const serverSchema = z.object({
   // Optional: when unset the compute capability returns no balances (graceful degradation)
   // until ESO surfaces the token onto the operator runtime.
   CHERRY_AUTH_TOKEN: optionalString,
+  // The Cherry team whose credit the Financials page reports. The token can see several teams;
+  // the report binds to this id and shows UNKNOWN when it is absent or not found (never teams[0]).
+  CHERRY_TEAM_ID: optionalString,
   // NOTE: AKASH_CONSOLE_API_KEY is deliberately GONE (task.5138). One Console account has ONE
   // key and it belongs to that account's actuator (hub `akash-actuator-wallet-cutover`). The
   // app's Akash awareness is the actuator's own ledger (akashSpend on /compute/balances,
@@ -279,9 +288,9 @@ export const serverSchema = z.object({
   // by its own ExternalSecret. serverEnv() is the PUBLIC operator app's env contract — declaring
   // the key here would invite a future wiring that reads a wallet the app must never hold.
   // The actuator reads it as a file in @bootstrap/akash-tx-actuator, not through serverEnv.
-  // Comma-separated Akash provider addresses whose egress IPs the substrate firewall
-  // allowlists (harden-docker-public-ports.sh compute-egress-allowlist). The adapter holds
-  // the bid window for these before falling back to the cheapest stranger.
+  // Comma-separated Akash provider addresses the adapter prefers: it holds the bid window for
+  // these before falling back to the cheapest stranger. Preference only; since task.5428 no
+  // substrate firewall row depends on the provider.
   AKASH_PREFERRED_PROVIDERS: optionalString,
   COMPUTE_BALANCE_QUERY_TIMEOUT_MS: z.coerce
     .number()

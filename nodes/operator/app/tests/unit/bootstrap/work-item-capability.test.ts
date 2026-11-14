@@ -1,0 +1,777 @@
+// SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
+// SPDX-FileCopyrightText: 2025 Cogni-DAO
+
+/**
+ * Module: `@tests/unit/bootstrap/work-item-capability`
+ * Purpose: Prove `core__work_item_query`'s capability reads through the injected backlog reader (task.5282).
+ * Scope: Unit test of createWorkItemCapability with fake ports. Does not touch Doltgres or markdown files.
+ * Invariants:
+ *   - QUERY_READS_THE_LIVE_BACKLOG: `query` lists via `backlogReader` when wired, never the markdown port
+ *   - WRITES_NOT_WIDENED: transition still resolves + commands through the markdown ports only
+ *   - PATCH_ON_THE_LIVE_BACKLOG / PATCH_CAS_PASSTHROUGH (story.5096): `patch` writes through the
+ *     Doltgres `backlogWriter` as its principal, forwards `expectedRevision`, and turns the store's
+ *     `WorkItemRevisionConflictError` into the ai-tools `WorkItemPatchConflictError`
+ *   - NO_PRIORITY_GUARD (task.5306): a priority-0/1 patch writes through like any other priority;
+ *     there is no bespoke node-admin gate on it
+ *   - MOVES_READ_AT_READ_TIME (story.0033): a read that returns exactly one item judges each move from the service's batched read; a page returns the stored moves and looks up nothing
+ *   - ONE_ITEM_ENVELOPE (task.0118): `read` also resolves each move's metric, KPI and goal and, on request, the first page of citation links; `query` never does
+ * Side-effects: none
+ * Links: src/bootstrap/capabilities/work-item.ts
+ * @internal
+ */
+
+import {
+  createWorkItemReadImplementation,
+  WorkItemQueryOutputSchema,
+  workItemReadContract,
+} from "@cogni/ai-tools";
+import {
+  createWorkItemQueryImplementation,
+  WorkItemPatchConflictError,
+  workItemQueryContract,
+} from "@cogni/shared-ai-tools";
+import type {
+  WorkItem,
+  WorkItemCommandPort,
+  WorkItemId,
+  WorkItemQueryPort,
+} from "@cogni/work-items";
+import { toWorkItemDto, WorkItemDtoSchema } from "@cogni/work-items";
+import { WorkItemRevisionConflictError } from "@cogni/work-items/adapters/doltgres";
+import { describe, expect, it, vi } from "vitest";
+
+import { createWorkItemCapability } from "@/bootstrap/capabilities/work-item";
+import { createMoveMetricPorts } from "@/bootstrap/capabilities/work-item-moves";
+
+function item(overrides: Partial<WorkItem> = {}): WorkItem {
+  return {
+    id: "task.5282" as WorkItemId,
+    type: "task",
+    title: "Prioritizer",
+    status: "needs_implement",
+    node: "operator",
+    assignees: [],
+    externalRefs: [],
+    actor: "either",
+    labels: [],
+    specRefs: ["work-items-port"],
+    revision: 4,
+    deployVerified: false,
+    createdAt: "2026-10-19T00:00:00.000Z",
+    updatedAt: "2026-10-19T00:00:00.000Z",
+    outcome: "Done when the graph runs",
+    parentId: "story.5096" as WorkItemId,
+    estimate: 2,
+    ...overrides,
+  };
+}
+
+function markdownPorts() {
+  const query: WorkItemQueryPort = {
+    get: vi.fn().mockResolvedValue(null),
+    list: vi.fn().mockResolvedValue({ items: [] }),
+    listRelations: vi.fn().mockResolvedValue([]),
+  };
+  const command = {
+    transitionStatus: vi.fn(),
+    patch: vi.fn(),
+  } as unknown as WorkItemCommandPort;
+  return { query, command };
+}
+
+describe("createWorkItemCapability", () => {
+  it("lists through backlogReader (Doltgres read path) and maps enrichment fields", async () => {
+    const md = markdownPorts();
+    const backlogReader = {
+      list: vi.fn().mockResolvedValue({
+        items: [item()],
+        pageInfo: { endCursor: null, hasMore: false },
+      }),
+    };
+    const cap = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogReader,
+    });
+
+    const result = await cap.query({ statuses: ["needs_implement"], limit: 5 });
+    const outputFields = WorkItemQueryOutputSchema.shape.items.element.shape;
+    for (const field of Object.keys(WorkItemDtoSchema.shape)) {
+      expect(outputFields).toHaveProperty(field);
+    }
+
+    expect(backlogReader.list).toHaveBeenCalledWith({
+      statuses: ["needs_implement"],
+      limit: 5,
+    });
+    expect(md.query.list).not.toHaveBeenCalled();
+    expect(result).toEqual([
+      expect.objectContaining({
+        id: "task.5282",
+        revision: 4,
+        outcome: "Done when the graph runs",
+        parentId: "story.5096",
+        estimate: 2,
+        specRefs: ["work-items-port"],
+      }),
+    ]);
+  });
+
+  it("forwards sort overrides through query and queryPage", async () => {
+    const md = markdownPorts();
+    const backlogReader = {
+      list: vi.fn().mockResolvedValue({ items: [item()], nextCursor: "next" }),
+    };
+    const cap = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogReader,
+    });
+    const params = {
+      sortBy: "rankScore",
+      sortDirection: "asc",
+      limit: 2,
+    } as const;
+    await cap.query(params);
+    expect(await cap.queryPage?.(params)).toMatchObject({ nextCursor: "next" });
+    expect(backlogReader.list).toHaveBeenNthCalledWith(1, params);
+    expect(backlogReader.list).toHaveBeenNthCalledWith(2, params);
+    expect(md.query.list).not.toHaveBeenCalled();
+  });
+
+  it("reads an exact selected full item through the real capability while discovery stays clipped", async () => {
+    const md = markdownPorts();
+    const lateConstraint = "HUMAN APPROVAL REQUIRED before proceeding";
+    const selected = item({
+      id: "task.7777" as WorkItemId,
+      outcome: `${"context ".repeat(100)}${lateConstraint}`,
+      summary: "summary ".repeat(100),
+    });
+    const backlog = [
+      item({ id: "task.1" as WorkItemId }),
+      item({ id: "task.2" as WorkItemId }),
+      selected,
+    ];
+    const backlogReader = {
+      list: vi.fn(async (params: Parameters<WorkItemQueryPort["list"]>[0]) => ({
+        items: (params?.ids
+          ? backlog.filter((row) => params.ids?.includes(row.id))
+          : backlog
+        ).slice(0, params?.limit ?? 20),
+      })),
+    };
+    const capability = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogReader,
+    });
+    const discovery = await createWorkItemQueryImplementation({
+      workItemCapability: capability,
+    }).execute({ limit: 3 });
+    expect(
+      discovery.items.find((row) => row.id === selected.id)?.outcome
+    ).not.toContain(lateConstraint);
+    expect(
+      discovery.items.find((row) => row.id === selected.id)?.summary?.length
+    ).toBe(601);
+    const full = await createWorkItemReadImplementation({
+      workItemCapability: capability,
+    }).execute({ id: selected.id });
+    expect(full.complete).toBe(true);
+    expect(full.item).toMatchObject({
+      id: selected.id,
+      revision: 4,
+      outcome: selected.outcome,
+      summary: selected.summary,
+    });
+    expect(backlogReader.list).toHaveBeenLastCalledWith({
+      ids: [selected.id],
+      limit: 2,
+    });
+    expect(md.query.get).not.toHaveBeenCalled();
+    expect(md.query.list).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { kind: "user", userId: "owner-user" },
+    { kind: "agent", agentId: "owner-agent" },
+    { kind: "system", serviceId: "owner-service" },
+  ] satisfies WorkItem["assignees"])("preserves $kind assignees through complete read and query output validation/redaction", async (assignee) => {
+    const md = markdownPorts();
+    const selected = item({
+      assignees: [assignee],
+      revision: 17,
+      outcome: "full constraint ".repeat(70),
+      externalRefs: [
+        {
+          system: "github",
+          kind: "pull_request",
+          url: "https://github.com/cogni-dao/cogni/pull/2982",
+        },
+      ],
+    });
+    const capability = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogReader: { list: vi.fn().mockResolvedValue({ items: [selected] }) },
+    });
+    const expectedAssignees = [
+      {
+        ...assignee,
+        id:
+          assignee.kind === "user"
+            ? assignee.userId
+            : assignee.kind === "agent"
+              ? assignee.agentId
+              : assignee.serviceId,
+      },
+    ];
+    const result = await createWorkItemReadImplementation({
+      workItemCapability: capability,
+    }).execute({ id: selected.id });
+    const full = workItemReadContract.redact(
+      workItemReadContract.outputSchema.parse(result)
+    );
+    expect(full).toEqual({
+      complete: true,
+      item: { ...toWorkItemDto(selected), assignees: expectedAssignees },
+    });
+    const queryResult = await createWorkItemQueryImplementation({
+      workItemCapability: capability,
+      nodePublicOrigin: "https://cognidao.org",
+    }).execute({ ids: [selected.id] });
+    const query = workItemQueryContract.redact(
+      workItemQueryContract.outputSchema.parse(queryResult)
+    );
+    expect(query.items[0]).toEqual({
+      ...full.item,
+      sourceUrl: `https://cognidao.org/work/items/${selected.id}`,
+      outcome: `${selected.outcome?.slice(0, 600)}…`,
+    });
+  });
+
+  it("retains missing, ambiguous and oversized complete-read refusals", async () => {
+    const md = markdownPorts();
+    const list = vi.fn().mockResolvedValue({ items: [] });
+    const capability = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogReader: { list },
+    });
+    const read = createWorkItemReadImplementation({
+      workItemCapability: capability,
+    });
+    await expect(read.execute({ id: "task.5282" })).rejects.toThrow(
+      "work_source_unavailable"
+    );
+    list.mockResolvedValue({ items: [item(), item()] });
+    await expect(read.execute({ id: "task.5282" })).rejects.toThrow(
+      "work_source_unavailable"
+    );
+    list.mockResolvedValue({ items: [item({ outcome: "x".repeat(65536) })] });
+    await expect(read.execute({ id: "task.5282" })).rejects.toThrow(
+      "work_source_incomplete"
+    );
+  });
+
+  it("requires numeric source revision while allowing honest missing acceptance text", async () => {
+    const md = markdownPorts();
+    const list = vi
+      .fn()
+      .mockResolvedValue({ items: [item({ revision: undefined })] });
+    const capability = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogReader: { list },
+    });
+    const read = createWorkItemReadImplementation({
+      workItemCapability: capability,
+    });
+    await expect(read.execute({ id: "task.5282" })).rejects.toThrow(
+      "work_source_revision_unavailable"
+    );
+    list.mockResolvedValue({ items: [item({ outcome: undefined })] });
+    expect(await read.execute({ id: "task.5282" })).toMatchObject({
+      complete: true,
+      item: { id: "task.5282", revision: 4 },
+    });
+  });
+
+  it("forwards exact IDs and cursor through query's shared read mapping", async () => {
+    const md = markdownPorts();
+    const backlogReader = { list: vi.fn().mockResolvedValue({ items: [] }) };
+    const capability = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogReader,
+    });
+    await capability.query({
+      ids: ["task.7777"],
+      cursor: "cursor-2",
+      limit: 2,
+    });
+    expect(backlogReader.list).toHaveBeenCalledWith({
+      ids: ["task.7777"],
+      cursor: "cursor-2",
+      limit: 2,
+    });
+  });
+
+  it("falls back to workItemQuery when no backlogReader is wired", async () => {
+    const md = markdownPorts();
+    const cap = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+    });
+    await cap.query({});
+    expect(md.query.list).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps transitions on the markdown ports (writes are not routed to the reader)", async () => {
+    const md = markdownPorts();
+    const backlogReader = { list: vi.fn() };
+    const cap = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogReader,
+    });
+
+    await expect(
+      cap.transitionStatus({ id: "task.5282", toStatus: "done" })
+    ).rejects.toThrow("Work item not found");
+    expect(md.query.get).toHaveBeenCalledTimes(1);
+    expect(backlogReader.list).not.toHaveBeenCalled();
+    expect(md.command.transitionStatus).not.toHaveBeenCalled();
+  });
+
+  it("patches through the Doltgres backlogWriter as its principal, forwarding expectedRevision", async () => {
+    const md = markdownPorts();
+    const store = {
+      patch: vi
+        .fn()
+        .mockResolvedValue(item({ priority: 2, rank: 2, revision: 5 })),
+    };
+    const cap = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogWriter: { store, principalId: "actor:system" },
+    });
+
+    const result = await cap.patch({
+      id: "task.5282",
+      expectedRevision: 4,
+      reason: "Raise the rank",
+      set: { priority: 2, rank: 2 },
+    });
+
+    expect(store.patch).toHaveBeenCalledWith(
+      {
+        id: "task.5282",
+        expectedRevision: 4,
+        reason: "Raise the rank",
+        set: { priority: 2, rank: 2 },
+      },
+      "actor:system"
+    );
+    expect(result).toMatchObject({ priority: 2, rank: 2, revision: 5 });
+    expect(md.query.get).not.toHaveBeenCalled();
+    expect(md.command.patch).not.toHaveBeenCalled();
+  });
+
+  it("sends an unconditioned patch when expectedRevision is absent", async () => {
+    const md = markdownPorts();
+    const store = { patch: vi.fn().mockResolvedValue(item()) };
+    const cap = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogWriter: { store, principalId: "actor:system" },
+    });
+
+    await cap.patch({
+      id: "task.5282",
+      reason: "Label it",
+      set: { labels: ["x"] },
+    });
+
+    expect(store.patch).toHaveBeenCalledWith(
+      { id: "task.5282", reason: "Label it", set: { labels: ["x"] } },
+      "actor:system"
+    );
+  });
+
+  it("passes a missing reason to the store, the one enforcer, which refuses it (task.0086)", async () => {
+    const md = markdownPorts();
+    const refused = Object.assign(new Error("reason is required"), {
+      name: "ChangeReasonInvalidError",
+    });
+    const store = { patch: vi.fn().mockRejectedValue(refused) };
+    const cap = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogWriter: { store, principalId: "actor:system" },
+    });
+
+    await expect(
+      cap.patch({ id: "task.5282", set: { labels: ["x"] } })
+    ).rejects.toBe(refused);
+    expect(store.patch).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps the store's revision conflict to WorkItemPatchConflictError", async () => {
+    const md = markdownPorts();
+    const store = {
+      patch: vi
+        .fn()
+        .mockRejectedValue(
+          new WorkItemRevisionConflictError("task.5282", 4, 6)
+        ),
+    };
+    const cap = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogWriter: { store, principalId: "actor:system" },
+    });
+
+    const err = await cap
+      .patch({
+        id: "task.5282",
+        expectedRevision: 4,
+        reason: "Raise priority",
+        set: { priority: 2 },
+      })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(WorkItemPatchConflictError);
+    expect(err).toMatchObject({
+      id: "task.5282",
+      expectedRevision: 4,
+      currentRevision: 6,
+    });
+  });
+
+  it("rethrows any other store failure unchanged", async () => {
+    const md = markdownPorts();
+    const denied = Object.assign(new Error("not authorized"), {
+      name: "WorkItemAuthorizationError",
+    });
+    const store = { patch: vi.fn().mockRejectedValue(denied) };
+    const cap = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogWriter: { store, principalId: "actor:system" },
+    });
+
+    await expect(
+      cap.patch({
+        id: "task.5282",
+        reason: "Edit summary",
+        set: { summary: "x" },
+      })
+    ).rejects.toBe(denied);
+  });
+
+  it("refuses expectedRevision without a backlogWriter (markdown has no caller CAS)", async () => {
+    const md = markdownPorts();
+    const cap = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+    });
+
+    await expect(
+      cap.patch({
+        id: "task.5282",
+        expectedRevision: 4,
+        reason: "Raise priority",
+        set: { priority: 2 },
+      })
+    ).rejects.toThrow("requires the Doltgres backlog writer");
+    expect(md.command.patch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    0, 1,
+  ])("writes priority %i with no node-admin gate (task.5306)", async (priority) => {
+    const md = markdownPorts();
+    const store = { patch: vi.fn().mockResolvedValue(item({ priority })) };
+    const cap = createWorkItemCapability({
+      workItemQuery: md.query,
+      workItemCommand: md.command,
+      backlogWriter: { store, principalId: "actor:system" },
+    });
+
+    const result = await cap.patch({
+      id: "task.5282",
+      reason: "Set priority",
+      set: { priority },
+    });
+
+    expect(store.patch).toHaveBeenCalledWith(
+      { id: "task.5282", reason: "Set priority", set: { priority } },
+      "actor:system"
+    );
+    expect(result.id).toBe("task.5282");
+  });
+});
+
+describe("shared evaluation capability adoption", () => {
+  it("returns the package rank and forwards a score-only CAS patch unchanged", async () => {
+    const { query, command } = markdownPorts();
+    const scores = {
+      goal: { v: 3 },
+      time: { v: 3 },
+      unblocks: { v: 3 },
+      ease: { v: 2 },
+      confidence: { v: 5, ev: "https://example.com/proof" },
+      agent: { v: 3 },
+    };
+    const scored = item({ scores, priority: 2, estimate: 7, revision: 5 });
+    const store = { patch: vi.fn().mockResolvedValue(scored) };
+    const capability = createWorkItemCapability({
+      workItemQuery: query,
+      workItemCommand: command,
+      backlogWriter: { store, principalId: "actor:test" },
+    });
+    const result = await capability.patch({
+      id: scored.id,
+      expectedRevision: 4,
+      reason: "Score it",
+      set: { scores },
+    });
+    expect(store.patch).toHaveBeenCalledWith(
+      {
+        id: scored.id,
+        expectedRevision: 4,
+        reason: "Score it",
+        set: { scores },
+      },
+      "actor:test"
+    );
+    expect(result).toMatchObject({
+      scores,
+      rankScore: 1.8,
+      priority: 2,
+      estimate: 7,
+      revision: 5,
+    });
+  });
+});
+
+// story.0033: a one-item read (core__work_item_read) judges each move; a page does not.
+describe("work-item moves at read time", () => {
+  const OBS = "11111111-1111-4111-8111-111111111111";
+  const withMoves = item({
+    moves: [{ metricId: "m-1", direction: "up", baselineObservationId: OBS }],
+  });
+  const ok = (value: number) => ({
+    id: OBS,
+    metricId: "m-1",
+    status: "ok",
+    value,
+    observedAt: "2026-11-10T00:00:00.000Z",
+    definitionHash: "h",
+    calculatorVersion: "work.count@1",
+    paramsHash: "p",
+    node: "operator",
+    environment: "test",
+    dataScope: "node-members",
+    unit: "items",
+    window: {
+      start: "2026-11-09T23:00:00.000Z",
+      end: "2026-11-10T00:00:00.000Z",
+    },
+    sourceWatermarks: [{ source: "test", asOf: "2026-11-10T00:00:00.000Z" }],
+    viewState: "ok",
+    maxAgeSeconds: 7200,
+  });
+  const metrics = (baseline: number, current: number) => ({
+    workReadBatch: vi
+      .fn()
+      .mockResolvedValue([{ baseline: ok(baseline), current: ok(current) }]),
+  });
+  const capability = (
+    items: WorkItem[],
+    service: unknown,
+    extra: Partial<Parameters<typeof createWorkItemCapability>[0]> = {},
+    goals?: unknown
+  ) =>
+    createWorkItemCapability({
+      workItemQuery: markdownPorts().query,
+      workItemCommand: markdownPorts().command,
+      backlogReader: {
+        list: vi.fn().mockResolvedValue({
+          items,
+          pageInfo: { endCursor: null, hasMore: false },
+        }),
+      } as unknown as Pick<WorkItemQueryPort, "list">,
+      moveReadings: createMoveMetricPorts(
+        () => service as never,
+        goals ? () => goals as never : undefined
+      ).readings,
+      ...extra,
+    });
+
+  it("a read that returns one item adds the baseline, current reading and verdict", async () => {
+    const service = metrics(1, 3);
+    const [read] = await capability([withMoves], service).query({
+      ids: ["task.5282"],
+      limit: 1,
+    });
+    expect(read?.moves).toMatchObject([
+      {
+        metricId: "m-1",
+        direction: "up",
+        baselineObservationId: OBS,
+        baseline: { value: 1, observedAt: "2026-11-10T00:00:00.000Z" },
+        current: { value: 3, observedAt: "2026-11-10T00:00:00.000Z" },
+        moved: "as_declared",
+      },
+    ]);
+    expect(service.workReadBatch).toHaveBeenCalledOnce();
+    expect(service.workReadBatch).toHaveBeenCalledWith(
+      [{ metricId: "m-1", baselineObservationId: OBS }],
+      expect.any(AbortSignal)
+    );
+  });
+
+  it("a page of items returns the stored moves and looks up nothing", async () => {
+    const service = metrics(1, 3);
+    const items = await capability(
+      [withMoves, { ...withMoves, id: "task.5283" as WorkItemId }],
+      service
+    ).query({});
+    expect(items.map((entry) => entry.moves)).toEqual([
+      [{ metricId: "m-1", direction: "up", baselineObservationId: OBS }],
+      [{ metricId: "m-1", direction: "up", baselineObservationId: OBS }],
+    ]);
+    expect(service.workReadBatch).not.toHaveBeenCalled();
+  });
+
+  it("a deprecated metric reads unknown with metric_deprecated", async () => {
+    const service = {
+      workReadBatch: vi.fn().mockResolvedValue([
+        {
+          baseline: null,
+          current: null,
+          unknownReason: "metric_deprecated",
+        },
+      ]),
+    };
+    const [read] = await capability([withMoves], service).query({
+      ids: ["task.5282"],
+    });
+    expect(read?.moves?.[0]).toMatchObject({
+      moved: "unknown",
+      unknownReason: "metric_deprecated",
+    });
+    expect(service.workReadBatch).toHaveBeenCalledOnce();
+  });
+
+  it("with no metrics service the move reads unknown", async () => {
+    const [read] = await capability([withMoves], undefined).query({
+      ids: ["task.5282"],
+    });
+    expect(read?.moves?.[0]).toMatchObject({ moved: "unknown" });
+  });
+
+  it("the complete-read tool returns the judged moves", async () => {
+    const service = metrics(5, 2);
+    const down = item({
+      moves: [
+        { metricId: "m-1", direction: "down", baselineObservationId: OBS },
+      ],
+    });
+    const tool = createWorkItemReadImplementation({
+      workItemCapability: capability([down], service),
+    });
+    const result = await tool.execute({ id: "task.5282" }, {} as never);
+    expect(result.item.moves?.[0]).toMatchObject({
+      baseline: { value: 5 },
+      current: { value: 2 },
+      moved: "as_declared",
+    });
+  });
+
+  // task.0118: `read` is the single-item envelope; query and queryPage never resolve the chain.
+  describe("read (single-item envelope)", () => {
+    const goalsPort = {
+      listActiveGoals: vi.fn().mockResolvedValue([
+        {
+          id: "goal-1",
+          title: "Goal one",
+          evaluateAt: null,
+          kpiBindings: [
+            {
+              metricId: "m-1",
+              comparator: "gte",
+              target: { value: 5, unit: "items" },
+            },
+          ],
+        },
+      ]),
+    };
+    const chainService = (service: ReturnType<typeof metrics>) => ({
+      ...service,
+      describe: vi
+        .fn()
+        .mockResolvedValue([
+          { id: "m-1", title: "Metric one", unit: "items", display: "volume" },
+        ]),
+      kpi: vi.fn().mockResolvedValue({
+        viewState: "ok",
+        assessment: { status: "on_track" },
+      }),
+    });
+    const build = (
+      service: unknown,
+      readLinks?: (id: string) => Promise<never>
+    ) =>
+      capability(
+        [withMoves],
+        service,
+        readLinks ? { links: { firstPage: readLinks } } : {},
+        goalsPort
+      );
+
+    it("adds readings, the chain and (on request) links; query does not", async () => {
+      const service = chainService(metrics(1, 3));
+      const readLinks = vi
+        .fn()
+        .mockResolvedValue({ items: [], nextCursor: "n1" });
+      const cap = build(service, readLinks);
+      const read = await cap.read?.("task.5282", { includeLinks: true });
+      expect(read?.moves?.[0]).toMatchObject({
+        moved: "as_declared",
+        metric: { id: "m-1", title: "Metric one", unit: "items" },
+        kpi: { metricId: "m-1", comparator: "gte", status: "on_track" },
+        goal: { id: "goal-1", title: "Goal one" },
+      });
+      expect(read?.links).toEqual({ items: [], nextCursor: "n1" });
+      const [queried] = await cap.query({ ids: ["task.5282"], limit: 1 });
+      expect(queried?.moves?.[0]).not.toHaveProperty("kpi");
+      expect(queried).not.toHaveProperty("links");
+      expect(service.describe).toHaveBeenCalledOnce();
+    });
+
+    it("reads links as unavailable when no links reader is wired, and omits them unless asked", async () => {
+      const cap = build(chainService(metrics(1, 3)));
+      expect(
+        (await cap.read?.("task.5282", { includeLinks: true }))?.links
+      ).toEqual({ items: [], nextCursor: null, unavailable: true });
+      expect(await cap.read?.("task.5282")).not.toHaveProperty("links");
+      expect(await cap.read?.("task.9999")).toBeNull();
+    });
+
+    it("marks the chain unavailable, never absent-as-empty, when the metrics service cannot describe", async () => {
+      const service = {
+        ...metrics(1, 3),
+        describe: vi.fn().mockRejectedValue(new Error("definitions down")),
+      };
+      const read = await build(service).read?.("task.5282");
+      expect(read?.moves?.[0]).toMatchObject({
+        moved: "as_declared",
+        context: "unavailable",
+      });
+      expect(read?.moves?.[0]).not.toHaveProperty("kpi");
+    });
+  });
+});

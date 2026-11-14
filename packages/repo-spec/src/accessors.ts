@@ -31,6 +31,10 @@ export interface GovernanceSchedule {
   cron: string;
   timezone: string;
   entrypoint: string;
+  /** Namespaced graph id to run; absent → the sandbox agent (back-compat). */
+  graph?: string;
+  /** Platform model id for the `graph` run (set iff `graph` is set). */
+  model?: string;
 }
 
 export interface LedgerPoolConfig {
@@ -119,12 +123,11 @@ export interface NodeServiceConfig {
   /**
    * Per-service deployment-environment allow-list (story.5043). Absent = deploy to every
    * environment. When present, the manifest builder DROPS this service from any environment
-   * not listed here (see buildComputeWorkloadManifest).
+   * not listed here (see resolveNodeArtifactBundleForEnvironment).
    */
   readonly envs?: readonly ("candidate-a" | "preview" | "production")[];
   readonly runtimeProfile?: NodeServiceRuntimeProfileSpec;
   readonly bindings: Readonly<Record<string, string>>;
-  readonly secretRefs: readonly { readonly key: string }[];
   readonly bindHost: "0.0.0.0";
   readonly internalUrl: string;
   readonly resources: {
@@ -139,7 +142,7 @@ export interface NodeServiceConfig {
 // ---------------------------------------------------------------------------
 
 /** Extract node_id from parsed repo-spec. */
-export function extractNodeId(spec: RepoSpec): string {
+export function extractNodeId(spec: Pick<RepoSpec, "node_id">): string {
   return spec.node_id;
 }
 
@@ -154,10 +157,10 @@ export function extractNodeName(spec: RepoSpec): string {
 /**
  * Did this node author its own `deployment:` block, or is it riding the legacy default?
  *
- * The two are NOT interchangeable: the default declares no `secret_refs`, which is correct for
- * the k3s lane (env arrives via the node's ExternalSecret overlay) and fatal for an off-cluster
- * workload (env arrives only through declared refs). Deploy gates that hand a node to an
- * off-cluster provider MUST require a real declaration instead of silently accepting the default.
+ * The two are NOT interchangeable: the default is correct for the k3s lane (env arrives via the
+ * node's ExternalSecret overlay) and fatal for an off-cluster workload (env arrives only through the
+ * runtime profile and the secrets catalog). Deploy gates that hand a node to an off-cluster provider
+ * MUST require a real declaration instead of silently accepting the default.
  */
 export function hasDeclaredNodeDeployment(spec: RepoSpec): boolean {
   return spec.deployment !== undefined;
@@ -167,12 +170,11 @@ export function hasDeclaredNodeDeployment(spec: RepoSpec): boolean {
  * Resolve the node's app-tier service declaration.
  *
  * Existing repo-specs intentionally need no migration: omission produces the
- * same single public Next.js app shape used by node-template today — including
- * its empty `secret_refs`. See `hasDeclaredNodeDeployment` before using this
+ * same single public Next.js app shape used by node-template today. See `hasDeclaredNodeDeployment` before using this
  * result to build off-cluster-compute desired state.
  */
 export function extractNodeServices(
-  spec: RepoSpec
+  spec: Pick<RepoSpec, "deployment">
 ): readonly NodeServiceConfig[] {
   const deployment = spec.deployment ?? LEGACY_DEFAULT_NODE_DEPLOYMENT;
   return deployment.services.map((service) => ({
@@ -192,7 +194,6 @@ export function extractNodeServices(
       ? { runtimeProfile: service.runtime_profile }
       : {}),
     bindings: service.bindings,
-    secretRefs: service.secret_refs,
     bindHost: service.bind_host,
     internalUrl: `http://${service.name}:${service.port}`,
     resources: {
@@ -318,7 +319,18 @@ export function extractGovernanceConfig(spec: RepoSpec): GovernanceConfig {
   const declared = spec.governance?.schedules ?? [];
   const ledger = extractLedgerConfig(spec);
 
-  const schedules = [...declared];
+  // Declared entries are copied field-by-field: an entry without `graph`/`model`
+  // keeps exactly the pre-task.5282 shape (sandbox agent, no new keys).
+  const schedules: GovernanceSchedule[] = declared.map((s) => ({
+    charter: s.charter,
+    cron: s.cron,
+    timezone: s.timezone,
+    entrypoint: s.entrypoint,
+    ...(s.graph !== undefined ? { graph: s.graph } : {}),
+    ...(s.model !== undefined ? { model: s.model } : {}),
+  }));
+  // LEDGER_PRESERVED: only a declared LEDGER_INGEST suppresses the synthesized one —
+  // adding any other charter (e.g. WORK_PRIORITIZER) never drops or alters it.
   const hasLedgerSchedule = declared.some(
     (s) => s.charter.toUpperCase() === LEDGER_INGEST_CHARTER
   );

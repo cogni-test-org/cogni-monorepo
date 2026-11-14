@@ -11,6 +11,7 @@
  * @public
  */
 
+import { RETIRED_SECRET_REFS_MESSAGE } from "@cogni/node-declarations";
 import { z } from "zod";
 
 /**
@@ -59,26 +60,52 @@ const evmAddressSchema = z
 
 /**
  * Schema for a single governance schedule entry.
- * Each schedule triggers a sandbox agent run with a 1-word entrypoint.
- * Invariants: Charter must be unique per config; cron must be 5 fields; entrypoint must be 1 token (no spaces).
+ * Each schedule triggers an agent run with a 1-word entrypoint — the sandbox agent
+ * by default, or the catalog graph named by `graph` (task.5282).
+ * Invariants: Charter must be unique per config; cron must be 5 fields; entrypoint must be 1 token (no spaces);
+ *   `graph` requires `model` (a graph run needs an explicit platform model id — there is no safe default).
  */
-export const governanceScheduleSchema = z.object({
-  /** Charter name (e.g., COMMUNITY, ENGINEERING, SUSTAINABILITY, GOVERN) */
-  charter: z.string().min(1, "Charter must be non-empty"),
-  /** 5-field cron expression (minute hour day month weekday) */
-  cron: z
-    .string()
-    .regex(
-      /^(\S+\s+){4}\S+$/,
-      "Cron must be a 5-field expression (minute hour day month weekday)"
-    ),
-  /** IANA timezone (defaults to UTC) */
-  timezone: z.string().default("UTC"),
-  /** Trigger word sent to the sandbox agent (single token, no spaces) */
-  entrypoint: z
-    .string()
-    .regex(/^\S+$/, "Entrypoint must be a single token (no spaces)"),
-});
+export const governanceScheduleSchema = z
+  .object({
+    /** Charter name (e.g., COMMUNITY, ENGINEERING, SUSTAINABILITY, GOVERN) */
+    charter: z.string().min(1, "Charter must be non-empty"),
+    /** 5-field cron expression (minute hour day month weekday) */
+    cron: z
+      .string()
+      .regex(
+        /^(\S+\s+){4}\S+$/,
+        "Cron must be a 5-field expression (minute hour day month weekday)"
+      ),
+    /** IANA timezone (defaults to UTC) */
+    timezone: z.string().default("UTC"),
+    /** Trigger word sent to the agent (single token, no spaces) */
+    entrypoint: z
+      .string()
+      .regex(/^\S+$/, "Entrypoint must be a single token (no spaces)"),
+    /**
+     * Optional namespaced graph id (`<provider>:<name>`, e.g. `langgraph:work-prioritizer`).
+     * Absent → the sandbox agent (`sandbox:openclaw`), byte-for-byte the pre-existing behavior.
+     * Ignored for LEDGER_INGEST (that charter always runs the epoch-collect workflow).
+     */
+    graph: z
+      .string()
+      .regex(
+        /^[a-z][a-z0-9-]*:[A-Za-z0-9][A-Za-z0-9._-]*$/,
+        "graph must be a namespaced graph id: '<provider>:<name>' (e.g. langgraph:work-prioritizer)"
+      )
+      .optional(),
+    /** Platform (LiteLLM) model id the `graph` run uses. Required when `graph` is set. */
+    model: z.string().min(1).optional(),
+  })
+  .superRefine((entry, ctx) => {
+    if (entry.graph !== undefined && entry.model === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["model"],
+        message: "`model` is required when `graph` is set",
+      });
+    }
+  });
 
 export type GovernanceScheduleSpec = z.infer<typeof governanceScheduleSchema>;
 
@@ -275,13 +302,19 @@ const serviceEnvKeySchema = z
     "service environment keys must be uppercase names"
   );
 
-export const nodeServiceSecretRefSchema = z
-  .object({ key: serviceEnvKeySchema })
-  .strict();
+/**
+ * `secret_refs` is retired (bug.5254). A node secret has ONE declaration: its entry in
+ * `.cogni/secrets-catalog.yaml`, whose `workloads` names the services that receive it. A repo-spec that
+ * still carries `secret_refs` (top level or on a service) is refused with the fixed message, never
+ * stripped (CD1: a declared field is never ignored). The message is owned by
+ * `@cogni-dao/node-declarations` (the node CI check and this deploy refusal share one literal).
+ */
+export { RETIRED_SECRET_REFS_MESSAGE };
 
-export type NodeServiceSecretRefSpec = z.infer<
-  typeof nodeServiceSecretRefSchema
->;
+/** The refused `secret_refs` field: absent parses, any value (even `[]`) fails with the fixed message. */
+const retiredSecretRefsSchema = z
+  .never({ message: RETIRED_SECRET_REFS_MESSAGE })
+  .optional();
 
 const relativeBuildPathSchema = z
   .string()
@@ -380,15 +413,8 @@ export const nodeServiceSpecSchema = z
         message: "A service may declare at most 16 sibling bindings",
       })
       .default({}),
-    /** Value-free logical secret needs; scope is derived outside Git. */
-    secret_refs: z
-      .array(nodeServiceSecretRefSchema)
-      .max(32)
-      .refine(
-        (refs) => new Set(refs.map((ref) => ref.key)).size === refs.length,
-        "secret_refs keys must be unique"
-      )
-      .default([]),
+    /** Retired (bug.5254): refused with a fixed message. Node secrets live in the catalog. */
+    secret_refs: retiredSecretRefsSchema,
     bind_host: z.literal("0.0.0.0").default("0.0.0.0"),
     /** Explicit for every declared service; environment policy owns recommended sizes. */
     resources: nodeServiceResourcesSchema,
@@ -396,6 +422,308 @@ export const nodeServiceSpecSchema = z
   .strict();
 
 export type NodeServiceSpec = z.infer<typeof nodeServiceSpecSchema>;
+
+/**
+ * A service as FROZEN in a recorded release (`artifactPlan.services`), read back on every sequencer
+ * tick, release GET and bundle lookup. Releases recorded before `secret_refs` was retired carry it
+ * (`[]` from the old default, or real keys). The stored path drops it and never acts on it: the secret
+ * keys a release delivers are the frozen `secretKeys`, not this field. The loud refusal belongs to the
+ * authoring surface only (the repo-spec parse). Never use this schema to parse a repo-spec.
+ */
+export const storedNodeServiceSpecSchema = z.preprocess((value) => {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return value;
+  const { secret_refs: _retired, ...rest } = value as Record<string, unknown>;
+  return rest;
+}, nodeServiceSpecSchema);
+
+// ---------------------------------------------------------------------------
+// Blue/green workloads (task.5400, story.5127): the deploy spec a release stores. A node declares
+// it through a workload manifest (`.cogni/workloads/<name>.yaml`, see workload-manifest.ts), which
+// the operator lowers to this shape. Repo-spec no longer carries workloads (story.5137).
+// ---------------------------------------------------------------------------
+
+/** `repo[:tag]@sha256:<64 hex>` — a workload image is ALWAYS pinned by digest (immutable deploys). */
+const workloadImageSchema = z
+  .string()
+  .max(512)
+  .regex(
+    /^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$/,
+    "workload image must be pinned by digest: repo[:tag]@sha256:<64 hex>"
+  );
+
+/**
+ * The ONE tag-only image a release may carry: `<repo>:sha-<40 hex>`, the image node CI builds at a source
+ * sha, valid ONLY with `imagePending: true` (story.5137). The operator's sequencer resolves it to a digest
+ * once the registry has it and pins that digest write-once on the release, so a mutable tag never reaches a
+ * paid create.
+ */
+const pendingWorkloadImageSchema = z
+  .string()
+  .max(512)
+  .regex(
+    /^[a-z0-9][a-z0-9._/-]*:sha-[0-9a-f]{40}$/,
+    "a pending workload image must be <repo>:sha-<40 hex>"
+  );
+
+const workloadHostSchema = z
+  .string()
+  .max(253)
+  .regex(
+    /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/,
+    "workload host must be a lowercase DNS name"
+  );
+
+/**
+ * How a workload is reached. `http` is a public hostname the edge routes to the active lease
+ * (a proxied CNAME); `tcp` is a provider-forwarded global TCP port (state services).
+ */
+export const nodeWorkloadExposeSchema = z.union([
+  z.object({ http: z.object({ host: workloadHostSchema }).strict() }).strict(),
+  z.object({ tcp: z.object({ global: z.literal(true) }).strict() }).strict(),
+]);
+
+const workloadHealthPathSchema = z.string().regex(/^\/[A-Za-z0-9._~/-]*$/);
+
+/**
+ * One blue/green workload (task.5400). An `app` is replaced by immutable blue/green; a `state`
+ * workload is created once and NEVER auto-replaced.
+ */
+/** A stateless private member of one authorized release; Score owns runtime shape. */
+const workloadCompanionSchema = z
+  .object({
+    name: serviceNameSchema,
+    image: z.string().max(512),
+    imagePending: z.literal(true).optional(),
+    command: z.array(z.string().max(8192)).min(1).max(32).optional(),
+    port: z.number().int().min(1).max(65535),
+    cpu: z.number().min(0.1).max(64),
+    memoryMi: z.number().int().min(128).max(262144),
+    storageMi: z.number().int().min(128).max(1048576),
+    env: z.record(serviceEnvKeySchema, z.string().max(4096)),
+    // The same path must fit the qualification observation before a release can be recorded.
+    ready: workloadHealthPathSchema.max(512),
+    secretKeys: z.array(serviceEnvKeySchema).max(32).optional(),
+  })
+  .strict();
+
+export const nodeWorkloadSpecSchema = z
+  .object({
+    /** Present only for the explicit Score/repo-spec companion bridge. */
+    serviceName: serviceNameSchema.optional(),
+    companions: z.array(workloadCompanionSchema).min(1).max(7).optional(),
+    artifactPlan: z
+      .object({
+        repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
+        imageRepository: z
+          .string()
+          .regex(/^ghcr\.io\/[a-z0-9._-]+\/[a-z0-9._-]+$/),
+        /** Frozen same-SHA build declarations, including services pruned in this environment. */
+        services: z.array(storedNodeServiceSpecSchema).min(1).max(8),
+        bundleDigest: workloadImageSchema.optional(),
+        selectedImages: z
+          .record(serviceNameSchema, workloadImageSchema)
+          .optional(),
+      })
+      .strict()
+      .optional(),
+    name: serviceNameSchema,
+    kind: z.enum(["app", "state"]),
+    /** Digest-pinned, or `<repo>:sha-<40 hex>` when `imagePending` is true (resolved before any create). */
+    image: z.string().max(512),
+    /**
+     * True when `image` is the tag the node's CI publishes at `source_sha` and NOT yet a digest. App only.
+     * Set by the operator at lowering (a manifest image of `.`), never by a manifest. The release store
+     * replaces `image` with the digest and drops this flag once the sequencer pins it (write-once).
+     */
+    imagePending: z.literal(true).optional(),
+    command: z.array(z.string().max(8192)).min(1).max(32).optional(),
+    /** Container port. An http app is exposed on 80; a tcp state service on the same number. */
+    port: z.number().int().min(1).max(65535),
+    expose: nodeWorkloadExposeSchema,
+    cpu: z.number().min(0.1).max(64),
+    memoryMi: z.number().int().min(128).max(262144),
+    /** Ephemeral storage. */
+    storageMi: z.number().int().min(128).max(1048576),
+    persistent: z
+      .object({
+        sizeMi: z.number().int().min(128).max(1048576),
+        mountPath: z.string().regex(/^\/(?!$)(?!.*(?:\/\.\.?)(?:\/|$))[^\0]+$/),
+      })
+      .strict()
+      .optional(),
+    /** NON-secret environment only; credentials arrive through `bindings`. */
+    env: z.record(serviceEnvKeySchema, z.string().max(4096)).default({}),
+    /** Env var -> state workload whose connection URL the operator derives (resolveBinding). */
+    bindings: z
+      .array(
+        z
+          .object({ env: serviceEnvKeySchema, workload: serviceNameSchema })
+          .strict()
+      )
+      .max(16)
+      .default([]),
+    /**
+     * Secret KEY NAMES (value-free) the operator delivers to an `app` from the node's own OpenBao
+     * bucket: the `cogni-node-app-v1` profile keys plus the catalog entries whose `workloads` names the
+     * app service (task.5405, bug.5254). Set by the operator when it lowers a declaration at a source sha, NEVER by a
+     * manifest. Absent = the profile keys only. Operator/fleet credentials are refused at lowering.
+     */
+    secretKeys: z.array(serviceEnvKeySchema).max(64).optional(),
+    /**
+     * `worker`: a sibling service of the node (for example a code-execution sandbox) that is NOT the node
+     * app. It gets ONLY its own declared secrets (never the `cogni-node-app-v1` profile: no database, auth
+     * or LLM credentials) and starts without the node-app database trust wrapper. Set by the operator when
+     * it lowers a declaration (the repo-spec names the workload's service with no runtime profile, beside a
+     * distinct node-app service), NEVER by a manifest. Absent = the node app.
+     */
+    runtimeProfile: z.literal("worker").optional(),
+    /**
+     * The node's own hard placement set for THIS release's env (story.5141): ISO 3166-1 alpha-2, from the
+     * manifest's `cogni.dev/placement-countries-<env>`, else `cogni.dev/placement-countries`. Set by the
+     * operator when it lowers a manifest at a source sha, so the release pins it (CD3). App only. Absent =
+     * the node declares no set.
+     */
+    placement: z
+      .object({
+        requiredCountryCodes: z
+          .array(z.string().regex(/^[A-Z]{2}$/))
+          .min(1)
+          .max(32)
+          .refine((codes) => new Set(codes).size === codes.length, {
+            message: "country codes must be unique",
+          }),
+      })
+      .strict()
+      .optional(),
+    /** REQUIRED, no default (CD6): does this workload do work only one live instance may do? */
+    exclusive: z.boolean(),
+    health: z
+      .object({
+        version: workloadHealthPathSchema,
+        ready: workloadHealthPathSchema,
+        qualification: z
+          .object({
+            path: workloadHealthPathSchema,
+            timeoutMs: z.number().int().min(1).max(20000),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .superRefine((w, ctx) => {
+    const http = "http" in w.expose;
+    const companions = w.companions ?? [];
+    const plan = w.artifactPlan;
+    if (plan && !!plan.bundleDigest !== !!plan.selectedImages)
+      ctx.addIssue({
+        code: "custom",
+        path: ["artifactPlan"],
+        message: "bundle identity and digest set must be sealed together",
+      });
+    if (plan?.bundleDigest && plan.selectedImages) {
+      const actual = Object.fromEntries([
+        [w.serviceName ?? w.name, w.image],
+        ...companions.map((c) => [c.name, c.image]),
+      ]);
+      if (
+        w.imagePending ||
+        companions.some((c) => c.imagePending) ||
+        JSON.stringify(Object.entries(actual).sort()) !==
+          JSON.stringify(Object.entries(plan.selectedImages).sort())
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["artifactPlan"],
+          message: "accepted digest set must match every selected service",
+        });
+    }
+    if (companions.length && (!w.health?.qualification || w.kind !== "app"))
+      ctx.addIssue({
+        code: "custom",
+        path: ["companions"],
+        message: "private companions require app qualification",
+      });
+    if (
+      new Set(companions.map((c) => c.name)).size !== companions.length ||
+      companions.some((c) => c.name === (w.serviceName ?? w.name))
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["companions"],
+        message: "service names must be unique",
+      });
+    for (const c of companions) {
+      if (
+        !(
+          c.imagePending ? pendingWorkloadImageSchema : workloadImageSchema
+        ).safeParse(c.image).success
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["companions", c.name, "image"],
+          message: "invalid companion image",
+        });
+    }
+    const imageSchema = w.imagePending
+      ? pendingWorkloadImageSchema
+      : workloadImageSchema;
+    const imageCheck = imageSchema.safeParse(w.image);
+    if (!imageCheck.success)
+      ctx.addIssue({
+        code: "custom",
+        path: ["image"],
+        message:
+          imageCheck.error.issues[0]?.message ?? "invalid workload image",
+      });
+    if (w.imagePending && w.kind !== "app")
+      ctx.addIssue({
+        code: "custom",
+        path: ["imagePending"],
+        message: "only an app workload can carry a pending image",
+      });
+    if (w.kind === "app" && !http)
+      ctx.addIssue({
+        code: "custom",
+        path: ["expose"],
+        message: "an app workload must expose an http host",
+      });
+    if (w.kind === "state" && http)
+      ctx.addIssue({
+        code: "custom",
+        path: ["expose"],
+        message: "a state workload must expose a global tcp port",
+      });
+    if (w.kind === "app" && !w.health)
+      ctx.addIssue({
+        code: "custom",
+        path: ["health"],
+        message: "an app workload must declare health {version, ready}",
+      });
+    if (w.kind === "state" && w.placement)
+      ctx.addIssue({
+        code: "custom",
+        path: ["placement"],
+        message: "only an app workload carries a placement set",
+      });
+    if (w.kind === "state" && w.bindings.length > 0)
+      ctx.addIssue({
+        code: "custom",
+        path: ["bindings"],
+        message: "a state workload cannot consume bindings",
+      });
+    if (w.kind === "state" && !w.persistent)
+      ctx.addIssue({
+        code: "custom",
+        path: ["persistent"],
+        message: "a state workload must declare persistent storage",
+      });
+  });
+
+export type NodeWorkloadSpec = z.infer<typeof nodeWorkloadSpecSchema>;
 
 /**
  * App-tier workload declaration. Exactly one service owns public ingress; all
@@ -434,17 +762,6 @@ export const nodeDeploymentSchema = z
         });
       } else {
         artifactsByName.set(service.artifact.name, service.artifact);
-      }
-      const bindingKeys = new Set(Object.keys(service.bindings));
-      const conflictingSecret = service.secret_refs.find((ref) =>
-        bindingKeys.has(ref.key)
-      );
-      if (conflictingSecret) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["services", index, "secret_refs"],
-          message: `${conflictingSecret.key} cannot be both a sibling binding and a secret ref`,
-        });
       }
     });
     if (
@@ -1027,6 +1344,13 @@ export const repoSpecSchema = z
      * author migration.
      */
     deployment: nodeDeploymentSchema.optional(),
+
+    /**
+     * Retired (bug.5254): refused with a fixed message. A node secret is declared once, in
+     * `.cogni/secrets-catalog.yaml` with `workloads`. Declared here (and not left to `.passthrough()`) so a
+     * stale repo-spec fails loudly instead of its keys being silently dropped.
+     */
+    secret_refs: retiredSecretRefsSchema,
 
     /** Provider-neutral state substrate requested by this sovereign node. */
     state: nodeStateSpecSchema.optional(),

@@ -17,9 +17,8 @@
  */
 
 import { NextResponse } from "next/server";
-import { dispatchLaneOnboard } from "@/app/_facades/deploy/lane-onboard.server";
 import { dispatchNodePreviewPromote } from "@/app/_facades/deploy/node-preview-promote.server";
-import { dispatchPrReview } from "@/app/_facades/review/dispatch.server";
+import { dispatchQueueReviewVerdict } from "@/app/_facades/review/queue-verdict.server";
 import {
   getContainer,
   resolveAttributionProfileResolver,
@@ -301,23 +300,18 @@ export async function POST(
       );
     }
 
-    // 5. Dispatches after successful verification. Review hooks remain async, but node
-    // preview promotion is awaited through native workflow-run identity: this webhook is not
-    // acknowledged until the deploy-plane write is observed (bug.5010).
-    if (source === "github" && eventType === "pull_request") {
-      dispatchPrReview(verified.payload, env, log);
-      // Env-membership merge → lane reconcile: the `POST /nodes/{id}/envs` verb's own PR
-      // landing is what provisions the lane's substrate (as its custodian) and renders its
-      // desired state. Matches only that verb's branch on the parent monorepo; every other
-      // merge no-ops (task.5132).
-      dispatchLaneOnboard(verified.payload, env, log);
-    }
-
+    // 5. Dispatches after successful verification. Node preview promotion is awaited through
+    // native workflow-run identity: this webhook is not acknowledged until the deploy-plane write
+    // is observed (bug.5010). REVIEW_IS_DEV_TRIGGERED (story.5102): no webhook event starts a PR
+    // review — only POST /api/v1/vcs/review does.
     if (source === "github" && eventType === "push") {
       // A default-branch push is the merge-queue-safe node preview signal. GitHub may omit the
       // pull_request closed/merged delivery for a queued merge (Poly #65); the canonical main
       // advance still identifies the exact on-main SHA.
       await dispatchNodePreviewPromote(verified.payload, env, log);
+      // A merge-queue branch push carries the PR head's review verdict onto the queue commit, so
+      // the review can be a GitHub-required check (task.5438). Ignores every other push.
+      await dispatchQueueReviewVerdict(verified.payload, env, log);
     }
 
     if (source === "alchemy") {
@@ -377,14 +371,6 @@ export async function POST(
       { source, eventType, error: String(error) },
       "webhook ingestion failed"
     );
-
-    if (
-      verifiedPayload !== null &&
-      source === "github" &&
-      eventType === "pull_request"
-    ) {
-      dispatchPrReview(verifiedPayload, env, log);
-    }
 
     if (verifiedPayload !== null && source === "alchemy") {
       dispatchSignalExecution(verifiedPayload, env, log);

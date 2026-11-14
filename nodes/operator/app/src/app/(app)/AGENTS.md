@@ -30,13 +30,20 @@ Protected (authenticated) pages wrapped in `SidebarProvider` + `AppSidebar` + `A
 ## Public Surface
 
 - **Exports:** none
-- **Routes:** `/chat`, `/dashboard`, `/work`, `/work/items/[id]`, `/activity`, `/knowledge`, `/gov`, `/credits`, `/nodes`, `/schedules`, `/setup`, `/identity/attest`
+- **Routes:** `/chat`, `/dashboard`, `/work`, `/work/items/[id]`, `/activity`, `/knowledge`, `/metrics`, `/gov`, `/credits`, `/nodes`, `/schedules`, `/schedules/[scheduleId]`, `/setup`, `/identity/attest`
 - **Files considered API:** `layout.tsx`
 
 ## Responsibilities
 
-- This directory **does**: Render the sidebar layout shell (sidebar + top bar + content area) for routes protected by `src/proxy.ts`.
+- This directory **does**: Render the sidebar layout shell (sidebar + top bar + content area) for routes protected by `src/proxy.ts`. It also mounts the one entry side sheet (`EntityPeekProvider`) that linked knowledge entries open in (bug.0011).
 - This directory **does not**: Handle sign-in/sign-out flows, contain business logic, manage session persistence.
+
+## Package mounts
+
+- `/work` reads bounded pages only (task.0056): the board is `useWorkBoard` over `/api/v1/work/board`, the table is `useWorkTablePage` over `/api/v1/work/summaries`; nothing here walks cursors.
+- The Knowledge Goals tab renders only the published `@cogni/knowledge-base-ui/goals` board through `knowledge/_components/GoalsMount.tsx` (story.0021); the app owns no Goals markup, chart or formatter.
+- `/metrics` (story.0016) renders the published `MetricsBoard` (goals, then KPIs, then metrics, drawn with the shared `MetricCard`) through `metrics/_components/MetricsMount.tsx`; every Goals mount (Metrics page, Knowledge Goals tab, work views) shares `_components/goals-host.ts`, so the goal read is one cache entry.
+- `/work` wraps the dashboard in `WorkGoalsMount` (task.0112): the table's Goal column, the board's goal pointer and the detail sheet's Moves block (`WorkMoveLinks`, `WorkExpectations` over `/api/v1/work/items/[id]/expectations`) resolve goals from that one read.
 
 ## Usage
 

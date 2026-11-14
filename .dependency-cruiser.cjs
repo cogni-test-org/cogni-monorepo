@@ -20,6 +20,7 @@ const srcLayers = {
   bootstrap: "^nodes/operator/app/src/bootstrap",
   lib: "^nodes/operator/app/src/lib",
   auth: "^nodes/operator/app/src/auth\\.ts$",
+  instrumentation: "^nodes/operator/app/src/instrumentation(?:\\.node)?\\.ts$",
   proxy: "^nodes/operator/app/src/proxy\\.ts$",
   components: "^nodes/operator/app/src/components",
   styles: "^nodes/operator/app/src/styles",
@@ -61,6 +62,22 @@ module.exports = {
   allowedSeverity: "error",
 
   allowed: [
+    // Next's Edge-safe entry loads its Node-only instrumentation module.
+    {
+      from: { path: "^nodes/operator/app/src/instrumentation\\.ts$" },
+      to: { path: [layers.instrumentation] },
+    },
+    // Node startup may invoke only the local admission composition bridge.
+    {
+      from: { path: "^nodes/operator/app/src/instrumentation\\.node\\.ts$" },
+      to: {
+        path: [
+          layers.instrumentation,
+          "^nodes/operator/app/src/bootstrap/startup-preflight\\.ts$",
+        ],
+      },
+    },
+
     // core → core, types
     {
       from: { path: layers.core },
@@ -342,7 +359,7 @@ module.exports = {
       name: "no-internal-adapter-imports",
       severity: "error",
       from: {
-        path: "^nodes/operator/app/src/(?!adapters/server/)(?!auth\\.ts$)(?!bootstrap/container\\.ts$)(?!bootstrap/graph-executor\\.factory\\.ts$)(?!bootstrap/agent-discovery\\.ts$)(?!bootstrap/jobs/(syncGovernanceSchedules|reconcileCatalogNodeRegistry)\\.job\\.ts$)",
+        path: "^nodes/operator/app/src/(?!adapters/server/)(?!auth\\.ts$)(?!bootstrap/container\\.ts$)(?!bootstrap/graph-executor\\.factory\\.ts$)(?!bootstrap/agent-discovery\\.ts$)(?!bootstrap/node-deploy-sequencer\\.ts$)(?!bootstrap/jobs/(syncGovernanceSchedules|reconcileCatalogNodeRegistry)\\.job\\.ts$)",
       },
       to: {
         path: "^nodes/operator/app/src/adapters/server/(?!index\\.ts$).*\\.ts$",
@@ -352,7 +369,35 @@ module.exports = {
         "Exempt: auth.ts (bootstrap), container.ts (trust boundaries), " +
         "graph-executor.factory.ts + agent-discovery.ts (sandbox subpath imports " +
         "to avoid Turbopack bundling dockerode native addon chain), " +
+        "node-deploy-sequencer.ts (narrowed by node-deploy-sequencer-headscale-only), " +
         "allowlisted bootstrap jobs (need serviceDb for advisory locks).",
+    },
+
+    // task.5431: the Headscale gRPC client stays out of the @/adapters/server barrel (the Next app imports
+    // it). The sequencer bootstrap may import exactly that one adapter file by path, and only it may.
+    {
+      name: "node-deploy-sequencer-headscale-only",
+      severity: "error",
+      from: {
+        path: "^nodes/operator/app/src/bootstrap/node-deploy-sequencer\\.ts$",
+      },
+      to: {
+        path: "^nodes/operator/app/src/adapters/server/(?!index\\.ts$)(?!node-deploy/headscale\\.adapter\\.ts$).*\\.ts$",
+      },
+      comment:
+        "The node-deploy sequencer bootstrap imports adapters from @/adapters/server, except the Headscale socket adapter, which stays out of the barrel.",
+    },
+    {
+      name: "headscale-adapter-sequencer-root-only",
+      severity: "error",
+      from: {
+        path: "^nodes/operator/app/src/(?!bootstrap/node-deploy-sequencer\\.ts$)(?!adapters/server/node-deploy/headscale)(?!.*\\.test\\.ts$)",
+      },
+      to: {
+        path: "^nodes/operator/app/src/adapters/server/node-deploy/headscale\\.adapter\\.ts$",
+      },
+      comment:
+        "Only the node-deploy sequencer bootstrap imports the Headscale socket adapter (never the @/adapters/server barrel).",
     },
 
     // adapters/test: must use @/adapters/test (index.ts), not internal files

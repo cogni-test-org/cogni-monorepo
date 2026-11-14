@@ -14,9 +14,23 @@
  * @public
  */
 
-import { HttpLangfuseReader, HttpLokiReader } from "@/adapters/server";
-import type { LangfuseReaderPort, LokiReaderPort } from "@/ports";
+import { createHash } from "node:crypto";
+import {
+  createGrafanaMimirAdapter,
+  HttpLangfuseGatewayReceiptVerifier,
+  HttpLangfuseOwnershipVerifier,
+  HttpLangfuseReader,
+  HttpLangfuseRootOwnershipVerifier,
+  HttpLokiReader,
+} from "@/adapters/server";
+import type {
+  LangfuseReaderPort,
+  LokiReaderPort,
+  MetricsQueryPort,
+} from "@/ports";
+import { getNodeId } from "@/shared/config/repoSpec.server";
 import { serverEnv } from "@/shared/env";
+import { TokenBucketRateLimiter } from "./http/rateLimiter";
 
 /** The operator's Loki reader, or null when `GRAFANA_URL`/`GRAFANA_SERVICE_ACCOUNT_TOKEN` are unset. */
 export function createLokiReader(): LokiReaderPort | null {
@@ -28,6 +42,36 @@ export function createLokiReader(): LokiReaderPort | null {
     grafanaUrl: env.GRAFANA_URL,
     token: env.GRAFANA_SERVICE_ACCOUNT_TOKEN,
   });
+}
+
+/**
+ * The operator's Mimir (Prometheus) instant reader for the substrate host-pressure goal calculator (bug.5613),
+ * or null when `GRAFANA_URL`/`GRAFANA_SERVICE_ACCOUNT_TOKEN` are unset. It reads through the governed Grafana
+ * datasource proxy (`createGrafanaMimirAdapter`). Datasource discovery runs on first use, not at boot, and a failed
+ * discovery is retried on the next read, so a Grafana outage at startup cannot pin the reader broken.
+ */
+export function createGoalPrometheusReader(): Pick<
+  MetricsQueryPort,
+  "queryInstant"
+> | null {
+  const env = serverEnv();
+  const { GRAFANA_URL: grafanaUrl, GRAFANA_SERVICE_ACCOUNT_TOKEN: token } = env;
+  if (!grafanaUrl || !token) {
+    return null;
+  }
+  let adapter: ReturnType<typeof createGrafanaMimirAdapter> | undefined;
+  const get = () => {
+    adapter ??= createGrafanaMimirAdapter({
+      grafanaUrl,
+      bearerToken: token,
+      timeoutMs: 10_000,
+    }).catch((error: unknown) => {
+      adapter = undefined;
+      throw error;
+    });
+    return adapter;
+  };
+  return { queryInstant: async (params) => (await get()).queryInstant(params) };
 }
 
 /** Langfuse Cloud default — the writer (LangfuseAdapter/SDK) falls back here when LANGFUSE_BASE_URL is unset. */
@@ -47,5 +91,42 @@ export function createLangfuseReader(): LangfuseReaderPort | null {
     baseUrl: env.LANGFUSE_BASE_URL ?? LANGFUSE_DEFAULT_BASE_URL,
     publicKey: env.LANGFUSE_PUBLIC_KEY,
     secretKey: env.LANGFUSE_SECRET_KEY,
+    operatorNodeId: getNodeId(),
+    ...(env.DEPLOY_ENVIRONMENT
+      ? { operatorEnvironment: env.DEPLOY_ENVIRONMENT }
+      : {}),
+    ...(env.GRAFANA_URL && env.GRAFANA_SERVICE_ACCOUNT_TOKEN
+      ? {
+          rootOwnership: new HttpLangfuseRootOwnershipVerifier({
+            grafanaUrl: env.GRAFANA_URL,
+            token: env.GRAFANA_SERVICE_ACCOUNT_TOKEN,
+          }),
+          laneReceipts: new HttpLangfuseGatewayReceiptVerifier({
+            grafanaUrl: env.GRAFANA_URL,
+            token: env.GRAFANA_SERVICE_ACCOUNT_TOKEN,
+          }),
+        }
+      : {}),
+    ownership: new HttpLangfuseOwnershipVerifier({
+      baseUrl: env.LITELLM_BASE_URL,
+      apiKey: env.LITELLM_MASTER_KEY,
+      operatorNodeId: getNodeId(),
+      operatorMasterKeyHash: createHash("sha256")
+        .update(env.LITELLM_MASTER_KEY)
+        .digest("hex"),
+      ...(env.DEPLOY_ENVIRONMENT
+        ? { operatorEnvironment: env.DEPLOY_ENVIRONMENT }
+        : {}),
+    }),
   });
+}
+
+// Per-node, per-process bound. A replica has an independent bucket, matching the existing limiter.
+const traceReadLimiter = new TokenBucketRateLimiter({
+  maxTokens: 10,
+  refillRate: 10 / 60,
+  burstSize: 5,
+});
+export function consumeTraceReadBudget(nodeId: string): boolean {
+  return traceReadLimiter.consume(nodeId);
 }

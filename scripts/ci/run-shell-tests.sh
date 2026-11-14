@@ -40,7 +40,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TESTS_DIR="$REPO_ROOT/scripts/ci/tests"
 
 MUTATORS=(
-  render-node-overlays.test.sh # hand-stales infra/k8s/overlays + `git checkout` restore
 )
 
 PARALLEL=(
@@ -51,12 +50,14 @@ PARALLEL=(
   openbao-clobber-proof.test.sh
   secrets-fanout.test.sh
   secret-materialize.test.sh
+  openbao-kv-http-read.test.sh
+  runtime-watchdog-maintenance.test.sh
   reconcile-node-substrate.test.sh
+  externalsecret-refresh.test.sh
   run-node-substrate.test.sh
   ssh-transport-retry.test.sh
   assert-target-substrate.test.sh
   resolve-remote-source-sha.test.sh
-  compute-workload-manifest-file.test.sh
   render-caddyfile.test.sh
   reconcile-edge-caddy.test.sh
   reconcile-node-dns.test.sh
@@ -82,6 +83,7 @@ PARALLEL=(
   lane-db-residency.test.sh
   lane-db-resolver.test.sh
   lane-db-dsn-host.test.sh
+  doltgres-lane-residency.test.sh
 )
 
 MAX_JOBS="${SHELL_TESTS_JOBS:-$(nproc 2>/dev/null || echo 4)}"

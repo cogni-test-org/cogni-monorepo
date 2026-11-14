@@ -41,11 +41,11 @@ import type { IdentityAttestationGithubIdentity } from "@/ports";
 import { serverEnv } from "@/shared/env";
 import { importAttestationSigningKey } from "@/shared/identity/attestation-keys";
 import { ATTESTATION_RETURN_PATHS } from "@/shared/identity/broker-config";
-import { baseDomain } from "@/shared/node-registry/resolve";
 
 export type AttestationBrokerErrorCode =
   | "attestation_unavailable"
   | "invalid_return_to"
+  | "invalid_target_origin"
   | "unknown_node";
 
 export class AttestationBrokerError extends Error {
@@ -89,17 +89,14 @@ export function validateAttestationReturnTo(
 
 interface BrokerConfig {
   issuer: string;
-  domain: string;
   signingKey: KeyObject;
 }
 
 function resolveBrokerConfig(): BrokerConfig {
   const env = serverEnv();
   const issuer = canonicalOrigin(env.APP_BASE_URL);
-  const domain = baseDomain(env);
   if (
     !issuer ||
-    !domain ||
     !env.IDENTITY_ATTESTATION_PRIVATE_KEY ||
     !env.NODE_SUBMODULE_PARENT_OWNER ||
     !env.NODE_SUBMODULE_PARENT_REPO ||
@@ -111,7 +108,6 @@ function resolveBrokerConfig(): BrokerConfig {
   try {
     return {
       issuer,
-      domain,
       signingKey: importAttestationSigningKey(
         env.IDENTITY_ATTESTATION_PRIVATE_KEY
       ),
@@ -123,11 +119,11 @@ function resolveBrokerConfig(): BrokerConfig {
 
 function mapPreconditionError(error: unknown): never {
   if (error instanceof AttestationPreconditionError) {
-    throw new AttestationBrokerError(
-      error.code === "invalid_target_origin" ? "invalid_return_to" : error.code
-    );
+    // Pass the precondition code through: "this origin is not registered for the node" is a
+    // different fault from "return_to is malformed" and needs its own error page (bug.5596).
+    throw new AttestationBrokerError(error.code);
   }
-  throw error;
+  throw new AttestationBrokerError("attestation_unavailable");
 }
 
 /**
@@ -148,12 +144,11 @@ export async function resolveAttestationTarget(params: {
     throw new AttestationBrokerError("invalid_return_to");
   }
 
-  const service = createIdentityAttestationService(
-    resolveIdentityAttestationDependencies(config.signingKey)
-  );
   try {
+    const service = createIdentityAttestationService(
+      resolveIdentityAttestationDependencies(config.signingKey)
+    );
     const node = await service.resolveNode({
-      domain: config.domain,
       request: params.request,
     });
     return { node, safeReturnTo };
@@ -187,7 +182,6 @@ export async function issueBrowserIdentityAttestation(params: {
     const issued = await service.issue({
       github: params.github,
       issuer: config.issuer,
-      domain: config.domain,
       request: params.request,
     });
     return {

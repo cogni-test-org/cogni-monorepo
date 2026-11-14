@@ -9,6 +9,9 @@
  *   - Per WORKER_IS_DUMB: domain logic lives here, not in activities
  *   - All inputs/outputs are plain serializable objects
  *   - Formatting matches cogni-git-review markdown conventions
+ *   - UNFUNDED_IS_NOT_A_VERDICT (bug.5626): a run the provider refused for lack of credit reports
+ *     `couldNotEvaluate: "unfunded"` and the check title says so, distinct from a model failure
+ *     (`graph_failed`). It is still a non-evaluation, never a pass or a neutral verdict.
  *   - Routing-diagnostic wording mirrors docs/spec/node-ci-cd-contract.md
  *     § Single-Domain Scope > Diagnostic contract: name conflicting domains,
  *     name operator-territory paths, suggest the split, link the spec.
@@ -49,6 +52,12 @@ export interface GateResult {
 export interface ReviewResult {
   readonly conclusion: GateStatus;
   readonly gateResults: readonly GateResult[];
+  /**
+   * COULD_NOT_EVALUATE_IS_NOT_NEUTRAL (story.5102): set when the run did not evaluate (graph
+   * failed, no structured output, missing rule, uncited verdict, head moved). With
+   * `fail_on_error: true` the conclusion is then `fail`, never `neutral`.
+   */
+  readonly couldNotEvaluate?: string;
 }
 
 export interface EvidenceBundle {
@@ -67,14 +76,143 @@ export interface EvidenceBundle {
   readonly totalDiffBytes: number;
 }
 
-/** Structured output from the pr-review graph's LLM evaluation. */
+/**
+ * Structured output from the pr-review graph. `metrics`/`summary`/`insufficientEvidence` come
+ * from the model (`evaluation-output` schema); `evidence`, `uncited` and `buildSha` are HOST
+ * fields the graph's finalize node adds from the run's own tool results — never model-written.
+ */
 export interface EvaluationOutput {
   metrics: Array<{
     metric: string;
     value: number;
     observations: string[];
+    /** Hub entry ids this metric's verdict rests on (VERDICT_CITES_WHAT_IT_READ). */
+    citations?: string[];
   }>;
   summary: string;
+  /** The model reports it lacked the evidence to judge. */
+  insufficientEvidence?: boolean;
+  /** Host: files read with content and hub/work entries whose bodies were returned this run. */
+  evidence?: { files: string[]; entries: string[] };
+  /** Host: a failing hub metric cited nothing the run read, or evidence was insufficient. */
+  uncited?: boolean;
+  /** Host: the run read no file with content (a verdict without code is not an evaluation). */
+  noCodeRead?: boolean;
+  /** Host: the run read no hub entry body (a verdict without a rule read is not an evaluation). */
+  noHubRead?: boolean;
+  /** Host: serving operator build that ran the graph. */
+  buildSha?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Machine-readable check block (CHECK_IS_REQUEST_BOUND, story.5102)
+// ---------------------------------------------------------------------------
+
+/** Marker that precedes the one fenced JSON block at the end of a review check summary. */
+export const REVIEW_RESULT_MARKER = "<!-- cogni-review-result v1 -->";
+
+/** The machine-readable review block. Graders read ONLY this, never the prose. */
+export interface ReviewResultBlock {
+  readonly requestId: string;
+  /** Serving operator build (stamped by the operator, not the worker). */
+  readonly buildSha: string | null;
+  readonly model: string;
+  readonly conclusion: "success" | "failure" | "neutral";
+  /** Set when the run could not evaluate; the reason code. */
+  readonly couldNotEvaluate: string | null;
+  /** Hub entry ids the model cited (union over metrics), unfiltered. */
+  readonly citations: readonly string[];
+  readonly evidence: {
+    readonly files: readonly string[];
+    readonly entries: readonly string[];
+  };
+}
+
+/** Render the block that ends a check summary: marker + one fenced JSON object. */
+export function formatReviewResultBlock(block: ReviewResultBlock): string {
+  return `\n${REVIEW_RESULT_MARKER}\n\`\`\`json\n${JSON.stringify(block)}\n\`\`\`\n`;
+}
+
+/** GitHub's check-run `output.summary` limit (characters). */
+export const CHECK_SUMMARY_MAX_CHARS = 65_535;
+/** Each machine-block list is capped so the block itself stays small. */
+export const REVIEW_BLOCK_LIST_CAP = 50;
+/** The machine block never exceeds this many characters; its lists shrink until it fits. */
+export const REVIEW_BLOCK_MAX_CHARS = 16_384;
+
+/**
+ * Render the machine block within REVIEW_BLOCK_MAX_CHARS (or `maxChars`, if smaller). Strings are
+ * capped at 300 chars and lists at REVIEW_BLOCK_LIST_CAP, then the lists are halved until the
+ * block fits. Items are dropped whole, never cut mid-string, so the block is always valid JSON.
+ */
+function boundedReviewBlock(
+  block: ReviewResultBlock,
+  maxChars: number
+): string {
+  const budget = Math.min(REVIEW_BLOCK_MAX_CHARS, maxChars);
+  const str = (x: string) => x.slice(0, 300);
+  // CITED_AND_READ_FIRST: ids that are both cited and read lead both lists, so no cap can
+  // drop the evidence a grader checks.
+  const read = new Set(block.evidence.entries);
+  const cited = new Set(block.citations);
+  const lead = (xs: readonly string[], keep: Set<string>) => [
+    ...xs.filter((x) => keep.has(x)),
+    ...xs.filter((x) => !keep.has(x)),
+  ];
+  const citations = lead(block.citations, read);
+  const entries = lead(block.evidence.entries, cited);
+  const render = (cap: number) => {
+    const list = (xs: readonly string[]) => xs.slice(0, cap).map(str);
+    return formatReviewResultBlock({
+      requestId: str(block.requestId),
+      buildSha: block.buildSha === null ? null : str(block.buildSha),
+      model: str(block.model),
+      conclusion: block.conclusion,
+      couldNotEvaluate:
+        block.couldNotEvaluate === null ? null : str(block.couldNotEvaluate),
+      citations: list(citations),
+      evidence: {
+        files: list(block.evidence.files),
+        entries: list(entries),
+      },
+    });
+  };
+  let cap = REVIEW_BLOCK_LIST_CAP;
+  let tail = render(cap);
+  while (tail.length > budget && cap > 0) {
+    cap = Math.floor(cap / 2);
+    tail = render(cap);
+  }
+  return tail;
+}
+
+/**
+ * Compose a check summary that fits GitHub's limit: the machine block is bounded
+ * (boundedReviewBlock) and kept intact at the end; the prose is truncated first.
+ */
+export function composeCheckSummary(
+  prose: string,
+  block: ReviewResultBlock | undefined,
+  maxChars: number = CHECK_SUMMARY_MAX_CHARS
+): string {
+  const tail = block ? boundedReviewBlock(block, maxChars) : "";
+  const room = maxChars - tail.length;
+  if (prose.length <= room) return prose + tail;
+  const marker = "\n\n… (summary truncated)\n";
+  return prose.slice(0, Math.max(0, room - marker.length)) + marker + tail;
+}
+
+/** Union of every metric's citations, in first-seen order. */
+export function collectCitations(
+  structured: EvaluationOutput | undefined
+): string[] {
+  const out = new Set<string>();
+  for (const m of structured?.metrics ?? []) {
+    for (const id of m.citations ?? []) {
+      if (typeof id === "string" && id.length > 0) out.add(id);
+    }
+  }
+  return [...out];
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +380,16 @@ export function aggregateGateStatuses(
 // Markdown Formatting (pure string rendering)
 // ---------------------------------------------------------------------------
 
+/** couldNotEvaluate reason for a run the provider refused because its account is out of credit. */
+export const COULD_NOT_EVALUATE_UNFUNDED = "unfunded";
+
+/** Check-run title for a run that did not evaluate (UNFUNDED_IS_NOT_A_VERDICT). */
+export function couldNotEvaluateTitle(reason: string | undefined): string {
+  return reason === COULD_NOT_EVALUATE_UNFUNDED
+    ? "PR Review: COULD NOT EVALUATE \u2014 provider out of credit"
+    : "PR Review: COULD NOT EVALUATE";
+}
+
 function verdictLabel(status: GateStatus): string {
   switch (status) {
     case "pass":
@@ -309,6 +457,16 @@ export function formatCheckRunSummary(
 
   if (opts?.daoBaseUrl && result.conclusion === "fail") {
     lines.push(`[Propose DAO Vote to Merge](${opts.daoBaseUrl})\n\n---\n`);
+  }
+
+  if (result.couldNotEvaluate) {
+    const why =
+      result.couldNotEvaluate === COULD_NOT_EVALUATE_UNFUNDED
+        ? " The model provider is out of credit."
+        : "";
+    lines.push(
+      `**COULD NOT EVALUATE** \u2014 \`${result.couldNotEvaluate}\`.${why} The review did not judge this PR; re-run it with POST /api/v1/vcs/review.\n`
+    );
   }
 
   lines.push(`**${verdictLabel(result.conclusion)}**\n`);

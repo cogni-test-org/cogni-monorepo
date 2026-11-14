@@ -4,70 +4,33 @@
 /**
  * Module: `@app/(app)/_components/EntityCitationLinks`
  * Purpose: Render depth-1 citation edges for a knowledge or work-item endpoint
- *   as compact clickable chips.
- * Scope: Protected app presentation plus React Query fetch. No write policy.
+ *   as the package's arrow, relation and slug rows.
+ * Scope: Node routing and transport only; links open entries in the side sheet. Presentation and paging live in
+ *   `@cogni/knowledge-base-ui` `CitationLinks`.
  * Side-effects: IO (GET /api/v1/citations/:id via fetchCitationLinks)
  * @internal
  */
 
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
-import Link from "next/link";
+import { CitationLinks } from "@cogni/knowledge-base-ui";
 import type { ReactElement } from "react";
 
-import { Badge } from "@/components";
-import {
-  type CitationLinkDto,
-  fetchCitationLinks,
-} from "../_api/fetchCitationLinks";
+import { fetchCitationLinks } from "../_api/fetchCitationLinks";
+import { PeekLink } from "./EntityPeek";
 
 interface EntityCitationLinksProps {
   readonly entityId: string;
 }
 
-function otherEndpoint(link: CitationLinkDto, entityId: string) {
-  return link.source.id === entityId ? link.target : link.source;
-}
-
-function chipLabel(link: CitationLinkDto, entityId: string): string {
-  const endpoint = otherEndpoint(link, entityId);
-  return `${link.citationType} ${endpoint.title ?? endpoint.id}`;
-}
-
 export function EntityCitationLinks({
   entityId,
 }: EntityCitationLinksProps): ReactElement | null {
-  const query = useQuery({
-    queryKey: ["citation-links", entityId],
-    queryFn: () => fetchCitationLinks(entityId),
-    staleTime: 30_000,
-  });
-
-  const links = query.data?.links ?? [];
-  if (query.isLoading || query.error || links.length === 0) return null;
-
   return (
-    <div className="flex flex-col gap-1">
-      <span className="font-medium text-muted-foreground text-xs uppercase tracking-wider">
-        Links
-      </span>
-      <div className="flex flex-wrap gap-1.5">
-        {links.map((link) => {
-          const endpoint = otherEndpoint(link, entityId);
-          return (
-            <Link
-              key={`${link.direction}-${link.id}`}
-              href={endpoint.href}
-              title={endpoint.title ?? endpoint.id}
-            >
-              <Badge intent="outline" size="sm">
-                <span className="font-mono">{chipLabel(link, entityId)}</span>
-              </Badge>
-            </Link>
-          );
-        })}
-      </div>
-    </div>
+    <CitationLinks
+      entityId={entityId}
+      loadPage={fetchCitationLinks}
+      LinkComponent={PeekLink}
+    />
   );
 }

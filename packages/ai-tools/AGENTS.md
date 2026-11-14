@@ -43,7 +43,7 @@ Pure tool definitions for AI agent execution. Defines `ToolContract`, `ToolImple
   - `ToolImplementation` - Pure execute function interface
   - `BoundTool` - Contract + implementation bundled together
   - `CatalogBoundTool` - Type alias for TOOL_CATALOG entries (type-erased BoundTool)
-  - `ToolResult`, `ToolErrorCode` - Execution result types
+  - `ToolResult`, `ToolErrorCode` - Execution result types, including bounded nonretryable lookup receipts
   - `getCurrentTimeBoundTool`, `GET_CURRENT_TIME_NAME` - Time tool
   - `metricsQueryBoundTool`, `METRICS_QUERY_NAME`, `createMetricsQueryImplementation` - Metrics query tool
   - `webSearchBoundTool`, `WEB_SEARCH_NAME`, `createWebSearchImplementation` - Web search tool
@@ -60,13 +60,16 @@ Pure tool definitions for AI agent execution. Defines `ToolContract`, `ToolImple
   - `vcsCreateBranchBoundTool`, `VCS_CREATE_BRANCH_NAME`, `createVcsCreateBranchImplementation` - VCS create branch tool
   - `vcsFlightCandidateBoundTool`, `VCS_FLIGHT_CANDIDATE_NAME`, `createVcsFlightCandidateImplementation` - VCS dispatch candidate-flight tool (NO_AUTO_FLIGHT)
   - `VcsCapability`, `CiStatusResult`, `MergeResult`, `PrSummary`, `CreateBranchResult`, `CheckInfo`, `DispatchCandidateFlightResult` - VCS capability types
-  - `workItemQueryBoundTool`, `WORK_ITEM_QUERY_NAME`, `createWorkItemQueryImplementation` - Work item query tool
+  - `workItemQueryBoundTool`, `WORK_ITEM_QUERY_NAME`, `createWorkItemQueryImplementation` - Work item query tool; `moves` is listed as stored, without readings (story.0033)
+  - `workItemReadBoundTool`, `WORK_ITEM_READ_NAME`, `createWorkItemReadImplementation` - One-item read tool; `item.moves` carries each move's pinned baseline, current reading and `moved` (as_declared, against, flat, unknown), added by the capability for a one-item read (story.0033, needs work-items ^0.10.0)
   - `workItemTransitionBoundTool`, `WORK_ITEM_TRANSITION_NAME`, `createWorkItemTransitionImplementation` - Work item transition tool
   - `WorkItemCapability`, `WorkItemInfo`, `WorkItemQueryParams`, `WorkItemTransitionResult` - Work item capability types
   - `knowledgeReadBoundTool`, `KNOWLEDGE_READ_NAME`, `createKnowledgeReadImplementation` - Knowledge read tool (read_only: get by id or list by domain+tags)
   - `knowledgeSearchBoundTool`, `KNOWLEDGE_SEARCH_NAME`, `createKnowledgeSearchImplementation` - Knowledge search tool (read_only: text search by domain+query)
   - `knowledgeWriteBoundTool`, `KNOWLEDGE_WRITE_NAME`, `createKnowledgeWriteImplementation` - Knowledge write tool (state_change: upsert + auto dolt_commit)
-  - `KnowledgeCapability`, `KnowledgeEntry`, `KnowledgeWriteParams`, `CONFIDENCE` - Knowledge capability types (see `@cogni/knowledge-store` for port + adapter)
+  - `goalListBoundTool`, `GOAL_LIST_NAME`, `createGoalListImplementation` - DAO goal list tool (read_only, requires `node.collaborate`: the node's approved `goal-*` atoms via `KnowledgeCapability.listActiveGoals`; never counted or truncated)
+  - `knowledgeIndexBoundTool`, `KNOWLEDGE_INDEX_NAME`, `createKnowledgeIndexImplementation` - Governing guidance index tool (read_only, requires `node.collaborate`: every governing row of the node's own hub via `KnowledgeCapability.listGoverningIndex`; id, domain, entryType, useWhen only)
+  - `KnowledgeCapability`, `KnowledgeEntry`, `KnowledgeWriteParams`, `GoverningIndexEntry`, `CONFIDENCE` - Knowledge capability types (see `@cogni/knowledge-store` for port + adapter)
   - `TOOL_CATALOG` - Package-wide lookup view for ai-tools entries (Record<string, CatalogBoundTool>); runtime exposure still comes from each node's composed bundle.
   - `CORE_TOOL_BUNDLE` - Cross-node core tool array safe for every node runtime; pass to createBoundToolSource. Poly node additionally imports POLY_TOOL_BUNDLE from `@cogni/poly-ai-tools`.
   - `VCS_TOOL_BUNDLE` - GitHub/VCS control-plane tools composed by operator runtimes only.

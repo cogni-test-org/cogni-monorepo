@@ -43,7 +43,7 @@ const authzState = vi.hoisted(() => ({
 // The route reads `nodes` then `billingAccounts` — distinguish by call order.
 // Inline the id literal: vi.hoisted runs before module-scope consts initialize.
 const dbState = vi.hoisted(() => ({
-  node: { id: "22222222-2222-4222-8222-222222222222", slug: "sigh" } as {
+  node: { id: "22222222-2222-4222-8222-222222222222", slug: "operator" } as {
     id: string;
     slug: string;
   } | null,
@@ -149,7 +149,7 @@ async function post(body: unknown): Promise<Response> {
 describe("POST /api/v1/deploy/promote", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    dbState.node = { id: NODE_ID, slug: "sigh" };
+    dbState.node = { id: NODE_ID, slug: "operator" };
     dbState.billing = { id: "billing-1" };
     dbState.call = 0;
     dbState.nodeQuery = undefined;
@@ -183,6 +183,19 @@ describe("POST /api/v1/deploy/promote", () => {
       workflowUrl: "https://github.com/test-owner/test-repo/actions",
       message: "Promote dispatched: sigh → production.",
     });
+  });
+
+  it("refuses a non-operator node with 409 node_on_deploy_verb before authz or dispatch (task.5411)", async () => {
+    dbState.node = { id: NODE_ID, slug: "poly" };
+    const res = await post({ nodeId: NODE_ID, env: "production" });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: "node_on_deploy_verb",
+      deployVerb: "POST /api/v1/deploy/workloads",
+    });
+    expect(authzState.check).not.toHaveBeenCalled();
+    expect(mockDeployPlane.promoteNode).not.toHaveBeenCalled();
+    expect(mockDeployPlane.promoteNodeFromPreview).not.toHaveBeenCalled();
   });
 
   it("records one bounded terminal failure when authorization throws", async () => {
@@ -278,7 +291,7 @@ describe("POST /api/v1/deploy/promote", () => {
       expect.objectContaining({
         parentOwner: "test-owner",
         parentRepo: "test-repo",
-        slug: "sigh",
+        slug: "operator",
         allowRollback: false,
       })
     );
@@ -295,7 +308,7 @@ describe("POST /api/v1/deploy/promote", () => {
         env: "production",
         parentOwner: "test-owner",
         parentRepo: "test-repo",
-        slug: "sigh",
+        slug: "operator",
         sourceSha,
         allowRollback: false,
       })
@@ -323,7 +336,7 @@ describe("POST /api/v1/deploy/promote", () => {
         env: "preview",
         parentOwner: "test-owner",
         parentRepo: "test-repo",
-        slug: "sigh",
+        slug: "operator",
         sourceSha,
         allowRollback: false,
       })
@@ -338,7 +351,7 @@ describe("POST /api/v1/deploy/promote", () => {
       owner: "test-owner",
       repo: "test-repo",
       env: "preview",
-      slug: "sigh",
+      slug: "operator",
     });
     expect(mockDeployPlane.promoteNodeFromPreview).not.toHaveBeenCalled();
   });
@@ -411,5 +424,112 @@ describe("POST /api/v1/deploy/promote", () => {
     });
     expect(mockDeployPlane.dispatchNodePromote).not.toHaveBeenCalled();
     expect(mockDeployPlane.promoteNodeFromPreview).not.toHaveBeenCalled();
+  });
+
+  it("passes `service` through on every promote path of the operator lane (CD5)", async () => {
+    const sourceSha = "0123456789012345678901234567890123456789";
+    expect(
+      (
+        await post({
+          nodeId: NODE_ID,
+          env: "production",
+          sourceSha,
+          service: "scheduler-worker",
+        })
+      ).status
+    ).toBe(200);
+    expect(mockDeployPlane.promoteNode).toHaveBeenCalledWith(
+      expect.objectContaining({
+        slug: "operator",
+        service: "scheduler-worker",
+        sourceSha,
+      })
+    );
+
+    dbState.call = 0; // the db mock answers by call order; one request per reset
+    expect(
+      (
+        await post({
+          nodeId: NODE_ID,
+          env: "production",
+          service: "scheduler-worker",
+        })
+      ).status
+    ).toBe(200);
+    expect(mockDeployPlane.promoteNodeFromPreview).toHaveBeenCalledWith(
+      expect.objectContaining({ slug: "operator", service: "scheduler-worker" })
+    );
+
+    dbState.call = 0;
+    expect(
+      (
+        await post({
+          nodeId: NODE_ID,
+          env: "preview",
+          service: "scheduler-worker",
+        })
+      ).status
+    ).toBe(200);
+    expect(mockDeployPlane.dispatchNodePromote).toHaveBeenCalledWith({
+      owner: "test-owner",
+      repo: "test-repo",
+      env: "preview",
+      slug: "operator",
+      service: "scheduler-worker",
+    });
+    // Same operator-node env gate; no new action.
+    expect(authzState.check).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "node.promote_production",
+        resource: `node:${NODE_ID}`,
+      })
+    );
+  });
+
+  it("omits `service` when the caller does not send it (default path unchanged)", async () => {
+    await post({ nodeId: NODE_ID, env: "production" });
+    const call = mockDeployPlane.promoteNodeFromPreview.mock.calls[0]?.[0];
+    expect(call).toBeDefined();
+    expect("service" in (call as object)).toBe(false);
+  });
+
+  it("refuses service on a non-operator node with 409 before authz or dispatch (CD4 refusal kept)", async () => {
+    dbState.node = { id: NODE_ID, slug: "poly" };
+    const res = await post({
+      nodeId: NODE_ID,
+      env: "production",
+      service: "scheduler-worker",
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "node_on_deploy_verb" });
+    expect(authzState.check).not.toHaveBeenCalled();
+    expect(mockDeployPlane.promoteNodeFromPreview).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed service name with 400 before any lookup", async () => {
+    const res = await post({
+      nodeId: NODE_ID,
+      env: "production",
+      service: "../operator",
+    });
+    expect(res.status).toBe(400);
+    expect(authzState.check).not.toHaveBeenCalled();
+    expect(mockDeployPlane.promoteNodeFromPreview).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a typed 404 service_not_found from the catalog check", async () => {
+    mockDeployPlane.promoteNodeFromPreview.mockRejectedValue(
+      Object.assign(new Error("no catalog entry for service nope"), {
+        code: "service_not_found",
+        status: 404,
+      })
+    );
+    const res = await post({
+      nodeId: NODE_ID,
+      env: "production",
+      service: "nope",
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ error: "service_not_found" });
   });
 });

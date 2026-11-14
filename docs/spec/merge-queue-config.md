@@ -28,7 +28,7 @@ Define the required-status-checks policy that actually works on GitHub today, ca
 
 ## Non-Goals
 
-- Defining the candidate-a `deploy_verified` gate — see [development-lifecycle.md](./development-lifecycle.md).
+- Defining the candidate-a `/validate-candidate` scorecard gate — see [development-lifecycle.md](./development-lifecycle.md).
 - Per-node merge queues — discarded after analysis (see task.0391); revisit if N > 5 nodes or queue depth becomes a real bottleneck.
 - Replacing the merge queue for ordinary code or human-authored PRs. Only the narrow, signed
   `cogni.env-manager.v1` change type may direct-merge after its deterministic-tree proof passes.
@@ -37,7 +37,7 @@ Define the required-status-checks policy that actually works on GitHub today, ca
 
 1. **REPORT_OR_DON'T_REQUIRE**: A required status check MUST be produced by a workflow that fires on both `pull_request:` AND `merge_group:` events. PR-only workflows cannot be required — the queue would wait forever for a status that never arrives. Empirically validated.
 2. **QUEUE_GATE_IS_TREE_CORRECTNESS**: Normal code PRs use the image-build aggregator (`manifest`) plus `static`, `unit`, and `component`. A verified `cogni.env-manager.v1` PR changes no runtime image, so the same required context names report success after the smaller generator-correctness proof defined below.
-3. **STUB_JOB_FOR_PR_INTENT**: When a check's "real validation" only makes sense on PR-time (e.g., title convention, security scan, candidate-a flight), the workflow MAY add a `merge_group:` trigger with a no-op passthrough step that emits a success status with the same context name. This makes the check visible on both events without doing duplicate work on the queue ref. **Canonical example: `candidate-flight`** — required-on-PR (every external-agent contribution must dispatch `/vcs/flight` and pass), but explicitly NOT required-on-merge-queue (the queue's rebased SHA is different from the PR head; re-flighting it would conflict with the slot lease and waste a candidate-a deploy). Implementation: `candidate-flight.yml` adds `merge_group:` trigger + a passthrough job that emits `candidate-flight` success on merge_group events. Spec'd; implementation tracked in task.0414.
+3. **STUB_JOB_FOR_PR_INTENT**: When a check's "real validation" only makes sense on PR-time (e.g., title convention, security scan, candidate-a flight), the workflow MAY add a `merge_group:` trigger with a no-op passthrough step that emits a success status with the same context name. This makes the check visible on both events without doing duplicate work on the queue ref. **Canonical example: `candidate-flight`** — required-on-PR (every external-agent contribution must dispatch `/vcs/flight` and pass), but explicitly NOT required-on-merge-queue (the queue's rebased SHA is different from the PR head; re-flighting it would conflict with the slot lease and waste a candidate-a deploy). Implementation: `candidate-flight.yml` (operator only) adds `merge_group:` trigger + a passthrough job that emits `candidate-flight` success on merge_group events. Spec'd; implementation tracked in task.0414.
 4. **CONFIG_AS_CODE**: The set of required checks is committed to `infra/github/branch-protection.json`. Drift between live and committed is detectable (`gh api ... | diff`).
 
 ## The Empirical Finding (2026-04-28)
@@ -83,6 +83,8 @@ Set committed to [`infra/github/branch-protection.json`](../../infra/github/bran
 
 All four workflows fire on both `pull_request:` and `merge_group:`.
 
+**Operator repo only — `Cogni Git PR Review` (task.5438).** The operator repo's required set is this table plus `Cogni Git PR Review`, pinned to the review App's integration id, declared in [`infra/github/branch-protection.operator.json`](../../infra/github/branch-protection.operator.json) and applied by one admin `PATCH .../required_status_checks`. It satisfies `REPORT_OR_DON'T_REQUIRE` through the operator webhook: on a push to `gh-readonly-queue/main/pr-<N>-…` the review App copies the PR head's verdict (same check name) onto the queue commit. A missing, unfinished or non-passing head verdict is written as `failure` — never neutral, never skipped, because a missing check would stall the entry for the queue's response timeout and eject it. Node repos do not require it (they cannot request a review yet — task.5448).
+
 Excluded from required (advisory on PR-time only):
 
 | Context             | Workflow                  | Why excluded from required                                                                                                                                               |
@@ -95,7 +97,7 @@ Excluded from required (advisory on PR-time only):
 
 `candidate-flight` is the contract gate for external-agent contributions: every PR must dispatch `/vcs/flight` and pass before merge. It is therefore required-on-PR. But it MUST NOT gate the merge queue — the queue's rebased SHA differs from the PR head, and re-flighting it would conflict with the candidate-slot lease and waste a candidate-a deploy.
 
-This is the canonical use of `STUB_JOB_FOR_PR_INTENT`: `candidate-flight.yml` will gain a `merge_group:` trigger with a passthrough job that emits `candidate-flight` success on merge_group events. Implementation tracked in `task.0414`. Once shipped, the canonical required set becomes `unit, component, static, manifest, candidate-flight` — the first stub-job-pattern entry in the live config.
+This is the canonical use of `STUB_JOB_FOR_PR_INTENT`: `candidate-flight.yml` (operator only) will gain a `merge_group:` trigger with a passthrough job that emits `candidate-flight` success on merge_group events. Implementation tracked in `task.0414`. Once shipped, the canonical required set becomes `unit, component, static, manifest, operator candidate flight` — the first stub-job-pattern entry in the live config.
 
 ## Implementation — Classic Protection (checks) + a `merge_queue` Ruleset (queue)
 
