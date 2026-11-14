@@ -18,6 +18,19 @@
  */
 
 import type {
+  DomainPatch,
+  KnowledgeHistoryEntry,
+} from "@cogni/shared-knowledge-store";
+
+export {
+  DomainNotEmptyError,
+  type DomainPatch,
+} from "@cogni/shared-knowledge-store";
+
+import type { ActiveGoal } from "../domain/dao-goals.js";
+import type { GoverningIndexRow } from "../domain/governing.js";
+import type { KnowledgeGraphNode } from "../domain/knowledge-graph.js";
+import type {
   Citation,
   CitationType,
   DoltCommit,
@@ -44,6 +57,32 @@ export interface NewDomain {
   id: string;
   name: string;
   description?: string;
+}
+
+/** Direct-edge read model: no knowledge bodies or work-item outcomes. */
+export interface CitationLinkSummary {
+  id: string;
+  citingId: string;
+  citedId: string;
+  citationType: CitationType;
+  context: string | null;
+  sourceTitle: string | null;
+  targetTitle: string | null;
+}
+
+export interface CitationLinkPage {
+  links: CitationLinkSummary[];
+  nextCursor: string | null;
+}
+
+/** A bounded first page of tracked hypotheses and their recorded outcomes. */
+export interface WorkEdoPage {
+  items: Array<{
+    hypothesis: Pick<Knowledge, "id" | "title" | "content" | "kpiBindings">;
+    outcomes: Array<{ id: string; title: string; content: string }>;
+    truncated: boolean;
+  }>;
+  truncated: boolean;
 }
 
 /**
@@ -86,17 +125,21 @@ export class DomainAlreadyRegisteredError extends Error {
 // ---------------------------------------------------------------------------
 
 /**
- * Thrown by `addKnowledge` / `upsertKnowledge` when a hypothesis row is
- * written without `evaluate_at`. Enforces `HYPOTHESIS_HAS_EVALUATE_AT`.
+ * Thrown when a hypothesis or goal row is written without `evaluate_at`.
+ * Enforces `HYPOTHESIS_HAS_EVALUATE_AT` (goals: their `By:` deadline).
  */
 export class HypothesisMissingEvaluateAtError extends Error {
   readonly entryId: string;
-  constructor(entryId: string) {
+  readonly entryType: string;
+  constructor(entryId: string, entryType = "hypothesis") {
     super(
-      `hypothesis '${entryId}' is missing evaluate_at — hypothesis rows must declare a resolution date`
+      entryType === "goal"
+        ? `goal '${entryId}' is missing evaluate_at — goal rows must declare their By: deadline`
+        : `hypothesis '${entryId}' is missing evaluate_at — hypothesis rows must declare a resolution date`
     );
     this.name = "HypothesisMissingEvaluateAtError";
     this.entryId = entryId;
+    this.entryType = entryType;
   }
 }
 
@@ -161,7 +204,58 @@ export class EdoEntryTypeRequiresAtomicToolError extends Error {
 // Port interface
 // ---------------------------------------------------------------------------
 
+/** Scoped row/edge API. It expires when withWrite returns; commit belongs to the adapter. */
+export type KnowledgeWriteSession = Omit<
+  KnowledgeStorePort,
+  "withWrite" | "registerDomain" | "updateDomain" | "deleteDomain" | "commit"
+>;
+
+export class KnowledgeWriteOutcomeUnknownError extends Error {
+  readonly code = "knowledge_write_outcome_unknown" as const;
+  readonly retryable = false;
+  constructor(
+    readonly operationId: string,
+    readonly branch: string,
+    readonly commitHash?: string
+  ) {
+    super(
+      `Knowledge write outcome requires inspection; do not replay ${operationId}. Inspect main and ${branch} using the operation receipt.`
+    );
+    this.name = "KnowledgeWriteOutcomeUnknownError";
+  }
+  get receipt(): {
+    code: string;
+    retryable: false;
+    lookup: Readonly<Record<string, string | null>>;
+  } {
+    return {
+      code: this.code,
+      retryable: false,
+      lookup: {
+        operationId: this.operationId,
+        branch: this.branch,
+        commitHash: this.commitHash ?? null,
+      },
+    };
+  }
+}
+
+export class KnowledgeWriteScopeRequiredError extends Error {
+  constructor() {
+    super(
+      "Knowledge mutations require withWrite; retain one logical write and its commit in the same scope."
+    );
+    this.name = "KnowledgeWriteScopeRequiredError";
+  }
+}
+
 export interface KnowledgeStorePort {
+  /** One admitted, isolated logical write; never hold this scope across requests. */
+  withWrite<T>(
+    input: { operationId: string; message: string },
+    run: (write: KnowledgeWriteSession) => Promise<T>
+  ): Promise<T>;
+
   // --- Read ---
   getKnowledge(id: string): Promise<Knowledge | null>;
   /**
@@ -173,16 +267,55 @@ export interface KnowledgeStorePort {
    * without downloading bodies (task.5204). Rows whose `useWhen` is null never
    * match. Full-text over title/content stays `searchKnowledge`; these are two
    * questions, not one endpoint with modes.
+   *
+   * SCHEMA_REFINED_BY_READ_FILTER: rows whose `entryType` is in
+   * `EDO_ENTRY_TYPES` are excluded unless `includeEdo: true` (chains/graph/
+   * audit surfaces opt in).
    */
   listKnowledge(
     domain: string,
-    opts?: { tags?: string[]; limit?: number; q?: string }
+    opts?: {
+      tags?: string[];
+      limit?: number;
+      q?: string;
+      includeEdo?: boolean;
+    }
   ): Promise<Knowledge[]>;
+  /**
+   * Case-insensitive substring match over title + content, newest first.
+   * SCHEMA_REFINED_BY_READ_FILTER: `EDO_ENTRY_TYPES` rows are excluded unless
+   * `includeEdo: true`.
+   */
   searchKnowledge(
     domain: string,
     query: string,
-    opts?: { limit?: number }
+    opts?: { limit?: number; includeEdo?: boolean }
   ): Promise<Knowledge[]>;
+  /**
+   * The approved DAO goals (ONE_GOAL_LIST): merged `entry_type = 'goal'` rows
+   * with id prefix `goal-`, not deprecated, sorted by id. Returns []
+   * when none are merged; every active goal, no count cap (NO_GOAL_CAP).
+   * Contribution-branch rows are never visible here.
+   */
+  listActiveGoals(): Promise<ActiveGoal[]>;
+  /**
+   * The governing index (GOVERNING_SET_DEFINED_ONCE, guidance-routing-design):
+   * every merged row across all domains that `selectGoverningIndex` keeps —
+   * governing entryType, non-blank useWhen, no inbound `supersedes` edge —
+   * sorted by domain then id. Built by its own unpaged query, never from a
+   * sampled domain page (INDEX_BUILT_BY_OWN_QUERY). Rows carry routing
+   * metadata only, never bodies (INDEX_CARRIES_NO_CONTENT).
+   */
+  listGoverningIndex(): Promise<GoverningIndexRow[]>;
+  /**
+   * Every entry projected to the knowledge-graph node shape — id, domain,
+   * title, entryType, confidencePct, sourceType; never `content`
+   * (INDEX_BUILT_BY_OWN_QUERY, same idiom as `listGoverningIndex`). ONE query,
+   * all rows (EDO included, like the graph view), no limit: memory is bounded
+   * by node count, not body bytes. Feeds `buildKnowledgeGraph` so the graph SSR
+   * never materializes full bodies it discards (bug.5547).
+   */
+  listKnowledgeGraphNodes(): Promise<KnowledgeGraphNode[]>;
   /** List distinct domain values present in the `knowledge` table (legacy / back-compat). */
   listDomains(): Promise<string[]>;
 
@@ -196,9 +329,12 @@ export interface KnowledgeStorePort {
    * `DomainAlreadyRegisteredError` on duplicate id.
    */
   registerDomain(input: NewDomain): Promise<Domain>;
+  getDomain(id: string): Promise<Domain | null>;
+  updateDomain(id: string, patch: DomainPatch): Promise<Domain>;
+  deleteDomain(id: string): Promise<void>;
 
-  // --- Write — rows ---
-  /** Upsert: inserts new entry or updates existing entry with same ID. */
+  // --- Write — rows (root adapters fail closed; use the withWrite scoped handle) ---
+  /** Insert or return an identical existing request; differing payload requires explicit update. */
   upsertKnowledge(entry: NewKnowledge): Promise<Knowledge>;
   addKnowledge(entry: NewKnowledge): Promise<Knowledge>;
   updateKnowledge(
@@ -239,6 +375,13 @@ export interface KnowledgeStorePort {
   listCitationsByCitingId(citingId: string): Promise<Citation[]>;
   /** List edges where cited_id = id (incoming). Used by recomputeConfidence. */
   listCitationsByCitedId(citedId: string): Promise<Citation[]>;
+  /** Five direct edges per page, with joined titles and an exclusive ID cursor. */
+  listCitationLinks(
+    endpointId: string,
+    after?: string
+  ): Promise<CitationLinkPage>;
+  /** The hypotheses a work item tracks and their recorded outcomes (bounded first page; the work item's Expectations read). */
+  readWorkEdo?(workItemId: string, signal?: AbortSignal): Promise<WorkEdoPage>;
   /**
    * List every citation edge in a single query. Used to assemble the full
    * knowledge graph without an N+1 over entries — the caller filters to edges
@@ -247,8 +390,11 @@ export interface KnowledgeStorePort {
   listAllCitations(): Promise<Citation[]>;
 
   // --- Doltgres versioning ---
+  /** Retired primitive: always fails closed. withWrite owns the single commit. */
   commit(message: string): Promise<string>;
   log(limit?: number): Promise<DoltCommit[]>;
   diff(fromRef: string, toRef: string): Promise<DoltDiffEntry[]>;
   currentCommit(): Promise<string>;
+  /** Versions of one entry, newest first, with their change reasons (story.0023). */
+  history?(id: string): Promise<KnowledgeHistoryEntry[]>;
 }

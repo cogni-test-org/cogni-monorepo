@@ -6,7 +6,7 @@
 
 - **Owners:** @derekg1729
 - **Status:** stable
-- **Last reviewed:** 2026-10-09 (shared-lane infra reconcile: preview + production)
+- **Last reviewed:** 2026-11-04
 
 ## Purpose
 
@@ -29,7 +29,16 @@ Infrastructure implementations of ports including server/, worker/, cli/, and te
 
 ## Public Surface
 
-- **Exports:** Port implementations for bootstrap injection (including identity-attestation live-catalog/Drizzle/Jose adapters and receipt-linked `DrizzleComputeCostStore`), database client (db, Database), MimirMetricsAdapter, ViemEvmOnchainClient, EvmRpcOnChainVerifierAdapter, EvmOnchainClient (type), GitHubWebhookNormalizer (ingestion), GitHubRepoWriter (operator App-backed deploy plane, including production infra reconcile), scheduling adapters (re-exported from @cogni/db-client)
+- Delivery KPI source (`server/node-deploy/delivery-kpi-source.adapter.ts`, task.5442): `DeliveryKpiSource` implements `DeliveryKpiSourcePort`: read-only SQL over the node-deploy release store plus one bounded public HTTPS GET per probe, for the goal-metric calculators in `features/node-deploy/delivery-kpis.ts`. Goal metrics, not telemetry.
+- Fleet observation reader (`server/node-deploy/fleet-observation-reader.adapter.ts`, task.5457): `FleetObservationReader` implements `FleetObservationReaderPort`: read-only SQL over the `@cogni-dao/metrics` `metric_observations` table (this node and environment scope only, `ok` rows) for the stored `fleet.lanes-down@1` readings that `fleet.uptime@1` integrates. It never writes.
+- Review KPI source (`server/review/review-kpi-source.adapter.ts`, task.5450): `GitHubReviewKpiSource` implements `ReviewKpiSourcePort`: bounded read-only GitHub GraphQL pages of PRs with the review App's `Cogni Git PR Review` check runs (suites filtered by `GH_REVIEW_APP_ID`), for the calculators in `features/review/review-kpis.ts`. Goal metrics, not telemetry.
+- Node mesh (`server/node-deploy/headscale.adapter.ts`, task.5429): `HeadscaleSocketAdapter` implements `NodeMeshPort` over ONE env Headscale v0.29.7's unix socket (gRPC, no API key, bounded deadlines, normalized payload-free errors). Its schema is `headscale-v0.29.7.descriptor.ts`, drift-pinned to the vendored protos in `headscale-proto-v0.29.7/` (BSD-3-Clause, LICENSE beside them). Contract test: `tests/component/node-deploy/headscale.adapter.int.test.ts`. Not exported through `@/adapters/server`; the sequencer bootstrap wires it (T4).
+
+- App-private `AkashNativeStateReader` (exported through `@/adapters/server`) reads only fixed public Akash deployment/lease GETs. Bootstrap injects public owner and transport; full identities, pagination, bytes, concurrency and deadlines are bounded. It returns observations, never closure or recovery policy.
+
+- Finance (`server/finance/`): `akashHostingReaders` (one operator-covered USD/day row per node from the exact on-chain lease price, measured blocks/day or 5.884 s/block), `akashCreditReader` (injected expected Console granter; verified available-credit/burn estimate, escrow excluded) + `readAkashBlocksPerDay`, `cherryFinanceReader` (port of `cherryPlane`), `grafanaOverageReader`, `domainExpiryReader`, `readAkashReports`, `collapseAkash` (hosting rows become children of the one Akash row), `creditedPurchasesQuery` (CREDITED payment_attempts for the package income reader), `unavailableFinanceReader` — every row in the hub money-plane-registry as a never-throwing `PlaneReader`, each carrying its `rail`.
+
+- **Exports:** Port implementations for bootstrap injection (including identity-attestation live-catalog/Drizzle/Jose adapters and receipt-linked `DrizzleComputeCostStore`), database client (db, Database), MimirMetricsAdapter, ViemEvmOnchainClient, EvmRpcOnChainVerifierAdapter, EvmOnchainClient (type), GitHubWebhookNormalizer (ingestion), GitHubRepoWriter (operator App-backed deploy plane, including candidate legacy-intent cancellation, production infra reconcile and fixed worker-routing receipt rollback), scheduling adapters (re-exported from @cogni/db-client)
 - **CLI (if any):** cli/ adapter implementations
 - **Env/Config keys:** DATABASE_URL, LITELLM_BASE_URL, LITELLM_MASTER_KEY, FLEET_CONTROL_ENV and FORK_DOMAIN_ROOT (injected into GitHubRepoWriter), PROMETHEUS_QUERY_URL, PROMETHEUS_READ_USERNAME, PROMETHEUS_READ_PASSWORD, ANALYTICS_QUERY_TIMEOUT_MS, EVM_RPC_URL
 - **Files considered API:** Port implementation exports, database client, onchain client interfaces
@@ -39,6 +48,8 @@ Infrastructure implementations of ports including server/, worker/, cli/, and te
 - **Uses ports:** none
 - **Implements ports:** All ports defined in ports/
 - **Contracts (required if implementing):** tests/contract/ must pass for all implementations
+
+- Node-deploy Cloudflare DNS reads bound native zone identity through the existing adapter. Parsed mismatch/unavailable results refuse use; rotation revalidates through the same projected files. Identity reads prove no edit permission.
 
 ## Responsibilities
 
@@ -62,7 +73,7 @@ pnpm test tests/contract/
 ## Dependencies
 
 - **Internal:** ports/, shared/
-- **External:** drizzle-orm, postgres, langfuse, pino, siwe, viem, litellm
+- **External:** drizzle-orm, postgres, langfuse, pino, siwe, viem, litellm, @grpc/grpc-js + @grpc/proto-loader (Headscale socket client)
 
 ## Change Protocol
 

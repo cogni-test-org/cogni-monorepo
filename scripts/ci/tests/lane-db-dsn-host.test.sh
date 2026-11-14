@@ -17,19 +17,18 @@
 #       baselines: the hand-spelled pre-change format, the current file with the resolver
 #       absent (the provision-env-vm.sh Phase 5c path, which must keep working untouched),
 #       and `origin/main`'s actual blob of the composer.
-#   [2] DOLTGRES_URL is byte-identical too, and keeps `${VM_IP}` + a CONTROL-env-keyed name.
-#       Doltgres residency is explicitly OUT of scope (immutable superuser, databases.md
-#       §5.2), so it must not move — not now, and not when a Postgres pin is deleted.
-#   [3] Deleting one pin moves ONLY that lane's two Postgres DSNs. Every other pair, and
-#       that lane's DOLTGRES_URL, stay byte-identical. That is the per-lane cutover
-#       mechanism, and the blast radius of a cutover is exactly one lane.
+#   [2] DOLTGRES_URL dials the LANE's own VM for every catalog pair (story.5098). Its
+#       superuser and fail-closed contract live in doltgres-lane-residency.test.sh.
+#   [3] Deleting one pin moves ONLY that lane's two Postgres DSNs. Every other pair stays
+#       byte-identical. That is the per-lane cutover mechanism, and the blast radius of a
+#       cutover is exactly one lane.
 #   [4] FAIL LOUD, NEVER COMPOSE A GUESSED HOST: an unset FORK_DOMAIN_ROOT on the foreign
 #       path (the cross-fleet widening class that a defaulted `cogni_domain_root` would
 #       cause), an unresolvable alias, an ambiguous multi-A alias, a missing catalog row on
 #       a pinned pair, and missing arguments all REFUSE.
 #   [5] `lane_db_assert_agreement` — the read-side-vs-write-side gate — passes for every
 #       pair against the DSN this composer actually produces.
-#   [6] SCOPE GUARDS: `${VM_IP}` is still the vault/SSH target, DOLTGRES_URL still dials it,
+#   [6] SCOPE GUARDS: `${VM_IP}` is still the vault/SSH target, DOLTGRES_URL dials the lane host,
 #       and nothing here emits a password rotation (the B2 carrier question is still open,
 #       and a moved host without its password on the target is 28P01).
 #
@@ -137,9 +136,11 @@ for catalog_file in "$CATALOG_DIR"/*.yaml; do
     PAIRS+=("${node}/${env}")
   done < <(yq -r '.envs[]?' "$catalog_file")
 done
-[ "${#PAIRS[@]}" -ge 1 ] || fail "only ${#PAIRS[@]} (node, lane) pairs derived from $CATALOG_DIR — expected the current primary node lane"
+[ "${#PAIRS[@]}" -ge 10 ] || fail "only ${#PAIRS[@]} (node, lane) pairs derived from $CATALOG_DIR — the enumeration is broken, not the fleet"
 
-DSN_KEYS=(DATABASE_URL DATABASE_SERVICE_URL DOLTGRES_URL)
+# Postgres only: DOLTGRES_URL moved to the lane host on purpose (story.5098), so it is not
+# part of the historical byte-identity baselines below.
+DSN_KEYS=(DATABASE_URL DATABASE_SERVICE_URL)
 
 # THE MATERIALIZE PATH, REPRODUCED EXACTLY (scripts/ci/secret-materialize.sh):
 #   DEPLOY_ENV          = the lane
@@ -249,25 +250,17 @@ compose_base_ref() {
       [ "${db_path%%\?*}" = "cogni_${node//-/_}" ] || fail "$pair/$key names a non-local DB"
       lane_db_assert_agreement "$node" "$lane" "$dsn" >/dev/null || fail "$pair/$key disagrees"
     done
-    [ "$(compose_now "$node" "$lane" DOLTGRES_URL)" = "$(compose_literal "$node" "$lane" DOLTGRES_URL)" ] \
-      || fail "$pair Doltgres residency changed"
+    # story.5098: Doltgres follows the same lane host; its name keeps the control-env suffix.
+    dgu="$(compose_now "$node" "$lane" DOLTGRES_URL)"
+    dg_after="${dgu##*@}"
+    [ "${dg_after%%:*}" = "$(addr_for_env "$lane")" ] || fail "$pair/DOLTGRES_URL dials a foreign instance: ${dg_after%%:*}"
+    dg_sfx=""; [ "$(control_env_for "$lane" "$node")" = "$lane" ] || dg_sfx="_${lane//-/_}"
+    grep -q ":5435/knowledge_${node//-/_}${dg_sfx}?" <<<"$dgu" || fail "$pair/DOLTGRES_URL renamed its database: ${dg_after}"
   done
 )
-echo '[current] all catalog lanes compose lane-local app/service/migration DSNs; Doltgres unchanged'
+echo '[current] all catalog lanes compose lane-local app/service/migration/Doltgres DSNs'
 
 # Historical pins are an EXPLICIT rollback fixture, not the committed contract.
-. "$SCRIPT_DIR/fixtures/catalog.sh"
-write_historical_catalog_fixture "$CATALOG_DIR" "$TMPROOT/historical-catalog"
-export CATALOG_DIR="$TMPROOT/historical-catalog" COGNI_CATALOG_ROOT="$TMPROOT/historical-catalog"
-export FLEET_CONTROL_ENV=production
-# The real reader caches its roster at source time; rebuild it from the selected fixture.
-. "$REPO_ROOT/scripts/ci/lib/image-tags.sh"
-# Include each authored rollback pair even when the current fleet has no such node.
-for fixture_pair in poly/candidate-a poly/preview red/candidate-a toks5/preview; do
-  found=false
-  for pair in "${PAIRS[@]}"; do [ "$pair" != "$fixture_pair" ] || found=true; done
-  if [ "$found" = false ]; then PAIRS+=("$fixture_pair"); fi
-done
 # Old inertness baselines apply only to the historical four or local-custody rows;
 # a future foreign-compute birth is covered above and never inherits these pins.
 HISTORICAL_PAIRS=()
@@ -320,17 +313,6 @@ This PR must move no DSN host and no database name (bug.5299 B1 is inert by cons
 done
 echo "  ok  ${checked} composed DSN values byte-identical"
 
-# DOLTGRES, EXPLICITLY: still ${VM_IP} (the control VM), still the control-env-keyed name.
-echo "[2] DOLTGRES_URL still dials the control VM for every pair"
-for pair in "${PAIRS[@]}"; do
-  node="${pair%%/*}"; lane="${pair##*/}"
-  control="$(control_env_for "$lane" "$node")"
-  dgu="$(PATH="$SHIM:$PATH" compose_now "$node" "$lane" DOLTGRES_URL)"
-  [ "$(printf '%s' "$dgu" | sed -e 's#.*@##' -e 's#:5435.*##')" = "$(addr_for_env "$control")" ] \
-    || fail "DOLTGRES_URL for ${pair} left the control VM: ${dgu}"
-done
-echo "  ok  all ${#PAIRS[@]} DOLTGRES_URLs still name the control env's VM on :5435"
-
 # ── 3. DELETING ONE PIN MOVES EXACTLY ONE LANE'S TWO POSTGRES DSNs ───────────────
 echo "[3] unpinning poly/candidate-a moves ONLY its two Postgres DSN hosts"
 declare -A PINNED_SNAPSHOT=()
@@ -350,7 +332,7 @@ done
     for key in "${DSN_KEYS[@]}"; do
       got="$(compose_now "$node" "$lane" "$key")"
       before="${PINNED_SNAPSHOT["${pair}/${key}"]}"
-      if [ "$pair" = "poly/candidate-a" ] && [ "$key" != "DOLTGRES_URL" ]; then
+      if [ "$pair" = "poly/candidate-a" ]; then
         [ "$got" != "$before" ] || fail "unpinning poly/candidate-a did not move its ${key} — the ledger could never empty"
         moved=$((moved + 1))
         continue
@@ -371,11 +353,7 @@ done
   out="$(lane_db_assert_agreement poly candidate-a "$dsn")" \
     || fail "the moved DSN must still satisfy the agreement gate; got: ${out}"
   echo "  ok  ${out}"
-  # ...and Doltgres did NOT follow: still production's VM, still the suffixed knowledge DB.
-  dgu="$(compose_now poly candidate-a DOLTGRES_URL)"
-  grep -q '@203.0.113.1:5435/knowledge_poly_candidate_a?' <<<"$dgu" \
-    || fail "Doltgres must NOT move with a Postgres pin deletion (out of scope, immutable superuser): ${dgu}"
-  echo "  ok  poly/candidate-a moved to 203.0.113.3/cogni_poly; DOLTGRES_URL untouched on 203.0.113.1"
+  echo "  ok  poly/candidate-a moved to 203.0.113.3/cogni_poly"
 )
 # the committed ledger is untouched by the experiment
 [ "$(PATH="$SHIM:$PATH" compose_now poly candidate-a DATABASE_URL)" = "${PINNED_SNAPSHOT[poly/candidate-a/DATABASE_URL]}" ] \
@@ -446,13 +424,13 @@ for pair in "${PAIRS[@]}"; do
 done
 
 # ── 6. SCOPE GUARDS — what this change must NOT have touched ─────────────────────
-echo "[6] scope guards: VM_IP is still the vault/SSH target, Doltgres still dials it, no rotations"
+echo "[6] scope guards: VM_IP is still the vault/SSH target, Doltgres dials the lane host, no rotations"
 # shellcheck disable=SC2016  # the literal source text is the assertion
 grep -q 'ssh \$SSH_OPTS root@"\$VM_IP"' "$REPO_ROOT/scripts/setup/lib/reconcile-secrets.sh" \
   || fail "bao_get_field must still SSH to \${VM_IP} — VM_IP is the vault/SSH target and only the two Postgres DSN hosts moved"
 # shellcheck disable=SC2016  # ditto
-grep -q '"\$_dgu" "\${VM_IP}"' "$REPO_ROOT/scripts/setup/lib/reconcile-secrets.sh" \
-  || fail "DOLTGRES_URL must still compose \${VM_IP} as its host (Doltgres residency is out of scope)"
+grep -q '"\$_dgu" "\${pg_host}"' "$REPO_ROOT/scripts/setup/lib/reconcile-secrets.sh" \
+  || fail "DOLTGRES_URL must compose the lane host \${pg_host}, like Postgres (story.5098)"
 for f in scripts/setup/lib/reconcile-secrets.sh scripts/ci/lib/lane-db-residency.sh scripts/ci/secret-materialize.sh; do
   # comments DISCUSS bug.5207's `ALTER USER app_poly PASSWORD`; no line may EXECUTE one.
   if grep -vE '^[[:space:]]*#' "$REPO_ROOT/$f" | grep -qiE 'ALTER +(USER|ROLE)'; then
@@ -470,12 +448,9 @@ echo "  ok  scope guards hold"
   fixture="$TMPROOT/db-provision"
   mkdir -p "$fixture/infra/catalog"
   cp "$REPO_ROOT/infra/database-budget-profiles.yaml" "$fixture/infra/"
-  # This caller scenario owns its full roster, including preview membership and tiers.
-  write_akash_catalog_fixture "$fixture/infra/catalog" operator shared operator-control-v1
-  write_akash_catalog_fixture "$fixture/infra/catalog" red
-  write_akash_catalog_fixture "$fixture/infra/catalog" poly dedicated dedicated-high-throughput-v1
-  yq -i '.envs = ["candidate-a", "production"]' "$fixture/infra/catalog/red.yaml"
-  cp "$fixture/infra/catalog/operator.yaml" "$fixture/operator-baseline.yaml"
+  for node in operator red poly; do
+    cp "$REPO_ROOT/infra/catalog/$node.yaml" "$fixture/infra/catalog/"
+  done
   for function_name in render_shared_db_provision_config read_node_db_secret provision_shared_node_databases; do
     function_source="$(awk -v name="$function_name" '
       $0 == name "() {" { capture=1 }
@@ -485,21 +460,27 @@ echo "  ok  scope guards hold"
     [[ -n "$function_source" ]] || fail "missing actual caller function $function_name"
     eval "$function_source"
   done
+  # shellcheck source=scripts/ci/lib/appset-paths.sh
+  source "$real_repo/scripts/ci/lib/appset-paths.sh"
   log_error() { echo "$*" >&2; }
   log_fatal() { echo "$*" >&2; exit 1; }
   log_info() { :; }
   log_warn() { printf '%s\n' "$*" >> "$fixture/skips"; }
   REPO_ROOT="$fixture"
-  export CATALOG_DIR="$fixture/infra/catalog" COGNI_CATALOG_ROOT="$fixture/infra/catalog"
-  . "$real_repo/scripts/ci/lib/image-tags.sh"
   NODE_TARGETS=(operator red poly)
   DEPLOY_ENVIRONMENT=candidate-a
   NODE_DB_PROVISION_CONFIG="$(render_shared_db_provision_config)"
-  [[ "$(jq -r 'keys | join(",")' <<<"$NODE_DB_PROVISION_CONFIG")" == operator,red ]] \
-    || fail "dedicated or inactive node entered shared provisioning"
+  [[ "$(jq -r 'keys | join(",")' <<<"$NODE_DB_PROVISION_CONFIG")" == operator ]] \
+    || fail "dedicated, inactive or foreign-controlled node entered shared provisioning"
+  # red is akash on candidate-a: production custody reconciles its lane roles. A
+  # self-controlled (k3s) red row is this VM's to provision.
+  yq -i '.deployment_provider."candidate-a" = "k3s"' "$fixture/infra/catalog/red.yaml"
+  [[ "$(render_shared_db_provision_config | jq -r 'keys | join(",")')" == operator,red ]] \
+    || fail "self-controlled shared node skipped"
+  [[ "$(render_shared_db_provision_config | jq -r '.red.DB_APP_CONNECTION_LIMIT')" == 2 ]]
+  cp "$real_repo/infra/catalog/red.yaml" "$fixture/infra/catalog/"
   [[ "$(jq -r '.operator.DB_BUDGET_PROFILE' <<<"$NODE_DB_PROVISION_CONFIG")" == operator-control-v1 ]]
   [[ "$(jq -r '.operator.DB_SERVICE_CONNECTION_LIMIT' <<<"$NODE_DB_PROVISION_CONFIG")" == 15 ]]
-  [[ "$(jq -r '.red.DB_APP_CONNECTION_LIMIT' <<<"$NODE_DB_PROVISION_CONFIG")" == 2 ]]
   DEPLOY_ENVIRONMENT=preview
   [[ "$(render_shared_db_provision_config | jq -r 'keys | join(",")')" == operator ]] \
     || fail "environment-absent red entered preview provisioning"
@@ -508,15 +489,15 @@ echo "  ok  scope guards hold"
   # An absent profile, bad limit or unknown tier fails before the caller runs.
   yq -i '.database."candidate-a".budget_profile = "absent"' "$fixture/infra/catalog/operator.yaml"
   if render_shared_db_provision_config >/dev/null 2>&1; then fail "missing profile accepted"; fi
-  cp "$fixture/operator-baseline.yaml" "$fixture/infra/catalog/operator.yaml"
+  cp "$real_repo/infra/catalog/operator.yaml" "$fixture/infra/catalog/"
   yq -i '."operator-control-v1".roles.app.connection_limit = 0' "$fixture/infra/database-budget-profiles.yaml"
   if render_shared_db_provision_config >/dev/null 2>&1; then fail "zero budget accepted"; fi
   cp "$real_repo/infra/database-budget-profiles.yaml" "$fixture/infra/"
   yq -i '.database."candidate-a".tier = "foreign"' "$fixture/infra/catalog/operator.yaml"
   if render_shared_db_provision_config >/dev/null 2>&1; then fail "unknown database boundary accepted"; fi
-  cp "$fixture/operator-baseline.yaml" "$fixture/infra/catalog/operator.yaml"
+  cp "$real_repo/infra/catalog/operator.yaml" "$fixture/infra/catalog/"
 
-  # Use the ACTUAL remote read helper with a hermetic kubectl substitute. A
+  # Use the ACTUAL remote read helper with a hermetic cached-reader substitute. A
   # migration password in the public bank is deliberately wrong: the isolated
   # bank is the sole permissible source. Fake values contain shell metacharacters
   # to catch accidental word splitting or evaluation in Docker argument assembly.
@@ -524,15 +505,17 @@ echo "  ok  scope guards hold"
   compose_log="$fixture/compose"
   : > "$read_log"
   : > "$compose_log"
-  timeout() { shift; "$@"; }
-  kubectl() {
-    printf '%s\n' "${*: -2}" >> "$read_log"
-    case "${*: -2}" in
-      '-field=APP_DB_PASSWORD cogni/candidate-a/operator') printf '%s' "app fixture ' \$(literal)" ;;
-      '-field=APP_DB_SERVICE_PASSWORD cogni/candidate-a/operator') printf '%s' 'service fixture' ;;
-      '-field=APP_DB_MIGRATION_PASSWORD cogni/candidate-a/operator-database-migration')
-        [[ "${missing_migration:-false}" == false ]] && printf '%s' 'isolated fixture' ;;
-      '-field=APP_DB_MIGRATION_PASSWORD cogni/candidate-a/operator') printf '%s' 'WRONG PUBLIC VALUE' ;;
+  openbao_get_field() {
+    [[ "$#" == 4 && "$3" == 10 && "$4" == 1 ]] \
+      || fail "late DB reads must retain one bounded ten-second attempt"
+    printf '%s\n' "-field=$2 cogni/${DEPLOY_ENVIRONMENT}/$1" >> "$read_log"
+    case "$1/$2" in
+      operator/APP_DB_PASSWORD) printf '%s' "app fixture ' \$(literal)" ;;
+      operator/APP_DB_SERVICE_PASSWORD) printf '%s' 'service fixture' ;;
+      operator-database-migration/APP_DB_MIGRATION_PASSWORD)
+        if [[ "${missing_migration:-false}" == false ]]; then printf '%s' 'isolated fixture'; fi ;;
+      operator/APP_DB_MIGRATION_PASSWORD) printf '%s' 'WRONG PUBLIC VALUE' ;;
+      red/APP_DB_PASSWORD | red/APP_DB_SERVICE_PASSWORD | red-database-migration/APP_DB_MIGRATION_PASSWORD) return 0 ;;
       *) return 1 ;;
     esac
   }
@@ -549,7 +532,7 @@ echo "  ok  scope guards hold"
     [[ "${passed[APP_DB_SERVICE_PASSWORD]}" == 'service fixture' ]]
     [[ "${passed[APP_DB_MIGRATION_PASSWORD]}" == 'isolated fixture' ]]
     [[ "${passed[DB_BUDGET_PROFILE]}" == operator-control-v1 ]]
-    [[ "${passed[DB_APP_CONNECTION_LIMIT]}" == 7 ]]
+    [[ "${passed[DB_APP_CONNECTION_LIMIT]}" == 8 ]]
     [[ "${passed[DB_APP_STATEMENT_TIMEOUT_MS]}" == 5000 ]]
     [[ "${passed[DB_SERVICE_CONNECTION_LIMIT]}" == 15 ]]
     [[ "${passed[DB_SERVICE_STATEMENT_TIMEOUT_MS]}" == 2000 ]]
@@ -564,6 +547,7 @@ echo "  ok  scope guards hold"
   grep -q '^APP_DB_MIGRATION_PASSWORD=isolated fixture$' "$compose_log" || fail "migration credential not forwarded"
   ! grep -q 'cogni/candidate-a/poly' "$read_log" || fail "dedicated cell credential read"
   ! grep -q 'cogni/production/' "$read_log" || fail "foreign environment credential read"
+  ! grep -q 'cogni/candidate-a/red' "$read_log" || fail "foreign-controlled lane credential read"
   # Unknown app/service credentials keep the existing unborn-node skip; red
   # must never reach Docker. An incomplete migration bank is also skipped,
   # preserving the existing per-node fail-soft policy without weakening provision.sh.

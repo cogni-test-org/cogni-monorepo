@@ -15,8 +15,18 @@
  *   - TOKEN_SHORT_LIVED: tokens are never persisted.
  *   - Owning-domain resolution mirrors the CI single-node-scope gate; `conflict`
  *     and `miss` short-circuit upstream in the workflow.
+ *   - PINNED_REVIEW_SUBJECT (story.5102): `resolvePullRequest` pins head + base SHAs for the
+ *     dev-triggered verb; `fetchPrContext` reads repo-spec + rules at the pinned base and compares
+ *     the PR head to the pinned head once (`headMoved`).
+ *   - CHECK_IS_REQUEST_BOUND: `createCheckRun` writes the request id as the check `external_id`.
+ *   - ABSENT_ONLY_ON_404: a repo-spec read is "absent" only on HTTP 404; other errors throw.
+ *   - QUEUE_VERDICT_IO_ONLY (task.5438): `readQueueVerdictInputs` / `writeQueueVerdict` only read and
+ *     write check runs; the copy decision is the pure `features/review/queue-verdict`. A queue
+ *     verdict counts as already written only when THIS App wrote a completed run (redelivery no-ops).
+ *   - SERVED_DEFAULT_MODEL: the default review model is `deepseek-v4-flash` (served, the fleet default_free);
+ *     a node may override it with repo-spec `review.model`.
  * Side-effects: IO (GitHub REST API)
- * Links: bug.5000, docs/spec/node-ci-cd-contract.md#single-domain-scope,
+ * Links: bug.5000, story.5102, docs/spec/node-ci-cd-contract.md#single-domain-scope,
  *   services/scheduler-worker/src/adapters/review-http.ts, github-auth.ts
  * @internal
  */
@@ -45,6 +55,7 @@ import {
   buildReviewUserMessage,
   type EvidenceBundle,
 } from "@cogni/temporal-workflows";
+import { createAppAuth } from "@octokit/auth-app";
 import type { Octokit } from "@octokit/core";
 import type { Logger } from "pino";
 import { parse as parseYaml } from "yaml";
@@ -54,11 +65,15 @@ import { createInstallationOctokit } from "./github-auth";
 // Constants (ported from the former worker review activity)
 // ---------------------------------------------------------------------------
 
-const CHECK_RUN_NAME = "Cogni Git PR Review";
-const DEFAULT_REVIEW_MODELREF = {
+/** The check the review App writes; the review KPIs (task.5450) read exactly this name. */
+export const CHECK_RUN_NAME = "Cogni Git PR Review";
+/** Served free (default_free) 1M-context model with reliable tool calls (hub `model-pricing-registry`). */
+export const DEFAULT_REVIEW_MODELREF = {
   providerKey: "platform",
-  modelId: "gpt-4o-mini",
+  modelId: "deepseek-v4-flash",
 } as const;
+/** The verb path (POST /api/v1/vcs/review) is a user request: every GitHub call is bounded. */
+const VERB_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_PATCH_BYTES_PER_FILE = 100_000;
 const MAX_TOTAL_PATCH_BYTES = 500_000;
 const MAX_FILES_WITH_PATCHES = 30;
@@ -73,6 +88,38 @@ export interface GithubReviewAdapterDeps {
   /** Base64-encoded PEM private key (GH_REVIEW_APP_PRIVATE_KEY_BASE64). */
   privateKeyBase64: string;
   logger: Logger;
+  /** Serving operator build (APP_BUILD_SHA) stamped on the context; null when unversioned. */
+  buildSha?: string | null;
+}
+
+/** A PR pinned for review by the dev-triggered verb. */
+export interface PinnedPullRequest {
+  readonly installationId: number;
+  readonly headSha: string;
+  readonly baseSha: string;
+  readonly state: string;
+}
+
+/** One check run read off a commit, narrowed to what the merge-queue verdict copy needs. */
+export interface QueueHeadCheckRun {
+  readonly id: number;
+  readonly name: string;
+  /** Integration id that wrote the run (`app.id`); null when GitHub reports none. */
+  readonly appId: number | null;
+  readonly status: string;
+  readonly conclusion: string | null;
+  readonly htmlUrl: string | null;
+}
+
+/** What the queue-verdict copy must know before deciding (task.5438). */
+export interface QueueVerdictInputs {
+  readonly installationId: number;
+  /** The PR's current head SHA. */
+  readonly headSha: string;
+  /** Every `Cogni Git PR Review` run on the head (all Apps; the decision filters by App id). */
+  readonly headRuns: readonly QueueHeadCheckRun[];
+  /** This App already wrote a completed verdict on the queue commit (redelivery guard). */
+  readonly queueHasVerdict: boolean;
 }
 
 /** Full review context returned to the worker. JSON-serializable. */
@@ -88,6 +135,10 @@ export interface PrReviewContext {
   repoSpecYaml?: string;
   changedFiles: string[];
   owningNode: OwningNode;
+  /** The PR head differs from the pinned head the request was made for. */
+  headMoved: boolean;
+  /** Serving operator build that produced this context. */
+  operatorBuildSha: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -127,8 +178,174 @@ async function fetchRepoFile(
 export function createGithubReviewAdapter(deps: GithubReviewAdapterDeps) {
   const { appId, privateKeyBase64, logger } = deps;
 
+  const operatorBuildSha = deps.buildSha ?? null;
+
   function octokitFor(installationId: number): Octokit {
     return createInstallationOctokit(installationId, appId, privateKeyBase64);
+  }
+
+  /**
+   * Resolve the review App's installation on a repo (App JWT). Throws `review_app_not_installed`
+   * with the HTTP status when absent (callers map it).
+   */
+  async function resolveInstallationId(target: {
+    owner: string;
+    repo: string;
+  }): Promise<number> {
+    const appAuth = createAppAuth({
+      appId,
+      privateKey: Buffer.from(privateKeyBase64, "base64").toString("utf-8"),
+    });
+    const { token } = await appAuth({ type: "app" });
+    const response = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/installation`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+        },
+        signal: AbortSignal.timeout(VERB_REQUEST_TIMEOUT_MS),
+      }
+    );
+    if (!response.ok) {
+      throw Object.assign(
+        new Error(
+          `review App not installed on ${target.owner}/${target.repo} (HTTP ${response.status})`
+        ),
+        { status: response.status, code: "review_app_not_installed" }
+      );
+    }
+    return ((await response.json()) as { id: number }).id;
+  }
+
+  /**
+   * Pin a PR for the dev-triggered review verb: resolve the installation, then read the PR head +
+   * base SHAs once. Throws on a missing installation or PR (callers map the HTTP status).
+   */
+  async function resolvePullRequest(target: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  }): Promise<PinnedPullRequest> {
+    const installationId = await resolveInstallationId(target);
+    const pr = await createInstallationOctokit(
+      installationId,
+      appId,
+      privateKeyBase64,
+      VERB_REQUEST_TIMEOUT_MS
+    ).request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
+      owner: target.owner,
+      repo: target.repo,
+      pull_number: target.prNumber,
+    });
+    return {
+      installationId,
+      headSha: pr.data.head.sha,
+      baseSha: pr.data.base.sha,
+      state: pr.data.state,
+    };
+  }
+
+  /** Every run of the verdict check on a commit (`filter: all`, so a re-run never hides a verdict). */
+  async function listVerdictRuns(
+    octokit: Octokit,
+    target: { owner: string; repo: string; sha: string }
+  ): Promise<QueueHeadCheckRun[]> {
+    const response = await octokit.request(
+      "GET /repos/{owner}/{repo}/commits/{ref}/check-runs",
+      {
+        owner: target.owner,
+        repo: target.repo,
+        ref: target.sha,
+        check_name: CHECK_RUN_NAME,
+        filter: "all",
+        per_page: 100,
+      }
+    );
+    return response.data.check_runs.map((run) => ({
+      id: run.id,
+      name: run.name,
+      appId: run.app?.id ?? null,
+      status: run.status,
+      conclusion: run.conclusion ?? null,
+      htmlUrl: run.html_url ?? null,
+    }));
+  }
+
+  /**
+   * Read what the queue-verdict copy needs (task.5438): the PR's head SHA, the review checks on it,
+   * and whether this App already wrote a completed verdict on the queue commit. Bounded reads only.
+   */
+  async function readQueueVerdictInputs(target: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    queueSha: string;
+  }): Promise<QueueVerdictInputs> {
+    const installationId = await resolveInstallationId(target);
+    const octokit = createInstallationOctokit(
+      installationId,
+      appId,
+      privateKeyBase64,
+      VERB_REQUEST_TIMEOUT_MS
+    );
+    const pr = await octokit.request(
+      "GET /repos/{owner}/{repo}/pulls/{pull_number}",
+      {
+        owner: target.owner,
+        repo: target.repo,
+        pull_number: target.prNumber,
+      }
+    );
+    const headSha = pr.data.head.sha;
+    const [headRuns, queueRuns] = await Promise.all([
+      listVerdictRuns(octokit, { ...target, sha: headSha }),
+      listVerdictRuns(octokit, { ...target, sha: target.queueSha }),
+    ]);
+    const queueHasVerdict = queueRuns.some(
+      (run) => run.appId === Number(appId) && run.status === "completed"
+    );
+    return { installationId, headSha, headRuns, queueHasVerdict };
+  }
+
+  /** Write the completed verdict check on the queue's merge-group commit. Returns the run id. */
+  async function writeQueueVerdict(target: {
+    installationId: number;
+    owner: string;
+    repo: string;
+    queueSha: string;
+    verdict: {
+      readonly conclusion: "success" | "failure";
+      readonly title: string;
+      readonly summary: string;
+    };
+  }): Promise<number> {
+    const octokit = createInstallationOctokit(
+      target.installationId,
+      appId,
+      privateKeyBase64,
+      VERB_REQUEST_TIMEOUT_MS
+    );
+    const now = new Date().toISOString();
+    const response = await octokit.request(
+      "POST /repos/{owner}/{repo}/check-runs",
+      {
+        owner: target.owner,
+        repo: target.repo,
+        name: CHECK_RUN_NAME,
+        head_sha: target.queueSha,
+        status: "completed",
+        conclusion: target.verdict.conclusion,
+        started_at: now,
+        completed_at: now,
+        external_id: `queue-verdict:${target.queueSha}`,
+        output: {
+          title: target.verdict.title,
+          summary: target.verdict.summary,
+        },
+      }
+    );
+    return response.data.id;
   }
 
   /** Create a Check Run in "in_progress" state. Returns its id. */
@@ -145,6 +362,7 @@ export function createGithubReviewAdapter(deps: GithubReviewAdapterDeps) {
         head_sha: target.headSha,
         status: "in_progress",
         started_at: new Date().toISOString(),
+        ...(target.externalId ? { external_id: target.externalId } : {}),
       }
     );
     return response.data.id;
@@ -275,8 +493,12 @@ export function createGithubReviewAdapter(deps: GithubReviewAdapterDeps) {
     };
 
     const changedFiles = files.map((f) => f.filename);
+    // PINNED_REVIEW_SUBJECT: read config at the pinned base commit; compare the head once.
+    const configRef = target.baseSha ?? pr.base.ref;
+    const headMoved =
+      target.headSha !== undefined && pr.head.sha !== target.headSha;
 
-    // Fetch repo-spec from target repo (base branch)
+    // Fetch repo-spec from target repo (pinned base commit, else base branch)
     let repoSpecYaml: string;
     try {
       repoSpecYaml = await fetchRepoFile(
@@ -284,9 +506,12 @@ export function createGithubReviewAdapter(deps: GithubReviewAdapterDeps) {
         owner,
         repo,
         ".cogni/repo-spec.yaml",
-        pr.base.ref
+        configRef
       );
-    } catch {
+    } catch (error) {
+      // Only a 404 means "no repo-spec". Any other failure (401, 5xx, network) throws so the
+      // Temporal activity retries instead of silently reviewing with no gates.
+      if ((error as { status?: unknown })?.status !== 404) throw error;
       // No repo-spec — empty gates; routing no-ops (miss).
       return {
         evidence,
@@ -298,6 +523,8 @@ export function createGithubReviewAdapter(deps: GithubReviewAdapterDeps) {
         modelRef: DEFAULT_REVIEW_MODELREF,
         changedFiles,
         owningNode: { kind: "miss" },
+        headMoved,
+        operatorBuildSha,
       };
     }
 
@@ -336,7 +563,7 @@ export function createGithubReviewAdapter(deps: GithubReviewAdapterDeps) {
 
     // Owning-domain resolution. The structured `review.routed` log is emitted by
     // the worker activity (the orchestrator's observability for the
-    // deploy_verified loop), not here — see services/scheduler-worker review.ts.
+    // validate-candidate scorecard loop), not here — see services/scheduler-worker review.ts.
     //
     // `extractOwningNode` is monorepo-shaped: it routes changed files across the root
     // `nodes:` registry and enforces the meta-test invariant that operator is registered.
@@ -388,7 +615,7 @@ export function createGithubReviewAdapter(deps: GithubReviewAdapterDeps) {
               owner,
               repo,
               `${ruleBasePath}/${ruleFile}`,
-              pr.base.ref
+              configRef
             );
             rules[ruleFile] = parseRule(ruleYaml);
           } catch (error) {
@@ -431,8 +658,9 @@ export function createGithubReviewAdapter(deps: GithubReviewAdapterDeps) {
 
     const responseFormat = {
       prompt:
-        "Respond with a JSON object containing a `metrics` array and a `summary` string. " +
-        "Each metric entry must have: `metric` (name), `value` (0.0-1.0), `observations` (string array).",
+        "Respond with a JSON object containing a `metrics` array, a `summary` string and an optional `insufficientEvidence` boolean. " +
+        "Each metric entry must have: `metric` (name), `value` (0.0-1.0), `observations` (string array) and `citations` " +
+        "(string array of the exact hub entry ids you read with core__knowledge_read that the score rests on; empty when none).",
       schemaId: "evaluation-output",
     };
 
@@ -449,10 +677,20 @@ export function createGithubReviewAdapter(deps: GithubReviewAdapterDeps) {
       repoSpecYaml,
       changedFiles,
       owningNode,
+      headMoved,
+      operatorBuildSha,
     };
   }
 
-  return { createCheckRun, updateCheckRun, postPrComment, fetchPrContext };
+  return {
+    createCheckRun,
+    updateCheckRun,
+    postPrComment,
+    fetchPrContext,
+    resolvePullRequest,
+    readQueueVerdictInputs,
+    writeQueueVerdict,
+  };
 }
 
 export type GithubReviewAdapter = ReturnType<typeof createGithubReviewAdapter>;

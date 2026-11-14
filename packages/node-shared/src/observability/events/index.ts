@@ -16,12 +16,30 @@
 // Event Name Registry (as const)
 // ============================================================================
 
+export const WORK_ITEMS_LIST_ERROR_CODES = {
+  INVALID_INPUT: "invalid_input",
+  INVALID_CURSOR: "invalid_cursor",
+  BACKEND_UNAVAILABLE: "backend_unavailable",
+  INTERNAL_ERROR: "internal_error",
+} as const;
+
+export const KNOWLEDGE_CONTRIBUTION_DIFF_ERROR_CODES = {
+  NOT_FOUND: "contribution_not_found",
+  BACKEND_UNAVAILABLE: "backend_unavailable",
+  DIFF_FAILED: "diff_failed",
+} as const;
+
 export const EVENT_NAMES = {
+  WORK_ITEMS_LIST_COMPLETE: "work.items.list_complete",
   // AI Domain - Server
   AI_COMPLETION: "ai.completion",
   AI_LLM_CALL: "ai.llm_call",
   AI_LLM_CALL_COMPLETED: "ai.llm_call_completed",
   AI_TOOL_CALL_ERROR: "ai.tool_call.error",
+  /** One structured authz decision per evaluated tool call (authz v0 audit). */
+  AI_TOOL_AUTHZ_DECISION: "ai.tool_authz.decision",
+  /** One structured summary per mission-loop cycle on the work-prioritizer slot (story.5108). */
+  AI_WORK_PRIORITIZER_CYCLE: "ai.work_prioritizer.cycle",
   AI_CHAT_RECEIVED: "ai.chat_received",
   AI_CHAT_RESPONSE_STARTED: "ai.chat_response_started",
   AI_CHAT_STREAM_CLOSED: "ai.chat_stream_closed",
@@ -80,9 +98,11 @@ export const EVENT_NAMES = {
   NODE_OBSERVABILITY_DB_SCHEMA_COMPLETE:
     "feature.node_observability_db_schema.complete",
   NODE_DEPLOY_STATE_COMPLETE: "feature.node_deploy_state.complete",
+  NODE_WORKLOAD_DEPLOY_COMPLETE: "feature.node_workload_deploy.complete",
   NODE_OPERATIONS_READ_COMPLETE: "feature.node_operations_read.complete",
   VCS_FLIGHT_REQUEST_COMPLETE: "feature.vcs_flight.request_complete",
   VCS_MERGE_REQUEST_COMPLETE: "feature.vcs_merge.request_complete",
+  VCS_REVIEW_REQUEST_COMPLETE: "feature.vcs_review.request_complete",
   VCS_RUN_CI_REQUEST_COMPLETE: "feature.vcs_run_ci.request_complete",
 
   // Adapter Events
@@ -116,6 +136,11 @@ export const EVENT_NAMES = {
 
   // Scheduling Domain
   SCHEDULE_CREDIT_GATE_REJECTED: "schedules.credit_gate_rejected",
+  SCHEDULE_DETAIL_READ: "schedules.detail_read",
+  SCHEDULE_HISTORY_READ: "schedules.history_read",
+  KNOWLEDGE_MERGE_CHECK_COMPLETE: "knowledge.merge_check.complete",
+  KNOWLEDGE_CONTRIBUTION_DIFF_COMPLETE: "knowledge.contribution_diff.complete",
+  AI_THREAD_READ: "ai.thread_read",
 
   // Governance Domain
   GOVERNANCE_SYNC_COMPLETE: "governance.sync.complete",

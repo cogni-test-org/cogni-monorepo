@@ -184,7 +184,7 @@ deployment_provider_for_target() {
 
 # True when <target> deploys to <env> through the in-cluster k3s/Argo lane, i.e.
 # the env VM owns its address, workload, and substrate. False for an externally
-# placed node (akash), whose ComputeWorkload controller owns those instead.
+# placed node (akash), whose node-deploy sequencer owns those instead.
 #   is_k3s_placed TARGET ENV
 is_k3s_placed() {
   local provider
@@ -465,73 +465,11 @@ deployment_provider_for_target() {
   esac
 }
 
-# Operator-owned per-environment RECONCILIATION AUTHORITY, read from the ONE place the catalog
-# already declares it (`compute_api.<env>`, infra/catalog/_schema.json). Shell twin of
-# resolveNodeComputeApi() in nodes/operator/app/src/features/compute/node-compute-api.ts —
-# ONE authority reader per language, same semantics, so the deploy lane can never disagree with
-# the typed materializer that RENDERS the manifest.
-#
-# LEGACY_IS_DEFAULT: an absent per-env cell resolves to `legacy`, the pre-existing bespoke
-# `compute-workload-controller`. Byte-for-byte the same default as the typed resolver, and the
-# same shape as K3S_IS_DEFAULT above — adding the field changed nothing until a row opted in.
-#
-# AUTHORITY_REQUIRES_AN_INSTALLED_API IS NOT RESTATED HERE: the typed resolver additionally
-# refuses a `crossplane` row in an environment with no Crossplane control plane, rather than
-# degrading it to `legacy`. That check belongs where desired state is BUILT — by the time this
-# lane runs, the materializer has already rendered or already failed. This reader's only job is
-# to name the file that render produced.
-#   compute_api_for_target NODE ENV   # → legacy | crossplane
-compute_api_for_target() {
-  local node="$1" env="${2:-}" api
-  if [ -z "${_image_tags_primary_cache[$node]+x}" ]; then
-    echo "[ERROR] image-tags: unknown target: $node" >&2
-    return 1
-  fi
-  [ -n "$env" ] || { echo "[ERROR] image-tags: compute_api_for_target needs an env" >&2; return 1; }
-  api=$(yq -N ".compute_api.\"${env}\" // \"legacy\"" "${_image_tags_catalog_root}/${node}.yaml")
-  [ -n "$api" ] && [ "$api" != "null" ] || api="legacy"
-  case "$api" in
-    legacy | crossplane) printf '%s' "$api" ;;
-    *)
-      echo "[ERROR] image-tags: unsupported compute_api '$api' for '$node' in env '$env' (expected legacy|crossplane; see infra/catalog/${node}.yaml)" >&2
-      return 1
-      ;;
-  esac
-}
-
-# ONE_AUTHORITY_PER_WORKLOAD (bug.5148), structural half. Shell twin of
-# computeWorkloadManifestFile() in
-# nodes/operator/app/src/features/compute/compute-workload-manifest.ts: each authority renders
-# into its OWN filename, and the materializer's `rsync --delete` means the kind NOT selected is
-# ABSENT from the overlay. So a lane that hardcodes `compute-workload.yaml` is silently
-# asserting the legacy authority — which is why the first real `crossplane` mint failed its
-# flight with the manifest correctly rendered as `xcomputeworkload.yaml` right beside the check.
-#   compute_workload_manifest_file_for_api API   # → the file that authority renders
-compute_workload_manifest_file_for_api() {
-  case "${1:-}" in
-    crossplane) printf 'xcomputeworkload.yaml' ;;
-    legacy) printf 'compute-workload.yaml' ;;
-    *)
-      echo "[ERROR] image-tags: unsupported compute_api '${1:-}' (expected legacy|crossplane)" >&2
-      return 1
-      ;;
-  esac
-}
-
-# The manifest filename a (node, env) cell's rendered desired state is committed under — the
-# one call sites should use. Deploy lanes RESOLVE the name; they never choose it.
-#   compute_workload_manifest_file NODE ENV   # → compute-workload.yaml | xcomputeworkload.yaml
-compute_workload_manifest_file() {
-  local api
-  api="$(compute_api_for_target "$1" "${2:-}")" || return 1
-  compute_workload_manifest_file_for_api "$api"
-}
-
 # bug.5094 — the address a CHERRY-RESIDENT caller must dial to reach a node's app.
 # Placement decides the address, not the caller:
 #   k3s   → the in-cluster Service DNS convention (unchanged; do not regress the fleet)
-#   akash → the node's public canonical URL, i.e. the SAME host the ComputeWorkload
-#           publishes (computeWorkloadPublicHost → hostForNode → host_for_node here),
+#   akash → the node's public canonical URL, i.e. the SAME host the node-deploy
+#           sequencer publishes (hostForNode → host_for_node here),
 #           because a node that left the cluster has no `<slug>-node-app` Service.
 # `domain` is the env's public domain (domain_for_env in scripts/setup/lib/fork-identity.sh);
 # only akash rows need it, so a pure-k3s render may pass "".
@@ -571,30 +509,60 @@ node_internal_service_endpoint_csv() {
   done
 }
 
-node_billing_endpoint_csv() {
-  # Routing (NOT build): billing attribution resolves a node_id per catalog type:node
-  # for EVERY node, submodule or not. Build filtering does not belong here.
-  #
-  # LiteLLM runs in Compose on the env VM, so a k3s node is reached at the VM's
-  # NodePort. bug.5094: an akash node has no NodePort on that VM — it is reached at
-  # its public URL, resolved from the same catalog placement as every other consumer.
-  local host="$1" env="${2:-}" domain="${3:-}" sep="" node node_id port url provider
+node_billing_endpoint_csv() (
+  # Key registration follows control_env_for; workload destinations follow their
+  # OWN lane. A gateway must never route a registered foreign lane by UUID alone.
+  # Subshell confines helper shell options and fixture catalog scope to this call.
+  local host="$1" env="${2:-}" domain="${3:-}" sep="" node node_id port url
+  local lane lanes owner provider lane_domain domain_root prefix
+  CATALOG_DIR="$_image_tags_catalog_root"
+  # shellcheck source=scripts/ci/lib/appset-paths.sh
+  source "$_image_tags_lib_dir/appset-paths.sh"
+  # shellcheck source=scripts/setup/lib/fork-identity.sh
+  source "$_image_tags_repo_root/scripts/setup/lib/fork-identity.sh"
+  domain_root="$domain"
+  if [ -n "$env" ]; then
+    prefix="$(domain_for_env "$env" "")" || return 1
+    domain_root="${domain#"$prefix"}"
+  fi
   for node in "${NODE_TARGETS[@]}"; do
     node_id="$(node_id_for_target "$node")" || return 1
-    provider="k3s"
-    if [ -n "$env" ]; then
-      provider="$(deployment_provider_for_target "$node" "$env")" || return 1
-    fi
-    if [ "$provider" = "akash" ]; then
-      url="$(node_app_url_for_target "$node" "$env" "$domain")" || return 1
-    else
+    if [ -z "$env" ]; then
+      # Local/bootstrap compatibility: no workload aliases without an explicit lane.
       port="$(node_port_for_target "$node")" || return 1
       url="http://${host}:${port}"
+      printf '%s%s=%s,%s=%s' "$sep" "$node" "$url" "$node_id" "$url"
+      sep=","
+      continue
     fi
-    printf '%s%s=%s,%s=%s' "$sep" "$node" "$url" "$node_id" "$url"
-    sep=","
+    lanes="$(yq -r '.envs[]?' "$CATALOG_DIR/$node.yaml")" || return 1
+    for lane in $lanes; do
+      target_in_env "$node" "$lane" || return 1
+      provider="$(deployment_provider_for_target "$node" "$lane")" || return 1
+      owner="$(control_env_for "$lane" "$node")" || return 1
+      [ "$owner" = "$env" ] || continue
+      if [ "$provider" = "akash" ]; then
+        if [ "$lane" = "$env" ]; then
+          lane_domain="$domain"
+        else
+          lane_domain="$(domain_for_env "$lane" "$domain_root")" || return 1
+        fi
+        url="$(node_app_url_for_target "$node" "$lane" "$lane_domain")" || return 1
+      else
+        # k3s workloads are local to their own gateway by the custody resolver.
+        [ "$lane" = "$env" ] || return 1
+        port="$(node_port_for_target "$node")" || return 1
+        url="http://${host}:${port}"
+      fi
+      if [ "$lane" = "$env" ]; then
+        printf '%s%s=%s,%s=%s' "$sep" "$node" "$url" "$node_id" "$url"
+        sep=","
+      fi
+      printf '%scogni:%s:%s:app:v1=%s' "$sep" "$lane" "$node_id" "$url"
+      sep=","
+    done
   done
-}
+)
 
 # missing_image_action <explicit_targets_csv>
 #

@@ -36,6 +36,11 @@ vi.mock("@/adapters/server/review/github-auth", () => ({
   }),
 }));
 
+// App-JWT mint for the installation lookup (task.5438); the lookup itself is a stubbed `fetch`.
+vi.mock("@octokit/auth-app", () => ({
+  createAppAuth: () => async () => ({ token: "app-jwt" }),
+}));
+
 import { createGithubReviewAdapter } from "@/adapters/server/review/github-review.adapter";
 
 const mockLogger = {
@@ -251,7 +256,7 @@ describe("fetchPrContext — review on/off + model (repo-spec driven)", () => {
     });
 
     expect(result.reviewEnabled).toBe(true);
-    expect(result.modelRef.modelId).toBe("gpt-4o-mini");
+    expect(result.modelRef.modelId).toBe("deepseek-v4-flash");
   });
 
   it("propagates review.enabled=false (node opts out)", async () => {
@@ -291,6 +296,195 @@ describe("fetchPrContext — review on/off + model (repo-spec driven)", () => {
     expect(result.modelRef).toEqual({
       providerKey: "platform",
       modelId: "claude-haiku-4-5",
+    });
+  });
+});
+
+describe("story.5102 — pinned review subject + request-bound check", () => {
+  it("reads repo-spec + rules at the pinned baseSha and reports headMoved", async () => {
+    setFetchPrHandlers({
+      changedFiles: ["nodes/poly/app/src/foo.ts"],
+      ruleAvailableAt: "nodes/poly/.cogni/rules/quality.rule.yaml",
+    });
+    const baseSha = "b".repeat(40);
+
+    const moved = await makeAdapter().fetchPrContext({
+      owner: "org",
+      repo: "repo",
+      prNumber: 123,
+      installationId: 1,
+      baseSha,
+      headSha: "c".repeat(40),
+    });
+    expect(moved.headMoved).toBe(true);
+    const contentRefs = requests
+      .filter((r) => r.route === "GET /repos/{owner}/{repo}/contents/{path}")
+      .map((r) => (r.params as { ref: string }).ref);
+    expect(contentRefs.length).toBeGreaterThan(0);
+    expect(contentRefs.every((ref) => ref === baseSha)).toBe(true);
+
+    const pinned = await makeAdapter().fetchPrContext({
+      owner: "org",
+      repo: "repo",
+      prNumber: 123,
+      installationId: 1,
+      baseSha,
+      headSha: "deadbeef",
+    });
+    expect(pinned.headMoved).toBe(false);
+  });
+
+  it("writes the request id as the check run external_id", async () => {
+    routeHandlers = {
+      "POST /repos/{owner}/{repo}/check-runs": () => ({ id: 7 }),
+    };
+    const id = await makeAdapter().createCheckRun({
+      owner: "org",
+      repo: "repo",
+      headSha: "deadbeef",
+      installationId: 1,
+      externalId: "req-1",
+    });
+    expect(id).toBe(7);
+    expect(requests[0]?.params).toMatchObject({
+      name: "Cogni Git PR Review",
+      head_sha: "deadbeef",
+      external_id: "req-1",
+    });
+  });
+});
+
+describe("repo-spec absence is 404 only (story.5102 review fix)", () => {
+  function withRepoSpecError(status: number | undefined) {
+    setFetchPrHandlers({ changedFiles: ["nodes/poly/app/src/foo.ts"] });
+    routeHandlers["GET /repos/{owner}/{repo}/contents/{path}"] = () => {
+      throw Object.assign(new Error("repo-spec read failed"), { status });
+    };
+  }
+  const target = {
+    owner: "org",
+    repo: "repo",
+    prNumber: 123,
+    installationId: 1,
+  };
+
+  it("treats a 404 repo-spec as absent (no gates, miss)", async () => {
+    withRepoSpecError(404);
+    const result = await makeAdapter().fetchPrContext(target);
+    expect(result.gatesConfig.gates).toEqual([]);
+    expect(result.owningNode.kind).toBe("miss");
+  });
+
+  it.each([
+    500,
+    401,
+    undefined,
+  ])("throws on a %s repo-spec read so Temporal retries", async (status) => {
+    withRepoSpecError(status);
+    await expect(makeAdapter().fetchPrContext(target)).rejects.toThrow(
+      "repo-spec read failed"
+    );
+  });
+});
+
+describe("task.5438 — merge-queue verdict I/O", () => {
+  const headSha = "a".repeat(40);
+  const queueSha = "b".repeat(40);
+  const runOf = (
+    id: number,
+    appId: number,
+    conclusion: string | null,
+    status = "completed"
+  ) => ({
+    id,
+    name: "Cogni Git PR Review",
+    app: { id: appId },
+    status,
+    conclusion,
+    html_url: `https://example.test/runs/${id}`,
+  });
+  const stubInstallation = () =>
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ id: 99 }) }))
+    );
+  const readTarget = {
+    owner: "org",
+    repo: "repo",
+    prNumber: 12,
+    queueSha,
+  };
+
+  it("reads the PR head, its review runs, and whether the App already wrote the queue verdict", async () => {
+    stubInstallation();
+    try {
+      routeHandlers = {
+        "GET /repos/{owner}/{repo}/pulls/{pull_number}": () => ({
+          head: { sha: headSha },
+        }),
+        "GET /repos/{owner}/{repo}/commits/{ref}/check-runs": (params) =>
+          (params as { ref: string }).ref === headSha
+            ? { check_runs: [runOf(5, 1, "success"), runOf(6, 777, "failure")] }
+            : { check_runs: [runOf(9, 1, "success")] },
+      };
+      const inputs = await makeAdapter().readQueueVerdictInputs(readTarget);
+      expect(inputs.installationId).toBe(99);
+      expect(inputs.headSha).toBe(headSha);
+      expect(inputs.headRuns.map((r) => [r.id, r.appId, r.conclusion])).toEqual(
+        [
+          [5, 1, "success"],
+          [6, 777, "failure"],
+        ]
+      );
+      // appId "1" wrote a completed run on the queue commit, so a redelivery is a no-op.
+      expect(inputs.queueHasVerdict).toBe(true);
+      const listed = requests.filter((r) => r.route.includes("check-runs"));
+      expect(listed[0]?.params).toMatchObject({
+        check_name: "Cogni Git PR Review",
+        filter: "all",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not treat a foreign App's run on the queue commit as already written", async () => {
+    stubInstallation();
+    try {
+      routeHandlers = {
+        "GET /repos/{owner}/{repo}/pulls/{pull_number}": () => ({
+          head: { sha: headSha },
+        }),
+        "GET /repos/{owner}/{repo}/commits/{ref}/check-runs": (params) =>
+          (params as { ref: string }).ref === headSha
+            ? { check_runs: [] }
+            : { check_runs: [runOf(9, 777, "success")] },
+      };
+      const inputs = await makeAdapter().readQueueVerdictInputs(readTarget);
+      expect(inputs.queueHasVerdict).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("writes a completed, same-named check run on the queue commit", async () => {
+    routeHandlers = {
+      "POST /repos/{owner}/{repo}/check-runs": () => ({ id: 41 }),
+    };
+    const id = await makeAdapter().writeQueueVerdict({
+      installationId: 99,
+      owner: "org",
+      repo: "repo",
+      queueSha,
+      verdict: { conclusion: "failure", title: "t", summary: "s" },
+    });
+    expect(id).toBe(41);
+    expect(requests[0]?.params).toMatchObject({
+      name: "Cogni Git PR Review",
+      head_sha: queueSha,
+      status: "completed",
+      conclusion: "failure",
+      output: { title: "t", summary: "s" },
     });
   });
 });

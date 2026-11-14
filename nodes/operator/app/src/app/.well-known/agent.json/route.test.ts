@@ -53,6 +53,36 @@ describe("GET /.well-known/agent.json", () => {
     });
   });
 
+  it("publishes the dev-triggered review action from the typed wire contract (story.5102)", async () => {
+    const { GET } = await import("./route");
+    const response = await GET(
+      new Request("http://0.0.0.0:3000/.well-known/agent.json", {
+        headers: {
+          "x-forwarded-host": "operator.example",
+          "x-forwarded-proto": "https",
+        },
+      })
+    );
+    const body = await response.json();
+
+    expect(body.endpoints.review).toBe(
+      "https://operator.example/api/v1/vcs/review"
+    );
+    expect(body.actions.requestReview).toMatchObject({
+      method: "POST",
+      endpoint: "https://operator.example/api/v1/vcs/review",
+      auth: { type: "bearer", capability: "node.flight" },
+      inputSchema: {
+        type: "object",
+        required: ["nodeId", "prNumber"],
+      },
+      outputSchema: {
+        type: "object",
+        required: ["workflowId", "headSha", "requestId"],
+      },
+    });
+  });
+
   // `endpoints.workItems` is only a URL — it cannot tell an agent the route takes
   // POST, what body it wants, or that the server allocates the id. Agents without
   // these schemas fall back to harness-local slash commands, which hardcode the
@@ -97,5 +127,98 @@ describe("GET /.well-known/agent.json", () => {
 
     // Creating is a first-class step of the loop, not an undocumented aside.
     expect(body.process.requiredLoop).toContain("adopt_or_create_work_item");
+
+    // story.0023 + task.0086: a PATCH must say why (the reason is readable back from
+    // history), and may cite the hub atoms it used.
+    expect(body.actions.updateWorkItem.inputSchema.properties).toHaveProperty(
+      "reason"
+    );
+    expect(body.actions.updateWorkItem.inputSchema.required).toContain(
+      "reason"
+    );
+    expect(body.actions.updateWorkItem.inputSchema.properties).toHaveProperty(
+      "cites"
+    );
+  });
+
+  it("publishes the change-history read actions from the package operations (story.0023)", async () => {
+    const { GET } = await import("./route");
+    const response = await GET(
+      new Request("http://0.0.0.0:3000/.well-known/agent.json", {
+        headers: {
+          "x-forwarded-host": "operator.example",
+          "x-forwarded-proto": "https",
+        },
+      })
+    );
+    const body = await response.json();
+
+    expect(body.actions.getWorkItemHistory).toMatchObject({
+      method: "GET",
+      endpoint: "https://operator.example/api/v1/work/items/{id}/history",
+      auth: { type: "bearer" },
+    });
+    expect(body.actions.getKnowledgeHistory).toMatchObject({
+      method: "GET",
+      endpoint: "https://operator.example/api/v1/knowledge/{id}/history",
+      auth: { type: "bearer" },
+    });
+    expect(body.actions.getWorkItemHistory.outputSchema).toHaveProperty(
+      "properties"
+    );
+  });
+
+  // story.0033: an agent can set `moves` on a work item and sees the baseline on the read.
+  it("offers moves on the create and PATCH actions, without a baseline, and shows it on the read (story.0033)", async () => {
+    const { GET } = await import("./route");
+    const response = await GET(
+      new Request("http://0.0.0.0:3000/.well-known/agent.json", {
+        headers: {
+          "x-forwarded-host": "operator.example",
+          "x-forwarded-proto": "https",
+        },
+      })
+    );
+    const body = await response.json();
+
+    const moves =
+      body.actions.updateWorkItem.inputSchema.properties.set.properties.moves;
+    expect(moves).toMatchObject({ type: "array", maxItems: 3 });
+    expect(moves.description).toContain("never send one");
+    expect(moves.items.required).toEqual(["metricId", "direction"]);
+    expect(moves.items.properties.metricId).toMatchObject({
+      minLength: 1,
+      maxLength: 40,
+    });
+    expect(
+      moves.items.properties.direction.anyOf.find(
+        (variant: { enum?: unknown }) => variant.enum
+      )?.enum
+    ).toEqual(["up", "down"]);
+    expect(moves.items.properties.direction.anyOf).toContainEqual({
+      type: "null",
+    });
+    expect(moves.items.properties).not.toHaveProperty("baselineObservationId");
+
+    // A create names its metrics at filing time with the same schema.
+    const onCreate = body.actions.createWorkItem.inputSchema.properties.moves;
+    expect(onCreate).toMatchObject({ type: "array", maxItems: 3 });
+    expect(onCreate.description).toContain("never send one");
+    expect(onCreate.items.properties).not.toHaveProperty(
+      "baselineObservationId"
+    );
+
+    expect(body.actions.getWorkItem).toMatchObject({
+      method: "GET",
+      endpoint: "https://operator.example/api/v1/work/items/{id}",
+    });
+    const read =
+      body.actions.getWorkItem.outputSchema.properties.moves.items.properties;
+    expect(read).toHaveProperty("baselineObservationId");
+    expect(
+      read.moved.anyOf.find((variant: { enum?: unknown }) => variant.enum)?.enum
+    ).toEqual(["as_declared", "against", "flat", "unknown"]);
+    expect(read.moved.anyOf).toContainEqual({ type: "null" });
+    expect(read.unknownReason.enum).toContain("metric_deprecated");
   });
 });

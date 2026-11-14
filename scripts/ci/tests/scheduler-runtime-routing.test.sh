@@ -19,8 +19,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-. "$SCRIPT_DIR/lib/catalog-input.sh"
-TEST_NODE="$(catalog_test_primary_node "$REPO_ROOT/infra/catalog")"
 cd "$REPO_ROOT"
 
 # shellcheck source=scripts/ci/lib/image-tags.sh
@@ -153,7 +151,7 @@ cp nodes/operator/.cogni/repo-spec.yaml "$TMP_TREE/nodes/operator/.cogni/repo-sp
 AY_ID="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 # (a) projection present → routed (slug + projected UUID), no parent-readable repo-spec needed
 yq ".name = \"ay\" | .path_prefix = \"nodes/ay/\" | .node_port = 30400 | .image_tag_suffix = \"-ay\" | .migrator_tag_suffix = \"-ay-migrate\" | .source_repo = \"https://github.com/cogni-test-org/ay.git\" | .image_repository = \"ghcr.io/cogni-test-org/ay\" | .node_id = \"$AY_ID\"" \
-  "$REPO_ROOT/infra/catalog/$TEST_NODE.yaml" > "$TMP_CATALOG/ay.yaml"
+  infra/catalog/node-template.yaml > "$TMP_CATALOG/ay.yaml"
 
 fixture_endpoints="$(COGNI_CATALOG_ROOT="$TMP_CATALOG" bash scripts/ci/render-scheduler-worker-endpoints.sh)" \
   || fail "render failed for a submodule catalog node carrying a node_id projection"
@@ -199,9 +197,9 @@ mkdir -p "$PLACEMENT_CATALOG"
 ZK_ID="11111111-2222-3333-4444-555555555555"
 ZA_ID="66666666-7777-8888-9999-aaaaaaaaaaaa"
 yq ".name = \"zk\" | .envs = [\"candidate-a\", \"preview\", \"production\"] | .path_prefix = \"nodes/zk/\" | .node_port = 30401 | .image_tag_suffix = \"-zk\" | .migrator_tag_suffix = \"-zk-migrate\" | .source_repo = \"https://github.com/cogni-test-org/zk.git\" | .image_repository = \"ghcr.io/cogni-test-org/zk\" | .node_id = \"$ZK_ID\" | del(.deployment_provider) | del(.is_primary_host)" \
-  "$REPO_ROOT/infra/catalog/$TEST_NODE.yaml" > "$PLACEMENT_CATALOG/zk.yaml"
+  infra/catalog/node-template.yaml > "$PLACEMENT_CATALOG/zk.yaml"
 yq ".name = \"za\" | .envs = [\"candidate-a\", \"preview\", \"production\"] | .path_prefix = \"nodes/za/\" | .node_port = 30402 | .image_tag_suffix = \"-za\" | .migrator_tag_suffix = \"-za-migrate\" | .source_repo = \"https://github.com/cogni-test-org/za.git\" | .image_repository = \"ghcr.io/cogni-test-org/za\" | .node_id = \"$ZA_ID\" | del(.is_primary_host) | .deployment_provider = {\"candidate-a\": \"akash\", \"production\": \"akash\"}" \
-  "$REPO_ROOT/infra/catalog/$TEST_NODE.yaml" > "$PLACEMENT_CATALOG/za.yaml"
+  infra/catalog/node-template.yaml > "$PLACEMENT_CATALOG/za.yaml"
 
 assert_endpoint() {
   local env="$1" want_zk="$2" want_za="$3" csv
@@ -247,9 +245,12 @@ case ",$scoped_endpoints," in
   *) fail "env filtering removed the active placed sibling" ;;
 esac
 
+# Restore membership before testing placement independently of custody.
+yq -i '.envs = ["candidate-a", "preview", "production"]' "$PLACEMENT_CATALOG/zk.yaml"
+
 # LiteLLM (Compose-on-VM) is a Cherry-resident consumer too: k3s -> VM NodePort,
 # akash -> the same public URL (no NodePort exists for an off-cluster workload).
-placement_billing="$(COGNI_CATALOG_ROOT="$PLACEMENT_CATALOG" bash -c 'source scripts/ci/lib/image-tags.sh && node_billing_endpoint_csv candidate-a.vm.example.test candidate-a test.example.test')" \
+placement_billing="$(FLEET_CONTROL_ENV=candidate-a COGNI_CATALOG_ROOT="$PLACEMENT_CATALOG" bash -c 'source scripts/ci/lib/image-tags.sh && node_billing_endpoint_csv candidate-a.vm.example.test candidate-a test.example.test')" \
   || fail "placement billing render failed"
 case ",$placement_billing," in
   *",zk=http://candidate-a.vm.example.test:30401,"*) pass "billing zk (k3s) -> VM NodePort" ;;
@@ -259,6 +260,95 @@ case ",$placement_billing," in
   *",za=https://za-test.example.test,"*) pass "billing za (akash) -> public URL" ;;
   *) fail "billing za should use the public URL: $placement_billing" ;;
 esac
+
+# Exercise the deploy caller, not just the catalog helper: an invented VM alias
+# dropped production billing callbacks even while model completions succeeded.
+deploy_billing_fragment="$(awk '
+  /^source .*\/cogni-deployment-identity.sh"$/ ||
+  /^LITELLM_NODE_HOST=/ || /^LITELLM_NODE_ENDPOINTS=/ { print }
+' scripts/ci/deploy-infra.sh)"
+assert_deploy_billing_route() {
+  local env="$1" root="$2" fallback_root="$3" slug="$4" want_host="$5" csv alias
+  csv="$(
+    REPO_ROOT="$REPO_ROOT" COGNI_CATALOG_ROOT="$PLACEMENT_CATALOG" FLEET_CONTROL_ENV="$env" \
+      DEPLOY_ENVIRONMENT="$env" DOMAIN=isolated-workload.example.test \
+      FORK_DOMAIN_ROOT="$root" COGNI_DOMAIN_ROOT="$fallback_root" \
+      COGNI_DEPLOYMENT_SLUG="$slug" DEPLOY_BILLING_FRAGMENT="$deploy_billing_fragment" \
+      bash -eu -c '
+        source "$REPO_ROOT/scripts/ci/lib/image-tags.sh"
+        eval "$DEPLOY_BILLING_FRAGMENT"
+        printf "%s" "$LITELLM_NODE_ENDPOINTS"
+      '
+  )" || fail "deploy billing route render failed for $env"
+  for alias in zk "$ZK_ID"; do
+    case ",$csv," in
+      *",$alias=http://$want_host:30401,"*) : ;;
+      *) fail "$env deploy billing $alias should use $want_host:30401, got: $csv" ;;
+    esac
+  done
+  if [ "$env" != preview ]; then
+    for alias in za "$ZA_ID"; do
+      case ",$csv," in
+        *",$alias=https://za-isolated-workload.example.test,"*) : ;;
+        *) fail "$env deploy billing changed Akash workload address for $alias: $csv" ;;
+      esac
+    done
+  fi
+  pass "$env deploy billing uses $want_host and preserves placement"
+}
+assert_deploy_billing_route production '' '' '' cogni.vm.cognidao.org
+assert_deploy_billing_route preview '' '' '' cogni-preview.vm.cognidao.org
+assert_deploy_billing_route candidate-a '' '' '' cogni-candidate-a.vm.cognidao.org
+assert_deploy_billing_route production substrate.example.test ignored.example.test fleet fleet.vm.substrate.example.test
+assert_deploy_billing_route candidate-a '' fallback.example.test fleet fleet-candidate-a.vm.fallback.example.test
+
+# The shared gateway owns only registered lanes; placement and membership are
+# independent of build ownership. Exercise its emitted map through the real router.
+shared_billing="$(COGNI_CATALOG_ROOT="$PLACEMENT_CATALOG" FLEET_CONTROL_ENV=production \
+  bash -c 'source scripts/ci/lib/image-tags.sh; node_billing_endpoint_csv cogni.vm.substrate.test production isolated-workload.test')"
+for route in \
+  "cogni:candidate-a:$ZA_ID:app:v1=https://za-test.isolated-workload.test" \
+  "cogni:production:$ZA_ID:app:v1=https://za.isolated-workload.test" \
+  "cogni:production:$ZK_ID:app:v1=http://cogni.vm.substrate.test:30401"; do
+  case ",$shared_billing," in
+    *",$route,"*) pass "shared billing route $route" ;;
+    *) fail "missing authenticated workload route $route: $shared_billing" ;;
+  esac
+done
+case "$shared_billing" in
+  *"cogni:preview:"*|*"cogni:candidate-a:$ZK_ID:"*) fail "foreign k3s lane escaped its own gateway" ;;
+esac
+candidate_billing="$(COGNI_CATALOG_ROOT="$PLACEMENT_CATALOG" FLEET_CONTROL_ENV=production \
+  bash -c 'source scripts/ci/lib/image-tags.sh; node_billing_endpoint_csv candidate.vm.test candidate-a test.isolated-workload.test')"
+case ",$candidate_billing," in
+  *",za="*|*",$ZA_ID="*|*"cogni:candidate-a:$ZA_ID:"*|*"cogni:production:"*)
+    fail "candidate gateway claimed a production-custodied workload" ;;
+esac
+# No key is emitted for a declared node absent from the gateway lane.
+yq -i '.envs = ["production"]' "$PLACEMENT_CATALOG/zk.yaml"
+excluded_billing="$(COGNI_CATALOG_ROOT="$PLACEMENT_CATALOG" FLEET_CONTROL_ENV=production \
+  bash -c 'source scripts/ci/lib/image-tags.sh; node_billing_endpoint_csv candidate.vm.test candidate-a test.isolated-workload.test')"
+[ -z "$excluded_billing" ] || fail "billing renderer ignored membership: $excluded_billing"
+yq -i '.envs = ["candidate-a", "preview", "production"]' "$PLACEMENT_CATALOG/zk.yaml"
+# An isolated fleet controls foreign Akash lanes in its own gateway. Strip the
+# gateway lane's prefix exactly once before resolving each foreign workload host.
+isolated_billing="$(COGNI_CATALOG_ROOT="$PLACEMENT_CATALOG" FLEET_CONTROL_ENV=candidate-a \
+  bash -c 'source scripts/ci/lib/image-tags.sh; node_billing_endpoint_csv candidate.vm.test candidate-a test.isolated-workload.test')"
+case ",$isolated_billing," in
+  *",cogni:production:$ZA_ID:app:v1=https://za.isolated-workload.test,"*) pass "isolated fleet derives foreign workload domain" ;;
+  *) fail "isolated fleet used the gateway domain for a foreign lane: $isolated_billing" ;;
+esac
+# A foreign preview on Akash is owned by the production gateway too. Keep the
+# earlier preview-k3s exclusion, then prove the placed preview via actual callback.
+yq -i '.deployment_provider.preview = "akash"' "$PLACEMENT_CATALOG/za.yaml"
+shared_billing="$(COGNI_CATALOG_ROOT="$PLACEMENT_CATALOG" FLEET_CONTROL_ENV=production \
+  bash -c 'source scripts/ci/lib/image-tags.sh; node_billing_endpoint_csv cogni.vm.substrate.test production isolated-workload.test')"
+case ",$shared_billing," in
+  *",cogni:preview:$ZA_ID:app:v1=https://za-preview.isolated-workload.test,"*) pass "foreign preview Akash uses its own workload host" ;;
+  *) fail "missing foreign preview Akash route: $shared_billing" ;;
+esac
+RENDERED_BILLING_ENDPOINTS="$shared_billing" python3 "$SCRIPT_DIR/litellm-callback-routing.test.py" \
+  || fail "actual callback rejected the catalog-derived workload map"
 
 # An unsupported placement value must fail loud, never silently fall back to k3s.
 yq '.deployment_provider = {"candidate-a": "fly"}' "$PLACEMENT_CATALOG/za.yaml" > "$PLACEMENT_CATALOG/za.tmp" \
@@ -284,40 +374,20 @@ check_scheduler_vm_alias() {
   pass "$env scheduler-worker ExternalNames -> $expected"
 }
 
-# Workload URLs follow DOMAIN; VM discovery follows its independent substrate root.
-SUBSTRATE_ROOT="${FORK_DOMAIN_ROOT:-$(cogni_domain_root)}"
 SUBSTRATE_SLUG="$(cogni_deployment_slug)"
 for env in "${DEPLOY_ENVS[@]}"; do
-  check_scheduler_vm_alias "$env" "$(cogni_vm_host_for_env "$env" "$SUBSTRATE_ROOT" "$SUBSTRATE_SLUG")"
+  check_scheduler_vm_alias "$env" "$(cogni_vm_host_for_env "$env" "$FORK_ROOT" "$SUBSTRATE_SLUG")"
 done
 
-echo "[5/5] the Crossplane materializer's substrate host IS that same env VM alias"
-# story.5016 step 8. `spec.runtime.substrateHost` is the one value the Crossplane authority
-# cannot recover the way the bespoke controller did — that read `new URL(DATABASE_URL).hostname`
-# out of a SECRET VALUE. The composite action re-derives it from non-secret config with
-# vm_host_for_env(), the SAME primitive scripts/setup/bootstrap.sh used to publish the VM's
-# unproxied A record. This asserts the derivation lands on the host the cluster already dials,
-# because the failure it prevents is silent: a plausible-but-wrong hostname renders, syncs, and
-# buys a lease before anything notices the node has no Temporal.
-ACTION_YML=".github/actions/materialize-compute-workload/action.yml"
-grep -q -- '--substrate-host' "$ACTION_YML" \
-  || fail "$ACTION_YML stopped passing --substrate-host; a Crossplane-born node would get no Temporal/Redis/LiteLLM env"
-grep -q -- 'cogni_deployment_slug' "$ACTION_YML" \
-  || fail "$ACTION_YML derives operator substrate identity from the parent repo name instead of the provisioned deployment"
+echo "[5/5] the env VM alias is never the Cloudflare-proxied public apex"
+# The proxied apex drops 7233/6379/4000. A plausible-but-wrong host renders and
+# syncs before anything notices the worker has no Temporal/Redis/LiteLLM.
 for env in "${DEPLOY_ENVS[@]}"; do
-  file="infra/k8s/overlays/$env/scheduler-worker/kustomization.yaml"
-  [ -f "$file" ] || { echo "  skip - $env scheduler-worker overlay missing"; continue; }
-  expected="$(cogni_vm_host_for_env "$env" "$SUBSTRATE_ROOT" "$SUBSTRATE_SLUG")"
+  expected="$(cogni_vm_host_for_env "$env" "$FORK_ROOT" "$SUBSTRATE_SLUG")"
   apex="$(domain_for_env "$env" "$FORK_ROOT" || true)"
   [ "$expected" != "$apex" ] \
     || fail "$env substrate host resolved to the Cloudflare-proxied public apex '$apex', which drops 7233/6379/4000"
-  mapfile -t external_names < <(grep -oE 'externalName: [^ ]+' "$file" | awk '{print $2}' | sort -u)
-  [ "${#external_names[@]}" -gt 0 ] || fail "$file has no ExternalName entries"
-  for name in "${external_names[@]}"; do
-    [ "$name" = "$expected" ] \
-      || fail "cogni_vm_host_for_env($env) = $expected but $file dials $name — a Crossplane node would be wired to a different substrate than the cluster uses"
-  done
-  pass "$env materializer substrate host -> $expected"
+  pass "$env substrate host -> $expected (not the apex)"
 done
 
 echo "[6/6] scheduler repair paths select only the worker and no tenant substrate"
@@ -356,9 +426,10 @@ CATALOG_JSON="$(yq -o=json -I=0 '.' infra/catalog/scheduler-worker.yaml)" \
   pnpm --dir nodes/operator/app exec tsx -e '
     import assert from "node:assert/strict";
     import { resolveDeploymentTargets } from "./src/features/compute/node-deployment-targets.ts";
-    assert.deepEqual(resolveDeploymentTargets({catalogRows:[JSON.parse(process.env.CATALOG_JSON!)],environment:"candidate-a",flightTargets:["scheduler-worker"]}), {
+    assert.deepEqual(resolveDeploymentTargets({catalogRows:[JSON.parse(process.env.CATALOG_JSON!)],environment:"candidate-a",parentRepository:"cogni-dao/cogni",flightTargets:["scheduler-worker"]}), {
       deployment:[],substrate:[],offCluster:[],providers:{"scheduler-worker":"k3s"},
-      k3s:["scheduler-worker"],k3sNodes:[],sourceRepositories:{},sourceShas:{}
+      k3s:["scheduler-worker"],k3sNodes:[],sourceRepositories:{},sourceShas:{},nodeDeploy:[],
+      flight:["scheduler-worker"]
     });
   ' || fail "scheduler-only flight touches a node/database substrate"
 [ "$(yq -N '.spec.replicas' infra/k8s/overlays/production/scheduler-worker/replicas.patch.yaml)" = 1 ] || fail "production worker count changed"
@@ -452,12 +523,12 @@ def run(name, samples, success, reason, budget="1073741824", expected_sleeps=Non
 # The observed failed sample was below the old 1Gi+384Mi profile.
 assert 1393980 < (1024 + 384) * 1024
 run("observed 1393980KiB now eligible", [sample(0, 1393980)], True, "requiredKiB=1310720", expected_sleeps=0)
-run("one KiB below calibrated budget times out", [sample(0, 1310719), sample(180, 1310719)], False, "timed out", expected_sleeps=1)
+run("one KiB below calibrated budget starts anyway at deadline", [sample(0, 1310719), sample(180, 1310719)], True, "below budget, starting anyway", expected_sleeps=1)
 run("below-budget then actual release", [sample("10.25", 800000), sample("12.25", 1310720)], True, "requiredKiB=1310720", expected_sleeps=1)
 run("already sufficient", [sample(0, 1310720)], True, "eligible", expected_sleeps=0)
-run("timeout wins even newly sufficient at boundary", [sample(0, 800000), sample(180, 1310720)], False, "timed out", expected_sleeps=1)
-run("below budget timeout", [sample(0, 800000), sample(181, 800000)], False, "timed out")
-run("larger main limit refuses old calibrated threshold", [sample(0, 1310720), sample(180, 1310720)], False, "timed out", budget="1610612736", expected_sleeps=1)
+run("deadline wins even newly sufficient at boundary", [sample(0, 800000), sample(180, 1310720)], True, "below budget, starting anyway", expected_sleeps=1)
+run("below budget never blocks start", [sample(0, 800000), sample(181, 800000)], True, "below budget, starting anyway")
+run("larger main limit raises the threshold it waits for", [sample(0, 1310720), sample(180, 1310720)], True, "requiredKiB=1835008", budget="1610612736", expected_sleeps=1)
 run("actual main limit change affects threshold", [sample(0, 1835008)], True, "requiredKiB=1835008", budget="1610612736")
 for budget in ("", "0", "-1", "1.5", "unknown", "99999999999999999999999"):
     run("invalid main budget " + repr(budget), [sample(0, 9999999)], False, "invalid main limit", budget=budget, expected_sleeps=0)

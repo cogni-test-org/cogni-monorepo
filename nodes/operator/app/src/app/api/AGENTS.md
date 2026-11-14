@@ -5,7 +5,7 @@
 ## Metadata
 
 - **Owners:** @derek @core-dev
-- **Last reviewed:** 2026-10-09
+- **Last reviewed:** 2026-10-31
 - **Status:** draft
 
 ## Purpose
@@ -38,6 +38,11 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
 
 - **Exports:** none
 - **Routes (if any):**
+  - `/api/v1/nodes/[id]/deploy-state` [GET] — node.flight-gated deploy probes, allocated leases/orphans, bounded all-state receipts and optional exact `cogniKey`/`environment` lookup. Independent ledger/native coverage; public Akash state never proves handle-bearing closure.
+  - `/api/v1/deploy/workloads/releases/[releaseId]` [GET] — one release's derived state (queued|deploying|active|parked|superseded|failed), park reason, lead-time timestamps and attempt step timelines; same per-env gate as `/deploy/workloads` GET, other node/env releases are 404 (task.5400)
+  - `/api/v1/deploy/workloads/lanes` [GET] — queue awareness + KPIs per `{node, env, workload}` lane: serving release, in-flight release (state, attempts, who recorded it), trailing-24h superseded/parked history (who replaced whom), release success ratio, lead p50/p90 and supersede count (24h, 7d); read-only, same per-env gate as `/deploy/workloads` GET (task.5479, bug.5621)
+  - `/api/v1/deploy/maintenance-cancel` [POST] — target-node env-manager-gated cancellation of unchanged unexecuted candidate intent; exact Git preconditions, no runtime mutation
+  - `/api/v1/nodes/[id]/observability/langfuse/api/public/v2/observations` [GET] — developer-gated native Langfuse observation reads with independent receipt ownership, bounded native pagination and privacy projection
   - `/api/auth/[...nextauth]` [GET, POST]
   - `/api/setup/verify` [POST] - DAO formation verification
   - `/api/v1/nodes` [GET, POST] - managed-node registry: list owner's nodes + create a new registration
@@ -46,6 +51,7 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
   - `/api/v1/nodes/[id]/developers` [POST] - owner-gated approve/reject for registered agent developer flight authority
   - `/api/v1/nodes/[id]/reconcile-merge-queue` [POST] - env-manager-gated convergence of a node repo's live merge queue to the git-owned operator policy
   - `/api/v1/nodes/[id]/launch-pack` [GET] - owner-gated AI-assistant handoff for post-publish node launch
+  - `/api/v1/nodes/[id]/launch-pack/v2` [GET] - owner-gated successor handoff with maintained canonical guidance; the legacy route retains its published metadata
   - `/api/v1/nodes/[id]/publish` [POST] - mints the node repo, opens the submodule deployment PR, advances dao_formed → published
   - `/api/v1/nodes/[id]/activate-distributions` [POST] - terminal owner/developer-gated repo-spec PR; verifies distributor ownership/token and paired CAS publishing authority before recording active
   - `/api/v1/nodes/[id]/distributions-status` [GET] - owner/developer-gated read of the git-plane activation record (repo-spec main + open/merged activation PR + distributor addresses)
@@ -57,7 +63,7 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
   - `/api/v1/chat/completions` [POST] - OpenAI-compatible chat completions (streaming + non-streaming, `cogni_status` extension); see [completions spec](../../../docs/spec/completions-api.md)
   - `/api/v1/ai/chat` [POST] - streaming chat with server-authoritative thread persistence
   - `/api/v1/activity` [GET]
-  - `/api/v1/citations/[id]` [GET] - depth-1 citation links for a knowledge or work-item endpoint
+  - `/api/v1/citations/[id]` [GET] - depth-1 citation links for a knowledge or work-item endpoint, each with this side's `label` and `tone` from the published citation definitions (bug.0011)
   - `/api/v1/public/attribution/epochs` [GET] - closed epochs list (public, no auth)
   - `/api/v1/public/attribution/epochs/[id]/user-projections` [GET] - closed epoch user projections (public)
   - `/api/v1/public/attribution/epochs/[id]/claimants` [GET] - closed epoch claimant attribution (public)
@@ -70,6 +76,9 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
   - `/api/v1/attribution/epochs/[id]/pool-components` [POST] - record pool component (SIWE + approver)
   - `/api/v1/users/me` [GET, PATCH] - current profile
   - `/api/v1/users/me/ownership` [GET] - current ownership summary derived from linked identities
+  - `/api/v1/work/summaries` [GET] - one bounded summary page, auth + logging + the published `handleWorkSummariesRequest` (task.0056); limit default 25, max 100
+  - `/api/v1/work/board` [GET] - first page (<=20) of each visible board column, auth + logging + the published `handleWorkBoardRequest` (task.0056)
+  - `/api/v1/metrics/**` [GET, POST compute] - goal-metric reads (list, detail, `goals`, ranged `/history`, exact `/observations/[id]`, `/subjects/[id]`, live `/compute`); each route is auth + logging + `metricHandlers()` from `_facades/metrics.server.ts`, which binds the published `@cogni-dao/metrics/http` core (story.0021)
   - `/api/v1/work/items` [GET, POST] - list/create node-local work items (Bearer or SIWE auth)
   - `/api/v1/work/items/[id]` [GET, PATCH, DELETE] - read/update/delete a node-local work item (Bearer or SIWE auth)
   - `/api/v1/work/items/[id]/claims` [POST] - claim an operator work-item execution session (Bearer or SIWE auth)
@@ -77,9 +86,13 @@ HTTP API endpoints using Next.js App Router. Contract-validated entry points tha
   - `/api/v1/work/items/[id]/pr` [POST] - link branch/PR metadata to the active work-item session and durable work item
   - `/api/v1/work/items/[id]/coordination` [GET] - read current operator coordination state for a work item
   - `/api/v1/agent/register` [POST] - unauthenticated machine actor registration (returns Bearer API key)
+  - `/api/v1/agent/credentials/{upgrade,rotate,confirm,revoke}` [POST] - handlers in `agent/credentials/`; package entrypoint `@cogni-dao/agent-grants/credentials`
   - `/api/v1/agent/runs` [GET] - machine-authenticated run list
   - `/api/v1/agent/runs/[runId]/stream` [GET] - machine-authenticated run stream SSE
   - `/api/v1/knowledge/contributions/[id]/commits` [GET, POST] - list/append authenticated contribution branch commits
+  - `/api/v1/knowledge/contributions/[id]/merge-check` [POST] - authenticated admitted native conflict check of immutable committed roots; does not merge or grant merge authority
+- `/api/v1/knowledge/domains/[domain]` [GET, PATCH, DELETE] — bearer/session principal, immutable ID, partial metadata patch, delete only empty non-baseline domains; domain operations retain private admission.
+- Fixed service target `scheduler-worker-custodied-routing` on `/api/v1/deploy/infra-reconcile`: own-production custodian only; additive Git publication or receipt rollback; publication is not rollout proof.
 - **Files considered API:** v1/_/route.ts, admin/_/route.ts
 
 ## Responsibilities

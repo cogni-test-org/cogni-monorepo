@@ -4,16 +4,18 @@
 /**
  * Module: `@app/_facades/work/coordination.server`
  * Purpose: App-layer facade for operator work-item execution sessions.
- * Scope: Validates Doltgres/markdown work-item existence, binds session user
- *   identity, delegates persistence through the session port, and maps DTOs.
- * Invariants: DOLT_IS_SOURCE_OF_TRUTH, PORT_VIA_CONTAINER.
+ * Scope: Binds session identity and maps session DTOs through the existing PG
+ *   port. Claims/PR linking and coordination without a session read durable content;
+ *   heartbeat and persisted-session recovery do not read Dolt or initialize providers.
+ * Invariants: DOLT_IS_SOURCE_OF_TRUTH, PORT_VIA_CONTAINER, SYSTEM_WRITER_FIXED_REASON (the PR link patch sends `Link PR #<n>`
+ *   or `Link work item branch`, a code-owned history reason, never model-written; task.0086).
  * Side-effects: IO through injected ports and work-item facade.
  * Links: docs/design/operator-dev-lifecycle-coordinator.md, task.5007
  * @internal
  */
 
 import type { SessionUser } from "@cogni/node-shared";
-import { getContainer } from "@/bootstrap/container";
+import { getContainer, getWorkItemSessionPort } from "@/bootstrap/container";
 import type {
   WorkItemSessionClaimInput,
   WorkItemSessionHeartbeatInput,
@@ -58,6 +60,10 @@ function requireSessionUser(user: SessionUser | null): SessionUser {
 
 function ttlSeconds(input: { ttlSeconds?: number | undefined }): number {
   return input.ttlSeconds ?? DEFAULT_SESSION_TTL_SECONDS;
+}
+
+function sessionNextAction(workItemId: string, statusUrl: string): string {
+  return `Read ${statusUrl} for session status and GET /api/v1/work/items/${workItemId} for current lifecycle guidance before continuing.`;
 }
 
 async function requireWorkItem(id: string) {
@@ -110,8 +116,8 @@ export async function heartbeatWorkItemSession(input: {
 }) {
   const sessionUser = requireSessionUser(input.sessionUser);
   const now = input.now ?? new Date();
-  const workItem = await requireWorkItem(input.workItemId);
-  const session = await getContainer().workItemSessions.heartbeat({
+  const sessions = getWorkItemSessionPort();
+  const session = await sessions.heartbeat({
     workItemId: input.workItemId,
     claimedByUserId: sessionUser.id,
     deadlineAt: deadlineFromNow(now, ttlSeconds(input.body)),
@@ -121,9 +127,7 @@ export async function heartbeatWorkItemSession(input: {
   });
 
   if (!session) {
-    const current = await getContainer().workItemSessions.getCurrent(
-      input.workItemId
-    );
+    const current = await sessions.getCurrent(input.workItemId);
     if (current && current.claimedByUserId !== sessionUser.id) {
       throw new WorkItemSessionForbiddenError(input.workItemId);
     }
@@ -132,9 +136,16 @@ export async function heartbeatWorkItemSession(input: {
 
   return {
     session: toWorkItemSessionDto(session, now),
-    nextAction: nextActionForWorkItem({ workItem, session, now }),
+    nextAction: sessionNextAction(session.workItemId, input.statusUrl),
     statusUrl: input.statusUrl,
   };
+}
+
+/** The history reason for linking a session's PR or branch to its work item (task.0086). */
+function linkPrReason(body: WorkItemSessionPrInput): string {
+  return body.prNumber !== undefined
+    ? `Link PR #${body.prNumber}`
+    : "Link work item branch";
 }
 
 export async function linkWorkItemSessionPr(input: {
@@ -167,6 +178,8 @@ export async function linkWorkItemSessionPr(input: {
   const patchedWorkItem = await patchWorkItem(
     {
       id: input.workItemId,
+      // SYSTEM_WRITER_FIXED_REASON (task.0086): a code-owned line, never model-written.
+      reason: linkPrReason(input.body),
       set: {
         ...(input.body.branch !== undefined && { branch: input.body.branch }),
         ...(input.body.prNumber !== undefined && {
@@ -194,10 +207,16 @@ export async function getWorkItemCoordination(input: {
   readonly now?: Date;
 }) {
   const now = input.now ?? new Date();
+  const session = await getWorkItemSessionPort().getCurrent(input.workItemId);
+  if (session) {
+    return {
+      workItemId: input.workItemId,
+      session: toWorkItemSessionDto(session, now),
+      nextAction: sessionNextAction(session.workItemId, input.statusUrl),
+      statusUrl: input.statusUrl,
+    };
+  }
   const workItem = await requireWorkItem(input.workItemId);
-  const session = await getContainer().workItemSessions.getCurrent(
-    input.workItemId
-  );
 
   return {
     workItemId: input.workItemId,

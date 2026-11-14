@@ -18,20 +18,24 @@ import type { ReactElement } from "react";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components";
 import { CopyLinkButton } from "./CopyLinkButton";
 import { KnowledgeEntryFields } from "./KnowledgeEntryFields";
+import { KnowledgeUseWhen } from "./KnowledgeUseWhen";
 
 interface KnowledgeDetailProps {
+  readonly loading?: boolean;
+  readonly error?: unknown;
+  readonly onRetry?: () => void;
   readonly item: KnowledgeRow | null;
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
-  /** When true, render the EDO chain walk inline below the entry body. */
-  readonly showChain?: boolean;
 }
 
 export function KnowledgeDetail({
   item,
+  loading,
+  error,
+  onRetry,
   open,
   onOpenChange,
-  showChain = false,
 }: KnowledgeDetailProps): ReactElement {
   const isHtml = item?.entryType === "html";
   return (
@@ -43,6 +47,21 @@ export function KnowledgeDetail({
             : "w-full overflow-y-auto sm:max-w-lg"
         }
       >
+        {!item && (
+          <SheetHeader>
+            <SheetTitle>Knowledge entry</SheetTitle>
+          </SheetHeader>
+        )}
+        {error ? (
+          <p role="alert">
+            Could not load this entry.{" "}
+            <button type="button" onClick={onRetry}>
+              Retry
+            </button>
+          </p>
+        ) : loading && !item ? (
+          <output>Loading entry…</output>
+        ) : null}
         {item && (
           <>
             <SheetHeader>
@@ -53,6 +72,7 @@ export function KnowledgeDetail({
               <SheetTitle className="text-lg leading-snug">
                 {item.title}
               </SheetTitle>
+              <KnowledgeUseWhen useWhen={item.useWhen} />
               <div className="flex items-center gap-1.5">
                 <span className="font-mono text-muted-foreground text-xs">
                   {item.id}
@@ -65,7 +85,7 @@ export function KnowledgeDetail({
             </SheetHeader>
 
             <div className="mt-6">
-              <KnowledgeEntryFields item={item} showChain={showChain} />
+              <KnowledgeEntryFields item={item} />
             </div>
           </>
         )}

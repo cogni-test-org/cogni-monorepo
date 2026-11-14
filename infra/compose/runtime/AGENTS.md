@@ -6,7 +6,7 @@
 
 - **Owners:** @derekg1729
 - **Status:** draft
-- **Last reviewed:** 2026-10-16
+- **Last reviewed:** 2026-11-11
 
 ## Purpose
 
@@ -36,7 +36,7 @@ Production runtime configuration directory copied to VM hosts for container orch
 
 - **Exports:** none
 - **CLI (if any):** docker-compose commands
-- **Env/Config keys:** `APP_IMAGE`, `MIGRATOR_IMAGE`, `APP_ENV`, `DEPLOY_ENVIRONMENT`, `COGNI_REPO_URL` (git-sync), `COGNI_REPO_REF` (git-sync, pinned SHA), `GIT_READ_USERNAME` (git-sync), `GIT_READ_TOKEN` (git-sync, Contents:Read PAT), `COGNI_REPO_PATH` (app, `/repo/current`), `COGNI_REPO_SHA` (app), `POSTGRES_ROOT_USER`, `POSTGRES_ROOT_PASSWORD`, `APP_DB_USER`, `APP_DB_PASSWORD`, `APP_DB_SERVICE_USER`, `APP_DB_SERVICE_PASSWORD`, `APP_DB_READONLY_USER`, `APP_DB_READONLY_PASSWORD`, `APP_DB_NAME`, `DATABASE_URL` (explicit DSN, app_user), `DATABASE_SERVICE_URL` (explicit DSN, app_service), `DB_BACKUP_INTERVAL_SECONDS`, `DB_BACKUP_RETENTION_DAYS`, `DB_BACKUP_OBSERVABILITY_GRACE_SECONDS`, `DOLTGRES_PASSWORD` / `DOLTGRES_READER_PASSWORD` / `DOLTGRES_WRITER_PASSWORD` (provisioning; derived deterministically from `POSTGRES_ROOT_PASSWORD` in deploy-infra.sh), `APP_BASE_URL`, `NEXTAUTH_URL`, `AUTH_SECRET`, `LITELLM_MASTER_KEY`, `OPENROUTER_API_KEY`, `LITELLM_DATABASE_URL`, `OPENFGA_API_URL`, `OPENFGA_STORE_ID`, `OPENFGA_AUTHORIZATION_MODEL_ID`, `OPENFGA_API_TOKEN`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL`, `LANGFUSE_TRACING_ENVIRONMENT` (derived from DEPLOY_ENVIRONMENT), `GRAFANA_CLOUD_LOKI_URL`, `GRAFANA_CLOUD_LOKI_USER`, `GRAFANA_CLOUD_LOKI_API_KEY`, `GRAFANA_PDC_SIGNING_TOKEN`, `GRAFANA_PDC_HOSTED_GRAFANA_ID`, `GRAFANA_PDC_CLUSTER`, `GRAFANA_PDC_NETWORK_ID`, `GRAFANA_PDC_NETWORK_UUID`, `METRICS_TOKEN` (app+alloy), `BILLING_INGEST_TOKEN` (app+litellm, callback auth), `INTERNAL_OPS_TOKEN` (app internal ops auth), `COGNI_NODE_ENDPOINTS` (litellm, per-node callback routing), `COGNI_DEFAULT_NODE_ID` (repo-spec-derived default node label for shared runtime metrics), `PROMETHEUS_REMOTE_WRITE_URL` (alloy), `PROMETHEUS_USERNAME` (alloy), `PROMETHEUS_PASSWORD` (alloy), `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_TASK_QUEUE`, `TEMPORAL_DB_USER`, `TEMPORAL_DB_PASSWORD`, `TEMPORAL_DB_HOST`, `TEMPORAL_DB_PORT`
+- **Env/Config keys:** `APP_IMAGE`, `MIGRATOR_IMAGE`, `APP_ENV`, `DEPLOY_ENVIRONMENT`, `COGNI_REPO_URL` (git-sync), `COGNI_REPO_REF` (git-sync, pinned SHA), `GIT_READ_USERNAME` (git-sync), `GIT_READ_TOKEN` (git-sync, Contents:Read PAT), `COGNI_REPO_PATH` (app, `/repo/current`), `COGNI_REPO_SHA` (app), `POSTGRES_ROOT_USER`, `POSTGRES_ROOT_PASSWORD`, `APP_DB_USER`, `APP_DB_PASSWORD`, `APP_DB_SERVICE_USER`, `APP_DB_SERVICE_PASSWORD`, `APP_DB_READONLY_USER`, `APP_DB_READONLY_PASSWORD`, `APP_DB_NAME`, `NODE_NAME` (db-migrate), `DATABASE_URL` (explicit DSN, app_user), `DATABASE_SERVICE_URL` (explicit DSN, app_service), `DB_BACKUP_INTERVAL_SECONDS`, `DB_BACKUP_RETENTION_DAYS`, `DB_BACKUP_OBSERVABILITY_GRACE_SECONDS`, `DOLTGRES_PASSWORD` / `DOLTGRES_READER_PASSWORD` / `DOLTGRES_WRITER_PASSWORD` (provisioning; derived deterministically from `POSTGRES_ROOT_PASSWORD` in deploy-infra.sh), `APP_BASE_URL`, `NEXTAUTH_URL`, `AUTH_SECRET`, `LITELLM_MASTER_KEY`, `OPENROUTER_API_KEY`, `LITELLM_DATABASE_URL`, `OPENFGA_API_URL`, `OPENFGA_STORE_ID`, `OPENFGA_AUTHORIZATION_MODEL_ID`, `OPENFGA_API_TOKEN`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL`, `LANGFUSE_TRACING_ENVIRONMENT` (derived from DEPLOY_ENVIRONMENT), `GRAFANA_CLOUD_LOKI_URL`, `GRAFANA_CLOUD_LOKI_USER`, `GRAFANA_CLOUD_LOKI_API_KEY`, `GRAFANA_PDC_SIGNING_TOKEN`, `GRAFANA_PDC_HOSTED_GRAFANA_ID`, `GRAFANA_PDC_CLUSTER`, `GRAFANA_PDC_NETWORK_ID`, `GRAFANA_PDC_NETWORK_UUID`, `METRICS_TOKEN` (app+alloy), `BILLING_INGEST_TOKEN` (app+litellm, callback auth), `INTERNAL_OPS_TOKEN` (app internal ops auth), `COGNI_NODE_ENDPOINTS` (litellm, per-node callback routing), `COGNI_DEFAULT_NODE_ID` (repo-spec-derived default node label for shared runtime metrics), `PROMETHEUS_REMOTE_WRITE_URL` (alloy), `PROMETHEUS_USERNAME` (alloy), `PROMETHEUS_PASSWORD` (alloy), `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_TASK_QUEUE`, `TEMPORAL_DB_USER`, `TEMPORAL_DB_PASSWORD`, `TEMPORAL_DB_HOST`, `TEMPORAL_DB_PORT`
 - **Files considered API:** `docker-compose.yml`, `db-backup/*.sh`, `postgres-init/*.sh`, `configs/alloy-config.alloy`
 
 ## Responsibilities
@@ -89,7 +89,7 @@ docker compose --project-name cogni-runtime logs -f app
 - Alloy host mounts: `/proc:/host/proc:ro`, `/sys:/host/sys:ro`, `/:/host/root:ro` (required for node exporter)
 - Alloy UI exposed at 127.0.0.1:12345 (internal only)
 - `DEPLOY_ENVIRONMENT` must be set (local|candidate-a|preview|production) - used for env label, fail-closed validation
-- `db-migrate` service runs via `--profile bootstrap`, receives only DB env vars (least-secret exposure)
+- `db-migrate` service runs via `--profile bootstrap`; inputs: `DATABASE_URL`, `NODE_NAME`
 - `db-backup` is a resource-bounded `--profile backup` one-shot service, serialized by the host `cogni-db-backup.service` and scheduled by `cogni-db-backup.timer`; it runs `pg_dump`/`pg_dumpall --globals-only` against app Postgres and Temporal Postgres every `DB_BACKUP_INTERVAL_SECONDS` (default 24h), waits briefly for Alloy log collection via `DB_BACKUP_OBSERVABILITY_GRACE_SECONDS` (default 90s), and dumps live in the persistent `db_backups` volume with `DB_BACKUP_RETENTION_DAYS` retention (default 5d). Candidate infra flights exercise a full backup; preview/production reconciles never launch an inline full dump.
 - `MIGRATOR_IMAGE` required in production compose (no fallback), derived from APP_IMAGE with `-migrate` suffix
 - `git-sync` runs as bootstrap profile service (prod) or regular service (dev), populates `repo_data` volume at `/repo/current` via atomic symlink
@@ -102,6 +102,8 @@ docker compose --project-name cogni-runtime logs -f app
 - Alloy writes to local Loki (http://loki:3100)
 - Grafana on http://localhost:3001 (anonymous admin access)
 - No cloud credentials needed
+- `dev:stack` captures host app stdout in `.context/dev-logs/app.log`. Dev Alloy tails only that log directory through `alloy-host-dev.alloy` and the existing JSON/Loki pipeline. It does not mount private workspace state.
+- Dev app, worker and Temporal use the same explicit `TEMPORAL_NAMESPACE`. `DOLTGRES_DATA_VOLUME` can select an isolated local named volume; the default preserves `doltgres_data`.
 
 **Preview/Production (docker-compose.yml):**
 
@@ -114,8 +116,8 @@ docker compose --project-name cogni-runtime logs -f app
 
 **Doltgres (knowledge plane):**
 
-- `doltgres`: Postgres-wire-compatible Dolt server, host port 5435→5432, volume `doltgres_data`. Public-NIC traffic on 5435 is dropped by `DOCKER-USER` chain (see `infra/provision/cherry/harden-docker-public-ports.sh`); k3s pods on `10.42.0.0/16` reach it via the EndpointSlice node IP. Image pinned to `dolthub/doltgresql:0.57.3` (bug.5076 — `:latest` rolled an auth-file format change; 0.56.3 additionally fresh-inits broken with no connectable default DB, fixed in 0.57.3, verified 2026-08-04). Entrypoint is wrapped by `doltgres-init/install-creds.sh` — when `DOLT_CREDS_JWK` + `DOLT_CREDS_KEYID` are set, installs the keypair at `/root/.dolt/creds/<keyid>.jwk` and merges `user.creds` into `config_global.json` before exec'ing the upstream entrypoint; no-op when unset.
-- `doltgres-provision` (profile: bootstrap): creates roles + per-node `knowledge_<node>` databases via `doltgres-init/provision.sh`. Schema owned by drizzle-kit (k8s PreSync Job), not this script
+- `doltgres`: Postgres-wire-compatible Dolt server, host port 5435→5432, volume `doltgres_data`. Public-NIC traffic on 5435 is dropped by `DOCKER-USER` chain (see `infra/provision/cherry/harden-docker-public-ports.sh`); k3s pods on `10.42.0.0/16` reach it via the EndpointSlice node IP. Image pinned to `ghcr.io/cogni-dao/cogni-template@sha256:f892b365ad6fc6c683da839260f20c4015615c105176a3c21c015ca90d2b70a3` (qualified upstream0.57.3 binary with session attribution and cold-TEXT lifetime fixes, PR2881; existing GHCR pull custody required) (bug.5076 — `:latest` rolled an auth-file format change; 0.56.3 additionally fresh-inits broken with no connectable default DB, fixed in 0.57.3, verified 2026-08-04). Entrypoint is wrapped by `doltgres-init/install-creds.sh` — when `DOLT_CREDS_JWK` + `DOLT_CREDS_KEYID` are set, installs the keypair at `/root/.dolt/creds/<keyid>.jwk` and merges `user.creds` into `config_global.json` before exec'ing the upstream entrypoint; no-op when unset.
+- `doltgres-provision` (profile: bootstrap): creates roles + per-node `knowledge_<node>` databases via `doltgres-init/provision.sh`; never commits application working sets. Schema and its first commit belong to drizzle-kit (k8s PreSync Job), not this script
 - Doltgres 0.56 RBAC is non-functional — runtime `DOLTGRES_URL_*` in k8s secrets connects as `postgres` superuser. Writer role is provisioned but vestigial until upstream GRANT works
 - Mirror env vars (operator only): `DOLT_CREDS_JWK`, `DOLT_CREDS_KEYID` (push auth for repo-spec `knowledge.remote`), and explicit env-scoped `DOLTHUB_OWNER`. See [`docs/runbooks/dolthub-remote-bootstrap.md`](../../../docs/runbooks/dolthub-remote-bootstrap.md).
 - See [knowledge data plane spec](../../../docs/spec/knowledge-data-plane.md)
@@ -132,6 +134,7 @@ docker compose --project-name cogni-runtime logs -f app
 **OpenFGA:**
 
 - `openfga`: shared authorization runtime on HTTP port 8080, backed by the shared Postgres `openfga` database. Image pinned to `openfga/openfga:v1.17.1@sha256:ff96f68d2f03a029e051027415c106295c782084daeef0934479f04a3fdc2d57`.
+- OpenFGA datastore readiness remains observable but does not trigger autoheal restarts. `restart: unless-stopped` still handles process exits; PostgreSQL unavailability must not create authorization restart loops.
 - `openfga-migrate`: one-shot upstream schema migration; runs before the server starts.
 - Operator pods reach it through `OPENFGA_API_URL=http://operator-openfga-external:8080`. `OPENFGA_STORE_ID` is runtime config from store bootstrap; `OPENFGA_API_TOKEN` is pod-consumed secret material and belongs in OpenBao/ESO, not checked-in Secret YAML.
 - Host port 8080 is published for k3s pod access; public-NIC traffic is dropped by `infra/provision/cherry/harden-docker-public-ports.sh`. Logs are collected by Alloy, and Prometheus metrics are scraped from `openfga:2112` in preview/production metrics config.

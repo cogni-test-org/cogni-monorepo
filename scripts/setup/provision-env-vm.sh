@@ -439,12 +439,23 @@ log_step "Phase 3: Provision VM"
 VM_NAME_PREFIX=$(echo "${GH_REPO//\//-}" | tr '[:upper:]' '[:lower:]')
 log_info "VM/SSH-key prefix: ${VM_NAME_PREFIX} (from \$GH_REPO=${GH_REPO})"
 
+# story.5084 — production hosts the fleet control plane plus the shared substrate for
+# every Akash lane in every env; on the 6GB shared VPS it swapped its databases out
+# (Doltgres/Temporal major faults, 10-65% iowait for 60 days). Production gets a 16GB
+# dedicated-core Cloud VDS; other envs keep the 6GB VPS. VM_PLAN overrides for one run.
+case "$DEPLOY_ENV" in
+  production) VM_PLAN_DEFAULT="G1-4-16gb-100nv-ded" ;;
+  *) VM_PLAN_DEFAULT="B1-6-6gb-100s-shared" ;;
+esac
+VM_PLAN="${VM_PLAN:-$VM_PLAN_DEFAULT}"
+log_info "Cherry plan: ${VM_PLAN} (env=${DEPLOY_ENV})"
+
 TFVARS="$PROVISION_DIR/terraform.${WORKSPACE}.tfvars"
 cat > "$TFVARS" << EOF
 environment          = "${DEPLOY_ENV}"
 vm_name_prefix       = "${VM_NAME_PREFIX}"
 project_id           = "${CHERRY_PROJECT_ID}"
-plan                 = "B1-6-6gb-100s-shared"
+plan                 = "${VM_PLAN}"
 region               = "LT-Siauliai"
 public_key_path      = "keys/cogni_${DEPLOY_ENV}_deploy.pub"
 ghcr_deploy_username = "${GHCR_USERNAME}"
@@ -1234,8 +1245,7 @@ phase_5b_timeout() {
 # Cogni's slice of Argo's core `argocd-cm` is delivered as an ADDITIVE JSON MERGE
 # PATCH, never as an owned GitOps resource. It carries the identity labels Argo's
 # own informer selects on (`app.kubernetes.io/part-of: argocd`),
-# `kustomize.buildOptions: --enable-helm` for the kustomize-with-helm substrate,
-# and the ComputeWorkload health rule (ci-cd.md Axiom 26).
+# and `kustomize.buildOptions: --enable-helm` for the kustomize-with-helm substrate.
 #
 # bug.5095: an Argo Application that declared `argocd-cm` in Git took ownership of
 # the object and server-side apply REPLACED `metadata.labels` with Argo's tracking
@@ -1250,7 +1260,7 @@ phase_5b_timeout() {
 # The copy+patch lives in scripts/setup/lib/argocd-cm-patch.sh so day-two recovery
 # (reconcile-env-substrate.sh, run by `provision-env.yml mode=substrate-only`)
 # applies the exact same patch — a wedged live env is repaired with no re-provision.
-log_info "Merge-patching argocd-cm (part-of label + kustomize --enable-helm + ComputeWorkload health)..."
+log_info "Merge-patching argocd-cm (part-of label + kustomize --enable-helm)..."
 apply_argocd_cm_runtime_patch "$REPO_ROOT" "$VM_IP" "$SSH_OPTS" \
   || phase_5b_timeout "argocd-cm merge patch failed"
 
@@ -1438,8 +1448,8 @@ HCL
   #
   # Policy is per-LANE, not per-env (bug.5206). Writers on this env cannot touch another
   # CLUSTER's vault — OpenBao is per-cluster, so that is structural — but the PAYING cluster
-  # must write every lane it reconciles, because the Composition interpolates each lane's
-  # secrets into the lease its Console account is billed for. Same lane set #2290 gave
+  # must write every lane it reconciles, because each lane's secrets go into the lease its
+  # Console account is billed for. Same lane set #2290 gave
   # node-secrets-writer; they had drifted, and `production-writer` (the role
   # secret-materialize.sh mints) still could not write cogni/data/candidate-a/*.
   # This WIDENS AN EXISTING IDENTITY rather than adding one: NS3 allows exactly one writer
@@ -1564,8 +1574,8 @@ HCL
   # mirror nodes/operator/app/src/shared/secrets/secrets-lane-trust.data.ts
   # (SECRETS_LANE_TRUST); the route check is only a fast-fail, THIS is the gate.
   #   production  -> candidate-a, preview, production   (the PAYING cluster custodies every
-  #                  lane, because the Crossplane Composition interpolates each lane's
-  #                  secrets into the lease production's Console account is billed for)
+  #                  lane, because each lane's secrets go into a lease production's
+  #                  Console account is billed for)
   #   preview     -> preview only
   #   candidate-a -> candidate-a only
   # Up-trust is refused forever: no pre-prod env gains a production path here. OpenBao is
@@ -2164,7 +2174,7 @@ echo "════════════════════════�
 echo "  DEPLOYMENT STATUS REPORT"
 echo "═══════════════════════════════════════════════════════════════════"
 echo ""
-echo "  Environment: ${APP_ENV} | VM: ${VM_IP} | Plan: B1-6-6gb-100s-shared"
+echo "  Environment: ${APP_ENV} | VM: ${VM_IP} | Plan: ${VM_PLAN}"
 echo "  Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "  Branch: ${BRANCH}"
 echo ""

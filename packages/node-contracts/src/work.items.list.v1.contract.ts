@@ -13,58 +13,42 @@
  * @internal
  */
 
+import {
+  WORK_ITEM_SORT_DIRECTIONS,
+  WORK_ITEM_SORT_FIELDS,
+  WorkItemDtoSchema,
+  WorkItemSummarySchema,
+  WorkSummaryPageInfoSchema,
+  WorkSummaryQuerySchema,
+} from "@cogni/work-items";
 import { z } from "zod";
 
-const SubjectRefSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("user"), userId: z.string() }),
-  z.object({ kind: z.literal("agent"), agentId: z.string() }),
-  z.object({ kind: z.literal("system"), serviceId: z.string() }),
-]);
+export { WorkItemDtoSchema, WorkItemSummarySchema } from "@cogni/work-items";
 
-const ExternalRefSchema = z.object({
-  system: z.string(),
-  kind: z.string(),
-  externalId: z.string().optional(),
-  url: z.string().optional(),
-  title: z.string().optional(),
-});
-
-export const WorkItemDtoSchema = z.object({
-  id: z.string(),
-  type: z.string(),
-  title: z.string(),
-  status: z.string(),
-  priority: z.number().optional(),
-  rank: z.number().optional(),
-  estimate: z.number().optional(),
-  summary: z.string().optional(),
-  outcome: z.string().optional(),
-  projectId: z.string().optional(),
-  parentId: z.string().optional(),
-  node: z.string().optional(),
-  assignees: z.array(SubjectRefSchema),
-  externalRefs: z.array(ExternalRefSchema),
-  actor: z.string().optional(),
-  labels: z.array(z.string()),
-  specRefs: z.array(z.string()),
-  branch: z.string().optional(),
-  pr: z.string().optional(),
-  reviewer: z.string().optional(),
-  revision: z.number(),
-  blockedBy: z.string().optional(),
-  deployVerified: z.boolean(),
-  claimedByRun: z.string().optional(),
-  claimedAt: z.string().optional(),
-  lastCommand: z.string().optional(),
-  createdAt: z.string(),
-  updatedAt: z.string(),
-});
+/**
+ * Do-it-now scores (story.5111): axis id → { v: int 0–5, ev?: evidence URL }.
+ * Axis ids are config (hub `work-item-scores-design`), so keys are an open,
+ * bounded string set rather than an enum. Writes replace the whole object.
+ *
+ * SCORES_ONE_ENFORCER: this schema is only the OpenAPI-visible outline and
+ * states no bounds. Every bound (axis-id pattern, ≤12 axes, integer 0–5,
+ * SCORE_NEEDS_EVIDENCE, https `ev` on the node's allow-list, ≤300 chars,
+ * ≤1 KB) is `parseWorkItemScores` from `@cogni-dao/work-items`, run by the
+ * Doltgres adapter with the node's ONE configured evidence-host list; the
+ * facade maps its `WorkItemScoresInvalidError` to HTTP 400. Validating here
+ * too would need a second copy of that list. `looseObject` keeps unknown
+ * entry keys so the package validator rejects them.
+ */
+export const WorkItemScoresInputSchema = z.record(
+  z.string(),
+  z.looseObject({ v: z.number(), ev: z.string().optional() })
+);
 
 export const workItemsListOperation = {
   id: "work.items.list.v1",
   summary: "List work items with optional filters",
   description:
-    "Returns work items matching optional type, status, text, and project filters.",
+    "Returns work items matching optional filters, globally ordered by evaluation rank descending unless sortBy/sortDirection override it. Unknown sort values remain last; changing order requires restarting pagination.",
   input: z.object({
     types: z.array(z.string()).optional(),
     statuses: z.array(z.string()).optional(),
@@ -72,8 +56,13 @@ export const workItemsListOperation = {
     actor: z.enum(["human", "ai", "either"]).optional(),
     projectId: z.string().optional(),
     node: z.union([z.string(), z.array(z.string())]).optional(),
+    labels: z.array(z.string()).optional(),
+    labelPrefix: z.string().optional(),
+    scored: z.boolean().optional(),
     limit: z.number().int().positive().max(500).optional(),
     cursor: z.string().optional(),
+    sortBy: z.enum(WORK_ITEM_SORT_FIELDS).optional(),
+    sortDirection: z.enum(WORK_ITEM_SORT_DIRECTIONS).optional(),
   }),
   output: z.object({
     items: z.array(WorkItemDtoSchema),
@@ -92,3 +81,27 @@ export const workItemsListOperation = {
 export type WorkItemDto = z.infer<typeof WorkItemDtoSchema>;
 export type WorkItemsListInput = z.infer<typeof workItemsListOperation.input>;
 export type WorkItemsListOutput = z.infer<typeof workItemsListOperation.output>;
+
+/**
+ * Bounded summary pages (task.0056, from work-items 0.7.0). The input is the
+ * published `WorkSummaryQuerySchema` (default 25, max 100 rows, cursor <= 2048
+ * chars, list filters <= 50 values, text <= 200 chars): the same schema the
+ * browser encodes and the route decodes with, never the 500-row full-item list
+ * input.
+ */
+export const workItemSummariesListOperation = {
+  id: "work.summaries.list.v1",
+  input: WorkSummaryQuerySchema,
+  /** `pageInfo` is always present: every summaries read is one bounded keyset page. */
+  output: workItemsListOperation.output.extend({
+    items: z.array(WorkItemSummarySchema),
+    pageInfo: WorkSummaryPageInfoSchema,
+  }),
+} as const;
+export type WorkItemSummary = z.infer<typeof WorkItemSummarySchema>;
+export type WorkItemSummariesListInput = z.infer<
+  typeof workItemSummariesListOperation.input
+>;
+export type WorkItemSummariesListOutput = z.infer<
+  typeof workItemSummariesListOperation.output
+>;

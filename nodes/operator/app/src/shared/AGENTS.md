@@ -6,7 +6,7 @@
 
 - **Owners:** @derekg1729
 - **Status:** stable
-- **Last reviewed:** 2026-10-15 (applied cell custody and truthful provenance)
+- **Last reviewed:** 2026-11-04
 
 ## Purpose
 
@@ -38,6 +38,7 @@ App-local building blocks that cannot be extracted to `@cogni/node-shared` (env,
 ## Public Surface
 
 - **App-local exports:**
+  - Fleet workload authority (`WorkloadZoneBinding`, `resolveWorkloadZoneBinding`): explicit owner/zone plus existing native ID/writer references; no fallback to auth/substrate roots.
   - Environment validation (`serverEnv`, `clientEnv`) — reads `process.env`
   - Database schemas (Drizzle ORM) — `db/schema.ts`
   - Cell allocation metadata — backward-compatible native bindings, retained lifecycle, minimal applied custody, immutable evidence bytes, per-role bounds and manual-observed provenance
@@ -45,7 +46,7 @@ App-local building blocks that cannot be extracted to `@cogni/node-shared` (env,
   - AI model catalog (`model-catalog.server.ts`) — LiteLLM fetch + env
   - Node app scaffold generators (`node-app-scaffold/gens/`) — pure catalog,
     overlay, AppSet, gitmodule, and ExternalSecret renderers for operator
-    GitHub App writes
+    GitHub App writes; membership plans update workload and derived control-worker routing together
   - Wagmi chain adapter (`evm-wagmi.ts`, `wagmi.config.ts`) — wagmi/chains runtime dep
   - Onchain client interface (`onchain/`) — viem types
   - Server logger (`observability/server/logger.ts`) — pino runtime

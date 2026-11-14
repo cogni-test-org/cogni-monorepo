@@ -19,6 +19,11 @@
  *   - FORWARD_ONLY_BY_DEFAULT: source-addressed and production preview-forward promotes refuse an
  *     off-main or backward source pin before workflow dispatch. `allowRollback:true` is explicit and
  *     remains behind the same env-specific RBAC gate.
+ *   - OPERATOR_SERVICES_RELEASE_INDEPENDENTLY (CD5, bug.5599): optional `service` promotes ONE in-repo
+ *     operator catalog service (scheduler-worker) on its own lane: `nodes: <service>`, own pin, own
+ *     forward check. It is valid only when the resolved node is the operator (every other node keeps
+ *     the CD4 refusal) and is authorized by the operator node's env gate. Never bundled into an
+ *     operator promote.
  * Side-effects: IO (authz check, GitHub workflow_dispatch)
  * Links: docs/spec/node-ci-cd-contract.md § Env-promotion progression, docs/spec/rbac.md, docs/spec/cicd-platform-boundary.md
  * @public
@@ -33,6 +38,7 @@ import { getSessionUser } from "@/app/_lib/auth/session";
 import { createOperatorDeployPlane } from "@/bootstrap/capabilities/operator-deploy-plane";
 import { getContainer, resolveServiceDb } from "@/bootstrap/container";
 import { wrapRouteHandlerWithLogging } from "@/bootstrap/http";
+import { refuseNodeOnFlightPromoteLane } from "@/features/compute/node-compute-api";
 import { nodeIdOrSlug } from "@/features/nodes/node-lookup";
 import { nodes } from "@/shared/db/nodes";
 import { serverEnv } from "@/shared/env";
@@ -48,6 +54,12 @@ const promoteInput = z.object({
   // production: the RBAC-gated manual dispatch, unchanged.
   env: z.enum(["preview", "production"]),
   sourceSha: z.string().optional(),
+  // CD5: promote this in-repo operator service (catalog row, `type: service`) instead of the operator
+  // app. Slug-shaped so it can never traverse out of infra/catalog/. Validated against the catalog.
+  service: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9-]*$/)
+    .optional(),
   // Deliberate rollback is explicit and still requires the normal env-specific RBAC grant.
   allowRollback: z.boolean().optional().default(false),
 });
@@ -69,7 +81,7 @@ export const POST = wrapRouteHandlerWithLogging(
       if (!parsed.success) {
         return NextResponse.json({ error: "Invalid request" }, { status: 400 });
       }
-      const { nodeId, env, sourceSha, allowRollback } = parsed.data;
+      const { nodeId, env, sourceSha, service, allowRollback } = parsed.data;
 
       const db = resolveServiceDb();
       const nodeRows = await db
@@ -81,6 +93,15 @@ export const POST = wrapRouteHandlerWithLogging(
       targetNodeId = node?.id;
       if (!node) {
         return NextResponse.json({ error: "node_not_found" }, { status: 404 });
+      }
+      // ONE_WRITER_PER_NODE_LANE (CD4, task.5411): only the operator still promotes here.
+      const refusal = refuseNodeOnFlightPromoteLane({
+        slug: node.slug,
+        lane: "promote",
+        environment: env,
+      });
+      if (refusal) {
+        return NextResponse.json(refusal, { status: 409 });
       }
 
       const billingRows = await db
@@ -152,6 +173,7 @@ export const POST = wrapRouteHandlerWithLogging(
                 parentRepo: repo,
                 slug: node.slug,
                 sourceSha,
+                ...(service !== undefined ? { service } : {}),
                 allowRollback,
               })
             : env === "production"
@@ -159,6 +181,7 @@ export const POST = wrapRouteHandlerWithLogging(
                   parentOwner: owner,
                   parentRepo: repo,
                   slug: node.slug,
+                  ...(service !== undefined ? { service } : {}),
                   allowRollback,
                 })
               : await deployPlane.dispatchNodePromote({
@@ -166,6 +189,7 @@ export const POST = wrapRouteHandlerWithLogging(
                   repo,
                   env,
                   slug: node.slug,
+                  ...(service !== undefined ? { service } : {}),
                 });
         return NextResponse.json(result, { status: 200 });
       } catch (error) {

@@ -77,8 +77,8 @@ write_files:
         - "event-ttl=5m"
 
   # k3s container registry config — node-level, all pods get access.
-  # - ghcr.io: auth for private cogni images (simpler than per-Deployment
-  #   imagePullSecrets for single-node).
+  # - ghcr.io: Cogni images are public; no registry credential (bug.5563). A
+  #   stale baked-in PAT gets 403 even on a public image, so none is written.
   # - docker.io: mirror via mirror.gcr.io (Google's pull-through cache) because
   #   this VM's direct Docker Hub path is unreliable (IPv6 routing issues).
   #   Required for vendor images like grafana/alloy (observability), else
@@ -95,18 +95,17 @@ write_files:
           endpoint:
             - "https://mirror.gcr.io"
             - "https://registry-1.docker.io"
-      configs:
-        "ghcr.io":
-          auth:
-            username: "${ghcr_deploy_username}"
-            password: "${ghcr_deploy_token}"
 
   # Firewall hardening — closes Docker-published internal ports (postgres,
   # doltgres, redis, litellm, temporal-grpc) to the public internet via the
   # DOCKER-USER iptables chain. Single-source script under
   # infra/provision/cherry/harden-docker-public-ports.sh; injected by
   # Terraform `templatefile()` so existing-VM SSH runs use the same logic.
-  # Links: bug.5167
+  # Its first run below also installs + enables the boot replay unit
+  # cogni-harden-docker-public-ports.service, which re-applies these rules
+  # whenever docker.service starts (Docker recreates DOCKER-USER empty on
+  # reboot). deploy-infra.sh refreshes the same unit on existing VMs.
+  # Links: bug.5167, story.5084
   - path: /usr/local/sbin/cogni-harden-docker-public-ports.sh
     owner: root:root
     permissions: "0755"
@@ -165,6 +164,7 @@ write_files:
       # ── Firewall: close Docker-published internal ports to public internet ──
       # Must run AFTER docker is up (DOCKER-USER chain is created by dockerd),
       # BEFORE compose services start publishing those ports. See bug.5167.
+      # Also installs + enables the reboot replay unit (story.5084).
       echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Hardening Docker-published ports..."
       bash /usr/local/sbin/cogni-harden-docker-public-ports.sh
 
@@ -213,7 +213,8 @@ write_files:
       # ── Argo CD + ksops ──────────────────────────────────────
       echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Cloning repo for Argo CD manifests..."
       apt-get install -y git
-      # Inject GHCR PAT for private repo access (same token works for git + registry).
+      # Inject the GitHub PAT for the repo clone. This is its only use: k3s
+      # pulls public GHCR images with no registry credential (bug.5563).
       AUTHED_URL=$(echo "${cogni_repo_url}" | sed "s|https://|https://${ghcr_deploy_username}:${ghcr_deploy_token}@|")
       git clone --depth=1 --branch "${cogni_repo_ref}" \
         "$AUTHED_URL" /tmp/cogni-repo

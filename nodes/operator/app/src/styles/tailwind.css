@@ -2,6 +2,12 @@
 @custom-variant dark (&:is(.dark *));
 @import "tw-animate-css";
 @import "@cogni/node-ui-kit/tailwind-source.css";
+@import "@cogni/knowledge-base-ui/tailwind-source.css";
+@import "@cogni/money-plane/tailwind-source.css";
+/* The shared FinanceReport ships as built JS; scan it so its utilities are emitted (Turbopack inlines the import above). */
+@source "../../node_modules/@cogni/money-plane/dist/react";
+/* The shared WorkBoard and kanban ship as built JS; scan them the same way so the board's utilities are emitted. */
+@source "../../node_modules/@cogni/knowledge-base-ui/dist";
 
 @theme inline {
   /* Colors - map CSS vars to Tailwind color namespace */
@@ -107,6 +113,15 @@
 
 @layer base {
   :root {
+    /* Brain loading spectrum */
+    --brain-loading-blue: #4070ff;
+    --brain-loading-teal: #00e8d5;
+    --brain-loading-green: #00f563;
+    --brain-loading-cyan: #00aaff;
+    --brain-loading-indigo: #594cff;
+    --brain-loading-violet: #9700ff;
+    --brain-loading-magenta: #f400e9;
+
     /* Single source of truth for font stacks */
     --font-sans:
       "Manrope", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
@@ -280,6 +295,24 @@
 /* Keep hero animation vars above (isolated to code.ts) */
 
 @layer utilities {
+  .brain-loading-orbit {
+    mask: url("/brain-loading-arc.svg") center / contain no-repeat;
+  }
+
+  .brain-loading-orbit > .brain-loading-spectrum {
+    animation-direction: reverse;
+    background: conic-gradient(
+      var(--brain-loading-blue) 0deg,
+      var(--brain-loading-teal) 45deg,
+      var(--brain-loading-green) 135deg,
+      var(--brain-loading-cyan) 180deg,
+      var(--brain-loading-indigo) 225deg,
+      var(--brain-loading-violet) 270deg,
+      var(--brain-loading-magenta) 315deg,
+      var(--brain-loading-blue) 360deg
+    );
+  }
+
   /* Desktop-only wallet button fill - scoped to data-wallet-slot to avoid affecting mobile */
   [data-wallet-slot="desktop"] button {
     width: 100%;
