@@ -374,6 +374,10 @@ patches:
       - op: add
         path: /data/OPENFGA_API_URL
         value: "http://operator-openfga-external:8080"
+      # task.5494: candidate-a proves write mode; production stays report-only until the flip change.
+      - op: add
+        path: /data/NODE_ADMIN_SYNC_WRITE
+        value: "true"
       # Node self-serve secret writes — the operator's OpenBao writer role (the
       # SA + projected token are wired on the Deployment below). OPENBAO_ADDR
       # defaults to the in-cluster ClusterIP, so only the role name is set here.
@@ -584,3 +588,7 @@ patches:
                     value: candidate-a
                   - name: FORK_DOMAIN_ROOT
                     value: cognidao.org
+  - target:
+      kind: Deployment
+      name: node-app
+    path: .prepare-init-compatibility.json
