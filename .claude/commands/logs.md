@@ -109,20 +109,26 @@ For CI failures, use `env="ci"`:
 >
 > **Query params** (all optional except `env`):
 >
-> | param           | default         | bounds                                     | meaning                                                                                                                                            |
-> | --------------- | --------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-> | `env`           | — (required)    | `candidate-a` \| `preview` \| `production` | which deploy env to read                                                                                                                           |
-> | `service`       | `app`           | lowercase DNS label                        | which of YOUR declared `deployment.services` to read (bug.5240). Non-`app` pins `{service=<name>, source="lease"}` — the pump-shipped lease stream |
-> | `query`         | node app stream | ≤2048 chars                                | the full LogQL (same string as MCP / `loki-query.sh`)                                                                                              |
-> | `limit`         | `100`           | 1–1000                                     | max lines returned (newest-first)                                                                                                                  |
-> | `minutes`       | `60`            | 1–1440                                     | **relative** window: last N minutes back from now                                                                                                  |
-> | `start` / `end` | —               | span ≤24h                                  | **absolute** window — RFC3339 (`2026-06-24T00:00:00Z`) or epoch-ms; missing `end`→now, missing `start`→`end-1h`. Overrides `minutes` when present. |
+> | param           | default         | bounds                                     | meaning                                                                                                                                                            |
+> | --------------- | --------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+> | `env`           | — (required)    | `candidate-a` \| `preview` \| `production` | which deploy env to read                                                                                                                                           |
+> | `service`       | `app`           | lowercase DNS label                        | which of YOUR declared `deployment.services` to read (bug.5240). Non-`app` pins `{service=<name>, source="lease"}` — the pump-shipped lease stream                 |
+> | `workload`      | — (all)         | workload name (`metadata.name`)            | narrow the read to ONE workload of the service (task.5490). Without it, a `service` read returns every workload of that service. A narrowing matcher, never forced |
+> | `query`         | node app stream | ≤2048 chars                                | the full LogQL (same string as MCP / `loki-query.sh`)                                                                                                              |
+> | `limit`         | `100`           | 1–1000                                     | max lines returned (newest-first)                                                                                                                                  |
+> | `minutes`       | `60`            | 1–1440                                     | **relative** window: last N minutes back from now                                                                                                                  |
+> | `start` / `end` | —               | span ≤24h                                  | **absolute** window — RFC3339 (`2026-06-24T00:00:00Z`) or epoch-ms; missing `end`→now, missing `start`→`end-1h`. Overrides `minutes` when present.                 |
 >
 > **Multi-service nodes (bug.5240):** every service you declare in `deployment.services` is tailed
 > by the operator-side lease-log pump — no log config in your repo, no credential in your runtime,
 > crashlooping containers included. Read a sidecar with `?service=<name>`, e.g.
 > `?env=candidate-a&service=paper-trader&query=| json | level="error"`. Streams carry the stable
-> envelope `{env, node=<uuid>, service, source="lease"}`; a `lease_log_pump_attached` marker line
+> envelope `{env, node=<uuid>, workload, service, source="lease"}` (task.5490): `workload` is the
+> manifest `metadata.name` (which deployment of the node) and `service` is the program (the Score
+> container key, a state id, or an operator companion). Two workloads of one program share `service`
+> and differ by `workload`: read one with `?service=app&workload=<name>`. Until a lane's next release
+> after the lowering change it may still log `service=<workload name>`; if `service=app&workload=<name>`
+> is empty, read `service=<name>`. A `lease_log_pump_attached` marker line
 > distinguishes "service is silent" from "pump never attached".
 >
 > Absolute beats relative; either form is capped at a 24h span (mirrors the operator-scope read budget).
@@ -134,7 +140,7 @@ For CI failures, use `env="ci"`:
 > selector needs that env's Alloy to promote the `node` label. A node's registry row and its `node`
 > label can split across envs (e.g. beacon: row in prod, label only on candidate-a). Per-env substrate
 > gaps tracked: **bug.5041** (prod Alloy `node` label stale), **bug.5040** (prod Reloader). Full
-> born-observable contract: `docs/spec/grafana-observability-access.md` §"Born observable".
+> born-observable contract: `https://cognidao.org/knowledge/node-log-proxy-contract` §"Born observable".
 >
 > **Parity / scope:** for the caller's node slice this is **1:1** with this guide's MCP /
 > `loki-query.sh` path — same selector syntax, same `| json | …` pipeline, same JSON output — the
@@ -142,8 +148,8 @@ For CI failures, use `env="ci"`:
 > is **not** yet multi-scope: querying _other_ nodes, shared services (`scheduler-worker`, …), or
 > env-wide is the **generic** route `GET /api/v1/observability/logs` + the `logs.query` RBAC action
 > (Phase 1, not yet built). When that lands, this guide will direct all node-dev agents to it
-> instead of the MCP. Identity + phasing: `docs/design/substrate-grafana-observability.md` §"Phase
-> 0"; node-scoped design: `docs/spec/grafana-observability-access.md` §"Node-dev log scope envelope".
+> instead of the MCP. Identity + phasing: `https://cognidao.org/knowledge/observability-access-design` §"Phase
+> 0"; node-scoped design: `https://cognidao.org/knowledge/node-log-proxy-contract` §"Node-dev log scope envelope".
 
 - `source` - `k8s` (in-cluster pod logs from cAdvisor) | `k8s-events`
   (kubernetes Events stream — pod OOMKilled, probe failures, evictions,

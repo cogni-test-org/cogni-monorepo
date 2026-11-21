@@ -420,7 +420,7 @@ export async function POST(request: Request, routeArgs: RouteParams) {
         // exactly when something is wrong (violating operator-fleet-safety.md "a node or
         // deploy spec must never silently starve an environment of capacity"). Fail
         // CLOSED with a diagnostic 503 — never a raw adapter throw → `unhandled` 500
-        // (error-handling.md Inv 2/3/6: translate at the boundary, fault-party before
+        // (https://node-template.cognidao.org/knowledge/layered-error-translation Inv 2/3/6: translate at the boundary, fault-party before
         // bucket). Node birth needs this SAME GitHub/App plane for the very next steps
         // (fork + submodule PR), so a catalog read we cannot make means the birth cannot
         // succeed anyway — failing here fails faster and names the real cause. (Advisory
@@ -577,6 +577,9 @@ export async function POST(request: Request, routeArgs: RouteParams) {
             // inherits the deployment monorepo's optional merge queue.
             mergeQueueSourceOwner: parentOwner,
             mergeQueueSourceRepo: parentRepo,
+            // The spawner's wallet is the node's first approver, so its admin answer exists from
+            // birth (task.5494). `session.walletAddress` is non-null: `wallet_required` above.
+            approvers: [session.walletAddress],
             ...identity,
           });
           currentStep = "open_submodule_pr";

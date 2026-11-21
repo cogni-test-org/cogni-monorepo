@@ -62,11 +62,13 @@ export {
   type AkashLeaseLogDescriptor,
   type AkashTxActuatorPort,
   type AkashTxAllocationLedgerPort,
+  type AkashTxAllocationPolicy,
   type AkashTxAllocationRecord,
   type AkashTxAllocationState,
   type AkashTxCompositeVerdict,
   type AkashTxConsolePort,
   type AkashTxCreateResult,
+  type AkashTxDatabaseCellRecoveryInput,
   AkashTxError,
   type AkashTxErrorCode,
   type AkashTxLeaseLogSource,
@@ -98,6 +100,13 @@ export type {
   BillingResolver,
   PreflightCreditCheckFn,
 } from "./billing-context";
+export type { BuiltImageResolverPort } from "./built-image.port";
+export { BuiltImageRegistryError } from "./built-image.port";
+export type {
+  CandidateBacklogSourcePort,
+  CandidateOpenPr,
+  CandidateRepo,
+} from "./candidate-backlog.port";
 export type {
   CatalogNodeOwnerProjection,
   CatalogNodeRegistryPort,
@@ -115,15 +124,6 @@ export type {
   ComputeResourceCostIdentity,
 } from "./compute-cost.port";
 export { ComputeCostInvariantError } from "./compute-cost.port";
-export type {
-  ComputeWorkloadArtifact,
-  ComputeWorkloadBundle,
-  ComputeWorkloadSecretRef,
-  ComputeWorkloadSource,
-  ComputeWorkloadSpec,
-  DeclaredProvisionServiceSpec,
-  DeclaredProvisionSpec,
-} from "./compute-workload.types";
 export {
   ComputeLifecycleError,
   type ComputeLifecycleFailureKind,
@@ -201,26 +201,45 @@ export type {
 } from "./database-containment.port";
 export { DATABASE_CELL_METRIC_LABEL_KEYS } from "./database-containment.port";
 export type {
+  DeliveryKpiSourcePort,
+  DeliveryLaneFacts,
+  DeliveryProbeResult,
+  DeliveryReleaseFacts,
+  DeliveryScope,
+} from "./delivery-kpi.port";
+export type {
+  CancelCandidateMaintenanceInput,
+  CancelCandidateMaintenanceResult,
   CandidateFlightDispatchResult,
   CatalogNodeDefinition,
   ClassifyEnvManagerPrInput,
+  DeclarationReadPort,
   DeployPlanePort,
   EnvManagerPrClassificationResult,
   NodeInfraReconcileResult,
   NodePromoteResult,
+  NodeSourceResolverPort,
   ObservedWorkflowDispatchResult,
   PreparedNodeRefCandidateFlight,
   PrepareNodeRefCandidateFlightInput,
   PromoteNodeFromPreviewInput,
   PromoteNodeInput,
-  PruneNodeEnvironmentInput,
   ReconcileNodeInfraInput,
   ResolvedNodeRepo,
+  ResolvedNodeSource,
   ResolveNodeRepoInput,
   SharedLaneInfraEnv,
 } from "./deploy-plane.port";
+export type {
+  EdgeCatalogNode,
+  EdgeHostCatalogPort,
+} from "./edge-host-catalog.port";
 export type { EpochsRead } from "./epochs-read.port";
 export { EpochsReadError } from "./epochs-read.port";
+export type {
+  FleetLanesDownReading,
+  FleetObservationReaderPort,
+} from "./fleet-observation.port";
 export type {
   GovernanceRun,
   GovernanceStatusPort,
@@ -234,6 +253,14 @@ export type {
   IdentityAttestationSignerPort,
 } from "./identity-attestation.port";
 export type {
+  KnowledgeRead,
+  KnowledgeReadCounter,
+  KnowledgeReaderClass,
+} from "./knowledge-read-counter.port";
+export type {
+  LangfuseObservationPage,
+  LangfuseObservationQuery,
+  LangfuseOwnershipPort,
   LangfuseReaderPort,
   LangfuseTraceQuery,
   LangfuseTraceSummary,
@@ -268,9 +295,12 @@ export {
   normalizeErrorToExecutionCode,
 } from "./llm.port";
 export type {
+  LokiInstantQuery,
+  LokiInstantReaderPort,
   LokiLogLine,
   LokiQueryRange,
   LokiReaderPort,
+  LokiVectorSample,
 } from "./loki-reader.port";
 export type {
   InstantQueryParams,
@@ -302,6 +332,61 @@ export type { ModelProviderResolverPort } from "./model-provider-resolver.port";
 export type { NodeAddressPort } from "./node-address.port";
 export { NodeAddressError } from "./node-address.port";
 export type {
+  NodeApproverRead,
+  NodeApproverReader,
+  NodeApproverTarget,
+  NodeApproverUnavailableReason,
+} from "./node-approver-reader.port";
+export type {
+  AttemptMesh,
+  AttemptPatch,
+  AttemptPhase,
+  AttemptRow,
+  AttemptStep,
+  ChainTruthPort,
+  DesiredRow,
+  DesiredState,
+  DnsOnlyRecordInput,
+  DnsRecord,
+  DnsRecordInput,
+  DnsRecordsPort,
+  HostNotRoutedStrike,
+  HttpResult,
+  NodeWorkloadSpec,
+  PayerCreateRequest,
+  PayerErrorCode,
+  PayerPort,
+  PayerResource,
+  PayerSpec,
+  ProbePort,
+  RecordReleaseInput,
+  ReleaseRow,
+  RequestStopResult,
+  SecretsPort,
+  SequencerClock,
+  SequencerLog,
+  StopRecord,
+  StorePort,
+  SubstrateTransport,
+  WorkloadKey,
+} from "./node-deploy.port";
+export {
+  buildCogniKey,
+  buildIdentity,
+  consecutiveFailures,
+  DnsZoneIdentityError,
+  IN_FLIGHT_PHASES,
+  isTestEnvKey,
+  isTestEnvSpec,
+  keyString,
+  MAX_ATTEMPT_STEPS,
+  PayerError,
+  SERVED_ATTEMPT_PHASES,
+  TEST_ENV_KEY_RE,
+  TEST_ENV_MARKER_ENV,
+  withResolvedImage,
+} from "./node-deploy.port";
+export type {
   NodeDeployedService,
   NodeDeploymentTopologyPort,
 } from "./node-deployment-topology.port";
@@ -318,6 +403,33 @@ export type {
   ServingResult,
 } from "./node-flight.port";
 export type {
+  CreatePreAuthKeyInput,
+  HeadscaleDeviceId,
+  HeadscaleKeyId,
+  HeadscaleUser,
+  MeshApiKey,
+  MeshDevice,
+  MeshKeyStorePort,
+  MeshPolicy,
+  MeshPreAuthKey,
+  MeshUser,
+  MintedPreAuthKey,
+  NodeMeshErrorCode,
+  NodeMeshErrorReason,
+  NodeMeshPort,
+  PublishedSubstrateRequest,
+  StoredMeshKey,
+  SubstrateRequestSourcePort,
+} from "./node-mesh.port";
+export {
+  headscaleDeviceId,
+  headscaleKeyId,
+  headscaleUser,
+  isNodeMeshError,
+  MESH_ATTEMPT_SECRET_NAME_RE,
+  NodeMeshError,
+} from "./node-mesh.port";
+export type {
   NodeMigrationReportRecord,
   NodeMigrationReportStorePort,
   RecordNodeMigrationReportInput,
@@ -329,11 +441,21 @@ export type {
   NodeSummary,
 } from "./node-registry.port";
 export type {
+  NodeCatalogEntry,
+  NodeCatalogPort,
+  NodeRuntimeSecretsErrorCode,
+  NodeRuntimeSecretsPort,
+} from "./node-runtime.port";
+export { NodeRuntimeSecretsError } from "./node-runtime.port";
+export type {
   OnChainVerifier,
   VerificationResult,
   VerificationStatus,
 } from "./onchain-verifier.port";
 export type {
+  EnsureGeneratedKeysInput,
+  EnsureGeneratedKeysResult,
+  GeneratedSecretRecipe,
   OperatorSecretsPlanePort,
   SecretWriteOp,
   WriteNodeSecretInput,
@@ -366,6 +488,21 @@ export type {
   ReceiptDelivery,
   ReceiptDeliveryTarget,
 } from "./receipt-delivery.port";
+export type {
+  RemoteIndexRow,
+  RemoteKnowledgeFailure,
+  RemoteKnowledgeFailureCode,
+  RemoteKnowledgeReadPort,
+  RemoteKnowledgeTarget,
+} from "./remote-knowledge.port";
+export { isRemoteKnowledgeFailure } from "./remote-knowledge.port";
+export type {
+  ReviewCheckFacts,
+  ReviewKpiRepo,
+  ReviewKpiSourcePort,
+  ReviewPrFacts,
+  ReviewPrSelector,
+} from "./review-kpi.port";
 export type {
   ProxyBillingEntry,
   SandboxErrorCode,

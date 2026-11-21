@@ -3,6 +3,17 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  async headers() {
+    return [
+      {
+        source: "/identity/attest/confirm",
+        headers: [
+          { key: "Content-Security-Policy", value: "frame-ancestors 'none'" },
+          { key: "X-Frame-Options", value: "DENY" },
+        ],
+      },
+    ];
+  },
   transpilePackages: ["@cogni/node-app", "@cogni/node-ui-kit"],
   // In monorepo: tell Next.js where the workspace root is so standalone output
   // includes shared packages and resolves node_modules correctly.
@@ -32,6 +43,9 @@ const nextConfig: NextConfig = {
     "pino-pretty",
     "prom-client",
     "posthog-node",
+    // Agent runtime: ESM NodeNext (`./types.js`) subpath imports turbopack can't
+    // bundle in dev — resolve as Node requires at runtime (story.5116 local run).
+    "@langchain/mcp-adapters",
   ],
   // WalletConnect pulls pino@7 → thread-stream@0.15 which ships test files
   // requiring 'tape'. outputFileTracingRoot broadens tracing to monorepo root,

@@ -16,7 +16,7 @@
  *   - TRANSPORT_UNCERTAINTY_IS_INCOMPLETE: exhausted retryable transport failures become timeout, never false execution errors
  *   - TYPED_TERMINAL_ARTIFACT: returns small typed result {ok, runId, structuredOutput} for parent workflow composition
  * Side-effects: none (deterministic orchestration only)
- * Links: docs/spec/unified-graph-launch.md, docs/spec/temporal-patterns.md
+ * Links: https://node-template.cognidao.org/knowledge/graph-run-launch-contract, https://cognidao.org/knowledge/temporal-workflow-rules
  * @public
  */
 
@@ -41,6 +41,8 @@ export interface GraphRunResult {
   runId: string;
   /** Structured output from graph (when responseFormat was provided). */
   structuredOutput?: unknown;
+  /** AiExecutionErrorCode of a failed run (e.g. `provider_unfunded`), so callers can tell why. */
+  errorCode?: string;
 }
 
 // Short timeout for metadata activities (grant validation, run record CRUD).
@@ -272,7 +274,11 @@ export async function GraphRunWorkflow(
         errorMessage: result.errorCode ?? "Graph execution failed",
         errorCode: result.errorCode,
       });
-      return { ok: false, runId };
+      return {
+        ok: false,
+        runId,
+        ...(result.errorCode !== undefined && { errorCode: result.errorCode }),
+      };
     }
   } catch (error) {
     // A non-retryable Activity failure is a definitive pre-execution rejection

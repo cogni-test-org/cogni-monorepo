@@ -100,7 +100,6 @@ jobs:
         run: |
           bash scripts/ci/render-scheduler-worker-endpoints.sh --check
           bash scripts/ci/render-node-appset.sh --check
-          bash scripts/ci/render-node-overlays.sh --check
 
   # Fast gate: install → typecheck → lint
   static:
@@ -146,6 +145,14 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Check design tokens
+        run: pnpm check:design-tokens
+
+      - name: Validate workflow contracts
+        run: |
+          node --test scripts/ci/tests/workflow-check.test.mjs
+          pnpm workflow:check
 
       - name: Build workspace packages
         run: pnpm packages:build
@@ -209,7 +216,7 @@ jobs:
 
       # Intentionally inline — single-workflow gate, no logic duplicated across
       # workflows. SCRIPTS_ARE_THE_API targets cross-workflow drift, not unique
-      # gate policy. See docs/spec/node-ci-cd-contract.md.
+      # gate policy. See https://node-template.cognidao.org/knowledge/node-ci-sovereignty.
       #
       # ARG_MAX: dorny's matched-file JSON is spliced into a quoted heredoc at
       # YAML-render time, NOT passed via `env:`. A whole-node-retirement diff
@@ -473,15 +480,6 @@ jobs:
       - name: per-node ApplicationSet drift (CATALOG_IS_SSOT)
         run: bash scripts/ci/render-node-appset.sh --check
 
-      # Per-node overlay drift (CATALOG_IS_SSOT + NODE_AT_ROOT_MIGRATE_PATH,
-      # bug.5008). Wizard-born node overlays are frozen to the operator version
-      # that minted them; a stale operator ships monorepo migrate paths that
-      # kustomize-build fine but crash-loop the migrate initContainer at runtime.
-      # Regenerate from the node-template overlay + catalog and fail on drift
-      # before flight (run `pnpm gen:node-overlays`).
-      - name: per-node overlay drift (NODE_AT_ROOT_MIGRATE_PATH)
-        run: bash scripts/ci/render-node-overlays.sh --check
-
       # task.5140 Stage B — affected-only unit tests. The suite is two disjoint
       # vitest universes: the ROOT config (tests/** + packages + services) always
       # runs full (turbo does not model it — dropping it would be a false green),
@@ -491,6 +489,15 @@ jobs:
       # any PR-time affected miss before merge). Logic + fail-safe live in
       # scripts/ci/run-unit-tests.sh (SCRIPTS_ARE_THE_API): ROOT config always
       # full + operator config affected-scoped on PRs, full on merge_group/push.
+      # Native dependency tests consume the same private catalog image as deploy.
+      # The job already has packages:read; use only its ephemeral repository token.
+      - name: Log in to GHCR for native dependency images
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
       - name: Unit + contract tests
         env:
           CI_EVENT: ${{ github.event_name }}
@@ -509,7 +516,7 @@ jobs:
   component:
     # Skip on merge_group: not in required-status-checks (see infra/github/branch-protection.json),
     # so the queue doesn't gate on it. Re-running on the rebased candidate burns ~3 min for marginal
-    # incremental signal vs PR-time. Spec: docs/spec/merge-queue-config.md § Excluded from required.
+    # incremental signal vs PR-time. Spec: https://cognidao.org/knowledge/merge-queue-required-checks § Excluded from required.
     needs: env_manager_fast_path
     if: always() && github.event_name != 'merge_group' && (needs.env_manager_fast_path.result != 'success' || needs.env_manager_fast_path.outputs.eligible != 'true')
     runs-on: ubuntu-latest
@@ -567,10 +574,17 @@ jobs:
       - name: Build sandbox runtime image
         run: pnpm sandbox:docker:build
 
+      - name: Log in to GHCR for native dependency images
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
       - name: Component tests (testcontainers)
         run: pnpm test:component
 
-      # Doltgres-migrator regression: boots dolthub/doltgresql:latest in its
+      # Doltgres-migrator regression: boots the pinned published catalog image in its
       # own container (separate from the Postgres globalSetup the rest of
       # test:component uses) and exercises migrate-doltgres.mjs + verifier
       # end-to-end. Proves the silent-skip drift gap is caught at runtime,

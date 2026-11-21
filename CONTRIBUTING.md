@@ -13,7 +13,7 @@ All development in this repo is agentic. External AI agents contribute code usin
 standard tools as any developer — git and the GitHub CLI — plus one operator-specific gate
 for requesting a candidate-a deployment flight.
 
-**Canonical spec:** [docs/spec/development-lifecycle.md](docs/spec/development-lifecycle.md)
+**Canonical spec:** [`work-item-status-machine`](https://node-template.cognidao.org/knowledge/work-item-status-machine)
 **Validation gate:** use [.claude/skills/validate-candidate](.claude/skills/validate-candidate/SKILL.md) after candidate-flight succeeds; do not replace it with a hand-written smoke note.
 
 ```bash
@@ -57,7 +57,6 @@ curl -s -X POST $BASE/api/v1/vcs/flight \
 | -------------------------- | ----------------------------- |
 | Open a PR                  | `gh pr create` (standard CLI) |
 | Flight a PR to candidate-a | `POST /api/v1/vcs/flight`     |
-| Monitor flight + merge     | `pr-manager` graph            |
 | Review code quality        | `pr-review` graph             |
 | Ask about the repo         | `brain` graph                 |
 
@@ -133,7 +132,7 @@ pnpm db:setup:test          # Create test database + run migrations
 - Use Conventional Commit types: `feat/`, `fix/`, `chore/`, `docs/`, `refactor/`
 - Examples: `feat/ai-preview-health-checks`, `fix/litellm-config-bug`, `chore/ci-playwright-cache`
 
-**See [CI/CD Pipeline Flow](docs/spec/ci-cd.md) for branch model details.**
+**See [CI/CD Pipeline Flow](https://cognidao.org/knowledge/operator-pipeline-contract) for branch model details.**
 
 ## Code Style
 

@@ -12,7 +12,7 @@
  *   - SSR_DISABLED (react-force-graph-3d touches window; dynamic import ssr:false).
  *   - SIDE_SHEET_REUSE (node click → KnowledgeDetail, not a bespoke panel).
  * Side-effects: IO (graph fetch), WebGL render.
- * Links: docs/spec/knowledge-syntropy.md
+ * Links: https://node-template.cognidao.org/knowledge/knowledge-recall-path
  * @internal
  */
 
@@ -86,7 +86,7 @@ const ForceGraph3D = dynamic(() => import("react-force-graph-3d"), {
   ),
 }) as unknown as ComponentType<ForceGraph3DProps>;
 
-// Mirrors ChainPanel.tsx chipFor() edge semantics.
+// Citation-edge colors for the graph legend.
 const CITE_COLOR: Record<string, string> = {
   supports: "#34d399",
   validates: "#34d399",
@@ -346,7 +346,6 @@ export function GraphView({
       <KnowledgeDetail
         item={selectedItem}
         open={selectedItem !== null}
-        showChain
         onOpenChange={(o) => {
           if (!o) setSelectedId(null);
         }}

@@ -103,7 +103,7 @@ jobs:
           # and reading it from local git is instant and not subject to the
           # commits/{sha}/pulls API's post-merge indexing lag — which silently
           # skipped every auto-flight in the 2026-04-18 incident window (see
-          # work/items/bug.0320.flight-preview-pr-lookup-race.md).
+          # bug.0320).
           SUBJECT=$(git log -1 --format=%s "$HEAD_SHA" 2>/dev/null || echo "")
           PR_NUMBER=$(printf '%s' "$SUBJECT" | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p')
 
@@ -121,7 +121,7 @@ jobs:
 
           if [ -z "$PR_NUMBER" ]; then
             if [ "$EVENT_NAME" = "push" ]; then
-              echo "::error::flight-preview triggered by push to main but no PR resolvable for ${HEAD_SHA:0:8} after primary (commit subject) + fallback (API 5×3s) lookups. Direct pushes to main are incident-only per docs/spec/ci-cd.md. If this push is intentional, dispatch flight-preview.yml manually with an explicit sha input after the commit you want flighted is on main."
+              echo "::error::flight-preview triggered by push to main but no PR resolvable for ${HEAD_SHA:0:8} after primary (commit subject) + fallback (API 5×3s) lookups. Direct pushes to main are incident-only per https://cognidao.org/knowledge/operator-pipeline-contract. If this push is intentional, dispatch flight-preview.yml manually with an explicit sha input after the commit you want flighted is on main."
               exit 1
             fi
             # workflow_dispatch with a non-PR SHA. Skip cleanly either way, but a

@@ -7,6 +7,8 @@
  * Scope: Interface only. Keeps hosted deploy operations out of shared AI-tool capabilities.
  * Invariants:
  *   - OPERATOR_OWNS_DEPLOY: deploy mutations target the operator parent repo/workflows.
+ *   - INDEPENDENT_WORKFLOW_IDENTITY: maintainer-authorized remote node requests may bind
+ *     reviewed parent workflow code separately from the child artifact source.
  *   - NODE_REF_ARTIFACT_GATE: node-ref flight dispatch requires a resolvable source artifact.
  *   - ONE_PROMOTION_PRIMITIVE: every promotion rung (candidate-a, preview, production)
  *     dispatches `promote-and-deploy.yml` directly via the operator App — no rung routes
@@ -18,9 +20,28 @@
  *     for governance/code merges). IN-REPO nodes (no catalog `source_repo`) are not source-addressed
  *     by node sha — they pass `source_sha` (the operator checkout ref) instead.
  * Side-effects: none
- * Links: docs/spec/node-ci-cd-contract.md, src/app/api/v1/vcs/flight/route.ts
+ * Links: https://node-template.cognidao.org/knowledge/node-ci-sovereignty, src/app/api/v1/vcs/flight/route.ts
  * @public
  */
+
+/** Exact preconditions for cancelling one unexecuted candidate intent. Custody is server-owned. */
+export interface CancelCandidateMaintenanceInput {
+  readonly nodeId: string;
+  readonly slug: string;
+  readonly env: "candidate-a";
+  readonly operationId: string;
+  readonly expectedDeployHead: string;
+  readonly expectedMarkerSha256: string;
+  readonly actorId: string;
+  readonly reason: string;
+}
+export interface CancelCandidateMaintenanceResult {
+  readonly commitSha: string;
+  readonly previousHead: string;
+  readonly treeSha: string;
+  readonly branch: string;
+  readonly operationId: string;
+}
 
 export interface CandidateFlightDispatchResult {
   readonly dispatched: boolean;
@@ -64,6 +85,13 @@ export interface PromoteNodeInput {
    * checkout ref (`source_sha`); never crossed between the two.
    */
   readonly sourceSha: string;
+  /**
+   * An in-repo catalog SERVICE of the operator lane (e.g. scheduler-worker) promoted on its OWN
+   * lane instead of the operator app (OPERATOR_SERVICES_RELEASE_INDEPENDENTLY, CD5). Only valid
+   * when `slug` is the operator; validated against `infra/catalog/<service>.yaml` at main
+   * (`type: service`, no `source_repo`, `envs` containing the target env). Absent = the node's own app.
+   */
+  readonly service?: string;
   /** Explicit authorized escape hatch for a deliberate rollback to an older commit on main. */
   readonly allowRollback?: boolean;
 }
@@ -72,17 +100,15 @@ export interface PromoteNodeFromPreviewInput {
   readonly parentOwner: string;
   readonly parentRepo: string;
   readonly slug: string;
+  /**
+   * An in-repo catalog SERVICE of the operator lane (e.g. scheduler-worker) promoted on its OWN
+   * lane instead of the operator app (OPERATOR_SERVICES_RELEASE_INDEPENDENTLY, CD5). Only valid
+   * when `slug` is the operator; validated against `infra/catalog/<service>.yaml` at main
+   * (`type: service`, no `source_repo`, `envs` containing the target env). Absent = the node's own app.
+   */
+  readonly service?: string;
   /** Explicit authorized escape hatch for a deliberate rollback to an older commit on main. */
   readonly allowRollback?: boolean;
-}
-
-export interface PruneNodeEnvironmentInput {
-  readonly parentOwner: string;
-  readonly parentRepo: string;
-  readonly slug: string;
-  readonly env: "candidate-a" | "preview" | "production";
-  /** GitHub environment whose VM owns this lane's Argo/Crossplane control plane. */
-  readonly controlEnv: "candidate-a" | "preview" | "production";
 }
 
 export interface NodePromoteResult {
@@ -115,6 +141,15 @@ export type SharedLaneInfraEnv = "preview" | "production";
 
 export type ReconcileNodeInfraInput =
   | {
+      readonly env: "production";
+      readonly slug: "operator";
+      readonly parentOwner: string;
+      readonly parentRepo: string;
+      readonly target: "scheduler-worker-custodied-routing";
+      /** Immutable publication commit receipt, resolved only from the fixed worker ref history. */
+      readonly rollbackReceipt?: string;
+    }
+  | {
       /** Existing shared-lane full-infra replay; the caller cannot select its source. */
       readonly env: SharedLaneInfraEnv;
       readonly parentOwner: string;
@@ -134,6 +169,24 @@ export type ReconcileNodeInfraInput =
     };
 
 export type NodeInfraReconcileResult =
+  | {
+      readonly status: "unchanged" | "git_published";
+      readonly version: 1;
+      readonly rollbackReceipt: string | null;
+      readonly env: "production";
+      readonly target: "scheduler-worker-custodied-routing";
+      readonly sourceSha: string;
+      readonly authoritySha: string;
+      readonly deploySha: string;
+      readonly deployRef: "deploy/production-scheduler-worker";
+      readonly path: string;
+      readonly beforeBlob: string;
+      readonly afterBlob: string;
+      readonly beforeHash: string;
+      readonly afterHash: string;
+      /** Receipt is immutable Git evidence, not rollout evidence. */
+      readonly receipt: string | null;
+    }
   | {
       readonly status: "dispatched";
       readonly env: SharedLaneInfraEnv;
@@ -178,6 +231,12 @@ export interface CatalogNodeDefinition {
   readonly repoUrl: string;
   readonly repoOwner: string;
   readonly repoName: string;
+  /**
+   * Path of the node's `.cogni/repo-spec.yaml` inside `repoOwner/repoName` (task.5494): a
+   * `source_repo` node keeps it at the repo root, an in-repo node (the operator) under its
+   * `path_prefix` in the parent. The node-admin sync reads it; see `deriveCatalogRepoSpecPath`.
+   */
+  readonly repoSpecPath: string;
   readonly deployEnvs: readonly ("candidate-a" | "preview" | "production")[];
   readonly activityEnv: "candidate-a" | "preview" | "production";
   readonly ownerWallet: string;
@@ -214,6 +273,40 @@ export interface ResolvedNodeRepo {
   readonly repo: string;
 }
 
+/** Where a node's own declarations and built image live (story.5127). */
+export interface ResolvedNodeSource extends ResolvedNodeRepo {
+  /**
+   * Catalog `image_repository` (`ghcr.io/<owner>/<repo>`) of a REMOTE-SOURCE node. `null` for an
+   * IN-REPO node (the operator): no built image is resolved for it.
+   */
+  readonly imageRepository: string | null;
+}
+
+/**
+ * Resolve a node's source repo and image repository from the catalog baked into the operator image
+ * (story.5137): the same declaration the node-deploy sequencer reads, so every env resolves a node
+ * the same way. An IN-REPO node (the operator, no `source_repo`) resolves to the given parent repo
+ * with `imageRepository: null`. Throws a coded `catalog_missing` (404) when the image does not know
+ * the node.
+ */
+export interface NodeSourceResolverPort {
+  resolveNodeSource(input: {
+    readonly nodeId: string;
+    readonly parentOwner: string;
+    readonly parentRepo: string;
+  }): Promise<ResolvedNodeSource>;
+}
+
+/**
+ * Read a node's declarations (repo-spec and workload manifests) from a repository at a sha. Read-only.
+ * The reader prefers the operator App; for a public repository the App is not installed on, it reads
+ * anonymously. A repository that is neither App-readable nor public reads as absent (`null`).
+ */
+export type DeclarationReadPort = Pick<
+  DeployPlanePort,
+  "fetchFileText" | "listDirectoryEntries"
+>;
+
 /** Input to `classifyEnvManagerPr` — a PR addressed in the parent monorepo. */
 export interface ClassifyEnvManagerPrInput {
   readonly owner: string;
@@ -233,12 +326,18 @@ export interface EnvManagerPrClassificationResult {
 }
 
 export interface DeployPlanePort {
+  /** Delete only an unchanged fenced marker through configured App custody; fail on drift or active delivery. */
+  cancelCandidateMaintenance(
+    input: CancelCandidateMaintenanceInput
+  ): Promise<CancelCandidateMaintenanceResult>;
+
   prepareNodeRefCandidateFlight(
     input: PrepareNodeRefCandidateFlightInput
   ): Promise<PreparedNodeRefCandidateFlight>;
 
   /**
-   * App-read every merged `type:node` catalog row for registry projection. Includes operator +
+   * App-read (or, for a public repo the App is not installed on, anonymously read via the bootstrap
+   * `createCatalogNodeLister`) every merged `type:node` catalog row for registry projection. Includes operator +
    * node-template and fails loud on a malformed node row: one bad file must never be mistaken for
    * an empty catalog.
    */
@@ -288,11 +387,26 @@ export interface DeployPlanePort {
   }): Promise<string | null>;
 
   /**
+   * List EVERY entry directly inside a repo directory via the operator App (contents:read): name,
+   * type (`file`, `dir`, `symlink` or `submodule`) and size in bytes. GitHub's directory listing
+   * reports a submodule as `file`; the adapter maps it to `submodule` (its git_url points at
+   * `/git/trees/`). Returns null when the directory is absent at `ref`. Nothing is filtered here:
+   * the node-deploy verb refuses any `.cogni/workloads/` entry that is not a regular `*.yaml` file
+   * or that is over the manifest size cap (story.5137).
+   */
+  listDirectoryEntries(input: {
+    owner: string;
+    repo: string;
+    path: string;
+    ref: string;
+  }): Promise<readonly { name: string; type: string; size: number }[] | null>;
+
+  /**
    * Grant a GitHub identity branch-push (Write) on a node repo — the operator App as the privilege
-   * bridge for the contributor golden path (rbac.md §6a, TRUST_BOUNDARY_IS_MERGE_NOT_PUSH). The App
+   * bridge for the contributor golden path (https://cognidao.org/knowledge/authz-port-contract §6a, TRUST_BOUNDARY_IS_MERGE_NOT_PUSH). The App
    * holds `administration: write`; the agent never holds standing GitHub admin. Idempotent (re-granting
    * is a GitHub no-op). Returns the invitation id when GitHub creates a pending invite — an outside
-   * collaborator the agent then auto-accepts with its own token (rbac.md §6 step 5) — else null
+   * collaborator the agent then auto-accepts with its own token (https://cognidao.org/knowledge/authz-port-contract §6 step 5) — else null
    * (applied immediately for an org member / existing collaborator).
    */
   setNodeCollaborator(input: {
@@ -303,7 +417,7 @@ export interface DeployPlanePort {
   }): Promise<{ invitationId: number | null }>;
 
   /**
-   * Revoke a node-repo collaborator (rbac.md §6a de-provision, on access reject/revoke). Idempotent:
+   * Revoke a node-repo collaborator (https://cognidao.org/knowledge/authz-port-contract §6a de-provision, on access reject/revoke). Idempotent:
    * a 404 (already not a collaborator) is treated as success so revocation is safe to retry.
    */
   removeNodeCollaborator(input: {
@@ -319,9 +433,13 @@ export interface DeployPlanePort {
     sourceSha: string;
     /**
      * Optional same-repository branch or tag containing candidate-flight.yml. The adapter resolves
-     * and accepts it only when it is the exact open same-repo PR head named by sourceSha.
+     * and accepts it only when it is the exact open same-repo PR head named by workflowSha
+     * (or sourceSha for the legacy same-source parent-PR mode).
      */
     workflowRef?: string;
+    /** Independently reviewed parent workflow SHA for a maintainer-authorized remote node flight.
+     * Keeps sourceSha as the child artifact identity; requires workflowRef. */
+    workflowSha?: string;
   }): Promise<CandidateFlightDispatchResult>;
 
   /**
@@ -368,15 +486,6 @@ export interface DeployPlanePort {
   ): Promise<CandidateFlightDispatchResult>;
 
   /**
-   * Remove one retired lane from its control cluster. Env-membership REMOVE deletes the generated
-   * AppSet from git; this workflow bridge deletes the live per-node AppSet/Application so Argo
-   * prunes the workload and Crossplane closes any paid lease. It never changes another lane.
-   */
-  pruneNodeEnvironment(
-    input: PruneNodeEnvironmentInput
-  ): Promise<ObservedWorkflowDispatchResult>;
-
-  /**
    * The sha an environment is ACTUALLY running for one node: `<slug>` in
    * `.promote-state/source-sha-by-app.json` on `deploy/<env>-<slug>` — the pin every promote and
    * every candidate flight writes (`scripts/ci/update-source-sha-map.sh`). This is the ONLY
@@ -421,6 +530,8 @@ export interface DeployPlanePort {
     repo: string;
     env: string;
     slug: string;
+    /** Operator-lane service to promote instead of the app (CD5); see PromoteNodeInput.service. */
+    service?: string;
     sourceSha?: string;
     nodeSourceSha?: string;
   }): Promise<ObservedWorkflowDispatchResult>;

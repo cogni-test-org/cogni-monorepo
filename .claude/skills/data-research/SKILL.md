@@ -79,25 +79,11 @@ If a metric a research view depends on isn't in this table, write down which que
 
 ## Persisting research as knowledge
 
-A research view's dashboard answers "what is the state now?" The harder question — "is it better than yesterday, and which fix moved it?" — needs a durable record of past runs. That record's home is the per-node `knowledge` table on Doltgres: `entry_type ∈ {scorecard, rule, finding}`, `confidence_pct`, citation DAG, `draft → candidate → established → canonical` status promotion. The HTTP wrapper for internal writes is **in design** (PR #1133) — once landed, agents call `core__knowledge_write` (direct to `main` for internal callers) or `POST /api/v1/knowledge/contributions/*` (branch-per-PR with diff/merge for reviewed entries). Corpus-as-knowledge (PR #1175) adds the `work_item_artifacts` join from scorecard rows → bugs/tasks/spikes.
+A research view's dashboard answers "what is the state now?" The harder question — "is it better than yesterday, and which fix moved it?" — needs a durable record of past runs. That record's home is the per-node `knowledge` table on Doltgres: `entry_type ∈ {scorecard, rule, finding}`, `confidence_pct`, citation DAG, `draft → candidate → established → canonical` status promotion.
 
-**Until that lands, persistence is markdown on disk** — `docs/research/<date>-<skill>.md` for scorecards, `nodes/<node>/app/src/app/(app)/research/<date>/page.tsx` for dated dashboard reports. Shape each markdown to match the future row so the migration is mechanical:
+**Persist each run as a hub contribution, never a Markdown file.** Read `GET /api/v1/knowledge/knowledge-contribution-flow` on the node hub with your saved `COGNI_NODE_API_KEY` first. It owns recall, edit ops, citations, the focused inbox and human review. An agent write lands on a contribution branch and a signed-in human merges it. Dated dashboard reports stay as code in `nodes/<node>/app/src/app/(app)/research/<date>/page.tsx`.
 
-| Knowledge row field   | Markdown convention                                                                   |
-| --------------------- | ------------------------------------------------------------------------------------- |
-| `domain`              | path segment or frontmatter (`poly_delta_minimizer`, `alpha_leak`, …)                 |
-| `entry_type`          | `scorecard` / `rule` / `finding` in title or frontmatter                              |
-| `confidence_pct`      | implicit 40 (draft) until promoted; surface in title when raised                      |
-| `tags`                | hashtag list at end of doc                                                            |
-| `citations`           | inline `[supersedes](path)` / `[cites](path)` markdown links (knowledge ↔ knowledge) |
-| `work_item_artifacts` | inline `bug.NNNN` / `task.NNNN` / `spike.NNNN` references (knowledge → work item)     |
-
-Once the API lands, two flows route differently:
-
-- **`scorecard`** (high-frequency, append-only): internal `core__knowledge_write` direct to `main`. No review.
-- **`rule` + `finding`** (decision-shaping): external-contribution flow with diff/merge gates.
-
-Do not wait — write markdown today. The future migration is a `git ls-files docs/research/*.md | …` walk; the structured-frontmatter convention is the contract.
+Set `domain`, `entryType` and `tags` natively. Cite related rows with native `supersedes` / `extends` edges. Name the `bug.NNNN` / `task.NNNN` / `spike.NNNN` it concerns in the contribution commit message.
 
 ### What each entry type captures
 
@@ -111,15 +97,15 @@ Do not wait — write markdown today. The future migration is a `git ls-files do
 on each tick:
   1. read live state (DB queries per Core principles 1+2)
   2. classify outliers via taxonomy → matrix
-  3. read prior scorecard (file glob today; knowledge_search post-API)
+  3. read prior scorecard (knowledge index search)
   4. compute Δ-vs-prev columns
-  5. write scorecard markdown (file today; knowledge_write post-API)
+  5. write the scorecard (knowledge contribution)
   6. for each unattributed → file spike via operator work-items API
   7. for active buckets trending up → PATCH heartbeat on tracking item
   8. if a rule's last 3 scorecards confirm bucket flat/shrinking → write a superseding rule at +20 confidence
 ```
 
-The taxonomy is deterministic; the markdown is a heredoc. LLM cycles enter only when `/triage` picks up an unattributed spike.
+The taxonomy is deterministic; the scorecard is a templated contribution. LLM cycles enter only when `/triage` picks up an unattributed spike.
 
 ## The pattern
 
@@ -275,7 +261,7 @@ Add a new recipe when a debugging path has been walked twice. The bar is reuse, 
 
 - **bug.5012** — poly prod OOM crashloop. Reading `wallet-analysis-service.ts:readDbFillsAsOrderFlowTrades` against RN1's 825k-fill backfill (spike.5024) blew the heap. Fix: SQL aggregation per `computeWalletMetrics` field, no raw fills in V8.
 - **PR #1257** (`cc0e70fe8`) — heap-bump + `pLimit(4)` cap on the redeem-catchup boot loop. Stops a _different_ OOM (boot-fan-out), not the read-path one. Sometimes both apply; they're orthogonal.
-- **`docs/research/nextjs-node-memory-sizing.md`** — Tier 0/1 sizing standard. Useful background but **not a substitute for SQL aggregation**. Tier 1 buys ~3× the heap; one big SELECT eats it.
+- **`https://cognidao.org/knowledge/nextjs-memory-sizing`** — Tier 0/1 sizing standard. Useful background but **not a substitute for SQL aggregation**. Tier 1 buys ~3× the heap; one big SELECT eats it.
 - **`features/wallet-analysis/server/wallet-analysis-service.ts`** — the canonical "before" (V8 reduce) and "after" (SQL aggregate) example once the SQL refactor lands.
 - **`app/api/v1/poly/research/trader-comparison/route.ts`** — canonical research-route shape (Zod, partial-failure-200, service-DB delegation).
 

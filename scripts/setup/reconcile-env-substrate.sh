@@ -18,7 +18,7 @@
 #   - <env>-db-reader   policy + role  (db-provisioner SA, per-env read-only)
 #   - ClusterSecretStore openbao-backend
 #   - argocd-cm         additive merge patch (Argo's `part-of` informer label +
-#                       kustomize --enable-helm + ComputeWorkload health rule)
+#                       kustomize --enable-helm)
 #
 # RENAME (additive, safe): the writer SA is `openbao-writer` (was `openbao-operator`).
 # The <env>-writer role binds BOTH names during transition, so consumers still on
@@ -75,7 +75,7 @@ ensure_sa() {
 # it up front with a diagnosis. See .claude/skills/devops-expert 'VM migration orphans deploy pointers'.
 if ! ssh $SSH_OPTS -o BatchMode=yes -o ConnectTimeout=15 "root@${VM_IP}" true 2>/tmp/_vmprobe; then
   # Classify into a stable reason; NEVER echo the host/IP or raw ssh stderr
-  # (privacy: docs/spec/observability.md §5 — stable fields only, no secrets).
+  # (privacy: https://node-template.cognidao.org/knowledge/observability-logging-contract §5 — stable fields only, no secrets).
   reason=unreachable
   grep -qi 'permission denied' /tmp/_vmprobe && reason=auth_denied
   rm -f /tmp/_vmprobe
@@ -97,7 +97,7 @@ rm -f /tmp/_vmprobe
 # re-asserts the two data keys, all without touching anything else in the object.
 # Identical call to provision-env-vm.sh Phase 5b.1 via the shared helper, so cold
 # start and day two can never drift. Idempotent — a re-run is a no-op.
-log "merge-patching argocd-cm (part-of label + kustomize buildOptions + ComputeWorkload health)..."
+log "merge-patching argocd-cm (part-of label + kustomize buildOptions)..."
 apply_argocd_cm_runtime_patch "$REPO_ROOT" "$VM_IP" "$SSH_OPTS" || {
   echo "::error::${DEPLOY_ENV}: argocd-cm merge patch failed — Argo may remain wedged (bug.5095)." >&2
   exit 1
@@ -132,8 +132,8 @@ bao_exec "write auth/kubernetes/role/eso-reader \
 # so `production-writer` (the role secret-materialize.sh actually mints) still could not
 # write cogni/data/candidate-a/*, and the first poly candidate-a mint died there.
 #   fleet control -> candidate-a, preview, production (the PAYING cluster custodies every
-#                  lane, because the Composition interpolates each lane's secrets into the
-#                  lease production's Console account is billed for)
+#                  lane, because each lane's secrets go into the lease production's
+#                  Console account is billed for)
 #   preview     -> preview only
 #   candidate-a -> candidate-a only, unless this isolated fleet declares it as control
 # Up-trust is refused forever. This WIDENS AN EXISTING IDENTITY, it does not add one:
@@ -210,13 +210,13 @@ bao_exec "write auth/kubernetes/role/${DEPLOY_ENV}-db-reader \
 # mirror nodes/operator/app/src/shared/secrets/secrets-lane-trust.data.ts
 # (SECRETS_LANE_TRUST); the route check is only a fast-fail, THIS is the gate.
 #   production  -> candidate-a, preview, production   (the PAYING cluster custodies every
-#                  lane, because the Crossplane Composition interpolates each lane's
-#                  secrets into the lease production's Console account is billed for)
+#                  lane, because each lane's secrets go into a lease production's
+#                  Console account is billed for)
 #   preview     -> preview only
 #   candidate-a -> candidate-a only
 # Up-trust is refused forever: no pre-prod env gains a production path here. OpenBao is
 # per-CLUSTER, so a lane prefix is a LABEL inside this env's own vault, never a reach into
-# another cluster's vault. Per secrets-management.md Invariant 1 the blast-radius boundary
+# another cluster's vault. Per https://cognidao.org/knowledge/secrets-management Invariant 1 the blast-radius boundary
 # is <service>; widening the lane set does not widen that boundary.
 # The two _system/_shared denies are carried onto EVERY lane gained, data AND metadata —
 # a per-node grant must never reach a shared path in ANY lane.

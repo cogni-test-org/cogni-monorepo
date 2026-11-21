@@ -11,17 +11,6 @@ cd "$REPO_ROOT"
 TMPROOT=$(mktemp -d -t aggregate-rollup.XXXXXX)
 trap 'rm -rf "$TMPROOT"' EXIT
 
-# The rollup reader derives overlay custody from its own script location. Copy that
-# existing reader and its library into a test tree with both authored overlay cells.
-FIXTURE_SOURCE="$TMPROOT/source"
-mkdir -p "$FIXTURE_SOURCE/scripts/ci/lib" "$FIXTURE_SOURCE/infra/k8s/overlays/production/operator" \
-  "$FIXTURE_SOURCE/infra/k8s/overlays/production/poly"
-cp "$REPO_ROOT/scripts/ci/aggregate-rollup.sh" "$FIXTURE_SOURCE/scripts/ci/"
-cp "$REPO_ROOT/scripts/ci/lib/"*.sh "$FIXTURE_SOURCE/scripts/ci/lib/"
-. "$SCRIPT_DIR/fixtures/catalog.sh"
-write_akash_catalog_fixture "$FIXTURE_SOURCE/infra/catalog" operator
-write_akash_catalog_fixture "$FIXTURE_SOURCE/infra/catalog" poly
-
 REMOTE="$TMPROOT/origin.git"
 WORK="$TMPROOT/work"
 git init --bare "$REMOTE" >/dev/null
@@ -58,7 +47,7 @@ ROLLUP_TARGETS_JSON='["operator"]' \
   REPO_URL="file://$REMOTE" \
   GH_TOKEN=dummy \
   GITHUB_REPOSITORY=Cogni-DAO/cogni \
-  bash "$FIXTURE_SOURCE/scripts/ci/aggregate-rollup.sh" production > "$TMPROOT/out.log" 2>&1
+  bash scripts/ci/aggregate-rollup.sh production > "$TMPROOT/out.log" 2>&1
 
 current_sha=$(git --git-dir="$REMOTE" show deploy/production:.promote-state/current-sha)
 if [ "$current_sha" != "$operator_tip" ]; then
@@ -89,23 +78,23 @@ for ((i = 0; i < 75; i++)); do
   operator_tip=$(printf 'operator promotion %s\n' "$i" | git -C "$WORK" commit-tree "$operator_tree" -p "$operator_tip")
 done
 git -C "$WORK" update-ref refs/heads/deploy/production-operator "$operator_tip"
-git -C "$WORK" switch -c deploy/production-poly main >/dev/null
-printf '{"poly":"1111111111111111111111111111111111111111"}\n' > "$WORK/.promote-state/source-sha-by-app.json"
+git -C "$WORK" switch -c deploy/production-scheduler-worker main >/dev/null
+printf '{"scheduler-worker":"1111111111111111111111111111111111111111"}\n' > "$WORK/.promote-state/source-sha-by-app.json"
 git -C "$WORK" add .
-git -C "$WORK" commit -m "seed poly production cell" >/dev/null
-poly_tip=$(git -C "$WORK" rev-parse HEAD)
-poly_tree=$(git -C "$WORK" rev-parse 'HEAD^{tree}')
+git -C "$WORK" commit -m "seed scheduler-worker production cell" >/dev/null
+worker_tip=$(git -C "$WORK" rev-parse HEAD)
+worker_tree=$(git -C "$WORK" rev-parse 'HEAD^{tree}')
 for ((i = 0; i < 75; i++)); do
-  poly_tip=$(printf 'poly promotion %s\n' "$i" | git -C "$WORK" commit-tree "$poly_tree" -p "$poly_tip")
+  worker_tip=$(printf 'scheduler-worker promotion %s\n' "$i" | git -C "$WORK" commit-tree "$worker_tree" -p "$worker_tip")
 done
-git -C "$WORK" update-ref refs/heads/deploy/production-poly "$poly_tip"
-git -C "$WORK" push origin deploy/production-operator deploy/production-poly >/dev/null
+git -C "$WORK" update-ref refs/heads/deploy/production-scheduler-worker "$worker_tip"
+git -C "$WORK" push origin deploy/production-operator deploy/production-scheduler-worker >/dev/null
 
-ROLLUP_TARGETS_JSON='["operator","poly"]' \
+ROLLUP_TARGETS_JSON='["operator","scheduler-worker"]' \
   REPO_URL="file://$REMOTE" \
   GH_TOKEN=dummy \
   GITHUB_REPOSITORY=Cogni-DAO/cogni \
-  bash "$FIXTURE_SOURCE/scripts/ci/aggregate-rollup.sh" production > "$TMPROOT/deep.log" 2>&1 || {
+  bash scripts/ci/aggregate-rollup.sh production > "$TMPROOT/deep.log" 2>&1 || {
     cat "$TMPROOT/deep.log"
     exit 1
   }
@@ -117,7 +106,7 @@ if [ "$actual_base" != "$common_base" ]; then
   exit 1
 fi
 map=$(git --git-dir="$REMOTE" show deploy/production:.promote-state/source-sha-by-app.json)
-if ! printf '%s' "$map" | jq -e '.operator == "6859ead900b33e4c3684f2c330b01ec5c790b73f" and .poly == "1111111111111111111111111111111111111111"' >/dev/null; then
+if ! printf '%s' "$map" | jq -e '.operator == "6859ead900b33e4c3684f2c330b01ec5c790b73f" and .["scheduler-worker"] == "1111111111111111111111111111111111111111"' >/dev/null; then
   echo "[FAIL] expected both source map entries after history recovery"
   exit 1
 fi

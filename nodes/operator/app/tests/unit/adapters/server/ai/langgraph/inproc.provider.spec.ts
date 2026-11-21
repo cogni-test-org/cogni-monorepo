@@ -14,13 +14,39 @@
  */
 
 import type { AiEvent, ToolSourcePort } from "@cogni/ai-core";
-import { TOOL_CATALOG, toBoundToolRuntime } from "@cogni/ai-tools";
+import { AiExecutionError } from "@cogni/ai-core";
+import {
+  CORE_TOOL_BUNDLE,
+  TOOL_CATALOG,
+  toBoundToolRuntime,
+} from "@cogni/ai-tools";
+import { FakeAuthorizationAdapter } from "@cogni/authorization-core";
+import { LANGGRAPH_CATALOG } from "@cogni/operator-graphs";
 import { describe, expect, it, vi } from "vitest";
+
+// Pass-through spy so the provider's tool-runner config can be asserted (authz v0).
+const toolRunnerSpy = vi.hoisted(() => ({ calls: [] as unknown[][] }));
+vi.mock("@cogni/ai-core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@cogni/ai-core")>();
+  return {
+    ...actual,
+    createToolRunner: (...args: Parameters<typeof actual.createToolRunner>) => {
+      toolRunnerSpy.calls.push(args);
+      return actual.createToolRunner(...args);
+    },
+  };
+});
 
 import { runInScope } from "@/adapters/server/ai/execution-scope";
 import type { CompletionUnitAdapter } from "@/adapters/server/ai/langgraph/inproc.provider";
-import { LangGraphInProcProvider } from "@/adapters/server/ai/langgraph/inproc.provider";
+import {
+  graphReportDelta,
+  graphReportLogFields,
+  LangGraphInProcProvider,
+  selectArchitectEntryId,
+} from "@/adapters/server/ai/langgraph/inproc.provider";
 import type { GraphRunRequest } from "@/ports";
+import { EVENT_NAMES } from "@/shared/observability";
 
 const TEST_SCOPE = {
   billing: {
@@ -170,6 +196,337 @@ describe("LangGraphInProcProvider", () => {
         // Result reflects success
         expect(result.ok).toBe(true);
       });
+    });
+  });
+
+  describe("authz v0 identity threading", () => {
+    it("passes the scope's nodeId and grantId (and the actor) to the tool runner", async () => {
+      toolRunnerSpy.calls.length = 0;
+      const scope = {
+        ...TEST_SCOPE,
+        actorUserId: "00000000-0000-4000-a000-000000000001",
+        nodeId: "operator-node-id",
+        grantId: "grant-123",
+      };
+      await runInScope(scope, async () => {
+        const provider = new LangGraphInProcProvider(
+          createMockAdapter(),
+          createMockToolSource(),
+          undefined,
+          [],
+          new FakeAuthorizationAdapter()
+        );
+        const { stream, final } = provider.runGraph(
+          createTestRequest({ graphId: "langgraph:poet" })
+        );
+        for await (const _ of stream) {
+          // drain
+        }
+        await final;
+      });
+
+      expect(toolRunnerSpy.calls.length).toBeGreaterThan(0);
+      const config = toolRunnerSpy.calls[0]?.[2] as Record<string, unknown>;
+      expect(config).toMatchObject({
+        nodeId: "operator-node-id",
+        grantId: "grant-123",
+        actorId: "user:00000000-0000-4000-a000-000000000001",
+        graphId: "langgraph:poet",
+      });
+      expect(typeof config.onAuthzDecision).toBe("function");
+    });
+
+    it("omits grantId for API/chat runs (no grant in scope)", async () => {
+      toolRunnerSpy.calls.length = 0;
+      await runInScope(
+        { ...TEST_SCOPE, actorUserId: "user-1", nodeId: "operator-node-id" },
+        async () => {
+          const provider = new LangGraphInProcProvider(
+            createMockAdapter(),
+            createMockToolSource()
+          );
+          const { stream, final } = provider.runGraph(createTestRequest());
+          for await (const _ of stream) {
+            // drain
+          }
+          await final;
+        }
+      );
+      const config = toolRunnerSpy.calls[0]?.[2] as Record<string, unknown>;
+      expect(config.nodeId).toBe("operator-node-id");
+      expect(config).not.toHaveProperty("grantId");
+    });
+
+    it("propagates trusted identity + audit hook WITHOUT an authz adapter (declared policies still apply)", async () => {
+      toolRunnerSpy.calls.length = 0;
+      await runInScope(
+        {
+          ...TEST_SCOPE,
+          actorUserId: "00000000-0000-4000-a000-000000000001",
+          nodeId: "operator-node-id",
+          grantId: "grant-123",
+        },
+        async () => {
+          const provider = new LangGraphInProcProvider(
+            createMockAdapter(),
+            createMockToolSource()
+          );
+          const { stream, final } = provider.runGraph(createTestRequest());
+          for await (const _ of stream) {
+            // drain
+          }
+          await final;
+        }
+      );
+      const config = toolRunnerSpy.calls[0]?.[2] as Record<string, unknown>;
+      expect(config).toMatchObject({
+        actorId: "user:00000000-0000-4000-a000-000000000001",
+        tenantId: "test-billing",
+        graphId: "langgraph:poet",
+        nodeId: "operator-node-id",
+        grantId: "grant-123",
+      });
+      expect(typeof config.onAuthzDecision).toBe("function");
+      expect(config).not.toHaveProperty("authz");
+    });
+  });
+
+  describe("host architect selection (task.5455)", () => {
+    const row = (id: string) => ({ id });
+
+    it("picks the one -architect entry in the index", () => {
+      expect(
+        selectArchitectEntryId([
+          row("no-secrets-in-logs"),
+          row("operator-architect"),
+        ])
+      ).toBe("operator-architect");
+    });
+
+    it("skips when none, or when several and no slug is known", () => {
+      expect(selectArchitectEntryId([row("a-rule")])).toBeNull();
+      expect(
+        selectArchitectEntryId([
+          row("operator-architect"),
+          row("node-template-architect"),
+        ])
+      ).toBeNull();
+    });
+
+    it("prefers the slug-named architect when several exist and the slug matches", () => {
+      const index = [row("operator-architect"), row("node-template-architect")];
+      expect(selectArchitectEntryId(index, "operator")).toBe(
+        "operator-architect"
+      );
+      expect(selectArchitectEntryId(index, "poly")).toBeNull();
+    });
+
+    it("the pr-review catalog entry opts in; other graphs do not", () => {
+      expect(LANGGRAPH_CATALOG["pr-review"]?.hostArchitect).toBe(true);
+      expect(LANGGRAPH_CATALOG.poet?.hostArchitect).toBeUndefined();
+    });
+  });
+
+  describe("catalog report seam (CatalogEntry.report)", () => {
+    const report = { event: "ai.work_prioritizer.cycle" };
+
+    it("every catalog-declared report names a registered event", () => {
+      const registered = new Set<string>(Object.values(EVENT_NAMES));
+      const declared = Object.values(LANGGRAPH_CATALOG).flatMap((e) => {
+        const r = (e as { report?: { event: string } }).report;
+        return r ? [r.event] : [];
+      });
+      expect(declared.length).toBeGreaterThan(0);
+      for (const name of declared) expect(registered.has(name)).toBe(true);
+    });
+
+    it("logs the telemetry as one `event`", () => {
+      expect(
+        graphReportLogFields(report, "run-9", {
+          telemetry: { changedItemIds: ["task.1"], changeCount: 1 },
+        })
+      ).toEqual([
+        {
+          event: "ai.work_prioritizer.cycle",
+          runId: "run-9",
+          changedItemIds: ["task.1"],
+          changeCount: 1,
+        },
+      ]);
+    });
+
+    it("emits nothing when the output carries no report", () => {
+      expect(graphReportLogFields(report, "r", undefined)).toEqual([]);
+      expect(graphReportLogFields(report, "r", { content: "x" })).toEqual([]);
+      expect(graphReportDelta({ content: "x" })).toBeNull();
+    });
+
+    it("echoes the telemetry as one <graph_report> delta", () => {
+      expect(graphReportDelta({ telemetry: { changeCount: 0 } })).toBe(
+        '\n<graph_report>{"changeCount":0}</graph_report>\n'
+      );
+    });
+  });
+
+  describe("review subject (task.5448)", () => {
+    const OPERATOR_NODE = "operator-node-id";
+    const OTHER_NODE = "b927a9dd-6132-4fc9-a51e-e3cee2568e3c";
+    const subjectOf = (nodeId: string) => ({
+      nodeId,
+      owner: "cogni-dao",
+      repo: "node-template",
+      baseSha: "b".repeat(40),
+      headSha: "a".repeat(40),
+    });
+    const grounding = {
+      nodeId: OTHER_NODE,
+      origin: "https://node-template.test",
+      mission: {
+        content: "SUBJECT MISSION TEXT",
+        sourceRef: "cogni-dao/node-template@bbbbbbbbbbbb:.cogni/repo-spec.yaml",
+        buildSha: null,
+      },
+      governingIndex: [
+        {
+          id: "subject-rule",
+          domain: "method",
+          entryType: "rule",
+          useWhen: "always",
+        },
+      ],
+    };
+
+    function build(opts: {
+      loader?: ConstructorParameters<typeof LangGraphInProcProvider>[10];
+    }) {
+      const adapter = createMockAdapter({
+        finalResult: { ok: true, requestId: "r", finishReason: "stop" },
+      });
+      const governingIndexReader = vi.fn(async () => [
+        {
+          id: "operator-rule",
+          domain: "method",
+          entryType: "rule",
+          useWhen: "operator only",
+        },
+      ]);
+      const architectRead = vi.fn(async () => "OPERATOR ARCHITECT");
+      const provider = new LangGraphInProcProvider(
+        adapter,
+        createMockToolSource(),
+        undefined,
+        [...CORE_TOOL_BUNDLE],
+        new FakeAuthorizationAdapter(),
+        OPERATOR_NODE,
+        "https://operator.test",
+        {
+          content: "OPERATOR MISSION TEXT",
+          sourceRef: "operator",
+          buildSha: null,
+        },
+        governingIndexReader,
+        { read: architectRead },
+        opts.loader
+      );
+      return { adapter, provider, governingIndexReader, architectRead };
+    }
+
+    async function run(
+      provider: LangGraphInProcProvider,
+      subject: ReturnType<typeof subjectOf>
+    ) {
+      toolRunnerSpy.calls.length = 0;
+      return runInScope(
+        {
+          ...TEST_SCOPE,
+          actorUserId: "00000000-0000-4000-a000-000000000001",
+          nodeId: OPERATOR_NODE,
+          codeSubject: subject,
+        },
+        async () => {
+          const { stream, final } = provider.runGraph(
+            createTestRequest({ graphId: "langgraph:pr-review" })
+          );
+          const events: AiEvent[] = [];
+          for await (const event of stream) events.push(event);
+          return { events, result: await final };
+        }
+      );
+    }
+
+    it("another node: preamble comes from the loader, never the operator hub; no work_item_read; authority on the subject node", async () => {
+      const loader = vi.fn(async () => grounding);
+      const { adapter, provider, governingIndexReader, architectRead } = build({
+        loader,
+      });
+      await run(provider, subjectOf(OTHER_NODE));
+
+      expect(loader).toHaveBeenCalledWith(subjectOf(OTHER_NODE));
+      expect(governingIndexReader).not.toHaveBeenCalled();
+      expect(architectRead).not.toHaveBeenCalled();
+
+      const call = (adapter.executeCompletionUnit as ReturnType<typeof vi.fn>)
+        .mock.calls[0]?.[0] as {
+        messages: Array<{ content: unknown }>;
+        tools?: unknown;
+      };
+      const prompt = JSON.stringify(call.messages);
+      expect(prompt).toContain("SUBJECT MISSION TEXT");
+      expect(prompt).toContain("subject-rule");
+      expect(prompt).not.toContain("OPERATOR MISSION TEXT");
+      expect(prompt).not.toContain("operator-rule");
+      const tools = JSON.stringify(call.tools ?? []);
+      expect(tools).toContain("core__knowledge_read");
+      expect(tools).not.toContain("core__work_item_read");
+
+      const config = toolRunnerSpy.calls[0]?.[2] as Record<string, unknown>;
+      expect(config.nodeId).toBe(OTHER_NODE);
+    });
+
+    it("a refused read fails the run with its typed code BEFORE any model call", async () => {
+      const loader = vi.fn(async () => {
+        throw new AiExecutionError("remote_policy_denied");
+      });
+      const { adapter, provider } = build({ loader });
+      const { events, result } = await run(provider, subjectOf(OTHER_NODE));
+      expect(adapter.executeCompletionUnit).not.toHaveBeenCalled();
+      expect(events.filter((e) => e.type === "error")).toEqual([
+        { type: "error", error: "remote_policy_denied" },
+      ]);
+      expect(events[events.length - 1]).toEqual({ type: "done" });
+      expect(result.ok).toBe(false);
+      expect(result.error).toBe("remote_policy_denied");
+    });
+
+    it("another node without a grounding loader fails closed; there is no operator fallback", async () => {
+      const { adapter, provider, governingIndexReader } = build({});
+      const { result } = await run(provider, subjectOf(OTHER_NODE));
+      expect(adapter.executeCompletionUnit).not.toHaveBeenCalled();
+      expect(governingIndexReader).not.toHaveBeenCalled();
+      expect(result.ok).toBe(false);
+      expect(result.error).toBe("internal");
+    });
+
+    it("the operator's own subject is exactly today's local path", async () => {
+      const loader = vi.fn(async () => grounding);
+      const { adapter, provider, governingIndexReader, architectRead } = build({
+        loader,
+      });
+      await run(provider, subjectOf(OPERATOR_NODE));
+
+      expect(loader).not.toHaveBeenCalled();
+      expect(governingIndexReader).toHaveBeenCalledTimes(1);
+      expect(architectRead).not.toHaveBeenCalled(); // no `*-architect` entry in the operator index fixture
+      const call = (adapter.executeCompletionUnit as ReturnType<typeof vi.fn>)
+        .mock.calls[0]?.[0] as { messages: unknown; tools?: unknown };
+      const prompt = JSON.stringify(call.messages);
+      expect(prompt).toContain("OPERATOR MISSION TEXT");
+      expect(prompt).toContain("operator-rule");
+      expect(JSON.stringify(call.tools ?? [])).toContain(
+        "core__work_item_read"
+      );
+      const config = toolRunnerSpy.calls[0]?.[2] as Record<string, unknown>;
+      expect(config.nodeId).toBe(OPERATOR_NODE);
     });
   });
 

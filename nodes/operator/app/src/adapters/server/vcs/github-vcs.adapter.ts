@@ -27,12 +27,18 @@ import type {
   CreateBranchResult,
   DispatchCandidateFlightResult,
   MergeResult,
+  NodeCodeBinding,
+  NodeCodeCapability,
   PrSummary,
   VcsCapability,
 } from "@cogni/ai-tools";
+import { PUSH_TOKEN_PERMISSIONS } from "@cogni/node-contracts";
 import { createAppAuth } from "@octokit/auth-app";
 import { Octokit } from "@octokit/core";
-
+import {
+  GitHubNodeCodeAdapter,
+  type NodeCodeAdmissionPolicy,
+} from "./github-node-code.adapter";
 import { resolveReviewedWorkflowRef } from "./reviewed-workflow-ref";
 
 // ---------------------------------------------------------------------------
@@ -59,6 +65,70 @@ export class GitHubVcsAdapter implements VcsCapability {
       appId: config.appId,
       privateKey: config.privateKey,
     });
+  }
+
+  /** Read-only Git objects for a host-pinned node source; never exposes credentials or arbitrary routes. */
+  nodeCodeReader(
+    binding: NodeCodeBinding,
+    log: {
+      info(fields: Record<string, unknown>): void;
+      warn(fields: Record<string, unknown>): void;
+    },
+    /** Admission policy; defaults to the binding's roots/manifests (story.5102 injects review). */
+    policy?: NodeCodeAdmissionPolicy
+  ): NodeCodeCapability {
+    const { owner, repo } = binding;
+    const readAuth = createAppAuth({
+      appId: this.config.appId,
+      privateKey: this.config.privateKey,
+      request: new Octokit({ request: { timeout: 15000 } }).request,
+    });
+    return new GitHubNodeCodeAdapter(
+      binding,
+      async (route, params, signal) => {
+        // Resolve the existing installation, then request a repository-limited contents:read token.
+        // auth-app retains its normal token refresh/cache; write credentials never enter tool arguments.
+        if (params.owner !== owner || params.repo !== repo)
+          throw new Error("node_code_repository_mismatch");
+        const installationId = await this.resolveInstallationId(
+          owner,
+          repo,
+          signal
+        );
+        const { token } = await readAuth({
+          type: "installation",
+          installationId,
+          repositoryNames: [repo],
+          permissions: { contents: "read" },
+        });
+        const client = new Octokit({
+          auth: token,
+          request: { timeout: 15000 },
+        });
+        const common = {
+          owner,
+          repo,
+          headers: { "X-GitHub-Api-Version": "2022-11-28" },
+          request: { signal },
+        };
+        const objectSha =
+          params.commit_sha ?? params.tree_sha ?? params.file_sha;
+        if (!objectSha || !/^[0-9a-f]{40}$/.test(objectSha))
+          throw new Error("node_code_object_invalid");
+        if (route === "GET /repos/{owner}/{repo}/git/commits/{commit_sha}")
+          return (
+            await client.request(route, { ...common, commit_sha: objectSha })
+          ).data;
+        if (route === "GET /repos/{owner}/{repo}/git/trees/{tree_sha}")
+          return (
+            await client.request(route, { ...common, tree_sha: objectSha })
+          ).data;
+        return (await client.request(route, { ...common, file_sha: objectSha }))
+          .data;
+      },
+      log,
+      policy
+    );
   }
 
   async listPrs(params: {
@@ -90,6 +160,29 @@ export class GitHubVcsAdapter implements VcsCapability {
         updatedAt: pr.updated_at,
       })
     );
+  }
+
+  /**
+   * A pull request's current head and merge state, for the work-item status gates (task.0122).
+   * One read: no checks, no reviews. Not part of `VcsCapability`; the work-item PR-facts port takes it structurally.
+   */
+  async getPrFacts(params: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    signal?: AbortSignal;
+  }): Promise<{ headSha: string; merged: boolean }> {
+    const octokit = await this.getOctokit(params.owner, params.repo);
+    const { data: pr } = await octokit.request(
+      "GET /repos/{owner}/{repo}/pulls/{pull_number}",
+      {
+        owner: params.owner,
+        repo: params.repo,
+        pull_number: params.prNumber,
+        ...(params.signal ? { request: { signal: params.signal } } : {}),
+      }
+    );
+    return { headSha: pr.head.sha, merged: pr.merged === true };
   }
 
   async getCiStatus(params: {
@@ -611,6 +704,31 @@ export class GitHubVcsAdapter implements VcsCapability {
     };
   }
 
+  /**
+   * Mint an installation token limited to ONE repo with exactly PUSH_TOKEN_PERMISSIONS (push a branch,
+   * open a PR). GitHub enforces both limits, so the holder cannot widen them. auth-app caches the
+   * token per (installation, repos, permissions) and refreshes it before expiry.
+   */
+  async mintRepoPushToken(params: {
+    owner: string;
+    repo: string;
+  }): Promise<{ token: string; expiresAt: string }> {
+    const installationId = await this.resolveInstallationId(
+      params.owner,
+      params.repo
+    );
+    const auth = await this.appAuth({
+      type: "installation",
+      installationId,
+      repositoryNames: [params.repo],
+      permissions: { ...PUSH_TOKEN_PERMISSIONS },
+      // auth-app caches installation tokens for 59 min; a node asks only when its own copy is near expiry,
+      // so always hand back a fresh 1-hour token.
+      refresh: true,
+    });
+    return { token: auth.token, expiresAt: auth.expiresAt };
+  }
+
   // ---------------------------------------------------------------------------
   // Private helpers
   // ---------------------------------------------------------------------------
@@ -638,7 +756,8 @@ export class GitHubVcsAdapter implements VcsCapability {
    */
   private async resolveInstallationId(
     owner: string,
-    repo: string
+    repo: string,
+    signal?: AbortSignal
   ): Promise<number> {
     const cacheKey = `${owner}/${repo}`;
     const cached = this.installationCache.get(cacheKey);
@@ -648,6 +767,7 @@ export class GitHubVcsAdapter implements VcsCapability {
     const response = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/installation`,
       {
+        ...(signal ? { signal } : {}),
         headers: {
           Authorization: `Bearer ${token}`,
           Accept: "application/vnd.github+json",

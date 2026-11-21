@@ -7,7 +7,7 @@
  * Scope: Names and public/private visibility only; no images, ports, resources, secrets, or provider state.
  * Invariants: DEPLOYED_GIT_IS_AUTHORITY, DISPLAY_SAFE_ONLY, PROVIDER_NEUTRAL_OUTPUT.
  * Side-effects: Implementations may perform read-only VCS IO.
- * Links: docs/spec/ci-cd.md, task.5112
+ * Links: https://cognidao.org/knowledge/operator-pipeline-contract, task.5112
  * @public
  */
 
@@ -18,6 +18,8 @@ export interface NodeDeployedService {
 
 export interface NodeDeploymentTopologyPort {
   listServices(input: {
+    /** Node id: the key of the node-deploy release view (story.5137). */
+    readonly nodeId: string;
     readonly slug: string;
     readonly environment: "candidate-a" | "preview" | "production";
   }): Promise<readonly NodeDeployedService[]>;

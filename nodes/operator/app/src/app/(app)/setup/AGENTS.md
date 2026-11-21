@@ -13,8 +13,7 @@ Legacy setup pages. Protected route group requiring wallet connection.
 
 ## Pointers
 
-- [Node Formation Spec](../../../../../../docs/spec/node-formation.md): P0 MVP design
-- [Chain Action Flow UI](../../../../../../docs/spec/chain-action-flow-ui.md): vNext reusable UI components
+- [Node Formation Spec](https://cognidao.org/knowledge/node-formation-contract): P0 MVP design
 
 ## Boundaries
 

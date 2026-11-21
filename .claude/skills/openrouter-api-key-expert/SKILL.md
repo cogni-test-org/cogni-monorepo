@@ -5,6 +5,8 @@ description: "End-to-end OpenRouter key + spend + outage playbook for Cogni. Use
 
 # OpenRouter API Key Expert
 
+Route the work through [operator-architect](https://cognidao.org/knowledge/operator-architect) first; this skill adds the OpenRouter key and spend rules on top of it.
+
 The playbook for OpenRouter spend investigation, leak/compromise response, outage diagnosis, and fleet key rotation. Battle-tested in the 2026-08-27→31 incident (leaked prod key `cogni-template-prod-2` drained the account **twice** via direct off-infra opus-4.8 abuse → two prod AI outages). Read this BEFORE touching a key.
 
 ## 0. Prereq: you need a MANAGEMENT key (mint it, use it, revoke it)
@@ -72,7 +74,7 @@ Coding agents (Cursor/opencode/aider/cline) can be pointed at OpenRouter with an
 
 ## 5. Rotation runbook
 
-**Clean path (preferred, per `docs/guides/secrets-rotate.md`):** self-serve API `POST /api/v1/nodes/<id>/secrets {env,key:"OPENROUTER_API_KEY",value,op:"rotate"}` with `COGNI_API_KEY_<ENV>`. **A `401` = the key is expired → STOP and ask a human to refresh it; do NOT fall back to spelunking.** (In the incident `COGNI_API_KEY_PROD` was expired, forcing break-glass.)
+**Clean path (preferred, per `https://cognidao.org/knowledge/break-glass-secret-write`):** self-serve API `POST /api/v1/nodes/<id>/secrets {env,key:"OPENROUTER_API_KEY",value,op:"rotate"}` with `COGNI_API_KEY_<ENV>`. **A `401` = the key is expired → STOP and ask a human to refresh it; do NOT fall back to spelunking.** (In the incident `COGNI_API_KEY_PROD` was expired, forcing break-glass.)
 
 **Break-glass (mgmt key + prod OpenBao root + kubeconfig from `~/dev/cogni-template/.local/provision-creds/production/`):**
 
@@ -95,6 +97,6 @@ Coding agents (Cursor/opencode/aider/cline) can be pointed at OpenRouter with an
 
 - [[project_ai_outage_openrouter_402_masked]] — the 402-masking + `FAULT_PARTY_BEFORE_BUCKET` fix (bug.5056).
 - [[reference_openrouter_preview_rotation]] — the LiteLLM-Compose-on-VM `.env` converge recipe (preview; same shape for prod).
-- `docs/guides/secrets-rotate.md` — the clean self-serve rotation lane + the `401 = STOP` rule.
+- `https://cognidao.org/knowledge/break-glass-secret-write` — the clean self-serve rotation lane + the `401 = STOP` rule.
 - `scripts/ci/deploy-infra.sh` (`source_openbao_runtime_key`) — proof the VM `.env` renders OPENROUTER from OpenBao SSOT.
 - `.claude/skills/cicd-secrets-expert/` — OpenBao/ESO custody + `pnpm secrets:set` lanes.

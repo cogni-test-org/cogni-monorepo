@@ -4,7 +4,7 @@
 /**
  * Module: `@shared/db/node-access-requests`
  * Purpose: Tracking rows for AI-agent → node-owner access requests. UX/audit only — OpenFGA role
- *   tuples remain the sole authority (rbac.md §6); the `node.flight` check never reads this table.
+ *   tuples remain the sole authority (https://cognidao.org/knowledge/authz-port-contract §6); the `node.flight` check never reads this table.
  * Scope: One row per (node, agent user). `role` is the OpenFGA relation requested. v0 grants
  *   `developer` (confers `can_flight`, candidate-a), `secrets_manager` (confers `can_manage_secrets`),
  *   `production_promoter` (confers `can_promote_production`), or `env_manager` (confers
@@ -14,7 +14,7 @@
  * Invariants: NOT_AUTHORITY, ONE_ROW_PER_AGENT_NODE_ROLE (an agent can request multiple roles on
  *   one node — each is its own row), ROLE_MAPS_TO_OPENFGA_RELATION.
  * Side-effects: none
- * Links: docs/spec/rbac.md §6, docs/spec/identity-model.md
+ * Links: https://cognidao.org/knowledge/authz-port-contract §6, https://cognidao.org/knowledge/identity-keys-no-overload
  * @public
  */
 
@@ -52,13 +52,21 @@ export const NODE_ACCESS_ROLES = [
   "secrets_manager",
   "production_promoter",
   "env_manager",
-  // `admin` → the node-administrator relation (node owner scope, above env_manager).
-  // Grantable so an agent can request it and the owner approves the single tuple; gates
-  // repo-governance verbs that flip GitHub Actions permissions (reconcile-actions, bug.5482).
-  "admin",
+  // `admin` is NOT requestable (task.5494, ONE_ADMIN_ANSWER): a node's admins are its repo-spec
+  // approvers, written only by the node-admin sync. The DB CHECK below keeps `admin` as a legacy
+  // value so rows written before this change stay valid; it is deliberately NOT derived from
+  // this list.
 ] as const;
 
 export type NodeAccessRole = (typeof NODE_ACCESS_ROLES)[number];
+
+/**
+ * Roles that can no longer be requested or approved but may still sit on old rows. The developers
+ * route lets an owner deny or revoke them (clean-up) and never approve them.
+ */
+export const LEGACY_NODE_ACCESS_ROLES = ["admin"] as const;
+
+export type LegacyNodeAccessRole = (typeof LEGACY_NODE_ACCESS_ROLES)[number];
 
 export const nodeAccessRequests = pgTable(
   "node_access_requests",
@@ -71,7 +79,7 @@ export const nodeAccessRequests = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     role: text("role").notNull().default("developer"),
-    // The AI agent's own GitHub login, declared at REQUEST time (rbac.md §6a). The agent requests
+    // The AI agent's own GitHub login, declared at REQUEST time (https://cognidao.org/knowledge/authz-port-contract §6a). The agent requests
     // access for its own GitHub account; on approve the owner-gated grant resolves push-access for
     // THIS login — the human never supplies a login, they just click Approve. Nullable: a request
     // with no GitHub identity grants only the OpenFGA role (the fork-PR fallback still applies).

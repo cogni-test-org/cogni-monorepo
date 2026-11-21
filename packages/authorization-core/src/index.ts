@@ -7,7 +7,7 @@
  * Scope: Pure package boundary for node-template-based RBAC. Does not load runtime env or select node adapters.
  * Invariants: OpenFGA is the sole permission/delegation source; deny by default; unavailable fails closed with a distinct code.
  * Side-effects: none
- * Links: docs/spec/rbac.md, docs/spec/access-control-charter.md
+ * Links: https://cognidao.org/knowledge/authz-port-contract
  * @public
  */
 
@@ -45,6 +45,8 @@ export interface AuthzContext {
   readonly graphId?: string;
   readonly runId?: string;
   readonly toolCallId?: string;
+  /** Execution grant backing a scheduled run (audit only; adapters do not read context). */
+  readonly grantId?: string;
 }
 
 export interface AuthzCheckParams {
@@ -89,6 +91,16 @@ export interface AuthorizationPort {
    * as "no grants"). `user` is a resource string (`user:<id>`).
    */
   listRelations(user: string): Promise<AuthzListDecision>;
+  /**
+   * Lists every stored tuple on one object (`node:<id>`), optionally one relation, across ALL
+   * subjects. Paginated to completion: a partial page is never returned as success. Same
+   * fail-closed-WITH-DISTINCTION shape as `listRelations` (`authz_list_unavailable`). The read
+   * plane the node-admin sync diffs against (task.5494).
+   */
+  listRelationsByObject(
+    object: string,
+    relation?: string
+  ): Promise<AuthzListDecision>;
 }
 
 export interface AuthzRelationTuple {

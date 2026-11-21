@@ -13,8 +13,8 @@ AI tool bindings and tool source factory. Wires tool implementations with inject
 
 ## Pointers
 
-- [Tool Use Spec](../../../../../docs/spec/tool-use.md)
-- [Tools Authoring](../../../../../docs/guides/tools-authoring.md)
+- [Tool Use Spec](https://node-template.cognidao.org/knowledge/tool-use-contract)
+- [Tools Authoring](https://node-template.cognidao.org/knowledge/add-an-ai-tool)
 
 ## Boundaries
 
@@ -28,8 +28,8 @@ AI tool bindings and tool source factory. Wires tool implementations with inject
 
 ## Public Surface
 
-- **Exports:** `createToolBindings()`, `createBoundToolSource()`, `ToolBindings`, `ToolBindingDeps`
-- **Files considered API:** `tool-bindings.ts`, `tool-source.factory.ts`
+- **Exports:** `createToolBindings()`, `createBoundToolSource()`, `ToolBindings`, `ToolBindingDeps`, `OPERATOR_CORE_TOOL_BUNDLE` (shared baseline contracts with existing operator requires metadata)
+- **Files considered API:** `tool-bindings.ts`, `tool-source.factory.ts`, `evaluation-baseline.ts`
 
 ## Responsibilities
 

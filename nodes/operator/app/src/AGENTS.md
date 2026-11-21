@@ -15,12 +15,12 @@ Next.js application source implementing hexagonal architecture for a fully web3-
 ## Pointers
 
 - [Root AGENTS.md](../../../AGENTS.md)
-- [Architecture](../../../docs/spec/architecture.md)
-- [Authentication overview](../../../docs/spec/authentication.md)
-- [Accounts design (billing + identity)](../../../docs/spec/accounts-design.md)
-- [Security & auth spec](../../../docs/spec/security-auth.md)
-- [Database architecture](../../../docs/spec/databases.md)
-- [Environment modes](../../../docs/spec/environments.md)
+- [Architecture](https://node-template.cognidao.org/knowledge/hexagonal-layering-contract)
+- [Authentication overview](https://node-template.cognidao.org/knowledge/authentication-session-bearer)
+- [Accounts design (billing + identity)](https://node-template.cognidao.org/knowledge/billing-account-tenancy)
+- [Operator identity model](https://cognidao.org/knowledge/operator-identity-model)
+- [Database architecture](https://node-template.cognidao.org/knowledge/database-migration-contract)
+- [Environment modes](https://github.com/cogni-dao/cogni/blob/2321821e61dd12aa0cf75d235bd668ff65739109/docs/spec/environments.md)
 - [DB schema](./shared/db/schema.ts) - Users, billing accounts, ledger, virtual keys
 - [Auth implementation](auth.ts) - NextAuth.js with SIWE provider
 

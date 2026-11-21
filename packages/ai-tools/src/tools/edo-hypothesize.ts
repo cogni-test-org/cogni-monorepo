@@ -11,10 +11,11 @@
  *   - HYPOTHESIS_HAS_EVALUATE_AT: evaluateAt is required by the Zod schema.
  *   - EDO_TOOLS_ATOMIC: write + edges + commit happen in one capability call.
  * Side-effects: IO (database write + dolt_commit via capability)
- * Links: docs/spec/knowledge-syntropy.md
+ * Links: https://node-template.cognidao.org/knowledge/knowledge-recall-path
  * @public
  */
 
+import { KnowledgeRowSchema } from "@cogni/shared-knowledge-store/contracts";
 import { z } from "zod";
 
 import type { EdoCapability } from "../capabilities/edo";
@@ -28,7 +29,7 @@ import type { BoundTool, ToolContract, ToolImplementation } from "../types";
 // duplicated here (not imported) because ai-tools is the lower package and
 // knowledge-store depends on it, so importing the domain schema would invert the
 // dependency. Widening the tool boundary to admit `metric:<kpi-id>` is the
-// goal-loop hook (docs/design/knowledge-goal-loop.md): a goal is a hypothesis
+// goal-loop hook (https://node-template.cognidao.org/knowledge/knowledge-goal-loop-design): a goal is a hypothesis
 // whose resolution_strategy is `metric:<kpi-id>`.
 const RESOLUTION_STRATEGY_RE = /^[a-z][a-z0-9_]*(:[A-Za-z0-9_./~^-]+)?$/;
 const METRIC_STRATEGY_PREFIX = "metric:";
@@ -87,13 +88,7 @@ export const EdoHypothesizeInputSchema = z.object({
 export type EdoHypothesizeInput = z.infer<typeof EdoHypothesizeInputSchema>;
 
 export const EdoHypothesizeOutputSchema = z.object({
-  entry: z.object({
-    id: z.string(),
-    domain: z.string(),
-    title: z.string(),
-    confidencePct: z.number().nullable(),
-    sourceType: z.string(),
-  }),
+  entry: KnowledgeRowSchema,
   evaluateAt: z.string(),
   resolutionStrategy: z.string().nullable(),
   evidenceCitationCount: z.number(),
@@ -164,13 +159,7 @@ export function createEdoHypothesizeImplementation(
       });
 
       return {
-        entry: {
-          id: entry.id,
-          domain: entry.domain,
-          title: entry.title,
-          confidencePct: entry.confidencePct,
-          sourceType: entry.sourceType,
-        },
+        entry: { ...entry },
         evaluateAt: input.evaluateAt,
         resolutionStrategy:
           input.resolutionStrategy === "manual" ||

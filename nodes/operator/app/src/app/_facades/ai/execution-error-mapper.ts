@@ -30,6 +30,13 @@ const HTTP_STATUS_MAP: Record<AiExecutionErrorCode, number> = {
   // Operator-fault (provider down / unfunded) → 503, never 500. Client maps 503
   // to a "temporarily unavailable" retry message, never "add credits" (bug.5056).
   provider_unavailable: 503,
+  // Operator's provider account is out of credit: also operator-fault, also 503 (bug.5626).
+  provider_unfunded: 503,
+  // A read of another node's hub (task.5448): neither a client nor a server fault of this node.
+  // The target asked, or refused, the read: 403-class. An unreachable target is 503.
+  remote_access_requested: 403,
+  remote_policy_denied: 403,
+  remote_unavailable: 503,
 };
 
 const OPENAI_ERROR_MAP: Record<
@@ -76,6 +83,28 @@ const OPENAI_ERROR_MAP: Record<
     status: 503,
     message:
       "The upstream AI provider is temporarily unavailable. Please retry shortly.",
+    type: "service_unavailable",
+  },
+  provider_unfunded: {
+    status: 503,
+    message:
+      "The upstream AI provider is temporarily unavailable. Please retry shortly.",
+    type: "service_unavailable",
+  },
+  remote_access_requested: {
+    status: 403,
+    message: "Access to the linked node was requested and is pending.",
+    type: "permission_error",
+  },
+  remote_policy_denied: {
+    status: 403,
+    message: "The linked node refused this read.",
+    type: "permission_error",
+  },
+  remote_unavailable: {
+    status: 503,
+    message:
+      "The linked node is temporarily unavailable. Please retry shortly.",
     type: "service_unavailable",
   },
 };

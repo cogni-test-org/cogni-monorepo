@@ -8,7 +8,7 @@
  * Invariants: Keys match CSS custom properties; all values defined in tailwind.css @theme block; maintains strict typing.
  * Side-effects: none
  * Notes: Single source of typed keys for ui.ts and kit components.
- * Links: src/styles/tailwind.css (values), docs/spec/ui-implementation.md
+ * Links: src/styles/tailwind.css (values), https://node-template.cognidao.org/knowledge/frontend-development
  * @public
  */
 
@@ -39,6 +39,13 @@ export const colorKeys = [
   "syntax-delimiter",
   "syntax-string",
   "syntax-keyword",
+  "brain-loading-blue",
+  "brain-loading-teal",
+  "brain-loading-green",
+  "brain-loading-cyan",
+  "brain-loading-indigo",
+  "brain-loading-violet",
+  "brain-loading-magenta",
 ] as const;
 
 // Radius token keys (semantic keys for CVA props - map to CSS vars)

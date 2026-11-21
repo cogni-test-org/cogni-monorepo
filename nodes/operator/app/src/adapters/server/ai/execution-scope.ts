@@ -9,8 +9,11 @@
  *   - ALS_NOT_SHARED: ExecutionScope is app-local, never exported to @cogni/graph-execution-core
  *   - BILLING_SET_BY_LAUNCHER: runInScope is called by the launcher (chat, schedule, webhook)
  *   - ABORT_CHAT_ONLY: abortSignal is temporary tech debt for browser disconnect, not durable cancellation
+ *   - REVIEW_SUBJECT_IS_HOST_BOUND (story.5102): `codeSubject` is set only by the internal graph
+ *     run route, only for catalog entries that declare it, and only after owner/repo matched
+ *     `resolveNodeRepo(nodeId)`. Graphs that do not declare it never receive it.
  * Side-effects: none (ALS is process-scoped, no I/O)
- * Links: docs/spec/unified-graph-launch.md
+ * Links: https://node-template.cognidao.org/knowledge/graph-run-launch-contract
  * @public
  */
 
@@ -35,6 +38,24 @@ export interface ExecutionScope {
   readonly llmService: LlmService;
   /** Billing source system for usage attribution (from ModelProviderPort.usageSource). */
   readonly usageSource: SourceSystem;
+  /** Node this run executes on (authz v0 node policy + audit). */
+  readonly nodeId?: string;
+  /** Execution grant backing a scheduled run (audit only; API/chat runs carry none). */
+  readonly grantId?: string;
+  /**
+   * Host-validated repository + commits a review run may read (story.5102). When set, the
+   * node-code capability builds a fresh reader for `owner/repo@headSha` per call.
+   */
+  readonly codeSubject?: ExecutionCodeSubject;
+}
+
+/** Host-bound code subject of a run (validated by the internal graph run route). */
+export interface ExecutionCodeSubject {
+  readonly nodeId: string;
+  readonly owner: string;
+  readonly repo: string;
+  readonly baseSha: string;
+  readonly headSha: string;
 }
 
 const executionScopeStorage = new AsyncLocalStorage<ExecutionScope>();
@@ -50,6 +71,11 @@ export function getExecutionScope(): ExecutionScope {
     );
   }
   return scope;
+}
+
+/** The current execution scope, or undefined outside runInScope. For observers that must never throw (story.0061). */
+export function findExecutionScope(): ExecutionScope | undefined {
+  return executionScopeStorage.getStore();
 }
 
 /**

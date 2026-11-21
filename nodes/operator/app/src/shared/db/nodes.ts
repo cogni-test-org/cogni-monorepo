@@ -9,7 +9,7 @@
  * Invariants: NODES_TABLE_SCOPE (env-local catalog projection + pre-merge wizard state),
  *   STATE_MACHINE_TOTAL, OWNER_GATING, NO_PRIVATE_KEYS,
  *   OPERATOR_NODE_ROW_ID_IS_NODE_ID — `nodes.id` IS the operator's projection of the node's repo-spec
- *   `node_id` (the deployment-identity SSOT, docs/spec/identity-model.md). It is the OpenFGA `node:<id>`
+ *   `node_id` (the deployment-identity SSOT, https://cognidao.org/knowledge/identity-keys-no-overload). It is the OpenFGA `node:<id>`
  *   resource and the Loki `node` label, never an unrelated surrogate. Wizard creation's `defaultRandom()`
  *   is the act of minting that `node_id` — `publish` writes the same value into the minted repo-spec.
  *   An externally-formed node MUST be inserted with `id = <child repo-spec node_id>`, never a fresh UUID,
@@ -18,7 +18,7 @@
  *   are projections of merged catalog intent. A node may deploy to many envs, but exactly one environment ingests activity and
  *   runs epoch schedules; the DB check requires that activity env to be in the deploy set.
  * Side-effects: none
- * Links: docs/spec/identity-model.md, docs/spec/node-formation.md, work/projects/proj.node-formation-ui.md, task.5083
+ * Links: https://cognidao.org/knowledge/identity-keys-no-overload, https://cognidao.org/knowledge/node-formation-contract, https://github.com/cogni-dao/cogni/blob/2321821e61dd12aa0cf75d235bd668ff65739109/work/projects/proj.node-formation-ui.md, task.5083
  * @public
  */
 
@@ -67,6 +67,14 @@ export const nodes = pgTable(
     repoOwner: text("repo_owner").notNull(),
     repoName: text("repo_name").notNull(),
     repoVisibility: text("repo_visibility").notNull().default("public"),
+    // REPO_SPEC_PATH_IS_PROJECTED (task.5494) — where the node's `.cogni/repo-spec.yaml` lives,
+    // inside the repo named by `repo_owner`/`repo_name` (for source_repo nodes that IS the node's
+    // own repo; for in-repo nodes like the operator it is the parent). The catalog reconcile writes
+    // it; the node-admin sync reads it. Null = not yet projected (wizard-born rows before listing):
+    // the sync skips such a row as `unavailable`.
+    repoSpecPath: text("repo_spec_path"),
+    // INSERT_ONLY_OWNER (task.5494) — records who spawned the node. The catalog reconcile sets it
+    // on insert and never overwrites it; node admins come from repo-spec approvers.
     ownerUserId: text("owner_user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),

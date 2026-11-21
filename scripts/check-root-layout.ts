@@ -8,7 +8,7 @@
  * Invariants: Required path set must exist; unexpected non-gitignored root entries must be reported.
  * Side-effects: IO (spawns `git check-ignore` for root entries)
  * Notes: Ignores .git, node_modules, macOS metadata, and pnpm store directories.
- * Links: docs/spec/style.md, scripts/validate-doc-headers.ts
+ * Links: https://node-template.cognidao.org/knowledge/code-style-standard, scripts/validate-doc-headers.ts
  * @internal
  */
 
@@ -64,12 +64,12 @@ const REQUIRED_PATHS: PathRequirement[] = [
 ];
 
 const ALLOWED_ROOT_ENTRIES = new Set<string>([
-  ".agent",
   ".agents",
   ".allstar",
   ".claude",
   ".codex",
   ".cogni",
+  ".conductor",
   ".dependency-cruiser.cjs",
   ".dockerignore",
   ".editorconfig",
@@ -87,6 +87,7 @@ const ALLOWED_ROOT_ENTRIES = new Set<string>([
   ".mcp.json",
   ".nvmrc",
   ".obsidian",
+  ".opencode",
   ".prettierignore",
   ".prettierrc",
   ".prettierrc.cjs",
@@ -111,7 +112,6 @@ const ALLOWED_ROOT_ENTRIES = new Set<string>([
   "biome.json",
   "commitlint.config.cjs",
   "config",
-  "conductor.json",
   "docs",
   "e2e",
   "eslint",

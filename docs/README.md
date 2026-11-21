@@ -23,7 +23,6 @@ tags:: documentation, meta
 | `guides/`      | Procedures (setup, howto, runbooks)   |
 | `postmortems/` | Incident reviews, root cause analysis |
 | `archive/`     | Deprecated docs                       |
-| `_templates/`  | Templates for each doc type           |
 
 ## Doc Types
 
@@ -58,7 +57,7 @@ tags: [scheduler, temporal]
 
 **Required (specs):** `id`, `type`, `title`, `status`, `spec_state`, `trust`, `summary`, `read_when`, `owner`, `created`, `verified`, `tags`
 
-Work items (`work/projects/`, `work/items/`) use a different field set — see `work/README.md`.
+Work items (`work/projects/`, `work/items/`) use a different field set — see `https://github.com/cogni-dao/cogni/blob/2321821e61dd12aa0cf75d235bd668ff65739109/work/README.md`.
 
 ## Trust Levels
 
@@ -71,10 +70,7 @@ Work items (`work/projects/`, `work/items/`) use a different field set — see `
 
 ## Creating Docs
 
-1. Copy template from `_templates/`
-2. Fill required properties
-3. Place in matching directory
-4. Ensure `type::` matches directory
+Do not add Markdown here. Contribute durable knowledge to the hub through [knowledge-contribution-flow](https://cognidao.org/knowledge/knowledge-contribution-flow). Contracts and invariants, procedures, research and incident lessons each have a hub entry type; [segment-markdown-knowledge](https://cognidao.org/knowledge/segment-markdown-knowledge) maps content to its destination.
 
 ## Hard Rules
 
@@ -86,6 +82,5 @@ Work items (`work/projects/`, `work/items/`) use a different field set — see `
 
 ## Related
 
-- [Work Management](../work/README.md)
-- [Spec Index](./spec/SPEC_INDEX.md)
+- [Work Management](https://github.com/cogni-dao/cogni/blob/2321821e61dd12aa0cf75d235bd668ff65739109/work/README.md)
 - [Organization Plan](./DOCS_ORGANIZATION_PLAN.md)

@@ -14,11 +14,11 @@
  *     boundary is OpenFGA per-node + the operator-stamped `cogni/<env>/<node>/*`
  *     path + the OpenBao `_system`/`_shared` policy deny — NOT a per-key list.
  *     This needs no per-node codegen and never blocks a node adding a new key.
- *   - SUBSTRATE_OWNS_DB_CREDS: the reserved set mirrors secrets-management.md
+ *   - SUBSTRATE_OWNS_DB_CREDS: the reserved set mirrors https://cognidao.org/knowledge/secrets-management
  *     Invariant 15 (DB role material is OpenBao/substrate-owned). Fixed +
  *     operator-domain — independent of any node's catalog.
  * Side-effects: none
- * Links: docs/design/node-self-serve-secrets.md, docs/spec/secrets-management.md
+ * Links: https://cognidao.org/knowledge/node-secret-write-design, https://cognidao.org/knowledge/secrets-management
  * @public
  */
 
@@ -41,7 +41,7 @@
  * let a self-serve write clobber `CONNECTIONS_ENCRYPTION_KEY` on prod beacon.
  */
 export const SUBSTRATE_RESERVED_KEYS: ReadonlySet<string> = new Set<string>([
-  // Per-node DB role material + DSNs (substrate-owned; secrets-management.md Inv 15).
+  // Per-node DB role material + DSNs (substrate-owned; https://cognidao.org/knowledge/secrets-management Inv 15).
   "APP_DB_PASSWORD",
   "APP_DB_SERVICE_PASSWORD",
   "APP_DB_MIGRATION_PASSWORD",
@@ -88,8 +88,8 @@ export const SUBSTRATE_RESERVED_KEYS: ReadonlySet<string> = new Set<string>([
   "LITELLM_VIRTUAL_KEY", // Per-node LiteLLM key; materializer owns registration + rotation
   // The private Akash transaction actuator's bearer token (task.5102). It became
   // `source: agent` with a hex generator, so secret-materialize.sh mints and rotates it
-  // into `cogni/<env>/akash-tx-actuator`. A self-serve write would clobber the value the
-  // Crossplane Composition authenticates with and silently wedge every paid mutation.
+  // into `cogni/<env>/akash-tx-actuator`. A self-serve write would clobber the value every
+  // actuator caller authenticates with and silently wedge every paid mutation.
   "AKASH_TX_ACTUATOR_TOKEN",
   "DATABASE_RELIABILITY_PASSWORD", // private actuator database role material
   "DATABASE_RELIABILITY_STATUS_TOKEN", // private actuator status/readback auth
@@ -104,6 +104,10 @@ export const SUBSTRATE_RESERVED_KEYS: ReadonlySet<string> = new Set<string>([
   // relying node, so a self-serve write does not fail loudly — it silently
   // invalidates every attestation on every node at once (task.5024).
   "IDENTITY_ATTESTATION_PRIVATE_KEY",
+  // Operator-only Ed25519 seed signing git-review's per-call assertions to linked nodes. Its
+  // public half is published at /.well-known/jwks.json and trusted by each linked node, so a
+  // self-serve write would silently break every linked-node review (task.5448).
+  "GIT_REVIEW_SIGNING_SEED",
 ]);
 
 /**
@@ -143,9 +147,13 @@ export const INHERITED_KEY_OWNER: ReadonlyMap<string, string> = new Map<
 >([
   ["LITELLM_MASTER_KEY", "operator"],
   ["SCHEDULER_API_TOKEN", "operator"],
+  ["BILLING_INGEST_TOKEN", "operator"],
   ["OPENROUTER_API_KEY", "operator"],
   ["EVM_RPC_URL", "operator"],
   ["GH_WEBHOOK_SECRET", "operator"],
+  ["POSTHOG_API_KEY", "operator"],
+  ["POSTHOG_HOST", "operator"],
+  ["TAVILY_API_KEY", "operator"],
 ]);
 
 /**
@@ -209,7 +217,8 @@ export const OFF_CLUSTER_WORKLOAD_DENIED_KEYS: ReadonlySet<string> = new Set([
   // it spends every node's budget. A workload gets the node-scoped
   // `LITELLM_VIRTUAL_KEY` instead — the cogni-node-app-v1 runtime profile
   // renames that virtual key to LITELLM_MASTER_KEY inside the container
-  // (now infra/crossplane/xcomputeworkload/composition.yaml), so the real master key never leaves here.
+  // (now the node-deploy sequencer's `nodeAppEnv`, features/node-deploy/node-app-env.ts), so the
+  // real master key never leaves here.
   "LITELLM_MASTER_KEY",
   "OPENROUTER_API_KEY",
   // Fleet-shared DoltHub credentials (`tier: A1, service: _shared`, same shape
@@ -229,9 +238,10 @@ export const OFF_CLUSTER_WORKLOAD_DENIED_KEYS: ReadonlySet<string> = new Set([
   // and its public half is pinned fleet-wide (task.5024); the review App key
   // is one GitHub App installed across every node repo.
   "IDENTITY_ATTESTATION_PRIVATE_KEY",
+  "GIT_REVIEW_SIGNING_SEED", // signs git-review's calls to linked nodes (task.5448)
   "GH_REVIEW_APP_ID",
   "GH_REVIEW_APP_PRIVATE_KEY_BASE64",
-  // Substrate-owned database role material (secrets-management.md Invariant 15).
+  // Substrate-owned database role material (https://cognidao.org/knowledge/secrets-management Invariant 15).
   // Minted by the DB provisioners, not by the node; they authorize direct
   // in-cluster Postgres/Doltgres role login, bypassing the node's app layer.
   // An off-cluster workload reaches its data through its own DSN, not these.

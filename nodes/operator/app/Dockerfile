@@ -16,6 +16,7 @@ RUN apk add --no-cache g++ make python3
 #    --parents preserves directory structure with wildcards (BuildKit feature)
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY --parents nodes/operator/app/package.json ./
+COPY --parents nodes/operator/graphs/package.json ./
 COPY --parents packages/*/package.json ./
 COPY --parents nodes/*/app/package.json ./
 COPY --parents nodes/*/packages/*/package.json ./
@@ -73,6 +74,12 @@ RUN pnpm --filter operator build:akash-tx-actuator \
 RUN pnpm --filter operator build:lease-log-pump \
     && pnpm --filter operator smoke:lease-log-pump-artifact
 
+# task.5400 — the node-deploy sequencer (blue/green deploy verb). Same pattern: a dedicated
+# process artifact in the shared operator image, started by its own Deployment
+# (infra/k8s/base/node-deploy-sequencer). It pays only through the akash-tx actuator.
+RUN pnpm --filter operator build:node-deploy-sequencer \
+    && pnpm --filter operator smoke:node-deploy-sequencer-artifact
+
 # task.5247 — isolated database reliability actuator. The private autonomous process
 # rides in the operator image but has its own Deployment, ServiceAccount, and secret bucket.
 RUN pnpm --filter operator build:database-reliability-actuator \
@@ -105,6 +112,7 @@ COPY --from=builder --chown=nextjs:nodejs /app/scripts/ops/database-cell-bootstr
 COPY --from=builder --chown=nextjs:nodejs /app/infra/compose/runtime/postgres-init/ /app/database-cell-bootstrap/
 COPY --from=builder --chown=nextjs:nodejs /app/infra/database-budget-profiles.yaml /app/database-cell-bootstrap/database-budget-profiles.yaml
 COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/dist-lease-log-pump/lease-log-pump.mjs ./nodes/operator/app/lease-log-pump.mjs
+COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/dist-node-deploy-sequencer/node-deploy-sequencer.mjs ./nodes/operator/app/node-deploy-sequencer.mjs
 COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/dist-database-reliability-actuator/database-reliability-actuator.mjs ./nodes/operator/app/database-reliability-actuator.mjs
 COPY --from=builder --chown=nextjs:nodejs /app/infra/catalog ./infra/catalog
 COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/.cogni/repo-spec.yaml ./nodes/operator/.cogni/repo-spec.yaml
@@ -167,6 +175,9 @@ COPY --from=builder --chown=nextjs:nodejs /app/nodes/operator/app/src/adapters/s
 # and runs the post-migrate schema check before any tracking-row stamping,
 # closing the silent-skip gap from drizzle-orm's folderMillis-only "applied?"
 # check.
+# The standalone CLI imports the exact released helper index outside Next's trace.
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@cogni-dao/doltgres-admission/dist /app/node_modules/@cogni-dao/doltgres-admission/dist
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@cogni-dao/doltgres-admission/package.json /app/node_modules/@cogni-dao/doltgres-admission/package.json
 COPY --from=builder --chown=nextjs:nodejs /app/scripts/db/migrate-doltgres.mjs /app/nodes/operator/app/migrate-doltgres.mjs
 COPY --from=builder --chown=nextjs:nodejs /app/scripts/db/verify-doltgres-schema.mjs /app/nodes/operator/app/verify-doltgres-schema.mjs
 

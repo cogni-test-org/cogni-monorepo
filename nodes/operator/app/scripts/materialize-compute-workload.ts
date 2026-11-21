@@ -2,56 +2,35 @@
 // SPDX-FileCopyrightText: 2026 Cogni-DAO
 
 /**
- * Typed materialization entrypoint for the existing GitHub Actions deploy-branch writer.
- * It owns catalog placement, immutable OCI bundle verification, and desired-state
- * rendering. It performs no git, secret, provider mutation, or cluster I/O.
+ * Typed deployment-target planner for the operator's flight/promote workflows. It partitions
+ * the requested targets by catalog placement and refuses node-deploy cells
+ * (`node_on_deploy_verb`). Workload rendering (ComputeWorkload / XComputeWorkload) was deleted
+ * by task.5411. It performs no git, secret, provider mutation, or cluster I/O.
  */
 
-import { execFile } from "node:child_process";
 import {
   appendFile,
   copyFile,
   mkdir,
-  mkdtemp,
   readdir,
   readFile,
-  rename,
   rm,
-  writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { parseArgs, promisify } from "node:util";
+import { basename, join } from "node:path";
+import { parseArgs } from "node:util";
 
-import { parseRepoSpec, resolveNodeArtifactBundle } from "@cogni/repo-spec";
-import { parse, stringify } from "yaml";
+import { parse } from "yaml";
 
-import {
-  buildComputeWorkloadManifest,
-  computeWorkloadManifestFile,
-  resolveNodeDatabasePoolLimits,
-} from "@/features/compute/compute-workload-manifest";
-import { buildComputeSecretResources } from "@/features/compute/compute-workload-secret-manifests";
-import {
-  buildNodeBundleTagRef,
-  NODE_BUNDLE_PAYLOAD_FILE,
-  verifyNodeBundleManifest,
-} from "@/features/compute/node-artifact-bundle-oci";
-import { resolveNodeBootRecovery } from "@/features/compute/node-boot-recovery";
-import { resolveNodeComputeApi } from "@/features/compute/node-compute-api";
 import {
   deploymentEnvironmentSchema,
   resolveNodeDeploymentProvider,
-} from "@/features/compute/node-deployment-provider";
+} from "../src/features/compute/node-deployment-provider";
 import {
+  decideNodeDeployExclusion,
   isInfraOnlyPromoteNoop,
   resolveDeploymentTargets,
   resolvePromoteDeploymentTargets,
-} from "@/features/compute/node-deployment-targets";
-import { resolveNodeLeaseGeneration } from "@/features/compute/node-lease-generation";
-import { resolveNodeRequiredPlacement } from "@/features/compute/node-required-placement";
-import { assertDeclaredNodeDeployment } from "@/features/compute/node-services-workload-spec";
-import { hostForNode } from "@/shared/node-registry/resolve";
+} from "../src/features/compute/node-deployment-targets";
 
 const options = {
   catalog: { type: "string" },
@@ -65,11 +44,18 @@ const options = {
   // `envs:` membership, so a production-only node never reaches deploy/preview-<node>.
   "preview-forward": { type: "string" },
   "catalog-projection-targets-json": { type: "string" },
+  // GitHub owner/name of the repository running this workflow (bug.5510): the
+  // source repository of in-repo nodes such as operator. Defaults to the
+  // Actions-provided GITHUB_REPOSITORY so the existing workflow call sites need
+  // no edit; absent both, target selection fails closed.
+  "parent-repository": { type: "string" },
   "github-output": { type: "string" },
   "repo-spec": { type: "string" },
   bundle: { type: "string" },
   "bundle-ref": { type: "string" },
   "bundle-repository": { type: "string" },
+  "destination-accepted-overlay-dir": { type: "string" },
+  "preview-overlay-dir": { type: "string" },
   "source-sha": { type: "string" },
   domain: { type: "string" },
   // Public Cloudflare zone identifier (NOT a credential — it appears in the dashboard URL).
@@ -88,10 +74,6 @@ const options = {
   "output-dir": { type: "string" },
 } as const;
 
-const CLOUDFLARE_ZONE_ID = /^[0-9a-f]{32}$/;
-
-const execFileAsync = promisify(execFile);
-
 async function main(): Promise<void> {
   const { values } = parseArgs({ options, strict: true });
   const environment = deploymentEnvironmentSchema.parse(
@@ -103,6 +85,10 @@ async function main(): Promise<void> {
       catalogRoot: required(values["catalog-root"], "--catalog-root"),
       environment,
       flightTargetsJson: values["flight-targets-json"],
+      parentRepository: parentRepository(values["parent-repository"]),
+      ...(values["source-sha"] !== undefined && {
+        parentSourceSha: values["source-sha"],
+      }),
       githubOutput: required(values["github-output"], "--github-output"),
     });
     return;
@@ -125,184 +111,14 @@ async function main(): Promise<void> {
       promoteTargetsCsv: values["promote-targets-csv"] ?? "",
       legacyK3sTargetsJson: values["legacy-k3s-targets-json"],
       previewForwardMode: values["preview-forward"] === "true",
+      parentRepository: parentRepository(values["parent-repository"]),
       githubOutput: required(values["github-output"], "--github-output"),
     });
     return;
   }
 
-  const catalogFile = required(values.catalog, "--catalog");
-  const catalog = parse(await readFile(catalogFile, "utf8")) as unknown;
-  const provider = resolveNodeDeploymentProvider({ catalog, environment });
-
-  if (values["print-provider"]) {
-    process.stdout.write(`${provider}\n`);
-    return;
-  }
-
-  if (provider !== "akash") {
-    throw new Error(
-      `[materialize-compute-workload] Refusing to replace the ${provider} overlay; materialization is only valid for catalog-selected external compute`
-    );
-  }
-
-  const catalogIdentity = parseCatalogIdentity(catalog);
-  const sourceSha = required(values["source-sha"], "--source-sha");
-  const repoSpecFile = required(values["repo-spec"], "--repo-spec");
-  const spec = parseRepoSpec(await readFile(repoSpecFile, "utf8"));
-  // Earliest operator-owned read of the node's own repo-spec — deliberately before
-  // any OCI pull. A node with no `deployment:` block would otherwise materialize a
-  // valid-looking workload from the legacy no-secrets fallback and die terminally
-  // at reconcile with an error that names nothing the author can act on.
-  assertDeclaredNodeDeployment({
-    spec,
-    slug: catalogIdentity.slug,
-    sourceSha,
-  });
-  const bundleInput = await resolveBundleInput({
-    bundleFile: values.bundle,
-    bundleRef: values["bundle-ref"],
-    bundleRepository: values["bundle-repository"],
-    sourceSha,
-  });
-  const domain = required(values.domain, "--domain");
-  const outputDir = required(values["output-dir"], "--output-dir");
-
-  const bundle = resolveNodeArtifactBundle(spec, bundleInput.payload, {
-    sourceSha,
-    repository: catalogIdentity.repository,
-  });
-  if (bundle.nodeId !== catalogIdentity.nodeId) {
-    throw new Error(
-      `[materialize-compute-workload] Catalog node_id mismatch: expected ${catalogIdentity.nodeId}, received ${bundle.nodeId}`
-    );
-  }
-
-  // WHICH authority reconciles this (node, environment) — one catalog cell, LEGACY_IS_DEFAULT.
-  // Resolved here, next to placement, because both are operator-owned policy read from the
-  // same row: a node never selects its own reconciler.
-  const computeApi = resolveNodeComputeApi({ catalog, environment });
-  // Explicit replacement counter for a terminally closed lease — same operator-owned row,
-  // never a CLI flag: a generation a caller could pass would be a generation automation could
-  // bump, and NOTHING may bump it implicitly. Absent cell resolves to 0.
-  const leaseGeneration = resolveNodeLeaseGeneration({ catalog, environment });
-  // Node-owned HARD placement requirement, same operator-reviewed row and never a CLI flag: a
-  // requirement a caller could pass would be a requirement a flight could relax. Absent = [].
-  const requiredPlacementCountries = resolveNodeRequiredPlacement({
-    catalog,
-    environment,
-  });
-  // story.5050 — whether a never-serving lease is held for a human or closed so the bounded
-  // re-mint can try the NEXT provider. Same operator-reviewed row, never a CLI flag.
-  const bootRecovery = resolveNodeBootRecovery({ catalog, environment });
-  const dnsZoneId = values["dns-zone-id"]?.trim();
-  if (dnsZoneId && !CLOUDFLARE_ZONE_ID.test(dnsZoneId)) {
-    throw new Error(
-      "[materialize-compute-workload] --dns-zone-id must be a 32-character hex Cloudflare zone id"
-    );
-  }
-  const databasePoolLimits = resolveNodeDatabasePoolLimits({
-    catalog,
-    environment,
-  });
-  if (
-    databasePoolLimits &&
-    (computeApi !== "crossplane" || !values["substrate-host"]?.trim())
-  )
-    throw new Error(
-      "[materialize-compute-workload] declared database pool limits require Crossplane runtime topology"
-    );
-  const manifest = buildComputeWorkloadManifest({
-    slug: catalogIdentity.slug,
-    environment,
-    bundleRef: bundleInput.ref,
-    bundle,
-    publicHost: hostForNode(
-      catalogIdentity.slug,
-      catalogIdentity.isPrimaryHost,
-      domain
-    ),
-    computeApi,
-    leaseGeneration,
-    ...(requiredPlacementCountries.length > 0
-      ? { requiredPlacementCountries }
-      : {}),
-    bootRecovery,
-    // DNS intent is Crossplane-only: the legacy controller resolves its own zone in-cluster.
-    ...(computeApi === "crossplane" && dnsZoneId
-      ? { dns: { provider: "cloudflare" as const, zoneId: dnsZoneId } }
-      : {}),
-    ...(computeApi === "crossplane" && values["substrate-host"]?.trim()
-      ? {
-          runtime: {
-            substrateHost: values["substrate-host"].trim(),
-            ...(databasePoolLimits ? { databasePoolLimits } : {}),
-          },
-        }
-      : {}),
-  });
-  // Read the resolved secret refs straight off the workload the manifest builder just emitted,
-  // so the projected secrets MATCH the workload exactly. The builder already unions each service's
-  // runtime-profile keys (PROFILE_SUPPLIES_ITS_SECRET_REFS) AND applies the per-service `envs`
-  // gate (story.5043), so a sidecar dropped from this environment contributes no service here and
-  // therefore no secret keys either — the projection can never re-introduce a gated-out service's
-  // secrets. This keeps the "projected secrets match the workload" invariant true by construction.
-  const resolvedSecretRefs = manifest.spec.workload.services.flatMap(
-    (service) => service.secretRefs ?? []
-  );
-  // Observability (stderr — stdout is the machine contract): make the EXACT set of secret keys
-  // this flight will project into the workload visible in the flight log. Key NAMES are public
-  // (they live in the git repo-spec); values never touch logs. This is the signal that turns a
-  // missing node-specific secret_ref (e.g. PAPER_ENFORCE_MODE) from a silent runtime no-op into
-  // a one-glance diff — "the flight materialized these keys, and yours isn't among them."
-  process.stderr.write(
-    `${JSON.stringify({
-      event: "compute.workload.secret_refs_resolved",
-      nodeSlug: catalogIdentity.slug,
-      environment,
-      keyCount: resolvedSecretRefs.length,
-      keys: resolvedSecretRefs.map((ref) => ref.key),
-    })}\n`
-  );
-  const secretResources = buildComputeSecretResources({
-    slug: catalogIdentity.slug,
-    environment,
-    secretRefs: resolvedSecretRefs,
-  });
-  // ONE_AUTHORITY_PER_WORKLOAD (task.5097). The kustomization lists exactly one compute
-  // resource, and the deploy-branch writer rsyncs this directory with `--delete`, so the
-  // authority NOT selected leaves git in the very commit that introduces the one that was.
-  // The two authorities key their Akash idempotence differently and would therefore buy TWO
-  // leases rather than collide safely — so this is a hard invariant, not a tidiness rule.
-  const workloadFile = computeWorkloadManifestFile(computeApi);
-  const kustomization = {
-    apiVersion: "kustomize.config.k8s.io/v1beta1",
-    kind: "Kustomization",
-    namespace: `cogni-${environment}`,
-    resources: [
-      workloadFile,
-      ...secretResources.map((resource) => resource.file),
-    ],
-  };
-
-  await mkdir(outputDir, { recursive: true });
-  await writeAtomically(
-    `${outputDir}/${workloadFile}`,
-    stringify(manifest, { lineWidth: 0 })
-  );
-  await Promise.all(
-    secretResources.map(({ file, manifest: resource }) =>
-      writeAtomically(
-        `${outputDir}/${file}`,
-        stringify(resource, { lineWidth: 0 })
-      )
-    )
-  );
-  await writeAtomically(
-    `${outputDir}/kustomization.yaml`,
-    stringify(kustomization, { lineWidth: 0 })
-  );
-  process.stdout.write(
-    `${JSON.stringify({ provider, computeApi, node: catalogIdentity.slug, outputDir })}\n`
+  throw new Error(
+    "[materialize-compute-workload] workload rendering was deleted (task.5411): every node is deployed only by POST /api/v1/deploy/workloads; only the planner modes (--flight-targets-json, --legacy-k3s-targets-json, --catalog-projection-targets-json) remain"
   );
 }
 
@@ -310,6 +126,8 @@ async function selectDeploymentTargets(input: {
   readonly catalogRoot: string;
   readonly environment: "candidate-a" | "preview" | "production";
   readonly flightTargetsJson: string;
+  readonly parentRepository: string;
+  readonly parentSourceSha?: string;
   readonly githubOutput: string;
 }): Promise<void> {
   const parsed = parseStringArray(
@@ -326,12 +144,31 @@ async function selectDeploymentTargets(input: {
     k3sNodes,
     sourceRepositories,
     sourceShas,
+    nodeDeploy,
+    flight,
   } = resolveDeploymentTargets({
     catalogRows: rows,
     environment: input.environment,
     flightTargets: parsed,
+    parentRepository: input.parentRepository,
+    ...(input.parentSourceSha !== undefined && {
+      parentSourceSha: input.parentSourceSha,
+    }),
+  });
+  // ONE_WRITER_PER_NODE_LANE (story.5137): `compute_api.<env>=node-deploy` cells belong to POST
+  // /api/v1/deploy/workloads. They are excluded above; REFUSE when nothing else is left (never a
+  // silent green no-op), otherwise say loudly which targets this flight skipped.
+  refuseOrWarnNodeDeploy({
+    lane: "flight",
+    environment: input.environment,
+    requestedTargets: parsed,
+    nodeDeploy,
+    remainingTargets: flight,
   });
   const outputs = {
+    // The per-node job matrices' input: the request minus node-deploy cells (story.5137).
+    flight_targets_json: JSON.stringify(flight),
+    has_flight_targets: String(flight.length > 0),
     deployment_node_targets_json: JSON.stringify(deployment),
     has_deployment_node_targets: String(deployment.length > 0),
     substrate_node_targets_json: JSON.stringify(substrate),
@@ -360,6 +197,7 @@ async function selectPromoteTargets(input: {
   readonly promoteTargetsCsv: string;
   readonly legacyK3sTargetsJson: string;
   readonly previewForwardMode: boolean;
+  readonly parentRepository: string;
   readonly githubOutput: string;
 }): Promise<void> {
   const requestedTargets = input.promoteTargetsCsv
@@ -375,6 +213,15 @@ async function selectPromoteTargets(input: {
       "--legacy-k3s-targets-json"
     ),
     previewForwardMode: input.previewForwardMode,
+    parentRepository: input.parentRepository,
+  });
+  // ONE_WRITER_PER_NODE_LANE (story.5137): refuse a request that names only `node-deploy` cells.
+  refuseOrWarnNodeDeploy({
+    lane: "promote",
+    environment: input.environment,
+    requestedTargets,
+    nodeDeploy: selection.nodeDeploy,
+    remainingTargets: [...selection.deployment, ...selection.infra],
   });
   // AN EMPTY APP PROMOTE IS A REFUSAL, NOT A SILENT SUCCESS (bug.5203). Every downstream job
   // gates on `has_targets`, so a promote that resolves nothing otherwise SKIPS its way to a
@@ -436,6 +283,24 @@ async function selectPromoteTargets(input: {
       .join("\n")}\n`,
     "utf8"
   );
+}
+
+/**
+ * CD4 / ONE_WRITER_PER_NODE_LANE guard for the old flight/promote path. The decision lives in the
+ * feature (`decideNodeDeployExclusion`, unit-tested); this only performs the I/O.
+ */
+function refuseOrWarnNodeDeploy(
+  input: Parameters<typeof decideNodeDeployExclusion>[0]
+): void {
+  const decision = decideNodeDeployExclusion(input);
+  if (decision.kind === "refuse") {
+    throw new Error(`[materialize-compute-workload] ${decision.message}`);
+  }
+  if (decision.kind === "warn") {
+    process.stderr.write(
+      `::warning::[materialize-compute-workload] ${decision.message}\n`
+    );
+  }
 }
 
 async function projectCatalogTargets(input: {
@@ -506,59 +371,12 @@ function parseStringArray(value: string, flag: string): string[] {
   return parsed as string[];
 }
 
-async function resolveBundleInput(input: {
-  readonly bundleFile: string | undefined;
-  readonly bundleRef: string | undefined;
-  readonly bundleRepository: string | undefined;
-  readonly sourceSha: string;
-}): Promise<{ readonly ref: string; readonly payload: unknown }> {
-  if (input.bundleFile || input.bundleRef) {
-    const bundleFile = required(input.bundleFile, "--bundle");
-    return {
-      ref: required(input.bundleRef, "--bundle-ref"),
-      payload: JSON.parse(await readFile(bundleFile, "utf8")) as unknown,
-    };
-  }
-
-  const repository = required(input.bundleRepository, "--bundle-repository");
-  const tagRef = buildNodeBundleTagRef({
-    repository,
-    sourceSha: input.sourceSha,
-  });
-  const { stdout: digestOutput } = await execFileAsync("oras", [
-    "resolve",
-    tagRef,
-  ]);
-  const digest = digestOutput.trim();
-  const provisionalRef = `${repository}@${digest}`;
-  const { stdout: manifestOutput } = await execFileAsync("oras", [
-    "manifest",
-    "fetch",
-    provisionalRef,
-  ]);
-  const { digestRef } = verifyNodeBundleManifest({
-    repository,
-    digest,
-    manifest: JSON.parse(manifestOutput) as unknown,
-  });
-  const directory = await mkdtemp(join(tmpdir(), "cogni-node-bundle-"));
-  try {
-    await execFileAsync("oras", ["pull", "--output", directory, digestRef]);
-    const files = await readdir(directory);
-    if (files.length !== 1 || files[0] !== NODE_BUNDLE_PAYLOAD_FILE) {
-      throw new Error(
-        `[materialize-compute-workload] OCI bundle must contain only ${NODE_BUNDLE_PAYLOAD_FILE}`
-      );
-    }
-    return {
-      ref: digestRef,
-      payload: JSON.parse(
-        await readFile(join(directory, NODE_BUNDLE_PAYLOAD_FILE), "utf8")
-      ) as unknown,
-    };
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
+function parentRepository(value: string | undefined): string {
+  return required(
+    // biome-ignore lint/style/noProcessEnv: the Actions runner identity of the parent repository; the reviewed workflow call sites pass no flag
+    value || process.env.GITHUB_REPOSITORY,
+    "--parent-repository (or GITHUB_REPOSITORY)"
+  );
 }
 
 function required(value: string | undefined, flag: string): string {
@@ -567,51 +385,14 @@ function required(value: string | undefined, flag: string): string {
   return value;
 }
 
-function parseCatalogIdentity(input: unknown): {
-  readonly slug: string;
-  readonly nodeId: string;
-  readonly repository: string;
-  readonly isPrimaryHost: boolean;
-} {
-  if (!input || typeof input !== "object") {
-    throw new Error("[materialize-compute-workload] catalog must be an object");
-  }
-  const row = input as Record<string, unknown>;
-  if (typeof row.name !== "string" || typeof row.node_id !== "string") {
-    throw new Error(
-      "[materialize-compute-workload] catalog name + node_id are required"
+if (
+  process.argv[1] &&
+  basename(process.argv[1]) === "materialize-compute-workload.ts"
+) {
+  void main().catch((error: unknown) => {
+    process.stderr.write(
+      `${error instanceof Error ? error.message : String(error)}\n`
     );
-  }
-  if (typeof row.source_repo !== "string") {
-    throw new Error(
-      "[materialize-compute-workload] external compute requires catalog source_repo"
-    );
-  }
-  const match = row.source_repo.match(
-    /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/
-  );
-  if (!match) {
-    throw new Error(
-      "[materialize-compute-workload] source_repo must be a GitHub repository URL"
-    );
-  }
-  return {
-    slug: row.name,
-    nodeId: row.node_id,
-    repository: `${match[1]}/${match[2]}`.toLowerCase(),
-    isPrimaryHost: row.is_primary_host === true,
-  };
+    process.exitCode = 1;
+  });
 }
-
-async function writeAtomically(path: string, contents: string): Promise<void> {
-  const temporary = `${path}.tmp`;
-  await writeFile(temporary, contents, "utf8");
-  await rename(temporary, path);
-}
-
-void main().catch((error: unknown) => {
-  process.stderr.write(
-    `${error instanceof Error ? error.message : String(error)}\n`
-  );
-  process.exitCode = 1;
-});

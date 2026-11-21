@@ -26,10 +26,10 @@
  *     candidate-a only itself. UP-TRUST IS REFUSED FOREVER (bug.5196).
  *     Why this is not a cross-env write: OpenBao is per-CLUSTER, so the path is always
  *     inside THIS operator's own vault — `cogni/preview/<node>` written by production
- *     never reaches preview's vault. Per secrets-management.md Invariant 1 the
+ *     never reaches preview's vault. Per https://cognidao.org/knowledge/secrets-management Invariant 1 the
  *     blast-radius boundary is `<service>`; the env prefix is a lane label. Required by
  *     the north star: the PAYING cluster must custody every lane's secrets, because the
- *     Composition interpolates them into the lease that cluster's account is billed for.
+ *     node-deploy sequencer puts them into the lease that cluster's account is billed for.
  *     The enforcing gate is the `<env>-node-secrets-writer` OpenBao policy, not this
  *     check — this one only fails fast and names the rule.
  *   - PATH_FROM_AUTHORIZED_RESOURCE: node slug from the registry-resolved node; lane
@@ -48,7 +48,7 @@
  *     narrowest authority expressible today — stated here, not implied.
  *   - NO_SECRETS_IN_LOG: the value never enters a log line; only key + env + KV version.
  * Side-effects: IO (node registry read, OpenBao HTTP write via OperatorSecretsPlanePort).
- * Links: docs/design/node-self-serve-secrets.md (Phase 3 Port alignment),
+ * Links: https://cognidao.org/knowledge/node-secret-write-design (Phase 3 Port alignment)
  *   src/app/api/v1/vcs/flight/route.ts, src/app/api/v1/nodes/[id]/observability/logs/route.ts
  * @public
  */

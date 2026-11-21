@@ -1,6 +1,6 @@
 ---
 name: conductor-worktree-setup
-description: Use when setting up, reviewing, or changing Cogni Conductor worktree bootstrap, including conductor.json, scripts/conductor-worktree-setup.sh, secret/auth symlinks, and AI launch-pack references for human or AI developers.
+description: Use when setting up, reviewing, or changing Cogni Conductor worktree bootstrap, including .conductor/settings.toml, scripts/conductor-worktree-setup.sh, secret/auth symlinks, and AI launch-pack references for human or AI developers.
 ---
 
 # Cogni Conductor Worktree Setup
@@ -9,9 +9,9 @@ Use this with the bundled Conductor app skill when a human asks how to run Cogni
 
 ## Ground Truth
 
-- `conductor.json` wires Conductor setup to `bash scripts/conductor-worktree-setup.sh`.
+- `.conductor/settings.toml` wires Conductor setup to `bash scripts/conductor-worktree-setup.sh`.
 - `scripts/conductor-worktree-setup.sh` is the canonical setup script.
-- `docs/guides/new-worktree-setup.md` is the human-facing worktree guide.
+- `https://cognidao.org/knowledge/operator-worktree-setup` is the human-facing worktree guide.
 - `.claude/skills/node-wizard-expert/SKILL.md` and `nodes/operator/app/src/features/nodes/launch-pack.ts` are the launch-handoff references.
 
 ## Human Flow
@@ -28,7 +28,7 @@ Use this with the bundled Conductor app skill when a human asks how to run Cogni
 5. In Codex, open `/hooks` once and trust that user-level SessionStart hook.
    Later local worktrees reuse the same trusted hook path.
 
-The setup script also fetches `origin/main` and fast-forwards the primary checkout only when it is already on clean `main`. It must not rewrite the Conductor feature branch after workspace creation.
+The setup script also fetches `origin/main`, merges it into the new workspace branch (it warns and leaves the branch as-is on a dirty tree, detached HEAD, or conflict), and fast-forwards the primary checkout only when it is already on clean `main`. It warms the session cognition cache right after linking `.env.cogni`; every agent session still fetches its own bundle at start.
 
 ## Invariants
 
@@ -36,4 +36,4 @@ The setup script also fetches `origin/main` and fast-forwards the primary checko
 - Keep the fleet-standard `pnpm install --offline --frozen-lockfile || pnpm install --frozen-lockfile`, `pnpm packages:build`, and `pnpm worktree:check` in the setup path. The first attempt is cache-only; the fallback fetches newly pinned tarballs and also retries transient filesystem failures once.
 - Local setup (`CONDUCTOR_IS_LOCAL=1`, including the local default) must reconcile the stable user-level Codex cognition hook. Cloud setup must not modify a user-level Codex home.
 - Codex still requires one explicit `/hooks` trust for that stable user-level hook; automatic reconciliation does not bypass trust.
-- If the setup contract changes, update the script, this skill, `docs/guides/new-worktree-setup.md`, and launch-pack wording together.
+- If the setup contract changes, update the script, this skill, `https://cognidao.org/knowledge/operator-worktree-setup`, and launch-pack wording together.

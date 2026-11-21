@@ -14,8 +14,9 @@
 import "@testing-library/jest-dom/vitest";
 
 import type { WorkItemDto } from "@cogni/node-contracts";
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { WorkItemFetchError } from "../_api/fetchWorkItems";
 import { WorkItemDetail } from "./WorkItemDetail";
@@ -39,17 +40,32 @@ const item: WorkItemDto = {
   updatedAt: "2026-10-03T00:00:00.000Z",
 };
 
+// The Moves block and Expectations read through react-query (the node's real provider supplies it).
+const clients = new Set<QueryClient>();
+
+afterEach(() => {
+  cleanup();
+  for (const client of clients) client.clear();
+  clients.clear();
+});
+
 function renderDetail(
   overrides: Partial<React.ComponentProps<typeof WorkItemDetail>> = {}
 ) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  clients.add(client);
   return render(
-    <WorkItemDetail
-      item={null}
-      itemId="bug.5355"
-      open
-      onOpenChange={() => {}}
-      {...overrides}
-    />
+    <QueryClientProvider client={client}>
+      <WorkItemDetail
+        item={null}
+        itemId="bug.5355"
+        open
+        onOpenChange={() => {}}
+        {...overrides}
+      />
+    </QueryClientProvider>
   );
 }
 
@@ -109,5 +125,14 @@ describe("WorkItemDetail accessibility states", () => {
       })
     ).toBeInTheDocument();
     expect(screen.getByText("Details for bug.5355")).toBeInTheDocument();
+  });
+
+  it("titles the scores block Evaluation, never do-it-now", () => {
+    renderDetail({
+      item: { ...item, scores: { goal: { v: 3 }, agent: { v: 2 } } },
+    });
+
+    expect(screen.getByText("Evaluation")).toBeInTheDocument();
+    expect(document.body.innerHTML).not.toMatch(/do-it-now/i);
   });
 });

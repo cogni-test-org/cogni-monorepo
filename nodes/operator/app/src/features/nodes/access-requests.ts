@@ -10,7 +10,7 @@
  *   RLS-forced with no app_user policy.
  * Invariants: NOT_AUTHORITY (OpenFGA role tuples are the authority), ONE_ROW_PER_AGENT_NODE.
  * Side-effects: IO (Postgres read/write)
- * Links: docs/spec/rbac.md §6
+ * Links: https://cognidao.org/knowledge/authz-port-contract §6
  * @public
  */
 
@@ -19,6 +19,7 @@ import { users } from "@cogni/db-schema/refs";
 import { and, desc, eq, sql } from "drizzle-orm";
 
 import {
+  type LegacyNodeAccessRole,
   type NodeAccessRequestStatus,
   type NodeAccessRole,
   nodeAccessRequests,
@@ -39,7 +40,7 @@ export interface NodeAccessRequestRow {
 /**
  * Idempotently open a pending access request for one (node, agent). Re-requesting reopens the
  * single row to `pending` rather than inserting a duplicate. `githubLogin` is the agent's OWN
- * declared GitHub identity (rbac.md §6a) — re-declared on each request, consumed at approve.
+ * declared GitHub identity (https://cognidao.org/knowledge/authz-port-contract §6a) — re-declared on each request, consumed at approve.
  */
 export async function upsertAccessRequest(
   db: Database,
@@ -75,7 +76,7 @@ export async function upsertAccessRequest(
 
 /**
  * The GitHub login the agent declared on its (node, agent, role) request — the identity the owner's
- * approve grants push for (rbac.md §6a). `null` when the agent declared none or filed no request.
+ * approve grants push for (https://cognidao.org/knowledge/authz-port-contract §6a). `null` when the agent declared none or filed no request.
  */
 export async function getRequestedGithubLogin(
   db: Database,
@@ -109,7 +110,8 @@ export async function transitionAccessRequestOnDecision(
   input: {
     readonly nodeId: string;
     readonly agentUserId: string;
-    readonly role: NodeAccessRole;
+    // A legacy `admin` row can still be denied or revoked (clean-up).
+    readonly role: NodeAccessRole | LegacyNodeAccessRole;
     readonly decision: "approve" | "reject";
   }
 ): Promise<void> {
