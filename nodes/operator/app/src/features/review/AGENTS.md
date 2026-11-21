@@ -14,8 +14,8 @@ PR review feature: deterministic gate orchestrator evaluates PRs against `.cogni
 ## Pointers
 
 - [Root AGENTS.md](../../../../../AGENTS.md)
-- [Architecture](../../../../../docs/spec/architecture.md)
-- [VCS Integration Spec](../../../../../docs/spec/vcs-integration.md)
+- [Architecture](https://node-template.cognidao.org/knowledge/hexagonal-layering-contract)
+- [VCS Integration Spec](https://cognidao.org/knowledge/pr-review-grounded-gate)
 - [repo-spec package](../../../../../packages/repo-spec/) (gate + rule schema validation)
 - [pr-review graph](../../../../../packages/langgraph-graphs/src/graphs/pr-review/) (LangGraph structured output)
 - **Related:** [../../adapters/server/review/](../../adapters/server/review/) (GitHub API adapters), [../../bootstrap/review-adapter.factory.ts](../../bootstrap/review-adapter.factory.ts) (wiring)
@@ -39,6 +39,8 @@ PR review feature: deterministic gate orchestrator evaluates PRs against `.cogni
   - `GateStatus`, `GateResult`, `ReviewResult` — gate evaluation results
   - `EvidenceBundle` — pre-fetched PR diff + file patches
   - `ReviewContext` — owner/repo/prNumber/headSha/installationId
+- **Goal-metric calculators (`review-kpis.ts`, task.5450):** `review.merge-coverage@1` and `review.fail-fix-rate@1` (unit `ratio`, param `days`, default 7) over `ReviewKpiSourcePort`; registered in `bootstrap/capabilities/goal-metrics.ts`. Count only check runs the review App wrote; neutral is not a pass; unknown is unavailable, never 0.
+- **Merge-queue verdict copy (`queue-verdict.ts`, task.5438):** pure `extractQueuePush`, `parseQueueRef`, `selectHeadVerdictRun`, `decideQueueVerdict` — copies the PR head's `Cogni Git PR Review` verdict (review App only) onto the queue commit so the check can be GitHub-required on the operator repo. Never neutral, never silently skipped; no LLM.
 - **Env/Config keys:** none (all deps injected)
 - **Files considered API:** `public.server.ts`, `types.ts`
 

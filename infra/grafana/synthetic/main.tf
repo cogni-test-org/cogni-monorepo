@@ -212,11 +212,15 @@ resource "grafana_synthetic_monitoring_check" "environment_readyz" {
   provider = grafana.sm
   for_each = local.environment_targets
 
-  job                = "cogni-${each.value.environment}-${each.value.node_slug}-readyz"
-  target             = "https://${each.value.host}/readyz"
-  enabled            = true
+  # Cadence is policy, not HCL (bug.5527): every execution is billed, and every
+  # serve-evidence consumer reads the same per-environment evidenceWindow.
+  job    = "cogni-${each.value.environment}-${each.value.node_slug}-readyz"
+  target = "https://${each.value.host}/readyz"
+  # CEO hard stop on all paid synthetics (task.5396, 2026-10-30).
+  # Retain check definitions and history; re-enabling needs explicit approval.
+  enabled            = false
   probes             = local.public_probe_ids
-  frequency          = 60000
+  frequency          = local.reliability_policy.serveProbes[each.value.environment].frequencyMs
   timeout            = 5000
   basic_metrics_only = true
   folder_uid         = data.grafana_folder.reliability.uid
@@ -242,6 +246,9 @@ resource "grafana_synthetic_monitoring_check" "environment_readyz" {
   }
 }
 
+# Incident-scoped (exists only while recovery_receipts names a slot) and
+# deliberately not policy-tuned: the readmission window
+# (hasHealthyReadmissionWindow) requires five samples exactly 60s apart.
 resource "grafana_synthetic_monitoring_check" "database_recovery" {
   provider = grafana.sm
   for_each = local.recovery_targets
@@ -249,7 +256,8 @@ resource "grafana_synthetic_monitoring_check" "database_recovery" {
   target = each.value.database_tier == "dedicated" ? (
     "https://${local.environment_configs[each.value.environment].primary_host}/readyz?proof=${each.value.proof_class}&node_slug=${each.value.node_slug}"
   ) : "https://${each.value.host}/readyz?proof=${each.value.proof_class}"
-  enabled            = true
+  # The hard stop includes incident-scoped recovery checks (task.5396).
+  enabled            = false
   probes             = [for region in local.reliability_policy.expectedRegions : data.grafana_synthetic_monitoring_probes.public.probes[region]]
   frequency          = 60000
   timeout            = 10000
@@ -410,9 +418,13 @@ resource "grafana_rule_group" "fleet_capacity" {
           datasource_uid = data.value.datasourceUid
           query_type     = try(data.value.queryType, data.value.model.queryType, "")
           model = replace(
-            jsonencode(data.value.model),
-            "__ENVIRONMENT__",
-            each.key,
+            replace(
+              jsonencode(data.value.model),
+              "__ENVIRONMENT__",
+              each.key,
+            ),
+            "__SERVE_WINDOW__",
+            local.reliability_policy.serveProbes[each.key].evidenceWindow,
           )
 
           relative_time_range {

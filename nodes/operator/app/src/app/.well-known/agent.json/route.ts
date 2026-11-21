@@ -14,19 +14,28 @@
  * Invariants:
  *   - NO_INTERNAL_BIND_ADDR: URLs must never expose `0.0.0.0:3000` or other
  *     in-pod addresses. Always derive origin from forwarded headers first.
+ *   - MOVES_SCHEMA_IS_THE_CONTRACT (story.0033): the create and PATCH `moves` schemas come from the shared work-items schema (at most 3 of { metricId, direction }) and offer no baseline; the GET output schema carries the pinned baseline and the read-time fields.
  * Side-effects: none
- * Links: docs/spec/development-lifecycle.md, docs/guides/agent-api-validation.md
+ * Links: https://node-template.cognidao.org/knowledge/work-item-status-machine, https://cognidao.org/knowledge/prove-node-agent-api
  * @public
  */
 
 import {
   agentMeOperation,
   flightOperation,
+  knowledgeHistoryOperation,
+  reviewOperation,
+  workItemsArtifactGetOperation,
+  workItemsArtifactsCreateOperation,
+  workItemsArtifactsListOperation,
   workItemsCreateOperation,
+  workItemsGetOperation,
+  workItemsHistoryOperation,
   workItemsPatchOperation,
 } from "@cogni/node-contracts";
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { LangfuseObservationQuerySchema } from "@/contracts/nodes.langfuse.observations.v1.contract";
 import {
   getNodeBrandColor,
   getNodeBrandIcon,
@@ -79,6 +88,24 @@ export async function GET(request: Request) {
     },
     registrationUrl: `${origin}/api/v1/agent/register`,
     auth: { type: "bearer", keyPrefix: "cogni_ag_sk_v1_" },
+    traceObservability: {
+      contractVersion: "langfuse-observations-v2.1",
+      querySchema: z.toJSONSchema(LangfuseObservationQuerySchema),
+      auth: "Cogni Bearer; node.flight developer permission",
+      nodeReference: "node UUID or slug",
+      operations: ["GET /api/public/v2/observations"],
+      applicationRootSelector:
+        "type=SPAN&traceId=<32-hex-trace-id>; exact app root only, independently verified from Loki creation/terminal receipts",
+      defaults: {
+        environment: "production",
+        limit: 50,
+        maxLimit: 100,
+        maxWindowHours: 24,
+      },
+      result: "Native Langfuse data/meta; scope and partiality in meta.cogni",
+      privacy:
+        "Allowlisted metadata; scrubbed bounded IO. Shared backend credentials stay server-side.",
+    },
     // Fleet identity (task.5024): public keys nodes use to verify operator-signed
     // identity attestations. Nodes start the round trip at `/identity/attest`, which
     // authenticates a GitHub account through this environment's OAuth client — no
@@ -93,28 +120,40 @@ export async function GET(request: Request) {
       workItemHeartbeat: `${origin}/api/v1/work/items/{id}/heartbeat`,
       workItemPr: `${origin}/api/v1/work/items/{id}/pr`,
       workItemCoordination: `${origin}/api/v1/work/items/{id}/coordination`,
+      workItemArtifacts: `${origin}/api/v1/work/items/{id}/artifacts`,
+      workItemHistory: `${origin}/api/v1/work/items/{id}/history`,
       runs: `${origin}/api/v1/agent/runs`,
+      nodeTraceObservations: `${origin}/api/v1/nodes/{id}/observability/langfuse/api/public/v2/observations`,
       runStream: `${origin}/api/v1/agent/runs/{runId}/stream`,
       // Agent self-identity: one authed read for "am I live, who am I, when does
       // my key expire, what can I do". A 200 proves the key is live; a 401 proves
       // it is expired/invalid — unlike `users/me`, which is session-cookie-only
       // and 401s every agent key regardless of liveness. See `actions.agentMe`.
       agentIdentity: `${origin}/api/v1/agent/me`,
-      // CI/CD plane (see docs/spec/node-ci-cd-contract.md § Env-promotion).
-      // flight → candidate-a (node.flight/can_flight); promote → production
-      // (node.promote_production/can_promote_production). Both dispatch via the
-      // operator GitHub App — never a personal gh credential. Promotion is
-      // app-digest only; infraReconcile is the separate, operator-node-only
-      // production substrate lever. Grant the role via the access-request →
-      // owner-approve loop below.
+      // CI/CD plane. flight + promote are OPERATOR-ONLY (task.5411, CD4
+      // ONE_WRITER_PER_NODE_LANE): they deploy the operator control plane itself and
+      // refuse every other node with 409 `node_on_deploy_verb`. Every other node
+      // deploys through `deployWorkloads` below. Promote also takes an optional `service`: an in-repo
+      // operator catalog service (e.g. scheduler-worker) promotes on its own lane, never bundled into
+      // an operator promote (CD5, bug.5599). infraReconcile is the separate,
+      // operator-node-only production substrate lever. Grant the role via the
+      // access-request → owner-approve loop below.
       flight: `${origin}/api/v1/vcs/flight`,
+      // Developer-requested PR review (story.5102) — the ONLY review trigger; no webhook starts one.
+      review: `${origin}/api/v1/vcs/review`,
       promote: `${origin}/api/v1/deploy/promote`,
+      // Node-deploy verb (task.5400): POST records intent to blue/green-deploy one declared
+      // workload at a sha; GET reads desired + releaseState (queued|deploying|active|parked|
+      // superseded|failed) + attempts with step timelines; `<this>/releases/{releaseId}?nodeId&env`
+      // follows one release; `/api/v1/nodes/{id}/observability/logs?service=deploy` is the node's own
+      // sequencer events. Same per-env gates as promote.
+      deployWorkloads: `${origin}/api/v1/deploy/workloads`,
       infraReconcile: `${origin}/api/v1/deploy/infra-reconcile`,
       openapi: `${origin}/openapi.json`,
       nodeAccessRequest: `${origin}/api/v1/nodes/{id}/access-requests`,
       nodeDevelopers: `${origin}/api/v1/nodes/{id}/developers`,
       // Cognition substrate: the session-start bundle (irreducible invariants +
-      // live skills index + domain pointers). A SessionStart hook fetches this
+      // live governing index + domain pointers). A SessionStart hook fetches this
       // and injects it — replaces git-synced AGENTS.md sprawl.
       cognition: `${origin}/api/v1/cognition`,
     },
@@ -133,12 +172,27 @@ export async function GET(request: Request) {
       flightCandidate: {
         method: "POST",
         endpoint: `${origin}/api/v1/vcs/flight`,
+        // Operator node only; any other node → 409 node_on_deploy_verb, use deployWorkloads.
+        scope: "operator",
         auth: {
           type: "bearer",
           capability: "node.flight",
         },
         inputSchema: z.toJSONSchema(flightOperation.input),
         outputSchema: z.toJSONSchema(flightOperation.output),
+      },
+      // REVIEW_IS_DEV_TRIGGERED (story.5102): a developer asks for a PR review; the requester is
+      // the run actor and pays. The check run carries `external_id = requestId` and its summary
+      // ends with one machine-readable block (marker `<!-- cogni-review-result v1 -->`).
+      requestReview: {
+        method: "POST",
+        endpoint: `${origin}/api/v1/vcs/review`,
+        auth: {
+          type: "bearer",
+          capability: "node.flight",
+        },
+        inputSchema: z.toJSONSchema(reviewOperation.input),
+        outputSchema: z.toJSONSchema(reviewOperation.output),
       },
       // WRITE_SEAM_IS_DISCOVERABLE: `endpoints.workItems` is only a URL — it cannot
       // tell an agent that the route accepts POST, what body it takes, or that the
@@ -153,17 +207,73 @@ export async function GET(request: Request) {
         inputSchema: z.toJSONSchema(workItemsCreateOperation.input),
         outputSchema: z.toJSONSchema(workItemsCreateOperation.output),
       },
+      // MOVES_READ_SHOWS_THE_BASELINE (story.0033): a single-item read returns each move with its pinned
+      // baseline and, at read time, the current reading and `moved`. The create and PATCH schemas above
+      // take `{ metricId, direction }` only; the server pins the baseline.
+      getWorkItem: {
+        method: "GET",
+        endpoint: `${origin}/api/v1/work/items/{id}?include={include}&artifact={artifact}`,
+        description: workItemsGetOperation.description,
+        auth: { type: "bearer" },
+        inputSchema: z.toJSONSchema(workItemsGetOperation.input),
+        outputSchema: z.toJSONSchema(workItemsGetOperation.output),
+      },
       updateWorkItem: {
         method: "PATCH",
         endpoint: `${origin}/api/v1/work/items/{id}`,
+        description: workItemsPatchOperation.description,
         auth: { type: "bearer" },
         inputSchema: z.toJSONSchema(workItemsPatchOperation.input),
         outputSchema: z.toJSONSchema(workItemsPatchOperation.output),
       },
+      // CHANGE_HISTORY (story.0023): versions of one row, newest first, each with its
+      // change reason. Schemas are the package-owned operations, projected like the rest.
+      getWorkItemHistory: {
+        method: "GET",
+        endpoint: `${origin}/api/v1/work/items/{id}/history?view={view}&cursor={cursor}`,
+        description: workItemsHistoryOperation.description,
+        auth: { type: "bearer" },
+        inputSchema: z.toJSONSchema(workItemsHistoryOperation.input),
+        outputSchema: z.toJSONSchema(workItemsHistoryOperation.output),
+      },
+      // ARTIFACTS_ARE_THE_ROUTES (task.0028): triage, review and validation verdicts are insert-only rows on one item.
+      // A forward status move needs the exit artifact of the stage it leaves, so these three are how an agent clears a gate.
+      recordWorkItemArtifact: {
+        method: "POST",
+        endpoint: `${origin}/api/v1/work/items/{id}/artifacts`,
+        description: workItemsArtifactsCreateOperation.description,
+        auth: { type: "bearer" },
+        inputSchema: z.toJSONSchema(workItemsArtifactsCreateOperation.input),
+        outputSchema: z.toJSONSchema(workItemsArtifactsCreateOperation.output),
+      },
+      listWorkItemArtifacts: {
+        method: "GET",
+        endpoint: `${origin}/api/v1/work/items/{id}/artifacts?view={view}&cursor={cursor}`,
+        description: workItemsArtifactsListOperation.description,
+        auth: { type: "bearer" },
+        inputSchema: z.toJSONSchema(workItemsArtifactsListOperation.input),
+        outputSchema: z.toJSONSchema(workItemsArtifactsListOperation.output),
+      },
+      getWorkItemArtifact: {
+        method: "GET",
+        endpoint: `${origin}/api/v1/work/items/{id}/artifacts/{artifactId}`,
+        description: workItemsArtifactGetOperation.description,
+        auth: { type: "bearer" },
+        inputSchema: z.toJSONSchema(workItemsArtifactGetOperation.input),
+        outputSchema: z.toJSONSchema(workItemsArtifactGetOperation.output),
+      },
+      getKnowledgeHistory: {
+        method: "GET",
+        endpoint: `${origin}/api/v1/knowledge/{id}/history`,
+        auth: { type: "bearer" },
+        inputSchema: z.toJSONSchema(knowledgeHistoryOperation.input),
+        outputSchema: z.toJSONSchema(knowledgeHistoryOperation.output),
+      },
     },
     process: {
-      contributionSpec: "docs/spec/development-lifecycle.md",
-      validationGuide: "docs/guides/agent-api-validation.md",
+      contributionSpec:
+        "https://node-template.cognidao.org/knowledge/work-item-status-machine",
+      validationGuide: "https://cognidao.org/knowledge/prove-node-agent-api",
       validationSkill: ".claude/skills/validate-candidate",
       requiredLoop: [
         "discover",

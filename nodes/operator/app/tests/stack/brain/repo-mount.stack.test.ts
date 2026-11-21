@@ -10,7 +10,7 @@
  *   - REPO_ROOT_ONLY: adapter validates paths within repo root
  *   - HARD_BOUNDS: search results bounded per spec
  * Side-effects: IO (rg/git subprocesses, file reads)
- * Links: docs/spec/cogni-brain.md (Step 4), src/adapters/server/repo/
+ * Links: https://node-template.cognidao.org/knowledge/repo-read-tools-contract (Step 4), src/adapters/server/repo/
  * @public
  */
 
@@ -57,8 +57,8 @@ describe("Brain repo mount smoke test", () => {
     expect(result.lineEnd).toBeGreaterThanOrEqual(result.lineStart);
   });
 
-  it("repo.open(ROADMAP.md) is readable", async () => {
-    const result = await adapter.open({ path: "ROADMAP.md" });
+  it("repo.open(README.md) is readable", async () => {
+    const result = await adapter.open({ path: "README.md" });
 
     expect(result.sha).toMatch(/^[0-9a-f]{7}$/);
     expect(result.content.length).toBeGreaterThan(0);

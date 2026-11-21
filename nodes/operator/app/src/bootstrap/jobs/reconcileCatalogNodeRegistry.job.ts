@@ -4,13 +4,16 @@
 /**
  * Module: `@bootstrap/jobs/reconcileCatalogNodeRegistry.job`
  * Purpose: Reconcile deployed git catalog intent into this environment's node registry and OpenFGA store.
- * Scope: Acquires a single-writer lock, App-reads the exact deployed parent revision, delegates DB projection,
+ * Scope: Acquires a single-writer lock, reads the exact deployed parent revision (App, or anonymous for a public
+ *   catalog repo the App is not installed on — bug.5596), delegates DB projection,
  *   then ensures node-admin ownership relations. Does not schedule epochs or deliver webhooks.
  * Invariants:
  *   - APP_READS_DEPLOYED_GIT: runtime disk contents are never treated as registry intent; candidate
  *     and production project the exact source revision their running image reports.
  *   - ENV_LOCAL_PROJECTION: each environment writes only its own Postgres and OpenFGA stores.
  *   - OWNER_PROJECTION_REQUIRED: missing/unavailable authorization fails the reconcile loudly.
+ *   - LEGACY_OWNER_WRITER_IS_FLAG_GUARDED: `ensureCatalogNodeOwnerRelations` runs only while
+ *     NODE_ADMIN_SYNC_WRITE is off; with it on, the node-admin sync is the only admin writer (task.5494).
  *   - SINGLE_WRITER: a reserved PostgreSQL connection holds the advisory lock for the whole run.
  * Side-effects: IO (GitHub App reads, PostgreSQL writes, OpenFGA writes).
  * Links: infra/catalog/_schema.json, src/bootstrap/catalog-registry-reconcile.ts
@@ -21,7 +24,7 @@ import type { AuthorizationPort } from "@cogni/authorization-core";
 
 import { DrizzleCatalogNodeRegistryAdapter } from "@/adapters/server";
 import { getServiceDb } from "@/adapters/server/db/drizzle.service-client";
-import { createOperatorDeployPlane } from "@/bootstrap/capabilities/operator-deploy-plane";
+import { createCatalogNodeLister } from "@/bootstrap/capabilities/operator-deploy-plane";
 import { getContainer } from "@/bootstrap/container";
 import type { CatalogNodeOwnerProjection } from "@/ports";
 import { serverEnv } from "@/shared/env/server-env";
@@ -76,7 +79,7 @@ export async function runCatalogNodeRegistryReconcileJob(): Promise<CatalogNodeR
       },
       "Starting catalog node registry reconcile"
     );
-    const definitions = await createOperatorDeployPlane(env).listCatalogNodes({
+    const definitions = await createCatalogNodeLister(env).listCatalogNodes({
       parentOwner,
       parentRepo,
       sourceRef,
@@ -84,10 +87,12 @@ export async function runCatalogNodeRegistryReconcileJob(): Promise<CatalogNodeR
     const registry = new DrizzleCatalogNodeRegistryAdapter(serviceDb);
     const projection = await registry.reconcile(definitions);
 
-    const ownersWritten = await ensureCatalogNodeOwnerRelations(
-      authorization,
-      projection.owners
-    );
+    // ONE_ADMIN_WRITER (task.5494): while NODE_ADMIN_SYNC_WRITE is off, this legacy boot-time owner
+    // write is the admin writer and the node-admin sync only reports. When the flag is on, the sync
+    // is the writer and this one is skipped. The change that flips the flag in production deletes it.
+    const ownersWritten = env.NODE_ADMIN_SYNC_WRITE
+      ? 0
+      : await ensureCatalogNodeOwnerRelations(authorization, projection.owners);
 
     const summary = {
       projected: projection.projected,

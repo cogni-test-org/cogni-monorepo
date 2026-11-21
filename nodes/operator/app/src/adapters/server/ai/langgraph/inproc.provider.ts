@@ -12,6 +12,16 @@
  *   - NODE_BUNDLE_IS_CANONICAL: Resolves BoundTool from injected node bundle (CORE_TOOL_BUNDLE [+ POLY_TOOL_BUNDLE for poly]); never iterates the global TOOL_CATALOG (which is per-package and can drift behind per-node bundles).
  *   - DENY_BY_DEFAULT: Tool policy explicitly provided per graph
  *   - MCP_VIA_ASYNC_SOURCE: MCP tools resolved via async getMcpToolSource() function (shared cache with reconnect-on-error)
+ *   - TOOL_AUTHZ_CONTEXT_ALWAYS_THREADED (authz v0): actor/tenant/graph/node/grant reach the tool runner with or
+ *     without an authz adapter, plus one `ai.tool_authz.decision` log per evaluated call; `authz` only when installed.
+ *   - CATALOG_REPORT_SEAM: a catalog entry's `report` (not a graph name) decides whether the run's structured
+ *     telemetry is logged as registered events and echoed onto the stream; graphs never touch the logger or ALS.
+ *   - SUBJECT_IS_THE_REVIEWED_NODE (task.5448): when the run's host-validated `codeSubject` is ANOTHER node, the
+ *     preamble sources (index, architect, mission, origin) come only from that node through the injected
+ *     `SubjectGroundingLoader`; there is no operator-hub fallback. A grounding failure fails the run BEFORE any
+ *     model call with its typed code. `work_item_read` leaves the tool ids and the allowlist, and the tool runner
+ *     checks node authority on the SUBJECT node while `scope.nodeId` stays the operator. With no subject, or the
+ *     operator itself as subject, behavior is exactly the local path.
  * Side-effects: IO (executes graphs via package runner, MCP tool resolution via HTTP)
  * Notes: Discovery is in LangGraphInProcAgentCatalogProvider, not here.
  * Links: GRAPH_EXECUTION.md, LANGGRAPH_AI.md
@@ -23,13 +33,16 @@ import {
   createStaticToolSourceFromRecord,
   createToolAllowlistPolicy,
   createToolRunner,
+  isAiExecutionError,
 } from "@cogni/ai-core";
-import type { CatalogBoundTool } from "@cogni/ai-tools";
+import { type CatalogBoundTool, WORK_ITEM_READ_NAME } from "@cogni/ai-tools";
 import type { AuthorizationPort } from "@cogni/authorization-core";
 import {
   type CompletionFn,
   type CreateGraphFn,
   createInProcGraphRunner,
+  GRAPH_REPORT_CLOSE,
+  GRAPH_REPORT_OPEN,
   type GraphResult,
   type InProcGraphRequest,
   type ToolExecFn,
@@ -37,7 +50,10 @@ import {
 import { LANGGRAPH_CATALOG } from "@cogni/operator-graphs";
 import { trace } from "@opentelemetry/api";
 import type { Logger } from "pino";
-import { getExecutionScope } from "@/adapters/server/ai/execution-scope";
+import {
+  type ExecutionCodeSubject,
+  getExecutionScope,
+} from "@/adapters/server/ai/execution-scope";
 import type {
   AiExecutionErrorCode,
   CompletionFinalResult,
@@ -76,12 +92,88 @@ export interface CompletionUnitAdapter {
  * Per NODE_BUNDLE_IS_CANONICAL: tools referenced by ID, resolved from the injected node bundle.
  */
 interface ProviderCatalogEntry {
+  readonly program?: "cogni" | "work-review";
   readonly displayName: string;
   readonly description: string;
   readonly toolIds: readonly string[];
   readonly mcpServerIds?: readonly string[];
   readonly graphFactory: CreateGraphFn;
   readonly systemPrompt?: string;
+  /** Graph-owned run report to log + echo on the stream (CatalogEntry.report). */
+  readonly report?: GraphReportDecl;
+  /** HOST_OWNED_ARCHITECT (task.5455): host injects the node's `*-architect` entry body. */
+  readonly hostArchitect?: true;
+}
+
+/** Governing-index row fields architect selection needs. */
+type ArchitectIndexRow = { readonly id: string };
+
+/**
+ * HOST_OWNED_ARCHITECT: pick the reviewed node's architect entry from the governing index.
+ * Exactly one id ending in `-architect` wins; with several, `${nodeSlug}-architect` wins when a
+ * slug is known; otherwise none (never guess between nodes).
+ */
+export function selectArchitectEntryId(
+  index: ReadonlyArray<ArchitectIndexRow>,
+  nodeSlug?: string
+): string | null {
+  const ids = index.map((r) => r.id).filter((id) => id.endsWith("-architect"));
+  if (ids.length === 1) return ids[0] ?? null;
+  if (ids.length > 1 && nodeSlug) {
+    const want = `${nodeSlug}-architect`;
+    return ids.includes(want) ? want : null;
+  }
+  return null;
+}
+
+/** Host-owned reader of one knowledge entry's full body (null when absent). */
+export interface ArchitectBodyReader {
+  /** Node slug used to break a tie between several `*-architect` entries. */
+  readonly nodeSlug?: string;
+  readonly read: (id: string) => Promise<string | null>;
+}
+
+/**
+ * The host-owned grounding of a review whose subject is ANOTHER node (task.5448): that node's index, its
+ * architect entry (id taken from the index), its origin, and its mission with provenance from its repo-spec at
+ * the base SHA. The loader throws on a failed read; an `AiExecutionError` carries the typed code.
+ */
+export interface SubjectGrounding {
+  readonly nodeId: string;
+  readonly origin: string;
+  readonly mission: {
+    readonly content: string;
+    readonly sourceRef: string;
+    readonly buildSha: string | null;
+  };
+  readonly governingIndex: ReadonlyArray<{
+    readonly id: string;
+    readonly domain: string;
+    readonly entryType: string;
+    readonly useWhen: string;
+  }>;
+  readonly architect?: {
+    readonly id: string;
+    readonly content: string;
+    readonly sourceRef: string;
+  };
+}
+
+export type SubjectGroundingLoader = (
+  subject: ExecutionCodeSubject
+) => Promise<SubjectGrounding>;
+
+/**
+ * The error code of a failure while setting a run up (MCP resolution, subject grounding): the typed code of an
+ * `AiExecutionError` (a failed read of another node's hub is `remote_*`), `internal` for anything else.
+ */
+function setupFailureCode(error: unknown): AiExecutionErrorCode {
+  return isAiExecutionError(error) ? error.code : "internal";
+}
+
+/** CatalogEntry.report: the registered event name for the graph's telemetry. */
+interface GraphReportDecl {
+  readonly event: string;
 }
 
 /**
@@ -107,9 +199,35 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
     private readonly getMcpToolSource: () => Promise<ToolSourcePort | null> = () =>
       Promise.resolve(null),
     nodeBundle: readonly CatalogBoundTool[] = [],
-    private readonly authorization?: AuthorizationPort
+    private readonly authorization?: AuthorizationPort,
+    private readonly nodeId?: string,
+    private readonly nodeOrigin?: string,
+    private readonly nodeMission?: {
+      readonly content: string;
+      readonly sourceRef: string;
+      readonly buildSha: string | null;
+    },
+    /**
+     * Host-owned governing-index reader (same `listGoverningIndex` the cognition bundle uses).
+     * Read per run so a reviewed hub change is seen without an app rebuild; metadata only.
+     */
+    private readonly governingIndexReader?: () => Promise<
+      ReadonlyArray<{
+        readonly id: string;
+        readonly domain: string;
+        readonly entryType: string;
+        readonly useWhen: string;
+      }>
+    >,
+    /** Host-owned architect body reader; used only for catalog entries with `hostArchitect`. */
+    private readonly architectReader?: ArchitectBodyReader,
+    /** Grounding of a review whose code subject is ANOTHER node (task.5448); absent = such a run fails closed. */
+    private readonly subjectGroundingLoader?: SubjectGroundingLoader
   ) {
-    this.log = makeLogger({ component: "LangGraphInProcProvider" });
+    this.log = makeLogger({
+      component: "LangGraphInProcProvider",
+      ...(nodeId ? { nodeId } : {}),
+    });
     this.boundToolMap = new Map(nodeBundle.map((bt) => [bt.contract.name, bt]));
 
     // Use node graph package catalog (single source of truth for this runtime)
@@ -153,9 +271,22 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
     // Create completion function wrapping adapter
     const completionFn = this.createCompletionFn(req);
 
+    // SUBJECT_IS_THE_REVIEWED_NODE (task.5448): a run whose host-validated subject is ANOTHER node. The
+    // operator's work items are not that node's, so `work_item_read` leaves the tool ids and the allowlist.
+    // Fail closed: without this node's own id a subject is never assumed to be self.
+    const otherSubject =
+      scope.codeSubject !== undefined &&
+      (this.nodeId === undefined || scope.codeSubject.nodeId !== this.nodeId)
+        ? scope.codeSubject
+        : undefined;
+    const forSubject = (ids: readonly string[]): readonly string[] =>
+      otherSubject ? ids.filter((id) => id !== WORK_ITEM_READ_NAME) : ids;
+
     // P0 Contract: undefined => catalog default, [] => deny-all, [...] => exact
-    const catalogToolIds = entry.toolIds;
-    const toolIds: readonly string[] = req.toolIds ?? catalogToolIds;
+    const catalogToolIds = forSubject(entry.toolIds);
+    const toolIds: readonly string[] = forSubject(
+      req.toolIds ?? catalogToolIds
+    );
     if (req.toolIds === undefined) {
       this.log.debug(
         { runId, graphName, catalogToolIds },
@@ -236,16 +367,46 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
             ? `user:${scope.actorUserId}`
             : undefined;
         const tenantId = scope.billing.billingAccountId;
+        // Authority is checked on the REVIEWED node (`node_code_*` needs `node.flight` there); `scope.nodeId`
+        // stays the operator everywhere else (task.5448).
+        const authzNodeId = otherSubject?.nodeId ?? scope.nodeId;
         const toolRunner = createToolRunner(source, emit, {
           policy,
           ctx: { runId },
+          // authz v0: trusted identity + audit flow regardless of adapter presence — declared
+          // node policies are evaluated with or without OpenFGA; `authz` only when installed.
+          // Undeclared tools keep the legacy path (authz-checked only when an adapter exists).
+          ...(actorId !== undefined ? { actorId } : {}),
+          tenantId,
+          graphId,
+          ...(authzNodeId !== undefined ? { nodeId: authzNodeId } : {}),
+          ...(scope.grantId !== undefined ? { grantId: scope.grantId } : {}),
+          onAuthzDecision: (record) => {
+            const fields = {
+              event: EVENT_NAMES.AI_TOOL_AUTHZ_DECISION,
+              runId,
+              graphName,
+              tool: record.toolName,
+              toolCallId: record.toolCallId,
+              decision: record.decision,
+              code: record.code,
+              policy: record.policy,
+              ...(record.reason !== undefined && {
+                reason: record.reason.slice(0, 200),
+              }),
+              actorId: record.actorId,
+              nodeId: record.nodeId,
+              graphId: record.graphId,
+              grantId: record.grantId,
+            };
+            if (record.decision === "allow") {
+              this.log.info(fields, "tool authz decision");
+            } else {
+              this.log.warn(fields, "tool authz decision");
+            }
+          },
           ...(this.authorization !== undefined
-            ? {
-                authz: this.authorization,
-                ...(actorId !== undefined ? { actorId } : {}),
-                tenantId,
-                graphId,
-              }
+            ? { authz: this.authorization }
             : {}),
         });
 
@@ -298,11 +459,119 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
             : {}),
           tenantId: scope.billing.billingAccountId,
           graphId,
+          // Scheduled-run signal for graphs (absent for API/chat runs).
+          ...(scope.grantId !== undefined ? { grantId: scope.grantId } : {}),
         },
       };
 
-      return createInProcGraphRunner({
+      // SUBJECT_IS_THE_REVIEWED_NODE (task.5448): a review of ANOTHER node takes its whole preamble from
+      // that node, before any model call. A failed read throws here (never `.catch(() => [])`), so the run
+      // fails with the typed code. Without a loader the run fails closed: no operator fallback.
+      let subjectGrounding: SubjectGrounding | undefined;
+      if (otherSubject) {
+        if (!this.subjectGroundingLoader)
+          throw new Error("subject_grounding_unavailable");
+        try {
+          subjectGrounding = await this.subjectGroundingLoader(otherSubject);
+        } catch (error) {
+          this.log.warn(
+            {
+              runId,
+              graphName,
+              errorCode: setupFailureCode(error),
+            },
+            "subject grounding failed; run fails before any model call"
+          );
+          throw error;
+        }
+      }
+
+      // Host-owned governing index, read per run (best-effort) so a reviewed hub change is
+      // seen without a rebuild. Held in the agent's context; the agent reads bodies on demand.
+      const governingIndex = subjectGrounding
+        ? subjectGrounding.governingIndex
+        : this.governingIndexReader
+          ? await this.governingIndexReader().catch((error) => {
+              this.log.warn(
+                { err: error },
+                "governing index read failed; proceeding without it"
+              );
+              return [];
+            })
+          : [];
+      // HOST_OWNED_ARCHITECT (task.5455): opt-in graphs get the node's architect body from the
+      // host, so grounding does not depend on the model choosing to read it. Best-effort: any
+      // failure omits it (one structured warn) and the review proceeds without.
+      let architect:
+        | { id: string; content: string; sourceRef: string }
+        | undefined = subjectGrounding?.architect;
+      if (
+        !subjectGrounding &&
+        entry.hostArchitect === true &&
+        this.architectReader
+      ) {
+        const architectId = selectArchitectEntryId(
+          governingIndex,
+          this.architectReader.nodeSlug
+        );
+        let reason: string | undefined;
+        let readError: unknown;
+        if (!architectId) {
+          reason = "no_unique_architect_entry";
+        } else {
+          try {
+            const content = await this.architectReader.read(architectId);
+            if (content?.trim()) {
+              architect = {
+                id: architectId,
+                content,
+                sourceRef: `hub:${architectId}`,
+              };
+            } else {
+              reason = "empty_body";
+            }
+          } catch (error) {
+            reason = "read_failed";
+            readError = error;
+          }
+        }
+        if (reason) {
+          this.log.warn(
+            {
+              runId,
+              graphName,
+              reason,
+              ...(architectId ? { architectId } : {}),
+              ...(readError ? { err: readError } : {}),
+            },
+            "host architect not injected; proceeding without it"
+          );
+        }
+      }
+      const runner = createInProcGraphRunner({
         createGraph: entry.graphFactory,
+        ...(subjectGrounding
+          ? {
+              sourceContext: {
+                nodeId: subjectGrounding.nodeId,
+                origin: subjectGrounding.origin,
+                mission: subjectGrounding.mission,
+                ...(governingIndex.length ? { governingIndex } : {}),
+                ...(architect ? { architect } : {}),
+              },
+            }
+          : this.nodeId && this.nodeOrigin
+            ? {
+                sourceContext: {
+                  nodeId: this.nodeId,
+                  origin: this.nodeOrigin,
+                  ...(this.nodeMission ? { mission: this.nodeMission } : {}),
+                  ...(governingIndex.length ? { governingIndex } : {}),
+                  ...(architect ? { architect } : {}),
+                },
+              }
+            : {}),
+        ...(entry.program !== undefined && { program: entry.program }),
         completionFn,
         createToolExecFn,
         toolContracts,
@@ -315,36 +584,62 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
           systemPrompt: entry.systemPrompt,
         }),
       });
+      // CatalogEntry.report: the graph's own report → registry events (graphs have no logger).
+      const report = entry.report;
+      if (report) {
+        void runner.final
+          .then((result) => {
+            for (const fields of graphReportLogFields(
+              report,
+              runId,
+              result.structuredOutput
+            )) {
+              this.log.info(fields, "graph report");
+            }
+          })
+          .catch(() => {
+            // Run failure is already logged by the inproc error path.
+          });
+      }
+      return runner;
     };
 
     // Execute: resolve MCP (if needed) then run graph.
     // Returns {stream, final} synchronously per GraphRunResult contract;
     // the inner async generator awaits the promise.
     const innerResult = resolveMcpAndExecute();
+    const report = entry.report;
 
     const stream = (async function* () {
       let inner: Awaited<ReturnType<typeof resolveMcpAndExecute>>;
       try {
         inner = await innerResult;
-      } catch {
+      } catch (error) {
         yield {
           type: "error" as const,
-          error: "internal" as AiExecutionErrorCode,
+          error: setupFailureCode(error),
         };
         yield { type: "done" as const };
         return;
       }
-      yield* inner.stream;
+      for await (const event of inner.stream) {
+        // CatalogEntry.report: echo the telemetry as one text delta just before `done`.
+        if (event.type === "done" && report && !entry.program) {
+          const delta = graphReportDelta((await inner.final).structuredOutput);
+          if (delta) yield { type: "text_delta" as const, delta };
+        }
+        yield event;
+      }
     })();
 
     const final = innerResult.then(
       (r) => this.mapToGraphFinal(r.final, runId, requestId, graphName),
-      () =>
+      (error) =>
         ({
           ok: false as const,
           runId,
           requestId,
-          error: "internal",
+          error: setupFailureCode(error),
         }) as const
     );
 
@@ -381,7 +676,9 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
       messages: Message[];
       model: string;
       tools?: readonly LlmToolDefinition[];
+      toolChoice?: import("@/ports").LlmToolChoice;
       abortSignal?: AbortSignal;
+      maxTokens?: number;
     }) => {
       const result = this.adapter.executeCompletionUnit({
         messages: params.messages as GraphRunRequest["messages"],
@@ -389,6 +686,8 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
         runContext: { runId, attempt, graphId },
         ...(params.abortSignal && { abortSignal: params.abortSignal }),
         ...(params.tools?.length && { tools: [...params.tools] }),
+        ...(params.toolChoice && { toolChoice: params.toolChoice }),
+        ...(params.maxTokens !== undefined && { maxTokens: params.maxTokens }),
       });
 
       return {
@@ -476,4 +775,29 @@ export class LangGraphInProcProvider implements GraphExecutorPort {
       }),
     };
   }
+}
+
+/**
+ * Log lines for a catalog-declared report: one `report.event` from `structuredOutput.telemetry`. Empty when
+ * the output carries none.
+ */
+export function graphReportLogFields(
+  report: GraphReportDecl,
+  runId: string,
+  structuredOutput: Record<string, unknown> | undefined
+): Record<string, unknown>[] {
+  const telemetry = structuredOutput?.telemetry;
+  return telemetry && typeof telemetry === "object"
+    ? [{ event: report.event, runId, ...telemetry }]
+    : [];
+}
+
+/** The stream echo of a catalog-declared report (`<graph_report>{telemetry}</graph_report>`), or null. */
+export function graphReportDelta(
+  structuredOutput: Record<string, unknown> | undefined
+): string | null {
+  const telemetry = structuredOutput?.telemetry;
+  return telemetry && typeof telemetry === "object"
+    ? `\n${GRAPH_REPORT_OPEN}${JSON.stringify(telemetry)}${GRAPH_REPORT_CLOSE}\n`
+    : null;
 }

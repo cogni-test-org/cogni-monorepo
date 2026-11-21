@@ -386,6 +386,118 @@
       "when": 1792179092202,
       "tag": "0054_solid_paper_doll",
       "breakpoints": true
+    },
+    {
+      "idx": 55,
+      "version": "7",
+      "when": 1793650901709,
+      "tag": "0055_node_workloads",
+      "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "7",
+      "when": 1793663276239,
+      "tag": "0056_node_workload_game_day",
+      "breakpoints": true
+    },
+    {
+      "idx": 57,
+      "version": "7",
+      "when": 1793667008063,
+      "tag": "0057_node_workload_attempt_steps",
+      "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1793734127987,
+      "tag": "0058_node_workload_resolved_image",
+      "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1793935228898,
+      "tag": "0059_node_workload_attempt_mesh",
+      "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1794015406580,
+      "tag": "0060_metric_observations",
+      "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1794053534099,
+      "tag": "0061_node_workload_attempt_activated_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1794061465148,
+      "tag": "0062_execution_request_structured_output",
+      "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "7",
+      "when": 1794416513978,
+      "tag": "0063_wet_midnight",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1794707046986,
+      "tag": "0064_node_workload_stop",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "7",
+      "when": 1795035002013,
+      "tag": "0065_node_repo_spec_path",
+      "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "7",
+      "when": 1795047502412,
+      "tag": "0066_agent_principals_orgs",
+      "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1795050599168,
+      "tag": "0067_backfill_agent_principals",
+      "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1795060291393,
+      "tag": "0068_pusher_role",
+      "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "7",
+      "when": 1795133439610,
+      "tag": "0069_role_check_no_pusher",
+      "breakpoints": true
+    },
+    {
+      "idx": 70,
+      "version": "7",
+      "when": 1795197343435,
+      "tag": "0070_easy_revanche",
+      "breakpoints": true
     }
   ]
 }

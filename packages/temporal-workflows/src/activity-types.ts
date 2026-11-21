@@ -11,7 +11,7 @@
  *   - All input/output types are plain serializable objects (JSON-safe for Temporal wire format)
  *   - Per NO_SERVICE_IMPORTS: never imports from services/
  * Side-effects: none
- * Links: docs/spec/temporal-patterns.md, docs/spec/packages-architecture.md
+ * Links: https://cognidao.org/knowledge/temporal-workflow-rules, https://node-template.cognidao.org/knowledge/package-isolation-rules
  * @public
  */
 
@@ -112,6 +112,8 @@ export interface ReviewActivities {
     repo: string;
     headSha: string;
     installationId: number;
+    /** Review request id → check run `external_id` (CHECK_IS_REQUEST_BOUND). */
+    externalId?: string;
   }): Promise<number>;
 
   /**
@@ -126,6 +128,10 @@ export interface ReviewActivities {
     repo: string;
     prNumber: number;
     installationId: number;
+    /** Pinned head SHA; the operator reports `headMoved` when the PR head differs. */
+    headSha?: string;
+    /** Pinned base SHA; repo-spec and rules are read at this commit. */
+    baseSha?: string;
   }): Promise<InternalReviewPrContextOutput>;
 
   postReviewResultActivity(input: Record<string, unknown>): Promise<void>;
@@ -144,6 +150,11 @@ export interface ReviewActivities {
     checkRunId?: number;
     owningNode: OwningNode;
     changedFiles: readonly string[];
+    /** Dev-triggered only (story.5102): honour fail_on_error + machine block. */
+    requestId?: string;
+    model?: string;
+    operatorBuildSha?: string | null;
+    failOnError?: boolean;
   }): Promise<void>;
 }
 
@@ -180,7 +191,7 @@ export interface SweepActivities {
 }
 
 // ---------------------------------------------------------------------------
-// Goal-loop Activities (AI goal + KPI loop I/O — docs/design/knowledge-goal-loop.md)
+// Goal-loop Activities (AI goal + KPI loop I/O — https://node-template.cognidao.org/knowledge/knowledge-goal-loop-design)
 //
 // All read/write through the owning node's API (EXECUTION_VIA_SERVICE_API); the
 // worker holds no DB creds on this path. `loadGoalStateActivity` projects the

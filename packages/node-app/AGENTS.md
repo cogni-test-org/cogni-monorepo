@@ -13,9 +13,8 @@ Internal source package providing the Cogni node platform: auth/query/wallet pro
 
 ## Pointers
 
-- [Node App Shell Spec](../../docs/spec/node-app-shell.md)
-- [Packages Architecture](../../docs/spec/packages-architecture.md)
-- [task.0248](../../work/items/task.0248.node-platform-package-extraction.md)
+- [Node App Shell Spec](https://node-template.cognidao.org/knowledge/node-app-shell-contract)
+- [Packages Architecture](https://node-template.cognidao.org/knowledge/package-isolation-rules)
 
 ## Boundaries
 

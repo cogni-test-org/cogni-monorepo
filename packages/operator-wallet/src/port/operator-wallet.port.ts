@@ -9,7 +9,7 @@
  *   - NO_GENERIC_SIGNING — the port has no `signTransaction(calldata)` / `signMessage(bytes)` surface.
  *   - KEY_NEVER_IN_APP — no raw key material.
  * Side-effects: none (interface definition only)
- * Links: docs/spec/operator-wallet.md, work/items/task.0315.poly-copy-trade-prototype.md
+ * Links: https://node-template.cognidao.org/knowledge/operator-wallet-custody-boundary
  * @public
  */
 
@@ -50,8 +50,16 @@ export interface OperatorWalletPort {
    * in USDC from that wallet via each vendor's hosted crypto checkout.
    *
    * @param amountUsdcAtomic - USDC atomic units (6 decimals) to transfer
-   * @returns txHash on successful broadcast
-   * @throws if the steward wallet is not configured or the amount exceeds the per-tx cap
+   * @returns the broadcast hash and whether the receipt succeeded, reverted, or remains pending. Once the transfer is
+   *   broadcast this method never throws: a receipt-wait or RPC failure returns `receiptStatus: "pending"`
+   *   so the caller can never read a real transfer as a refusal (NO_BLIND_RETRY).
+   * @throws only BEFORE broadcast: steward not configured, non-positive amount, or amount over the per-tx cap
    */
-  withdrawToSteward(amountUsdcAtomic: bigint): Promise<string>;
+  withdrawToSteward(amountUsdcAtomic: bigint): Promise<StewardWithdrawal>;
+}
+
+/** Outcome of a steward withdrawal: the transfer is on the wire; `receiptStatus` distinguishes success, revert and an unread receipt. */
+export interface StewardWithdrawal {
+  txHash: string;
+  receiptStatus: "success" | "reverted" | "pending";
 }

@@ -15,6 +15,8 @@
  * Invariants:
  *   - COGNI_TOKEN_ONLY (Bearer-first); DEVELOPER_GATED (`node.flight`); fail-closed without a store.
  *   - NEVER_ISSUES_A_TOKEN: returns log lines, never a Grafana credential.
+ *   - WORKLOAD_FILTER_NARROWS (task.5490): `?workload=` is one optional narrowing matcher; the default read
+ *     of a service returns every workload of it.
  *   - NODE_PIN_IS_FORCED: env/service/node are re-emitted server-side; a caller matcher may only narrow
  *     (see scopeNodeLogQL). Out-of-scope selectors → 400, never a widened query.
  *   - GRACEFUL_UNWIRED: 503 `observability_unwired` until the operator's read token is ESO-wired.
@@ -22,13 +24,13 @@
  *     errorCode + target nodeId/env + counts only. Never the raw query, never log lines (privacy).
  * Side-effects: IO (registry read, authz check, Loki query)
  * Links: src/features/nodes/observability-logs.ts, src/bootstrap/observability.factory.ts,
- *   docs/spec/grafana-observability-access.md, flight-status/route.ts (same tuple), task.5025
+ *   https://cognidao.org/knowledge/node-log-proxy-contract, flight-status/route.ts (same tuple), task.5025
  * @public
  */
 
 import type { AuthzDecisionCode } from "@cogni/authorization-core";
 import { NextResponse } from "next/server";
-
+import { resolveRouteIdentity } from "@/app/_lib/auth/route-identity";
 import { getSessionUser } from "@/app/_lib/auth/session";
 import { getContainer, resolveServiceDb } from "@/bootstrap/container";
 import { createLokiReader } from "@/bootstrap/observability.factory";
@@ -111,7 +113,16 @@ export async function GET(
     );
   };
 
-  const sessionUser = await getSessionUser();
+  const auth = await resolveRouteIdentity(getSessionUser);
+  if (!auth.ok) {
+    logComplete({
+      outcome: "error",
+      status: auth.status,
+      errorCode: auth.errorCode,
+    });
+    return auth.response;
+  }
+  const sessionUser = auth.user;
   if (!sessionUser) {
     logComplete({ outcome: "error", status: 401, errorCode: "unauthorized" });
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
@@ -192,6 +203,8 @@ export async function GET(
       query: params.get("query") ?? undefined,
       // Explicitly empty degrades to the default app scope, like the other params.
       service: params.get("service")?.trim() || undefined,
+      // Optional narrowing to one workload of the service (task.5490); empty means every workload.
+      workload: params.get("workload")?.trim() || undefined,
     });
   } catch (err) {
     if (err instanceof ObservabilityQueryError) {

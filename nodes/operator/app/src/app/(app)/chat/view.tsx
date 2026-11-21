@@ -4,7 +4,7 @@
 /**
  * Module: `@app/(app)/chat/view`
  * Purpose: Chat view with assistant-ui Thread. Thread history lives in the global AppSidebar via Zustand store.
- * Scope: Client component that renders model/graph selection and ChatRuntimeProvider with key-based remount. Wrapped in Suspense by page.tsx for useSearchParams() support.
+ * Scope: Client component that renders model/graph selection and ChatRuntimeProvider with key-based remount. The route loading boundary covers useSearchParams().
  * Invariants:
  *   - INV-UI-NO-PAID-DEFAULT-WHEN-ZERO: gates rendering until models + credits resolve
  *   - INV-NO-CLIENT-INVENTED-MODEL-IDS: all model IDs from server's models list
@@ -31,7 +31,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { ErrorAlert, Thread } from "@/components";
+import { BrainLoading, Button, ErrorAlert, Thread } from "@/components";
 import { useChatSidebarStore } from "@/features/ai/chat/components/ChatSidebarContext";
 import { ChatRuntimeProvider } from "@/features/ai/chat/providers/ChatRuntimeProvider.client";
 import { toErrorAlertProps } from "@/features/ai/chat/utils/toErrorAlertProps";
@@ -266,11 +266,7 @@ export function ChatView(): ReactNode {
 
   // INV-UI-NO-PAID-DEFAULT-WHEN-ZERO: Gate rendering until init completes
   if (!hasInitializedRef.current) {
-    return (
-      <div className="flex min-h-0 flex-1 flex-col items-center justify-center">
-        <div className="text-muted-foreground">Loading...</div>
-      </div>
-    );
+    return <BrainLoading />;
   }
 
   // INV-NO-INTERACTION-BEFORE-READY: Blocked state shows error only, no chat
@@ -317,8 +313,14 @@ export function ChatView(): ReactNode {
 
   // Gate provider render: for existing threads, wait until messages are loaded.
   const isThreadLoading = activeThreadKey != null && threadData.isPending;
+  if (isThreadLoading) {
+    return <BrainLoading />;
+  }
 
-  // After the isThreadLoading gate, threadData.data is guaranteed for existing threads.
+  // A requested thread must load saved messages before mounting a new composer.
+  const threadUnavailable =
+    activeThreadKey != null &&
+    (threadData.isError || !threadData.data?.messages.length);
   const initialMessages: UIMessage[] =
     activeThreadKey != null && threadData.data
       ? (threadData.data.messages as UIMessage[])
@@ -326,9 +328,33 @@ export function ChatView(): ReactNode {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      {isThreadLoading ? (
-        <div className="flex flex-1 items-center justify-center">
-          <div className="text-muted-foreground">Loading thread...</div>
+      {threadUnavailable ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 text-center">
+          <h1 className="font-semibold text-lg">
+            {threadData.isError
+              ? "Unable to load conversation"
+              : "Conversation unavailable"}
+          </h1>
+          <p
+            role={threadData.isError ? "alert" : "status"}
+            className="max-w-md text-muted-foreground text-sm"
+          >
+            {threadData.isError
+              ? "Try again to load this conversation."
+              : "No saved messages are available. The run may still be in progress, or the conversation may no longer be available."}
+          </p>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              disabled={threadData.isFetching}
+              onClick={() => void threadData.refetch()}
+            >
+              {threadData.isFetching ? "Loading…" : "Try again"}
+            </Button>
+            <Button variant="ghost" onClick={handleNewThread}>
+              New conversation
+            </Button>
+          </div>
         </div>
       ) : (
         <ChatRuntimeProvider

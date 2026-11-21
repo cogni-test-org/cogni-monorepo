@@ -3,7 +3,7 @@
 
 /**
  * Module: `@cogni/operator-doltgres-schema/work-items`
- * Purpose: Operator's Doltgres `work_items` table — pure re-export of the shared
+ * Purpose: Operator's Doltgres `work_items` and `work_item_artifacts` tables — pure re-export of the shared
  *   shape from @cogni/knowledge-base. Promoted to base 2026-05-30 (spike.5004) so
  *   every knowledge-capable node owns its own work_items without re-defining the schema.
  * Scope: Re-exports only. Targets Doltgres via pg wire protocol (dialect: postgresql).
@@ -16,12 +16,15 @@
  *   - PATCH_ALLOWLIST: server-managed columns (`id`, `created_at`, `updated_at`)
  *     are not in the adapter's PATCH allowlist.
  * Side-effects: none
- * Links: docs/spec/work-items-port.md, docs/spec/knowledge-data-plane.md, docs/research/dolt-baseline-port-syntropy.md
+ * Links: https://node-template.cognidao.org/knowledge/work-items-port-contract, https://node-template.cognidao.org/knowledge/knowledge-data-plane, https://github.com/cogni-dao/cogni/blob/2321821e61dd12aa0cf75d235bd668ff65739109/docs/research/dolt-baseline-port-syntropy.md
  * @public
  */
 
 export {
+  workItemArtifacts,
   workItems,
+  type NewWorkItemArtifactRow,
   type NewWorkItemRow,
+  type WorkItemArtifactRow,
   type WorkItemRow,
 } from "@cogni/knowledge-base";

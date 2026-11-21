@@ -16,12 +16,11 @@ AI service adapters including LiteLLM completion/streaming, usage telemetry, age
 - [LlmService port](../../../ports/llm.port.ts)
 - [AgentCatalogPort](../../../ports/agent-catalog.port.ts)
 - [GraphExecutorPort](../../../../../../packages/graph-execution-core/src/graph-executor.port.ts)
-- [Agent Discovery Design](../../../../../../docs/spec/agent-discovery.md)
+- [Agent Discovery Design](https://node-template.cognidao.org/knowledge/agent-discovery-pipeline)
 - [LiteLLM configuration](../../../../../../infra/compose/runtime/configs/)
-- [Activity Metrics Design](../../../../../../docs/spec/activity-metrics.md)
-- [Graph Execution Design](../../../../../../docs/spec/graph-execution.md)
-- [LangGraph Server Design](../../../../../../docs/spec/langgraph-server.md)
-- [Thread Persistence Spec](../../../../../../docs/spec/thread-persistence.md)
+- [Graph Execution Design](https://node-template.cognidao.org/knowledge/graph-execution-invariants)
+- [LangGraph Server Design](https://node-template.cognidao.org/knowledge/langgraph-server-adapter)
+- [Thread Persistence Spec](https://node-template.cognidao.org/knowledge/thread-persistence-contract)
 
 ## Boundaries
 
@@ -62,7 +61,7 @@ pnpm test tests/component/ai/
 ## Standards
 
 - Never logs prompts or API keys for security
-- Enforces 15s connect timeout for streaming (fetch TTFB only)
+- Streaming: a 60s connect/TTFB guard (fetch→headers only, cleared in finally) combined with any caller abortSignal; a fired guard reports kind "timeout"; stream duration stays unbounded. No app-side run budget exists yet for scheduled runs (follow-up).
 - Handles provider-specific response formatting
 - Streaming malformed SSE chunks logged as warnings without failing stream
 - Promise settlement guaranteed exactly once via defer helper
@@ -75,6 +74,7 @@ pnpm test tests/component/ai/
 - AgentCatalogProvider pattern: listAgents() returns AgentDescriptor[]; AggregatingAgentCatalog fans out to providers
 - GraphExecutorPort pattern: providerId prefixes graphId (e.g., "langgraph:poet"); NamespaceGraphRouter routes to registered providers
 - langgraph/ subdirectory: LangGraphInProcAgentCatalogProvider (discovery) and LangGraphInProcProvider (execution) wire @cogni/langgraph-graphs catalog. InProcProvider passes `responseFormat` through to graph factory and `structuredOutput` back to `GraphFinal`.
+- Review subject (task.5448): a run whose host-validated `codeSubject` is ANOTHER node takes its preamble only from the injected `SubjectGroundingLoader` (that node's index, architect, origin, mission), loses `work_item_read`, and checks tool authority on the subject node; a failed read fails the run before any model call with a typed `remote_*` code. `remote-knowledge-capability.ts` adapts the remote read port to the stock `KnowledgeCapability` (read-only) and maps remote failures to execution error codes.
 - TavilyWebSearchAdapter: HARD_CAPS_ENFORCED_AT_TOOL_BOUNDARY — maxResults capped at 5, title≤120, snippet≤160 chars regardless of caller requests
 
 ## Dependencies

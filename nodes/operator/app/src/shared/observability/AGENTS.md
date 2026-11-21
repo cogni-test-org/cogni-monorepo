@@ -13,7 +13,7 @@ Cross-cutting observability concerns: structured logging, request context, and e
 
 ## Pointers
 
-- [Observability](../../../../../docs/spec/observability.md) - Observability system documentation
+- [Observability](https://node-template.cognidao.org/knowledge/observability-logging-contract) - Observability system documentation
 - [Event Registry](events/index.ts) - EVENT_NAMES as const (single source of truth)
 - [Server Logger](server/logger.ts) - Pino factory with sync mode
 - [Client Logger](client/logger.ts) - Browser console logger with event registry
@@ -32,7 +32,7 @@ Cross-cutting observability concerns: structured logging, request context, and e
 ## Public Surface
 
 - **Exports:**
-  - `EVENT_NAMES` - Event name registry as const (prevents ad-hoc strings)
+  - `EVENT_NAMES` - Event name registry as const (prevents ad-hoc strings); `WORK_ITEMS_LIST_ERROR_CODES` - stable work-list terminal error codes
   - `EventName`, `EventBase` - Registry-derived types
   - `makeLogger(bindings?)` - Pino logger factory (sync mode, zero buffering)
   - `makeNoopLogger()` - Silent logger for tests
@@ -145,7 +145,7 @@ export function MyComponent() {
 ## Change Protocol
 
 - Update this file when exports, event schemas, or boundaries change
-- Update docs/spec/observability.md for architecture changes
+- Update https://node-template.cognidao.org/knowledge/observability-logging-contract for architecture changes
 - Ensure arch:check passes after boundary changes
 
 ## Notes

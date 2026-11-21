@@ -16,12 +16,12 @@
  *   - MCP_NOT_SINGLETON: MCP connections use McpConnectionCache with reconnect-on-error + TTL backstop
  *   - MCP_RECONNECT_ON_ERROR: ErrorDetectingMcpToolSource invalidates cache on transport-level connection errors
  * Side-effects: global (module-scoped McpConnectionCache, cached sandbox provider promise)
- * Links: container.ts, NamespaceGraphRouter, GRAPH_EXECUTION.md, OBSERVABILITY.md, mcp-control-plane.md
+ * Links: container.ts, NamespaceGraphRouter, GRAPH_EXECUTION.md, OBSERVABILITY.md, https://node-template.cognidao.org/knowledge/mcp-tool-sources
  * @public
  */
 
 import type { SourceSystem, ToolSourcePort } from "@cogni/ai-core";
-import { CORE_TOOL_BUNDLE, VCS_TOOL_BUNDLE } from "@cogni/ai-tools";
+import { VCS_TOOL_BUNDLE } from "@cogni/ai-tools";
 import type {
   ExecutionContext,
   GraphFinal,
@@ -51,7 +51,13 @@ import {
   LangGraphDevProvider,
   LangGraphInProcProvider,
 } from "@/adapters/server";
-import { runInScope } from "@/adapters/server/ai/execution-scope";
+import {
+  type ExecutionCodeSubject,
+  runInScope,
+} from "@/adapters/server/ai/execution-scope";
+import { OPERATOR_CORE_TOOL_BUNDLE } from "@/bootstrap/ai/evaluation-baseline";
+import { createCommitFileReader } from "@/bootstrap/capabilities/node-code";
+import { createSubjectGroundingLoader } from "@/bootstrap/review/subject-grounding";
 import type {
   AiExecutionErrorCode,
   BillingContext,
@@ -61,6 +67,7 @@ import type {
   ModelProviderResolverPort,
   PreflightCreditCheckFn,
 } from "@/ports";
+import { getNodeMission } from "@/shared/config";
 import { serverEnv } from "@/shared/env";
 import { makeLogger } from "@/shared/observability";
 import {
@@ -135,6 +142,10 @@ export function createScopedGraphExecutor(params: {
   readonly broker?: ConnectionBrokerPort;
   readonly resolver: ModelProviderResolverPort;
   readonly actorId: string;
+  /** Execution grant backing a scheduled run; threaded into tool authz audit. */
+  readonly grantId?: string;
+  /** Host-validated review code subject (story.5102); only for catalog entries declaring it. */
+  readonly codeSubject?: ExecutionCodeSubject;
 }): GraphExecutorPort {
   const container = getContainer();
 
@@ -250,6 +261,9 @@ export function createScopedGraphExecutor(params: {
             billing: params.billing,
             llmService,
             usageSource: provider.usageSource,
+            nodeId: container.nodeId,
+            ...(params.grantId ? { grantId: params.grantId } : {}),
+            ...(params.codeSubject ? { codeSubject: params.codeSubject } : {}),
             ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
           });
 
@@ -271,6 +285,9 @@ export function createScopedGraphExecutor(params: {
         billing: params.billing,
         llmService,
         usageSource: provider.usageSource,
+        nodeId: container.nodeId,
+        ...(params.grantId ? { grantId: params.grantId } : {}),
+        ...(params.codeSubject ? { codeSubject: params.codeSubject } : {}),
         ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
       });
     },
@@ -294,6 +311,9 @@ export function runGraphWithScope(params: {
   readonly llmService: LlmService;
   readonly usageSource: SourceSystem;
   readonly abortSignal?: AbortSignal;
+  readonly nodeId?: string;
+  readonly grantId?: string;
+  readonly codeSubject?: ExecutionCodeSubject;
 }): GraphRunResult {
   const { executor, req, ctx, billing, llmService, usageSource } = params;
   return runInScope(
@@ -301,6 +321,9 @@ export function runGraphWithScope(params: {
       billing,
       llmService,
       usageSource,
+      ...(params.nodeId ? { nodeId: params.nodeId } : {}),
+      ...(params.grantId ? { grantId: params.grantId } : {}),
+      ...(params.codeSubject ? { codeSubject: params.codeSubject } : {}),
       ...(ctx?.actorUserId ? { actorUserId: ctx.actorUserId } : {}),
       ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
     },
@@ -320,7 +343,7 @@ const mcpLog = makeLogger({ component: "mcp-bootstrap" });
  *
  * This is the MVP seam — not the final control plane. Phase 1 replaces
  * `parseMcpConfigFromEnv()` with DB registry reads. The `getSource()` interface
- * stays the same. See docs/spec/mcp-control-plane.md.
+ * stays the same. See https://node-template.cognidao.org/knowledge/mcp-tool-sources.
  *
  * Invariants:
  *   - MCP_NOT_SINGLETON: Connections have bounded lifetime, not forever cache
@@ -534,8 +557,40 @@ function createInProcProvider(
     inprocAdapter,
     container.toolSource,
     () => cache.getSource(),
-    [...CORE_TOOL_BUNDLE, ...VCS_TOOL_BUNDLE],
-    container.authorization
+    [...OPERATOR_CORE_TOOL_BUNDLE, ...VCS_TOOL_BUNDLE],
+    container.authorization,
+    container.nodeId,
+    serverEnv().APP_BASE_URL,
+    {
+      content: getNodeMission() ?? "",
+      sourceRef: ".cogni/repo-spec.yaml#intent.mission",
+      buildSha: serverEnv().APP_BUILD_SHA ?? null,
+    },
+    // Host-owned governing index (same listGoverningIndex the cognition bundle renders),
+    // read per run so Cogni holds its guidance map in context without a mid-run index dump.
+    () =>
+      container.knowledgeStorePort
+        ? container.knowledgeStorePort.listGoverningIndex()
+        : Promise.resolve([]),
+    // Host-owned architect body (pr-review opt-in): same knowledge store, full entry body.
+    container.knowledgeStorePort
+      ? {
+          read: async (id: string) =>
+            (await container.knowledgeStorePort?.getKnowledge(id))?.content ??
+            null,
+        }
+      : undefined,
+    // task.5448: a review of ANOTHER node is grounded only from that node (its index, architect, origin and
+    // mission), read before any model call. The operator's own hub is never a fallback.
+    createSubjectGroundingLoader({
+      readCommitFile: createCommitFileReader({
+        appId: serverEnv().GH_REVIEW_APP_ID,
+        privateKeyBase64: serverEnv().GH_REVIEW_APP_PRIVATE_KEY_BASE64,
+        log: container.log,
+      }),
+      operatorBuildSha: serverEnv().APP_BUILD_SHA ?? null,
+      log: container.log,
+    })
   );
 }
 

@@ -14,15 +14,16 @@
  *   TEMPLATE_SPEC_SHAPE — minting should be value substitution against the node-template repo-spec,
  *   not a thinner generated replacement. BORN_REVIEWABLE — the template's default review `gates:`
  *   MUST remain. EPOCH_ACTIVE_BY_DEFAULT — the template's `activity_ledger:` block MUST remain so
- *   ledger ingest schedules are synthesized by @cogni/repo-spec. BORN_DEPLOYABLE — the minted spec
- *   MUST carry a complete `deployment:` block (rendered from @cogni/repo-spec's single source of
- *   truth) so a fresh node is off-cluster-compute capable with zero hand-editing.
+ *   ledger ingest schedules are synthesized by @cogni/repo-spec. NO_LEGACY_DEPLOYMENT_BLOCK
+ *   (task.5411) — the minted spec carries NO `deployment:` block; a node's workloads live in its own
+ *   `.cogni/workloads/*.yaml` (rendered by gens/workload-manifest) and its secrets in the node's
+ *   `.cogni/secrets-catalog.yaml`. The spec carries no `secret_refs` (retired, bug.5254; the
+ *   schema refuses it).
  * Side-effects: none — pure function, no IO, no env.
- * Links: Cogni-DAO/node-template:.cogni/repo-spec.yaml, src/features/nodes/repo-spec-builder.ts, docs/spec/node-ci-cd-contract.md, task.5092, task.5079
+ * Links: Cogni-DAO/node-template:.cogni/repo-spec.yaml, src/features/nodes/repo-spec-builder.ts, https://node-template.cognidao.org/knowledge/node-ci-sovereignty, task.5092, task.5079
  * @public
  */
 
-import { renderNodeDeploymentYaml } from "@cogni/repo-spec";
 import { v5 as uuidv5 } from "uuid";
 
 import type { NodeKnowledgeRemote } from "../knowledge-remote";
@@ -43,6 +44,27 @@ export interface RenderRepoSpecInput {
    * yet, so a starter seed is emitted by default for the launch agent to refine.
    */
   readonly mission?: string | undefined;
+  /**
+   * `activity_ledger.approvers`: the wallets that administer this node (task.5494). The node-admin
+   * sync turns them into OpenFGA `node:<id>#admin`. The mint passes the spawner's wallet. At least
+   * one valid EVM address is required: an empty list would mint a node nobody can administer.
+   */
+  readonly approvers: readonly string[];
+}
+
+const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+
+function renderApprovers(approvers: readonly string[]): string {
+  if (approvers.length === 0) {
+    throw new Error("renderRepoSpec requires at least one approver wallet");
+  }
+  for (const wallet of approvers) {
+    // Also keeps the YAML scalar safe: only `0x` + 40 hex chars reach the template.
+    if (!EVM_ADDRESS.test(wallet)) {
+      throw new Error("renderRepoSpec approver is not an EVM address");
+    }
+  }
+  return approvers.map((wallet) => `    - "${wallet}"`).join("\n");
 }
 
 /** uuidv5 of the scope key under the node_id namespace — matches `repo-spec-builder`'s derivation. */
@@ -95,7 +117,7 @@ export function renderRepoSpec(input: RenderRepoSpecInput): string {
 # regenerate both UUIDs:
 #   node_id:  openssl rand -hex 16 | sed 's/\\(.\\{8\\}\\)\\(.\\{4\\}\\)\\(.\\{4\\}\\)\\(.\\{4\\}\\)\\(.\\{12\\}\\)/\\1-\\2-\\3-\\4-\\5/'
 #   scope_id: uuidv5(node_id, "default")
-# See docs/spec/identity-model.md, docs/spec/multi-node-tenancy.md.
+# See https://cognidao.org/knowledge/identity-keys-no-overload, https://node-template.cognidao.org/knowledge/node-tenancy-isolation.
 
 schema_version: "0.1.4"
 
@@ -112,15 +134,12 @@ ${daoLines}
 
 ${input.knowledgeRemote ? renderKnowledgeBlock(input.knowledgeRemote) : ""}
 
-# App-tier workload this node runs, in the node's own words: services, ports,
-# resources, and exactly one \`public\` service. This is provider-neutral — the
-# parent catalog, not this file, decides whether an environment lands on k3s or
-# off-cluster compute.
-# The \`cogni-node-app-v1\` runtime_profile pins the Cogni Next.js app contract;
-# the operator supplies that profile's standard secrets automatically, so you only
-# add \`secret_refs\` here for a secret BEYOND the profile.
-# Add sibling services here (private by default) as this node grows.
-${renderNodeDeploymentYaml().trimEnd()}
+# App-tier workloads live in .cogni/workloads/*.yaml (story.5137): the operator's
+# node-deploy verb reads them at the deployed sha. The \`cogni-node-app-v1\` profile
+# secrets are supplied automatically. Declare a secret BEYOND the profile once, in
+# .cogni/secrets-catalog.yaml, with \`workloads\` naming the services that receive it
+# (names only; values live in OpenBao). This file has no secret list: \`secret_refs\`
+# is retired and the schema refuses it.
 
 # State substrate is declared separately from app compute. New nodes start on
 # bounded shared Postgres and graduate to a dedicated provider-VM cell only
@@ -134,12 +153,12 @@ state:
 
 # Activity ledger ingestion + approver allowlist.
 # \`approvers\` gates the \`(admin)/\` route group and write routes under
-# \`/api/v1/attribution/*\`. Replace with the fork's DAO-owner wallet(s) when
-# spinning up a new node from this template.
+# \`/api/v1/attribution/*\`, and they are the node's admins in the operator
+# (the node-admin sync). Minted with the spawner's wallet.
 activity_ledger:
   epoch_length_days: 7
   approvers:
-    - "0x070075F1389Ae1182aBac722B36CA12285d0c949" # derekg1729.eth (template default)
+${renderApprovers(input.approvers)}
   activity_sources:
     github:
       attribution_pipeline: cogni-v0.0

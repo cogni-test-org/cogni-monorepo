@@ -5,27 +5,29 @@ description: >
   skill when working on anything involving: GitHub App permissions or installation
   auditing (cogni-node-template, cogni-git-review), VCS tool layer changes
   (VcsCapability interface, GitHubVcsAdapter, vcs-flight-candidate tool schema),
-  candidate-a flight dispatch debugging (workflow_dispatch permissions, slot
-  acquisition, Argo sync, buildSha verify), per-app slot isolation work, or
-  wiring the pr-manager agent end-to-end. Use proactively whenever the user
-  mentions "flight", "pr-manager dispatch", "workflow permissions", "GH_REVIEW_APP",
+  operator flight dispatch debugging (workflow_dispatch permissions,
+  Argo sync, buildSha verify), or
+  wiring VCS flight dispatch end-to-end. Use proactively whenever the user
+  mentions "flight", "flight dispatch", "workflow permissions", "GH_REVIEW_APP",
   "VcsCapability not configured", "actions:write", or asks to add a workflowRef /
-  per-app lease / VCS tool parameter.
+  VCS tool parameter.
 ---
 
 # Git App Expert
+
+Route the work through [operator-architect](https://cognidao.org/knowledge/operator-architect) first; this skill adds the GitHub App and VCS rules on top of it.
 
 You are the expert on Cogni's GitHub App integration, VCS tool layer, and candidate-a
 flight pipeline. Your job is to audit, debug, and implement — from the GitHub org
 installation level down to the tool schema and CI scripts.
 
-> **Boundary first.** Read [CI/CD Platform Boundary & Freeze Policy](../../../docs/spec/cicd-platform-boundary.md) before adding deploy/flight behavior. The operator deploy brain in `scripts/ci/*.sh` + `.github/workflows/*.yml` is **frozen** — new control logic routes to the substrate (catalog/overlay/Argo/ESO) or into the typed `.ts` operator control plane. `DeployCapability` (`packages/ai-tools/src/capabilities/deploy.ts`) is the **sibling of `VcsCapability`** — same `CAPABILITY_INJECTION`/`ADAPTER_SWAPPABLE` shape, adapter in `nodes/operator/app/src/adapters/server/`. v0 is read-only over live Argo state and reuses `dispatchCandidateFlight` for promotion (no second dispatch path; Argo stays the reconciler). When asked to add a flight/deploy feature, prefer a `DeployCapability` method over a new workflow input or a new `.sh`.
+> **Boundary first.** Read [CI/CD Platform Boundary & Freeze Policy](https://cognidao.org/knowledge/operator-plane-contract) before adding deploy/flight behavior. The operator deploy brain in `scripts/ci/*.sh` + `.github/workflows/*.yml` is **frozen** — new control logic routes to the substrate (catalog/overlay/Argo/ESO) or into the typed `.ts` operator control plane. `DeployCapability` (`packages/ai-tools/src/capabilities/deploy.ts`) is the **sibling of `VcsCapability`** — same `CAPABILITY_INJECTION`/`ADAPTER_SWAPPABLE` shape, adapter in `nodes/operator/app/src/adapters/server/`. v0 is read-only over live Argo state and reuses `dispatchCandidateFlight` for promotion (no second dispatch path; Argo stays the reconciler). When asked to add a flight/deploy feature, prefer a `DeployCapability` method over a new workflow input or a new `.sh`.
 
 ## GitHub Apps on Cogni-DAO Org
 
 **One App per environment** — each App has exactly one webhook URL, so prod/preview/candidate-a
 cannot share one. Create + wire per the canonical guide:
-[`docs/guides/github-app-webhook-setup.md`](../../../docs/guides/github-app-webhook-setup.md).
+[`https://cognidao.org/knowledge/github-app-per-environment`](https://cognidao.org/knowledge/github-app-per-environment).
 
 | App                        | ID      | Install ID | env              | webhooks → / installed on                                              |
 | -------------------------- | ------- | ---------- | ---------------- | ---------------------------------------------------------------------- |
@@ -34,6 +36,12 @@ cannot share one. Create + wire per the canonical guide:
 | `cogni-node-template`      | 3062001 | 115515535  | legacy/vcs       | selected repos; use only if the env's `GH_REVIEW_APP_ID` is `3062001`  |
 | `cogni-git-review`         | 1761205 | 80293097   | production       | `cognidao.org/...webhooks/github` · `Cogni-DAO/cogni`                  |
 | `cogni-git-review-preview` | 2011345 | 87655574   | preview          | `preview.cognidao.org/...webhooks/github` · selected preview repos     |
+
+**Node AI push tokens come from the operator App, narrowed.** `POST /api/v1/vcs/push-token` mints a 1-hour
+installation token from the env's operator App (`GH_REVIEW_APP_*`) for ONE node repo with Contents and Pull requests
+write only, gated on `node.flight` (`developer`). GitHub shows those pushes as the operator App; the route's terminal
+log names the requesting principal and the node records its run. Design:
+[node-ai-code-identity](https://node-template.cognidao.org/knowledge/node-ai-code-identity).
 
 `Cogni-DAO/test-repo` is only a legacy review-webhook fixture. It is not
 sufficient for node publish/flight testing: the candidate/test App must see the
@@ -73,8 +81,8 @@ Operator mint/flight Apps require `actions:write`, `administration:write`, `cont
 package policy/visibility management; node-ref flight must not treat GitHub Packages metadata reads
 as the deploy gate because private package metadata can false-negative even when the child image
 exists. Do not add a PAT to child node repos for publishing: child workflows publish with their
-repo-local `GITHUB_TOKEN` and `permissions.packages: write`. Parent candidate-flight and k3s image
-pulls are separate cross-repo read paths and still need either public packages, package Actions
+repo-local `GITHUB_TOKEN` and `permissions.packages: write`. The operator flight and k3s image
+pulls (operator only) are separate cross-repo read paths and still need either public packages, package Actions
 access grants, or the existing `GHCR_DEPLOY_TOKEN`/registry credential path with `read:packages`.
 If the installation lacks a newly requested permission, the org admin must approve the pending
 permission upgrade at the installation URL:
@@ -121,7 +129,7 @@ createBranch({ owner, repo, branch, fromRef }) → CreateBranchResult
 dispatchCandidateFlight({ owner, repo, prNumber, headSha? }) → DispatchCandidateFlightResult
 ```
 
-`CiStatusResult.allGreen` is the pr-manager's gate: `true` only when all checks are `success`
+`CiStatusResult.allGreen` is the VCS flight gate: `true` only when all checks are `success`
 and none are `pending`.
 
 ### GitHubVcsAdapter
@@ -144,7 +152,7 @@ Key design points:
    `packages/ai-tools/src/capabilities/vcs.ts`
 3. Change `ref: "main"` → `ref: params.workflowRef ?? "main"` in the adapter
 4. Update `vcs-flight-candidate.ts` tool description to document the parameter
-5. Run `pnpm check:fast` — TypeScript will catch any missed call sites
+5. Run `pnpm typecheck` — TypeScript will catch any missed call sites
 
 Use case: flight PR #1004 using PR #1003's workflow branch so the CI fix in #1003 is tested
 while validating #1004's app build.
@@ -156,118 +164,20 @@ core__vcs_list_prs          — read_only  — lists open PRs
 core__vcs_get_ci_status     — read_only  — full CI state for one PR
 core__vcs_merge_pr          — state_change — squash/merge/rebase into staging
 core__vcs_create_branch     — state_change — naming: agent/<work-item-id>/<desc>
-core__vcs_flight_candidate  — state_change — dispatches candidate-flight.yml
+core__vcs_flight_candidate  — state_change — operator flight (POST /api/v1/vcs/flight)
 ```
 
 **NO_AUTO_FLIGHT invariant**: `core__vcs_flight_candidate` must only be called when a human
-or scheduled run explicitly requests it. Enforced via tool description and pr-manager prompt —
+or scheduled run explicitly requests it. Enforced via tool description —
 not in code. The tool description repeats this to the planner.
 
-## pr-manager Graph
+## Operator flight anatomy (operator only)
 
-`packages/langgraph-graphs/src/graphs/pr-manager/` — registered in catalog as `langgraph:pr-manager`.
+`.github/workflows/candidate-flight.yml` flights an operator PR to its candidate. It is dispatched by `POST /api/v1/vcs/flight`, never by a personal `gh` credential. Per-`(env, target)` workflow concurrency serializes mutation. It is not a reviewer reservation, and the old slot-lease file is retired.
 
-Tool IDs it uses:
+A node PR does not use this workflow. A node PR ships with `POST /api/v1/deploy/workloads {nodeId, env:"candidate-a", workload, sourceSha}`. Read [cicd-e2e-required-sequence](https://cognidao.org/knowledge/cicd-e2e-required-sequence).
 
-```
-core__repo_open          ← reads pr-management-playbook.md at run start
-core__vcs_list_prs
-core__vcs_get_ci_status  ← must be called BEFORE dispatching flight
-core__vcs_merge_pr
-core__vcs_create_branch
-core__vcs_flight_candidate
-core__work_item_query
-```
-
-Invoke via agent API:
-
-```bash
-curl -s -X POST $BASE/api/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o-mini","graph_name":"pr-manager","messages":[{"role":"user","content":"..."}]}'
-```
-
-Playbook lives at `docs/guides/pr-management-playbook.md` — the pr-manager reads it on every
-run. Flight-specific debugging guidance (permission errors, slot states, known patterns) belongs
-there, not in agent-api-validation.md (that doc is a per-feature validation checklist).
-
-## Candidate-Flight.yml — 3-Job Anatomy
-
-`.github/workflows/candidate-flight.yml` — triggered by `workflow_dispatch` with `pr_number` input.
-
-```
-flight job
-  ├─ acquire-candidate-slot.sh   → writes infra/control/candidate-lease.json (state: leased)
-  ├─ resolve-pr-build-images.sh  → finds GHCR digests for this PR's image tag
-  ├─ promote-build-payload.sh    → patches deploy/candidate-a overlay; emits promoted_apps
-  ├─ push deploy/candidate-a
-  └─ reconcile ArgoCD ApplicationSet via SSH
-
-verify-candidate job (gated: promoted_apps != '')
-  ├─ wait-for-argocd.sh          → EXPECTED_SHA = deploy_branch_sha (NOT source SHA)
-  ├─ wait-for-candidate-ready.sh → DOMAIN health check
-  ├─ wait-for-in-cluster-services.sh
-  ├─ smoke-candidate.sh
-  └─ verify-buildsha.sh          → per-app /version.buildSha check (SOURCE_SHA_MAP mode)
-
-release-slot job (always, if acquired == true)
-  ├─ decide: state=free (verify success or nothing promoted) | state=failed (otherwise)
-  ├─ release-candidate-slot.sh   → updates infra/control/candidate-lease.json
-  └─ report commit status to PR
-```
-
-**Critical**: `EXPECTED_SHA` for wait-for-argocd.sh is `deploy_branch_sha` (the deploy branch
-tip after promotion), not the source PR head SHA. Passing the wrong SHA causes silent timeouts
-because Argo tracks the deploy branch, not the source branch.
-
-**`promoted_apps` gate**: if empty (nothing was promoted, e.g., CI-only PR with no built
-images), verify-candidate is visibly SKIPPED — not silently green. A PR with promoted apps
-where verify was skipped is a contradiction → flight fails.
-
-### Slot lease file
-
-`infra/control/candidate-lease.json` on `deploy/candidate-a` branch.
-
-Leased state:
-
-```json
-{ "slot": "candidate-a", "state": "leased", "pr_number": N, "head_sha": "...",
-  "run_id": "...", "acquired_at": "...", "expires_at": "...", "status_url": "..." }
-```
-
-Released state:
-
-```json
-{ "slot": "candidate-a", "state": "free"|"failed", "released_at": "...",
-  "last_owner": { "pr_number": N, "head_sha": "...", "run_id": "..." } }
-```
-
-Check live lease:
-
-```bash
-gh api "repos/Cogni-DAO/standalone-node/contents/infra/control/candidate-lease.json?ref=deploy%2Fcandidate-a" \
-  | jq -r '.content' | base64 -d | jq .
-```
-
-## Per-App Slot Isolation (Planned)
-
-**Current**: one global `candidate-lease.json` — all apps share a single slot. A single-node
-PR blocks operator and vice versa.
-
-**Goal**: per-app leases so any two nodes can fly concurrently.
-
-Design:
-
-- Replace single `infra/control/candidate-lease.json` with per-app files:
-  `infra/control/candidate-lease-{app}.json`
-- `promote-build-payload.sh` already emits `promoted_apps` (the affected node subset for that PR)
-- `acquire-candidate-slot.sh` takes `APP_NAMES` env, acquires lock per promoted app
-- A PR is blocked only if any of _its_ promoted apps are currently leased by another flight
-- `release-candidate-slot.sh` releases only the apps that were acquired
-- `candidate-flight.yml` passes `promoted_apps` to acquire/release steps
-
-This change is in-scope for the `feat/vcs-workflow-ref-git-app-expert` branch.
+Verify an operator flight by `/version.buildSha` on the candidate host. A flight whose `promoted_apps` is empty must show verify as skipped, not green. A PR with promoted apps and a skipped verify is a contradiction and fails.
 
 ## Flight Debugging Checklist
 
@@ -306,12 +216,12 @@ When a flight fails or dispatch errors, work through this in order:
 
 ## Environment Variables Reference
 
-| Var                                | Where set                                                                             | Purpose                                          |
-| ---------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------ |
-| `GH_REVIEW_APP_ID`                 | **OpenBao** `cogni/<env>/operator/*` (ESO); GH env secret is provision seed only      | GitHub App ID for VcsCapability                  |
-| `GH_REVIEW_APP_PRIVATE_KEY_BASE64` | **OpenBao** `cogni/<env>/operator/*` (ESO); GH env secret is provision seed only      | Base64-encoded PEM private key                   |
-| `GH_WEBHOOK_SECRET`                | **OpenBao** `cogni/<env>/operator/*` (ESO); must MATCH the App's webhook-secret field | Webhook signature verification                   |
-| `GH_REPOS`                         | candidate-a + production GitHub env **vars** (config, not secret)                     | pr-manager repo scope (review is payload-driven) |
-| `DOMAIN`                           | candidate-a env var: `test.cognidao.org`                                              | Used in smoke + buildSha verify                  |
-| `VM_HOST`                          | candidate-a GitHub env secret                                                         | SSH target for Argo reconcile                    |
-| `SSH_DEPLOY_KEY`                   | candidate-a GitHub env secret                                                         | SSH key for VM access                            |
+| Var                                | Where set                                                                             | Purpose                                   |
+| ---------------------------------- | ------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `GH_REVIEW_APP_ID`                 | **OpenBao** `cogni/<env>/operator/*` (ESO); GH env secret is provision seed only      | GitHub App ID for VcsCapability           |
+| `GH_REVIEW_APP_PRIVATE_KEY_BASE64` | **OpenBao** `cogni/<env>/operator/*` (ESO); GH env secret is provision seed only      | Base64-encoded PEM private key            |
+| `GH_WEBHOOK_SECRET`                | **OpenBao** `cogni/<env>/operator/*` (ESO); must MATCH the App's webhook-secret field | Webhook signature verification            |
+| `GH_REPOS`                         | candidate-a + production GitHub env **vars** (config, not secret)                     | VCS repo scope (review is payload-driven) |
+| `DOMAIN`                           | candidate-a env var: `test.cognidao.org`                                              | Used in smoke + buildSha verify           |
+| `VM_HOST`                          | candidate-a GitHub env secret                                                         | SSH target for Argo reconcile             |
+| `SSH_DEPLOY_KEY`                   | candidate-a GitHub env secret                                                         | SSH key for VM access                     |

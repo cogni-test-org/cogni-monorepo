@@ -12,8 +12,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-. "$SCRIPT_DIR/lib/catalog-input.sh"
-TEST_NODE="$(catalog_test_primary_node "$REPO_ROOT/infra/catalog")"
 TARGET="$REPO_ROOT/scripts/secrets/set-secret.sh"
 
 TMPROOT=$(mktemp -d -t set-secret.XXXXXX)
@@ -64,8 +62,8 @@ run_case() {
 
 # Case 1 — happy path: valid env + catalog service + key + value via stdin.
 run_case "happy path writes through to bao" "hunter2" 0 \
-  "cogni/candidate-a/${TEST_NODE}|OPENROUTER_API_KEY|hunter2" \
-  candidate-a "$TEST_NODE" OPENROUTER_API_KEY
+  "cogni/candidate-a/node-template|OPENROUTER_API_KEY|hunter2" \
+  candidate-a node-template OPENROUTER_API_KEY
 
 # Case 2 — preview env accepted.
 run_case "preview env accepted" "v" 0 \
@@ -87,7 +85,7 @@ run_case "_unknown reserved namespace rejected" "x" 2 "" \
 
 # Case 6 — unknown env rejected.
 run_case "unknown env rejected" "x" 2 "" \
-  staging "$TEST_NODE" FOO
+  staging node-template FOO
 
 # Case 7 — unknown service (no catalog file) rejected.
 run_case "unknown service rejected" "x" 2 "" \
@@ -95,33 +93,23 @@ run_case "unknown service rejected" "x" 2 "" \
 
 # Case 8 — lowercase key rejected.
 run_case "lowercase key rejected" "x" 2 "" \
-  candidate-a "$TEST_NODE" lowercase_key
+  candidate-a node-template lowercase_key
 
 # Case 9 — key starting with digit rejected.
 run_case "digit-leading key rejected" "x" 2 "" \
-  candidate-a "$TEST_NODE" 1_BAD_KEY
+  candidate-a node-template 1_BAD_KEY
 
 # Case 10 — key with hyphen rejected.
 run_case "hyphenated key rejected" "x" 2 "" \
-  candidate-a "$TEST_NODE" BAD-KEY
+  candidate-a node-template BAD-KEY
 
 # Case 11 — empty stdin value rejected.
 run_case "empty value rejected" "" 2 "" \
-  candidate-a "$TEST_NODE" GOOD_KEY
+  candidate-a node-template GOOD_KEY
 
 # Case 12 — wrong arg count rejected.
 run_case "missing service arg rejected" "x" 2 "" \
-  candidate-a "$TEST_NODE"
-
-# Give dynamic ownership validation its own catalog identity, even in a TEST fleet.
-# The real typed validator and package tools remain in the checkout; only ownership is synthetic.
-COMPONENT_ROOT="$TMPROOT/component-root"
-mkdir -p "$COMPONENT_ROOT/infra/catalog"
-. "$REPO_ROOT/scripts/ci/tests/fixtures/catalog.sh"
-write_akash_catalog_fixture "$COMPONENT_ROOT/infra/catalog" poly
-ln -s "$REPO_ROOT/scripts" "$COMPONENT_ROOT/scripts"
-ln -s "$REPO_ROOT/node_modules" "$COMPONENT_ROOT/node_modules"
-ln -s "$REPO_ROOT/package.json" "$COMPONENT_ROOT/package.json"
+  candidate-a node-template
 
 # Dynamic manual-cell components use the real CLI path with a fake bao executable,
 # so -method=patch/CAS and no-fallback behavior are observed rather than bypassed.
@@ -151,7 +139,7 @@ chmod +x "$TMPROOT/fakebin/bao"
 component_case() {
   local name="$1" mode="$2" version="$3" body="$4" expected="$5" env_name="$6" service="$7" key="$8" rc=0 output
   : > "$TMPROOT/component.log"; rm -f "$TMPROOT/component-value"
-  output="$(printf '%s' "$body" | env -u SET_SECRET_BAO PATH="$TMPROOT/fakebin:$PATH" BAO_ADDR=http://fixture.invalid BAO_TOKEN=fixture-only FAKE_MODE="$mode" FAKE_BAO_LOG="$TMPROOT/component.log" FAKE_BAO_VALUE="$TMPROOT/component-value" TSX_TSCONFIG_PATH="$REPO_ROOT/nodes/operator/app/tsconfig.app.json" SET_SECRET_EXPECTED_VERSION="$version" REPO_ROOT="$COMPONENT_ROOT" bash "$TARGET" "$env_name" "$service" "$key" 2>&1)" || rc=$?
+  output="$(printf '%s' "$body" | env -u SET_SECRET_BAO PATH="$TMPROOT/fakebin:$PATH" BAO_ADDR=http://fixture.invalid BAO_TOKEN=fixture-only FAKE_MODE="$mode" FAKE_BAO_LOG="$TMPROOT/component.log" FAKE_BAO_VALUE="$TMPROOT/component-value" SET_SECRET_EXPECTED_VERSION="$version" REPO_ROOT="$REPO_ROOT" bash "$TARGET" "$env_name" "$service" "$key" 2>&1)" || rc=$?
   if { [[ "$expected" == pass && "$rc" == 0 ]] || [[ "$expected" == fail && "$rc" != 0 ]]; } && ! grep -q 'kv put' "$TMPROOT/component.log"; then
     printf 'OK  %s\n' "$name"; pass=$((pass+1))
   elif [[ "$expected" == create && "$rc" == 0 ]] && grep -q '^kv put -cas=0 ' "$TMPROOT/component.log"; then
