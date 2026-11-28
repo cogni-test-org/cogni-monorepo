@@ -16,14 +16,14 @@
 import { useConnectModal } from "@rainbow-me/rainbowkit";
 import { Check, Server as ServerIcon } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { signIn, useSession } from "next-auth/react";
+import { useSession } from "next-auth/react";
 import type { ReactElement, ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   Avatar,
-  AvatarFallback,
   Button,
+  ColorAvatarFallback,
   DiscordIcon,
   EthereumIcon,
   GitHubIcon,
@@ -31,6 +31,7 @@ import {
   PageContainer,
 } from "@/components";
 import { OpenAIIcon } from "@/features/ai/icons/providers/OpenAIIcon";
+import { LinkProviderButton } from "./LinkProviderButton";
 
 /* ─── Types ────────────────────────────────────────────────────────── */
 
@@ -252,7 +253,7 @@ function ColorPickerSwatch({
         aria-label="Change avatar color"
       />
       {open && (
-        <div className="absolute top-full right-0 z-50 mt-2 rounded-lg border border-border bg-popover p-3 shadow-md">
+        <div className="absolute top-full right-0 z-50 mt-2 w-max rounded-lg border border-border bg-popover p-3 shadow-md">
           <div className="grid grid-cols-6 gap-3">
             {colors.map((color) => (
               <button
@@ -631,13 +632,10 @@ export function ProfileView(): ReactElement {
             Display Name
           </div>
           <div className="flex items-center gap-3">
-            <Avatar
-              className="size-8"
-              style={{ "--avatar-bg": selectedColor } as React.CSSProperties}
-            >
-              <AvatarFallback className="bg-[var(--avatar-bg)] font-semibold text-primary-foreground text-sm">
+            <Avatar className="size-8">
+              <ColorAvatarFallback color={selectedColor}>
                 {avatarLetter}
-              </AvatarFallback>
+              </ColorAvatarFallback>
             </Avatar>
             <span className="rounded-md border border-input bg-background px-3 py-1.5 text-foreground text-sm">
               {displayName}
@@ -701,21 +699,7 @@ export function ProfileView(): ReactElement {
             ) : isLinked ? (
               <ConnectedBadge login="Connected" />
             ) : (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={async () => {
-                  const res = await fetch(`/api/auth/link/${id}`, {
-                    method: "POST",
-                  });
-                  if (!res.ok) return;
-                  signIn(id, {
-                    callbackUrl: `/profile?linked=${id}`,
-                  });
-                }}
-              >
-                Link
-              </Button>
+              <LinkProviderButton provider={id} />
             )}
           </SettingRow>
         );
@@ -859,7 +843,7 @@ export function ProfileView(): ReactElement {
               </a>{" "}
               for remote access.{" "}
               <a
-                href="https://github.com/Cogni-DAO/cogni/blob/staging/docs/guides/connect-local-llm.md"
+                href="https://node-template.cognidao.org/knowledge/connect-local-llm"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="underline"

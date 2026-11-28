@@ -14,7 +14,7 @@ Bottom-of-tree type definitions. TS utility types, branded types, ambient global
 ## Pointers
 
 - [Root AGENTS.md](../../../../AGENTS.md)
-- [Architecture](../../../../docs/spec/architecture.md)
+- [Architecture](https://node-template.cognidao.org/knowledge/hexagonal-layering-contract)
 - **Related:** [contracts](../contracts/) (external IO specs), [shared/schemas](../shared/) (runtime primitives), [packages/ai-core](../../../../packages/ai-core/) (canonical AI types)
 
 ## Boundaries
@@ -37,6 +37,8 @@ Bottom-of-tree type definitions. TS utility types, branded types, ambient global
 ```
 
 ## Public Surface
+
+- `akash-native-state.ts`: app-private native observation and full lease identity DTOs; independent deployment/lease coverage, safe errors and observation times. No runtime code or Console lifecycle dependency.
 
 - **Exports:** TS utility types, branded types, global.d.ts, Env interfaces, domain enums
   - `payments.ts` - PaymentFlowState, PaymentStatus, PaymentAttemptStatus, PaymentErrorCode (canonical source)

@@ -16,12 +16,59 @@
 // Event Name Registry (as const)
 // ============================================================================
 
+export const WORK_ITEMS_LIST_ERROR_CODES = {
+  INVALID_INPUT: "invalid_input",
+  INVALID_CURSOR: "invalid_cursor",
+  BACKEND_UNAVAILABLE: "backend_unavailable",
+  INTERNAL_ERROR: "internal_error",
+} as const;
+
+export const KNOWLEDGE_CONTRIBUTION_DIFF_ERROR_CODES = {
+  NOT_FOUND: "contribution_not_found",
+  BACKEND_UNAVAILABLE: "backend_unavailable",
+  DIFF_FAILED: "diff_failed",
+} as const;
+
 export const EVENT_NAMES = {
+  WORK_ITEMS_LIST_COMPLETE: "work.items.list_complete",
+  // Review and validation artifacts (task.0028): a write, a refusal (400, 404, 409) and a read, each one terminal event; codes and counts only, never a body, a row or a url.
+  WORK_ITEMS_ARTIFACT_RECORDED: "work.items.artifact_recorded",
+  WORK_ITEMS_ARTIFACT_REFUSED: "work.items.artifact_refused",
+  WORK_ITEMS_ARTIFACTS_READ: "work.items.artifacts_read",
+  // A refused work item write (task.0122): one terminal event per refusal with its errorCode (invalid_input, gate_unmet, revision_conflict, ...); codes and ids only, never a body.
+  WORK_ITEMS_CREATE_REFUSED: "work.items.create_refused",
+  WORK_ITEMS_PATCH_REFUSED: "work.items.patch_refused",
+  // The success twins: one terminal event per accepted create or patch, ids and counts only.
+  WORK_ITEMS_CREATE_SUCCESS: "work.items.create_success",
+  WORK_ITEMS_PATCH_SUCCESS: "work.items.patch_success",
+  // An item envelope part (links, artifacts, readings) that could not be read in time or failed: the envelope is served without it and marked unavailable. One warn per degraded part.
+  WORK_ITEMS_ENVELOPE_DEGRADED: "work.items.envelope_degraded",
+  // The work-items store's own signals (task.0122): a stage that ran slow or failed, the status gate's PR read failing, a retired flag written.
+  ADAPTER_WORK_ITEMS_STAGE_START: "adapter.work_items.stage_start",
+  ADAPTER_WORK_ITEMS_STAGE_COMPLETE: "adapter.work_items.stage_complete",
+  ADAPTER_WORK_ITEMS_STAGE_ERROR: "adapter.work_items.stage_error",
+  ADAPTER_WORK_ITEMS_GATE_PR_READ_FAILED:
+    "adapter.work_items.gate_pr_read_failed",
+  ADAPTER_WORK_ITEMS_DEPLOY_VERIFIED_WRITE:
+    "adapter.work_items.deploy_verified_write",
+  // Work-item PR repo pin at boot (task.0122): unset or malformed leaves it unpinned; entries that are not owner/repo are ignored. Once at boot, never per request.
+  ADAPTER_WORK_ITEMS_PR_REPO_UNPINNED: "adapter.work_items.pr_repo_unpinned",
+  ADAPTER_WORK_ITEMS_PR_REPO_IGNORED: "adapter.work_items.pr_repo_ignored",
+  // Agent atom read counters (story.0061): one line per flush with key and read counts; a drop or a failed flush with its count. Never ids.
+  KNOWLEDGE_READ_COUNTS_FLUSHED: "knowledge.read_counts_flushed",
+  KNOWLEDGE_READ_COUNT_WRITE_FAILED: "knowledge.read_count_write_failed",
+  // A citing patch's (atom, item) pairs recorded, or not recorded (story.0061): counts and reason only.
+  KNOWLEDGE_CITE_PAIRS_RECORDED: "knowledge.cite_pairs_recorded",
+  KNOWLEDGE_CITE_PAIRS_WRITE_FAILED: "knowledge.cite_pairs_write_failed",
   // AI Domain - Server
   AI_COMPLETION: "ai.completion",
   AI_LLM_CALL: "ai.llm_call",
   AI_LLM_CALL_COMPLETED: "ai.llm_call_completed",
   AI_TOOL_CALL_ERROR: "ai.tool_call.error",
+  /** One structured authz decision per evaluated tool call (authz v0 audit). */
+  AI_TOOL_AUTHZ_DECISION: "ai.tool_authz.decision",
+  /** One structured summary per mission-loop cycle on the work-prioritizer slot (story.5108). */
+  AI_WORK_PRIORITIZER_CYCLE: "ai.work_prioritizer.cycle",
   AI_CHAT_RECEIVED: "ai.chat_received",
   AI_CHAT_RESPONSE_STARTED: "ai.chat_response_started",
   AI_CHAT_STREAM_CLOSED: "ai.chat_stream_closed",
@@ -80,9 +127,12 @@ export const EVENT_NAMES = {
   NODE_OBSERVABILITY_DB_SCHEMA_COMPLETE:
     "feature.node_observability_db_schema.complete",
   NODE_DEPLOY_STATE_COMPLETE: "feature.node_deploy_state.complete",
+  NODE_WORKLOAD_DEPLOY_COMPLETE: "feature.node_workload_deploy.complete",
   NODE_OPERATIONS_READ_COMPLETE: "feature.node_operations_read.complete",
   VCS_FLIGHT_REQUEST_COMPLETE: "feature.vcs_flight.request_complete",
   VCS_MERGE_REQUEST_COMPLETE: "feature.vcs_merge.request_complete",
+  VCS_PUSH_TOKEN_REQUEST_COMPLETE: "feature.vcs_push_token.request_complete",
+  VCS_REVIEW_REQUEST_COMPLETE: "feature.vcs_review.request_complete",
   VCS_RUN_CI_REQUEST_COMPLETE: "feature.vcs_run_ci.request_complete",
 
   // Adapter Events
@@ -116,6 +166,11 @@ export const EVENT_NAMES = {
 
   // Scheduling Domain
   SCHEDULE_CREDIT_GATE_REJECTED: "schedules.credit_gate_rejected",
+  SCHEDULE_DETAIL_READ: "schedules.detail_read",
+  SCHEDULE_HISTORY_READ: "schedules.history_read",
+  KNOWLEDGE_MERGE_CHECK_COMPLETE: "knowledge.merge_check.complete",
+  KNOWLEDGE_CONTRIBUTION_DIFF_COMPLETE: "knowledge.contribution_diff.complete",
+  AI_THREAD_READ: "ai.thread_read",
 
   // Governance Domain
   GOVERNANCE_SYNC_COMPLETE: "governance.sync.complete",

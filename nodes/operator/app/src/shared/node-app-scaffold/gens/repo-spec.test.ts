@@ -5,8 +5,8 @@
  * Module: `@shared/node-app-scaffold/gens/repo-spec`
  * Purpose: Pin BORN_REVIEWABLE — the minted `.cogni/repo-spec.yaml` must carry the default review
  *   gates, and the ai-rule filenames must match the external node-template's inherited rules — and
- *   BORN_DEPLOYABLE: the minted spec must declare a complete `deployment:` block so a fresh node is
- *   external-compute capable with zero hand-editing (task.5079).
+ *   NO_LEGACY_DEPLOYMENT_BLOCK: the minted spec carries no `deployment:` block; workloads live in
+ *   `.cogni/workloads/*.yaml` (task.5411).
  * Scope: Pure unit test over `renderRepoSpec` output; does not exercise the mint network path.
  * Invariants: minted spec has gates, has no `nodes:` registry (single-node-fork signal), and its
  *   ai-rule `rule_file`s match the template contract.
@@ -16,11 +16,10 @@
  */
 
 import {
-  COGNI_NODE_APP_V1_DEPLOYMENT,
   COGNI_NODE_APP_V1_REQUIRED_SECRET_KEYS,
-  extractNodeServices,
   hasDeclaredNodeDeployment,
   parseRepoSpec,
+  RETIRED_SECRET_REFS_MESSAGE,
   resolveRuntimeProfileSecretRefs,
 } from "@cogni/repo-spec";
 import { describe, expect, it } from "vitest";
@@ -34,11 +33,15 @@ const TEMPLATE_RULE_FILES = [
   "repo-goal-alignment.yaml",
 ];
 
+const SPAWNER_WALLET = "0xAbCdEf0123456789aBcDeF0123456789AbCdEf01";
+const TEMPLATE_DEFAULT_APPROVER = "0x070075F1389Ae1182aBac722B36CA12285d0c949";
+
 const rendered = renderRepoSpec({
   slug: "my-node",
   repoOwner: "cogni-dao-test",
   nodeId: "11111111-2222-4333-8444-555555555555",
   chainId: 8453,
+  approvers: [SPAWNER_WALLET],
   daoContract: "0x1111111111111111111111111111111111111111",
   pluginContract: "0x2222222222222222222222222222222222222222",
   signalContract: "0x3333333333333333333333333333333333333333",
@@ -107,6 +110,7 @@ describe("renderRepoSpec — BORN_REVIEWABLE", () => {
         repoOwner: "cogni-dao-test",
         nodeId: "11111111-2222-4333-8444-555555555555",
         chainId: 8453,
+        approvers: [SPAWNER_WALLET],
         mission: "Mirror Polymarket copy-trades for the DAO.",
       })
     ) as ParsedSpec;
@@ -125,9 +129,8 @@ describe("renderRepoSpec — BORN_REVIEWABLE", () => {
         },
       },
     });
-    expect(spec.activity_ledger?.approvers).toContain(
-      "0x070075F1389Ae1182aBac722B36CA12285d0c949"
-    );
+    // Approvers are the spawner's wallet, not the template default (task.5494).
+    expect(spec.activity_ledger?.approvers).toEqual([SPAWNER_WALLET]);
   });
 
   it("emits the default review gates so minted nodes are born-reviewable", () => {
@@ -165,39 +168,72 @@ describe("renderRepoSpec — BORN_REVIEWABLE", () => {
   });
 });
 
-describe("renderRepoSpec — BORN_DEPLOYABLE", () => {
+describe("renderRepoSpec — NO_LEGACY_DEPLOYMENT_BLOCK (task.5411)", () => {
   const parsed = parseRepoSpec(rendered);
 
-  it("declares its own deployment instead of inheriting the legacy fallback", () => {
-    expect(hasDeclaredNodeDeployment(parsed)).toBe(true);
-    expect(parsed.deployment).toEqual(COGNI_NODE_APP_V1_DEPLOYMENT);
+  it("mints no deployment: block (workloads live in .cogni/workloads)", () => {
+    expect(hasDeclaredNodeDeployment(parsed)).toBe(false);
+    expect(rendered).not.toMatch(/^deployment:/m);
   });
 
-  it("declares exactly one public service with complete resources", () => {
-    const services = extractNodeServices(parsed);
-    expect(
-      services.filter((service) => service.visibility === "public")
-    ).toHaveLength(1);
-    for (const service of services) {
-      expect(service.resources.cpuUnits).toBeGreaterThan(0);
-      expect(service.resources.memoryMi).toBeGreaterThan(0);
-      expect(service.resources.storageMi).toBeGreaterThan(0);
-    }
-  });
-
-  it("mints a clean block: no per-node profile refs, resolved to the full contract at build time", () => {
-    const [app] = extractNodeServices(parsed);
-    expect(app?.runtimeProfile).toBe("cogni-node-app-v1");
-    // The minted spec does not re-list the profile's keys (bug.5175 prune)...
-    expect(app?.secretRefs).toEqual([]);
-    // ...and the raw minted YAML never contains them either.
+  it("carries no secret list; the profile supplies the full contract", () => {
+    expect(rendered).not.toMatch(/^\s*secret_refs:/m);
     expect(rendered).not.toContain("EVM_RPC_URL");
-    // The profile supplies the complete contract when the workload is built.
     expect(
       resolveRuntimeProfileSecretRefs({
-        runtimeProfile: app?.runtimeProfile,
-        secretRefs: app?.secretRefs ?? [],
+        runtimeProfile: "cogni-node-app-v1",
       }).map((ref) => ref.key)
     ).toEqual([...COGNI_NODE_APP_V1_REQUIRED_SECRET_KEYS]);
+  });
+
+  it("tells a new node to use the catalog; the schema refuses secret_refs", () => {
+    expect(rendered).toContain(".cogni/secrets-catalog.yaml");
+    expect(() =>
+      parseRepoSpec(`${rendered}\nsecret_refs:\n  - key: EXTRA_KEY\n`)
+    ).toThrow(RETIRED_SECRET_REFS_MESSAGE);
+  });
+});
+
+describe("renderRepoSpec — SPAWNER_IS_FIRST_APPROVER (task.5494)", () => {
+  const spec = parseYaml(rendered) as ParsedSpec;
+
+  it("writes the given approvers and not the template default", () => {
+    expect(spec.activity_ledger?.approvers).toEqual([SPAWNER_WALLET]);
+    expect(rendered).not.toContain(TEMPLATE_DEFAULT_APPROVER);
+  });
+
+  it("writes every approver in order", () => {
+    const second = "0x2222222222222222222222222222222222222222";
+    const two = parseYaml(
+      renderRepoSpec({
+        slug: "my-node",
+        repoOwner: "cogni-dao-test",
+        nodeId: "11111111-2222-4333-8444-555555555555",
+        chainId: 8453,
+        approvers: [SPAWNER_WALLET, second],
+      })
+    ) as ParsedSpec;
+    expect(two.activity_ledger?.approvers).toEqual([SPAWNER_WALLET, second]);
+  });
+
+  it("round-trips through the real repo-spec parser", () => {
+    expect(parseRepoSpec(rendered).activity_ledger?.approvers).toEqual([
+      SPAWNER_WALLET,
+    ]);
+  });
+
+  it("refuses to mint a node nobody can administer, or a non-address approver", () => {
+    const base = {
+      slug: "my-node",
+      repoOwner: "cogni-dao-test",
+      nodeId: "11111111-2222-4333-8444-555555555555",
+      chainId: 8453,
+    };
+    expect(() => renderRepoSpec({ ...base, approvers: [] })).toThrow(
+      /at least one approver/
+    );
+    expect(() =>
+      renderRepoSpec({ ...base, approvers: ['0x1"\nevil: true'] })
+    ).toThrow(/not an EVM address/);
   });
 });

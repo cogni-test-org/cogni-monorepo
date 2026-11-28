@@ -38,7 +38,7 @@
  *   `@cogni/*` workspace packages resolve from src via tsconfig.e2e-roundtrip.json, so
  *   NO prior `pnpm build` is required. Not run in PR CI (external lane, ❌ in CI).
  * ────────────────────────────────────────────────────────────────────────────
- * Links: docs/runbooks/dolthub-remote-bootstrap.md, .context/dolthub-e2e-roundtrip-plan.md
+ * Links: https://cognidao.org/knowledge/dolthub-mirror-bootstrap, .context/dolthub-e2e-roundtrip-plan.md
  * @internal
  */
 
@@ -235,7 +235,11 @@ describe.skipIf(!hasRequiredEnv)(
         "e2e-agent"
       );
       const patched = await wi.patch(
-        { id: created.id, set: { status: "in_progress" } } as never,
+        {
+          id: created.id,
+          reason: "Start the round trip",
+          set: { status: "in_progress" },
+        } as never,
         "e2e-agent"
       );
       expect(patched?.status).toBe("in_progress");

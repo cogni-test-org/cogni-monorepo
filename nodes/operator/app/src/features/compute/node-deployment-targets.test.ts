@@ -1,15 +1,193 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
 // SPDX-FileCopyrightText: 2026 Cogni-DAO
 
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { parse } from "yaml";
 
 import {
+  decideNodeDeployExclusion,
   isInfraOnlyPromoteNoop,
   resolveDeploymentTargets,
   resolvePromoteDeploymentTargets,
 } from "./node-deployment-targets";
 
+// GitHub reports the running repository with its owner's display case; the
+// resolver normalizes it exactly like catalog `source_repo`.
+const PARENT_REPOSITORY = "Cogni-DAO/cogni";
+const PARENT = "cogni-dao/cogni";
+
 describe("resolveDeploymentTargets", () => {
+  it("supplies the unchanged floor callers with a valid parent PR identity", () => {
+    const root = path.resolve(import.meta.dirname, "../../../../../..");
+    const head = "b00e4101a24fad3d18e93d9a6c76ec65e776266d";
+    const selection = resolveDeploymentTargets({
+      catalogRows: [{ name: "operator", type: "node", envs: ["candidate-a"] }],
+      environment: "candidate-a",
+      parentRepository: PARENT_REPOSITORY,
+      parentSourceSha: head,
+      flightTargets: ["operator"],
+    });
+    type Step = { name?: string; run?: string; env?: Record<string, string> };
+    const workflow = parse(
+      readFileSync(
+        path.join(root, ".github/workflows/candidate-flight.yml"),
+        "utf8"
+      )
+    ) as { jobs: Record<string, { steps: Step[] }> };
+    const select = workflow.jobs.decide?.steps.find(
+      (step) => step.name === "Select deployment targets by provider"
+    );
+    expect(select?.env?.PARENT_SOURCE_SHA).toBe(
+      ["$", "{{ steps.meta.outputs.head_sha }}"].join("")
+    );
+    expect(select?.run).toContain('--source-sha "$PARENT_SOURCE_SHA"');
+    const callers = Object.values(workflow.jobs)
+      .flatMap((job) => job.steps)
+      .filter(
+        (step) =>
+          step.run?.includes("maintenance-fence.py check") &&
+          step.env?.SOURCE_REPOSITORY
+      );
+    expect(callers).toHaveLength(3);
+    for (const caller of callers) {
+      expect(caller.env?.SOURCE_SHA).toBe(
+        [
+          "$",
+          "{{ needs.decide.outputs.node_source_sha || fromJSON(needs.decide.outputs.source_sha_by_target_json)[matrix.node] }}",
+        ].join("")
+      );
+    }
+    const result = execFileSync(
+      "python3",
+      [
+        "-c",
+        `
+import json, runpy, sys
+scope = runpy.run_path(sys.argv[1])
+check = scope['check']
+receipt = {'version': 1, 'phase': 'audited', 'operationId': 'a' * 64,
+    'request': {'sourceRepository': 'cogni-dao/cogni',
+                'sourceSha': '3e8ebeab9ce76be7bf5429ba23cee01062c2c7a2'}}
+check.__globals__['read_present'] = lambda root, name: receipt if name == scope['RECEIPT'] else None
+identity = json.load(sys.stdin)
+calls = []
+def compare(repo, base, head):
+    calls.append([repo, base, head])
+    return 'ahead' if head in ('main', identity['sha']) else 'behind'
+check('.', identity['repo'], identity['sha'], compare)
+assert calls[-1][2] == identity['sha']
+for sha in ('', 'invalid', '0' * 40):
+    try:
+        check('.', identity['repo'], sha, compare)
+    except RuntimeError as error:
+        assert str(error) in ('maintenance_compatibility_floor_invalid', 'maintenance_compatibility_floor_violation')
+    else:
+        raise AssertionError('unsafe floor identity accepted')
+print('valid-parent-accepted; missing-invalid-older-refused')
+`,
+        path.join(root, "scripts/ci/lib/maintenance-fence.py"),
+      ],
+      {
+        input: JSON.stringify({
+          repo: selection.sourceRepositories.operator,
+          sha: selection.sourceShas.operator,
+        }),
+        encoding: "utf8",
+      }
+    );
+    expect(result.trim()).toBe(
+      "valid-parent-accepted; missing-invalid-older-refused"
+    );
+  });
+
+  it("binds a reviewed parent PR head to only the selected in-repo node", () => {
+    const head = "b00e4101a24fad3d18e93d9a6c76ec65e776266d";
+    const result = resolveDeploymentTargets({
+      catalogRows: [
+        { name: "operator", type: "node", envs: ["candidate-a"] },
+        { name: "sibling", type: "node", envs: ["candidate-a"] },
+        { name: "scheduler-worker", type: "service" },
+      ],
+      environment: "candidate-a",
+      parentRepository: PARENT_REPOSITORY,
+      parentSourceSha: head,
+      flightTargets: ["operator", "scheduler-worker"],
+    });
+    expect(result.sourceRepositories).toEqual({ operator: PARENT });
+    expect(result.sourceShas).toEqual({ operator: head });
+    expect(result.deployment).toEqual(["operator"]);
+  });
+
+  it("keeps an external catalog SHA separate from the reviewed parent head", () => {
+    const child = "0123456789abcdef0123456789abcdef01234567";
+    const result = resolveDeploymentTargets({
+      catalogRows: [
+        { name: "operator", type: "node", envs: ["candidate-a"] },
+        {
+          name: "remote",
+          type: "node",
+          envs: ["candidate-a"],
+          source_repo: "https://github.com/cogni-dao/remote",
+          source_sha: child,
+          deployment_provider: { "candidate-a": "akash" },
+        },
+        {
+          name: "explicit-parent",
+          type: "node",
+          envs: ["candidate-a"],
+          source_repo: "https://github.com/cogni-dao/cogni",
+        },
+      ],
+      environment: "candidate-a",
+      parentRepository: PARENT_REPOSITORY,
+      parentSourceSha: "a".repeat(40),
+      flightTargets: ["operator", "remote", "explicit-parent"],
+    });
+    expect(result.sourceShas).toEqual({
+      operator: "a".repeat(40),
+      remote: child,
+    });
+    expect(result.sourceShas["explicit-parent"]).toBeUndefined();
+  });
+
+  it("refuses an invalid supplied parent SHA and never repairs a missing external SHA with it", () => {
+    const input = {
+      catalogRows: [{ name: "operator", type: "node", envs: ["candidate-a"] }],
+      environment: "candidate-a" as const,
+      parentRepository: PARENT_REPOSITORY,
+      flightTargets: ["operator"],
+    };
+    for (const parentSourceSha of [
+      "",
+      "main",
+      "a".repeat(39),
+      "g".repeat(40),
+    ]) {
+      expect(() =>
+        resolveDeploymentTargets({ ...input, parentSourceSha })
+      ).toThrow(/parentSourceSha/);
+    }
+    expect(() =>
+      resolveDeploymentTargets({
+        ...input,
+        parentSourceSha: "a".repeat(40),
+        flightTargets: ["remote"],
+        catalogRows: [
+          {
+            name: "remote",
+            type: "node",
+            envs: ["candidate-a"],
+            source_repo: "https://github.com/cogni-dao/remote",
+            deployment_provider: { "candidate-a": "akash" },
+          },
+        ],
+      })
+    ).toThrow(/source_sha/);
+  });
+
   it("keeps omitted placement on k3s and separates explicit off-cluster nodes", () => {
     expect(
       resolveDeploymentTargets({
@@ -30,6 +208,7 @@ describe("resolveDeploymentTargets", () => {
           { name: "scheduler-worker", type: "service" },
         ],
         environment: "candidate-a",
+        parentRepository: PARENT_REPOSITORY,
         flightTargets: ["node-template", "toks4", "scheduler-worker"],
       })
     ).toEqual({
@@ -43,7 +222,9 @@ describe("resolveDeploymentTargets", () => {
       },
       k3s: ["node-template", "scheduler-worker"],
       k3sNodes: ["node-template"],
-      sourceRepositories: { toks4: "cogni-dao/toks4" },
+      nodeDeploy: [],
+      flight: ["node-template", "toks4", "scheduler-worker"],
+      sourceRepositories: { "node-template": PARENT, toks4: "cogni-dao/toks4" },
       sourceShas: { toks4: "0123456789abcdef0123456789abcdef01234567" },
     });
   });
@@ -65,6 +246,7 @@ describe("resolveDeploymentTargets", () => {
       resolveDeploymentTargets({
         catalogRows,
         environment: "candidate-a",
+        parentRepository: PARENT_REPOSITORY,
         flightTargets: ["operator"],
       })
     ).toEqual({
@@ -74,13 +256,16 @@ describe("resolveDeploymentTargets", () => {
       providers: { operator: "k3s" },
       k3s: ["operator"],
       k3sNodes: ["operator"],
-      sourceRepositories: {},
+      nodeDeploy: [],
+      flight: ["operator"],
+      sourceRepositories: { operator: PARENT },
       sourceShas: {},
     });
     expect(
       resolveDeploymentTargets({
         catalogRows,
         environment: "candidate-a",
+        parentRepository: PARENT_REPOSITORY,
         flightTargets: ["toks4"],
       })
     ).toEqual({
@@ -90,9 +275,82 @@ describe("resolveDeploymentTargets", () => {
       providers: { toks4: "akash" },
       k3s: [],
       k3sNodes: [],
+      nodeDeploy: [],
+      flight: ["toks4"],
       sourceRepositories: { toks4: "cogni-dao/toks4" },
       sourceShas: { toks4: "0123456789abcdef0123456789abcdef01234567" },
     });
+  });
+
+  // bug.5510: an in-repo self-flight used to emit no repository, so the
+  // deploy-branch maintenance fence received SOURCE_REPOSITORY="" and refused
+  // every operator flight once an audited receipt existed.
+  it("gives every in-repo and remote k3s node target a source repository (bug.5510)", () => {
+    const selection = resolveDeploymentTargets({
+      catalogRows: [
+        { name: "operator", type: "node", envs: ["candidate-a"] },
+        {
+          name: "beacon",
+          type: "node",
+          envs: ["candidate-a"],
+          source_repo: "https://github.com/cogni-dao/beacon.git",
+        },
+        { name: "scheduler-worker", type: "service" },
+      ],
+      environment: "candidate-a",
+      parentRepository: PARENT_REPOSITORY,
+      flightTargets: ["operator", "beacon", "scheduler-worker"],
+    });
+
+    expect(selection.sourceRepositories).toEqual({
+      operator: PARENT,
+      beacon: "cogni-dao/beacon",
+    });
+    // No catalog pin exists for an in-repo node; its SHA is the flight's node-ref.
+    expect(selection.sourceShas).toEqual({});
+  });
+
+  it.each([
+    "",
+    "cogni",
+    "cogni-dao/cogni/extra",
+    "https://github.com/cogni-dao/cogni",
+    "../..",
+    "./cogni",
+    "cogni-dao/..",
+  ])("fails closed on parent repository %j instead of emitting an empty identity", (parentRepository) => {
+    expect(() =>
+      resolveDeploymentTargets({
+        catalogRows: [
+          { name: "operator", type: "node", envs: ["candidate-a"] },
+        ],
+        environment: "candidate-a",
+        parentRepository,
+        flightTargets: ["operator"],
+      })
+    ).toThrow("parentRepository must be a GitHub owner/name");
+  });
+
+  it.each([
+    "git@github.com:cogni-dao/beacon.git",
+    "https://github.com/cogni-dao/..",
+    "https://github.com/../beacon.git",
+  ])("refuses malformed catalog source_repo %j rather than substituting the parent", (sourceRepo) => {
+    expect(() =>
+      resolveDeploymentTargets({
+        catalogRows: [
+          {
+            name: "beacon",
+            type: "node",
+            envs: ["candidate-a"],
+            source_repo: sourceRepo,
+          },
+        ],
+        environment: "candidate-a",
+        parentRepository: PARENT_REPOSITORY,
+        flightTargets: ["beacon"],
+      })
+    ).toThrow("Target beacon has invalid source_repo");
   });
 
   it("fails closed for a target absent from the reviewed catalog", () => {
@@ -100,6 +358,7 @@ describe("resolveDeploymentTargets", () => {
       resolveDeploymentTargets({
         catalogRows: [],
         environment: "candidate-a",
+        parentRepository: PARENT_REPOSITORY,
         flightTargets: ["unreviewed"],
       })
     ).toThrow("Unknown flight target");
@@ -119,6 +378,7 @@ describe("resolveDeploymentTargets", () => {
           },
         ],
         environment: "candidate-a",
+        parentRepository: PARENT_REPOSITORY,
         flightTargets: ["poly"],
       })
     ).toThrow("Flight target poly is not configured for candidate-a");
@@ -148,6 +408,7 @@ describe("resolvePromoteDeploymentTargets", () => {
       resolvePromoteDeploymentTargets({
         catalogRows,
         environment: "preview",
+        parentRepository: PARENT_REPOSITORY,
         requestedTargets: [],
         legacyK3sTargets: ["scheduler-worker", "legacy", "external"],
       })
@@ -162,11 +423,12 @@ describe("resolvePromoteDeploymentTargets", () => {
       },
       k3s: ["scheduler-worker", "legacy"],
       k3sNodes: ["legacy"],
-      sourceRepositories: { external: "cogni-dao/external" },
+      sourceRepositories: { legacy: PARENT, external: "cogni-dao/external" },
       sourceShas: {
         external: "0123456789abcdef0123456789abcdef01234567",
       },
       infra: [],
+      nodeDeploy: [],
       // No preview-forward mode stated ⇒ every target false (bug.5195).
       previewForward: {
         "scheduler-worker": false,
@@ -194,6 +456,7 @@ describe("resolvePromoteDeploymentTargets", () => {
     const selection = resolvePromoteDeploymentTargets({
       catalogRows: mixedPlacementRows,
       environment: "production",
+      parentRepository: PARENT_REPOSITORY,
       requestedTargets: ["node-template"],
       legacyK3sTargets: ["node-template"],
     });
@@ -207,6 +470,32 @@ describe("resolvePromoteDeploymentTargets", () => {
     expect(selection.sourceRepositories).toEqual({
       "node-template": "cogni-dao/node-template",
     });
+  });
+
+  it("gives an in-repo promote target the parent repository (bug.5510)", () => {
+    const selection = resolvePromoteDeploymentTargets({
+      catalogRows: [{ name: "operator", type: "node", envs: ["preview"] }],
+      environment: "preview",
+      parentRepository: PARENT_REPOSITORY,
+      requestedTargets: ["operator"],
+      legacyK3sTargets: ["operator"],
+    });
+
+    expect(selection.deployment).toEqual(["operator"]);
+    expect(selection.sourceRepositories).toEqual({ operator: PARENT });
+    expect(selection.sourceShas).toEqual({});
+  });
+
+  it("fails closed on an empty promote parent repository (bug.5510)", () => {
+    expect(() =>
+      resolvePromoteDeploymentTargets({
+        catalogRows: [{ name: "operator", type: "node", envs: ["preview"] }],
+        environment: "preview",
+        parentRepository: "",
+        requestedTargets: ["operator"],
+        legacyK3sTargets: ["operator"],
+      })
+    ).toThrow("parentRepository must be a GitHub owner/name");
   });
 
   it("projects the reviewed catalog pin for an operator-merge preview", () => {
@@ -223,6 +512,7 @@ describe("resolvePromoteDeploymentTargets", () => {
         },
       ],
       environment: "preview",
+      parentRepository: PARENT_REPOSITORY,
       requestedTargets: ["toks4"],
       legacyK3sTargets: [],
     });
@@ -236,6 +526,7 @@ describe("resolvePromoteDeploymentTargets", () => {
       resolvePromoteDeploymentTargets({
         catalogRows,
         environment: "production",
+        parentRepository: PARENT_REPOSITORY,
         requestedTargets: ["external"],
         legacyK3sTargets: [],
       }).deployment
@@ -249,6 +540,7 @@ describe("resolvePromoteDeploymentTargets", () => {
         { name: "openfga", type: "infra" },
       ],
       environment: "preview",
+      parentRepository: PARENT_REPOSITORY,
       requestedTargets: ["litellm", "openfga"],
       legacyK3sTargets: [],
     });
@@ -268,6 +560,7 @@ describe("resolvePromoteDeploymentTargets", () => {
     const selection = resolvePromoteDeploymentTargets({
       catalogRows,
       environment: "production",
+      parentRepository: PARENT_REPOSITORY,
       requestedTargets,
       legacyK3sTargets: [],
     });
@@ -281,6 +574,7 @@ describe("resolvePromoteDeploymentTargets", () => {
       resolvePromoteDeploymentTargets({
         catalogRows,
         environment: "preview",
+        parentRepository: PARENT_REPOSITORY,
         requestedTargets: ["not-in-catalog"],
         legacyK3sTargets: [],
       })
@@ -292,6 +586,7 @@ describe("resolvePromoteDeploymentTargets", () => {
       resolvePromoteDeploymentTargets({
         catalogRows,
         environment: "preview",
+        parentRepository: PARENT_REPOSITORY,
         requestedTargets: ["legacy"],
         legacyK3sTargets: [],
       }).deployment
@@ -327,6 +622,7 @@ describe("resolvePromoteDeploymentTargets", () => {
       const selection = resolvePromoteDeploymentTargets({
         catalogRows: mixed,
         environment: "production",
+        parentRepository: PARENT_REPOSITORY,
         requestedTargets: ["prodonly"],
         legacyK3sTargets: [],
         previewForwardMode: true,
@@ -339,6 +635,7 @@ describe("resolvePromoteDeploymentTargets", () => {
       const selection = resolvePromoteDeploymentTargets({
         catalogRows: mixed,
         environment: "production",
+        parentRepository: PARENT_REPOSITORY,
         requestedTargets: ["bothenvs"],
         legacyK3sTargets: [],
         previewForwardMode: true,
@@ -350,6 +647,7 @@ describe("resolvePromoteDeploymentTargets", () => {
       const selection = resolvePromoteDeploymentTargets({
         catalogRows: mixed,
         environment: "production",
+        parentRepository: PARENT_REPOSITORY,
         requestedTargets: ["prodonly", "bothenvs"],
         legacyK3sTargets: [],
         previewForwardMode: true,
@@ -364,6 +662,7 @@ describe("resolvePromoteDeploymentTargets", () => {
       const selection = resolvePromoteDeploymentTargets({
         catalogRows: mixed,
         environment: "production",
+        parentRepository: PARENT_REPOSITORY,
         requestedTargets: ["prodonly", "bothenvs"],
         legacyK3sTargets: [],
         previewForwardMode: false,
@@ -378,10 +677,200 @@ describe("resolvePromoteDeploymentTargets", () => {
       const selection = resolvePromoteDeploymentTargets({
         catalogRows: mixed,
         environment: "production",
+        parentRepository: PARENT_REPOSITORY,
         requestedTargets: ["bothenvs"],
         legacyK3sTargets: [],
       });
       expect(selection.previewForward.bothenvs).toBe(false);
+    });
+  });
+});
+
+/**
+ * ONE_WRITER_PER_NODE_LANE (story.5137, CD4). A `compute_api.<env>: node-deploy` cell is written
+ * only by the deploy verb: the old flight/promote planner excludes it from every list, so nothing
+ * renders it, writes its deploy branch, or touches its lease or DNS.
+ */
+describe("node-deploy cells are excluded from the old flight/promote path", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  const rows = [
+    {
+      name: "handed",
+      type: "node",
+      envs: ["candidate-a", "production"],
+      source_repo: "https://github.com/Cogni-DAO/handed.git",
+      source_sha: SHA,
+      deployment_provider: { "candidate-a": "akash", production: "akash" },
+      compute_api: { production: "node-deploy" },
+    },
+    {
+      name: "classic",
+      type: "node",
+      envs: ["candidate-a", "production"],
+      source_repo: "https://github.com/Cogni-DAO/classic.git",
+      source_sha: SHA,
+      deployment_provider: { "candidate-a": "akash", production: "akash" },
+    },
+  ];
+
+  it("flight: skips the node-deploy cell but plans the same node's other env", () => {
+    const production = resolveDeploymentTargets({
+      catalogRows: rows,
+      environment: "production",
+      parentRepository: PARENT_REPOSITORY,
+      flightTargets: ["handed", "classic"],
+    });
+    expect(production.nodeDeploy).toEqual(["handed"]);
+    // The per-node job matrices (reconcile-appset, flight, images) consume THIS list, so an
+    // affected set holding a node-deploy node yields no entry for it (no empty DEPLOYMENT_PROVIDER).
+    expect(production.flight).toEqual(["classic"]);
+    expect(production.deployment).toEqual(["classic"]);
+    expect(production.offCluster).toEqual(["classic"]);
+    expect(production.providers).toEqual({ classic: "akash" });
+    expect(production.sourceShas).toEqual({ classic: SHA });
+
+    const candidate = resolveDeploymentTargets({
+      catalogRows: rows,
+      environment: "candidate-a",
+      parentRepository: PARENT_REPOSITORY,
+      flightTargets: ["handed"],
+    });
+    expect(candidate.nodeDeploy).toEqual([]);
+    expect(candidate.offCluster).toEqual(["handed"]);
+  });
+
+  it("reproduces the failed candidate-a flight: every per-node matrix entry has a provider, and the workflow feeds the matrices from the planner", () => {
+    // run 41629488889: toks5 (node-deploy) stayed in the reconcile-appset matrix, so its
+    // DEPLOYMENT_PROVIDER (providers[node]) was empty and resolve-candidate-deploy-repository.sh failed.
+    const selection = resolveDeploymentTargets({
+      catalogRows: rows,
+      environment: "production",
+      parentRepository: PARENT_REPOSITORY,
+      flightTargets: ["handed", "classic"],
+    });
+    for (const node of selection.flight) {
+      expect(
+        selection.providers[node],
+        `${node} needs a provider`
+      ).toBeTruthy();
+    }
+    expect(selection.flight).not.toContain("handed");
+
+    const root = path.resolve(import.meta.dirname, "../../../../../..");
+    type Job = {
+      outputs?: Record<string, string>;
+      strategy?: { matrix?: { node?: string } };
+    };
+    const workflow = parse(
+      readFileSync(
+        path.join(root, ".github/workflows/candidate-flight.yml"),
+        "utf8"
+      )
+    ) as { jobs: Record<string, Job> };
+    expect(workflow.jobs.decide?.outputs?.flight_targets_json).toContain(
+      "steps.substrate-targets.outputs.flight_targets_json"
+    );
+    expect(workflow.jobs.decide?.outputs?.has_flight_targets).toContain(
+      "steps.substrate-targets.outputs.has_flight_targets"
+    );
+    expect(workflow.jobs["reconcile-appset"]?.strategy?.matrix?.node).toContain(
+      "needs.decide.outputs.flight_targets_json"
+    );
+  });
+
+  it("promote: a fleet-wide promote skips the node-deploy cell and still promotes the rest", () => {
+    const selection = resolvePromoteDeploymentTargets({
+      catalogRows: rows,
+      environment: "production",
+      parentRepository: PARENT_REPOSITORY,
+      requestedTargets: [],
+      legacyK3sTargets: [],
+    });
+    expect(selection.nodeDeploy).toEqual(["handed"]);
+    expect(selection.deployment).toEqual(["classic"]);
+    expect(selection.offCluster).toEqual(["classic"]);
+    expect(selection.sourceRepositories).toEqual({
+      classic: "cogni-dao/classic",
+    });
+  });
+
+  it("promote: an explicit request for only the node-deploy cell resolves to nothing, flagged", () => {
+    const selection = resolvePromoteDeploymentTargets({
+      catalogRows: rows,
+      environment: "production",
+      parentRepository: PARENT_REPOSITORY,
+      requestedTargets: ["handed"],
+      legacyK3sTargets: [],
+    });
+    expect(selection.deployment).toEqual([]);
+    expect(selection.nodeDeploy).toEqual(["handed"]);
+  });
+
+  describe("decideNodeDeployExclusion (the materialize-compute-workload refusal)", () => {
+    const base = { environment: "production" as const, nodeDeploy: ["handed"] };
+
+    it("REFUSES with node_on_deploy_verb when the request names only node-deploy cells", () => {
+      const decision = decideNodeDeployExclusion({
+        ...base,
+        lane: "promote",
+        requestedTargets: ["handed"],
+        remainingTargets: [],
+      });
+      expect(decision.kind).toBe("refuse");
+      expect(decision).toMatchObject({
+        message: expect.stringMatching(
+          /promote refused: node_on_deploy_verb: handed in production .*POST \/api\/v1\/deploy\/workloads/
+        ),
+      });
+    });
+
+    it("refuses a flight the same way", () => {
+      expect(
+        decideNodeDeployExclusion({
+          ...base,
+          lane: "flight",
+          requestedTargets: ["handed"],
+          remainingTargets: [],
+        }).kind
+      ).toBe("refuse");
+    });
+
+    it("WARNS, and lets the rest proceed, for a mixed request", () => {
+      const decision = decideNodeDeployExclusion({
+        ...base,
+        lane: "flight",
+        requestedTargets: ["handed", "classic"],
+        remainingTargets: ["classic"],
+      });
+      expect(decision).toMatchObject({
+        kind: "warn",
+        message: expect.stringContaining(
+          "node_on_deploy_verb: flight skips handed"
+        ),
+      });
+    });
+
+    it("WARNS for a fleet-wide promote that names nothing (no refusal)", () => {
+      expect(
+        decideNodeDeployExclusion({
+          ...base,
+          lane: "promote",
+          requestedTargets: [],
+          remainingTargets: [],
+        }).kind
+      ).toBe("warn");
+    });
+
+    it("is silent when no node-deploy cell was excluded", () => {
+      expect(
+        decideNodeDeployExclusion({
+          ...base,
+          nodeDeploy: [],
+          lane: "promote",
+          requestedTargets: ["classic"],
+          remainingTargets: ["classic"],
+        })
+      ).toEqual({ kind: "none" });
     });
   });
 });

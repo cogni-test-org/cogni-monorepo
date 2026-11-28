@@ -16,10 +16,10 @@
  *   - ONE_VAULT_MANY_LANES: OpenBao is per-CLUSTER. The production operator writing
  *     `cogni/preview/<node>` writes into ITS OWN vault at a lane-labelled path — it is
  *     not a cross-cluster write and never reaches preview's vault. Per
- *     `secrets-management.md` Invariant 1 (PATH_CONVENTION_PER_SERVICE_PER_ENV) the
+ *     https://cognidao.org/knowledge/secrets-management Invariant 1 (PATH_CONVENTION_PER_SERVICE_PER_ENV) the
  *     blast-radius boundary is `<service>`; the env prefix is a lane label inside one
  *     vault, so widening the lane set does not widen that boundary.
- * Links: docs/spec/secrets-management.md, docs/design/node-self-serve-secrets.md,
+ * Links: https://cognidao.org/knowledge/secrets-management, https://cognidao.org/knowledge/node-secret-write-design
  *   scripts/setup/provision-env-vm.sh (§5b.4d), scripts/setup/reconcile-env-substrate.sh
  * @public
  */
@@ -30,9 +30,9 @@ export type SecretsLane = "candidate-a" | "preview" | "production";
 /**
  * Lanes each serving environment may custody in the default production-controlled fleet.
  *
- * `production` is the multi-lane custodian because it is the PAYING cluster: the
- * Crossplane Composition interpolates every lane's secrets into the lease production's
- * Console account is billed for, so those values must live in production's own vault.
+ * `production` is the multi-lane custodian because it is the PAYING cluster: every lane's
+ * secrets go into a lease production's Console account is billed for, so those values must
+ * live in production's own vault.
  * The alternative — production READING a pre-prod vault — inverts trust: a cluster that
  * runs unmerged control-plane trees would become the source of values production pays
  * for. Refused.

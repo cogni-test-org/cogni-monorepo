@@ -7,7 +7,7 @@
  * Scope: HTTP parsing/auth/logging only. Delegates coordination to facade.
  * Invariants: AUTH_REQUIRED, CONTRACTS_ARE_TRUTH.
  * Side-effects: IO (HTTP response, DB through facade).
- * Links: docs/design/operator-dev-lifecycle-coordinator.md, task.5007
+ * Links: https://cognidao.org/knowledge/validation-hold-design, task.5007
  * @public
  */
 
@@ -30,6 +30,12 @@ export const POST = wrapRouteHandlerWithLogging<{
 }>(
   {
     routeId: "work.items.sessions.heartbeat",
+    getRequestDependencies: async () => {
+      const { getRequestLoggingDependencies } = await import(
+        "@/bootstrap/container"
+      );
+      return getRequestLoggingDependencies();
+    },
     auth: { mode: "required", getSessionUser },
   },
   async (ctx, request, sessionUser, context) => {

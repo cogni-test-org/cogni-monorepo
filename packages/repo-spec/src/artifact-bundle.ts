@@ -7,7 +7,7 @@
  * Scope: Pure schemas and assembly. Does not read git, registries, files, or deployment state.
  * Invariants: EXACT_SERVICE_COVERAGE, EXACT_ARTIFACT_COVERAGE, ONE_SOURCE_SHA, DIGEST_PINNED, ATOMIC_OR_NOTHING.
  * Side-effects: none
- * Links: story.5016, task.5065, docs/spec/node-ci-cd-contract.md
+ * Links: story.5016, task.5065, https://node-template.cognidao.org/knowledge/node-ci-sovereignty
  * @public
  */
 
@@ -229,7 +229,7 @@ export function buildNodeArtifactBundle(input: {
  * Exact service+artifact equality is checked before any workload assembly.
  */
 export function resolveNodeArtifactBundle(
-  spec: RepoSpec,
+  spec: Pick<RepoSpec, "node_id" | "deployment">,
   input: unknown,
   expected: ExpectedNodeArtifactBundleIdentity
 ): ResolvedNodeArtifactBundle {
@@ -315,9 +315,8 @@ export function resolveNodeArtifactBundle(
 
 /**
  * Resolve a bundle for ONE deployment environment, honoring the per-service `envs` gate
- * (story.5043) as a COMPLETE cascade so the rendered per-env manifest always satisfies the
- * XComputeWorkload XRD's two cross-reference invariants
- * (infra/crossplane/xcomputeworkload/xrd.yaml):
+ * (story.5043) as a COMPLETE cascade so the per-env bundle always satisfies the two
+ * cross-reference invariants (first stated by the retired XComputeWorkload XRD, task.5411):
  *
  *   - "every bundle artifact must be used by at least one service"
  *   - "every binding must target a different declared sibling service"

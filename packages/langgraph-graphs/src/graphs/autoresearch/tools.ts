@@ -9,7 +9,7 @@
  *   - SINGLE_SOURCE_OF_TRUTH: This is THE list of tools autoresearch variants can use
  *   - CAPABILITY_NOT_POLICY: These are capabilities, not authorization
  * Side-effects: none
- * Links: docs/spec/tool-use.md, docs/spec/knowledge-syntropy.md
+ * Links: https://node-template.cognidao.org/knowledge/tool-use-contract, https://node-template.cognidao.org/knowledge/knowledge-recall-path
  * @public
  */
 
@@ -18,6 +18,7 @@ import {
   EDO_HYPOTHESIZE_NAME,
   EDO_RECORD_OUTCOME_NAME,
   GET_CURRENT_TIME_NAME,
+  KNOWLEDGE_INDEX_NAME,
   KNOWLEDGE_READ_NAME,
   KNOWLEDGE_SEARCH_NAME,
   KNOWLEDGE_WRITE_NAME,
@@ -29,6 +30,7 @@ import {
 
 export const AUTORESEARCH_TOOL_IDS = [
   GET_CURRENT_TIME_NAME,
+  KNOWLEDGE_INDEX_NAME,
   KNOWLEDGE_SEARCH_NAME,
   KNOWLEDGE_READ_NAME,
   KNOWLEDGE_WRITE_NAME,

@@ -49,15 +49,16 @@ variable "ssh_private_key" {
   sensitive   = true
 }
 
-# GHCR registry auth for k3s to pull private images
+# GitHub credential for the cloud-init repo clone only (Argo CD bootstrap).
+# Not a registry credential: GHCR images are public (bug.5563).
 variable "ghcr_deploy_username" {
-  description = "GitHub username for GHCR registry auth (k3s)"
+  description = "GitHub username for the cloud-init repo clone"
   type        = string
   default     = "Cogni-1729"
 }
 
 variable "ghcr_deploy_token" {
-  description = "GitHub PAT for GHCR registry auth (k3s)"
+  description = "GitHub PAT for the cloud-init repo clone only"
   type        = string
   sensitive   = true
 }
@@ -84,7 +85,7 @@ variable "sops_age_private_key" {
   sensitive   = true
 }
 
-# HONEST_ALLOCATABLE (docs/research/2026-06-10-node-app-scaling-architecture.md,
+# HONEST_ALLOCATABLE (https://cognidao.org/knowledge/node-app-scaling-path,
 # Step 1): co-resident VMs run k3s + the ~2.8GB Compose stack on one box; k3s
 # can't see Compose's RAM, so it over-commits node-app pods → OOM. system-reserved
 # subtracts the Compose+OS footprint from allocatable so the scheduler stops

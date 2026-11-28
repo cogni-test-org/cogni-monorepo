@@ -14,8 +14,8 @@ Full-stack HTTP API integration tests requiring running Docker Compose infrastru
 ## Pointers
 
 - [Root AGENTS.md](../../../../AGENTS.md)
-- [Architecture](../../../../docs/spec/architecture.md)
-- [Testing Documentation](../../../../docs/guides/testing.md)
+- [Architecture](https://node-template.cognidao.org/knowledge/hexagonal-layering-contract)
+- [Testing Documentation](https://node-template.cognidao.org/knowledge/node-test-contract)
 
 ## Boundaries
 

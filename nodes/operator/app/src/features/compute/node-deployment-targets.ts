@@ -2,6 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Cogni-DAO
 
 import {
+  isNodeOnDeployVerb,
+  nodeOnDeployVerbMessage,
+} from "./node-compute-api";
+import {
   type DeploymentEnvironment,
   resolveNodeDeploymentProvider,
 } from "./node-deployment-provider";
@@ -13,8 +17,35 @@ export interface DeploymentTargetSelection {
   readonly providers: Readonly<Record<string, "akash" | "k3s">>;
   readonly k3s: readonly string[];
   readonly k3sNodes: readonly string[];
+  /**
+   * Every selected node target's canonical GitHub `owner/name` (bug.5510). A
+   * remote-source node carries its catalog `source_repo`; an in-repo node
+   * (no `source_repo`, e.g. operator) is built from the repository running the
+   * workflow, so it carries `parentRepository`. The deploy-branch maintenance
+   * fence compares this exact value with an audited receipt's
+   * `request.sourceRepository`; an empty value is never a valid identity.
+   */
   readonly sourceRepositories: Readonly<Record<string, string>>;
   readonly sourceShas: Readonly<Record<string, string>>;
+  /**
+   * Targets whose `compute_api.<env>` cell is `node-deploy` (story.5137, CD4 ONE_WRITER_PER_NODE_LANE).
+   * They are deployed only by POST /api/v1/deploy/workloads, so the flight/promote path EXCLUDES them
+   * from every list above — no render, no deploy-branch write, no lease or DNS. They are reported
+   * (never silently dropped) so the caller can refuse when nothing else remains.
+   */
+  readonly nodeDeploy: readonly string[];
+}
+
+export interface FlightDeploymentTargetSelection
+  extends DeploymentTargetSelection {
+  /**
+   * The flight's per-node job matrix input: every requested target EXCEPT `nodeDeploy` cells
+   * (story.5137). The candidate flight workflow feeds this, not the raw request, to its
+   * reconcile-appset, flight and image matrices, so a verb-owned node never reaches a job that
+   * needs a placement provider. Promote has no equivalent: its matrices already consume the
+   * filtered `deployment` list.
+   */
+  readonly flight: readonly string[];
 }
 
 export interface PromoteDeploymentTargetSelection
@@ -55,13 +86,48 @@ export function candidateDeploymentFingerprint(
     candidateBranch: catalogScalar(row.candidate_a_branch),
     deploymentProvider: candidateCatalogCell(row, "deployment_provider"),
     computeApi: candidateCatalogCell(row, "compute_api"),
-    leaseGeneration: candidateCatalogCell(row, "lease_generation"),
     requiredPlacementCountries: candidateCatalogCell(
       row,
       "required_placement_countries"
     ),
-    bootRecovery: candidateCatalogCell(row, "boot_recovery"),
   });
+}
+
+export type NodeDeployExclusionDecision =
+  | { readonly kind: "none" }
+  | { readonly kind: "refuse"; readonly message: string }
+  | { readonly kind: "warn"; readonly message: string };
+
+/**
+ * CD4 / ONE_WRITER_PER_NODE_LANE (story.5137). The planners above EXCLUDE `node-deploy` cells;
+ * this decides what the caller does about it. A request that names a node-deploy cell and has
+ * nothing else left to deploy is a REFUSAL (`node_on_deploy_verb`), never a green no-op; a mixed
+ * or fleet-wide request proceeds for the rest and WARNS which cells were skipped.
+ */
+export function decideNodeDeployExclusion(input: {
+  readonly lane: "flight" | "promote";
+  readonly environment: DeploymentEnvironment;
+  readonly requestedTargets: readonly string[];
+  readonly nodeDeploy: readonly string[];
+  /** Requested targets that still deploy (or, for promote, are explicit infra no-ops). */
+  readonly remainingTargets: readonly string[];
+}): NodeDeployExclusionDecision {
+  if (input.nodeDeploy.length === 0) return { kind: "none" };
+  const named = input.requestedTargets.filter((target) =>
+    input.nodeDeploy.includes(target)
+  );
+  if (named.length > 0 && input.remainingTargets.length === 0) {
+    return {
+      kind: "refuse",
+      message: `${input.lane} refused: ${named
+        .map((target) => nodeOnDeployVerbMessage(target, input.environment))
+        .join(" | ")}`,
+    };
+  }
+  return {
+    kind: "warn",
+    message: `node_on_deploy_verb: ${input.lane} skips ${input.nodeDeploy.join(", ")} in ${input.environment} (compute_api=node-deploy; deployed only by POST /api/v1/deploy/workloads)`,
+  };
 }
 
 export function isInfraOnlyPromoteNoop(input: {
@@ -80,7 +146,20 @@ export function resolveDeploymentTargets(input: {
   readonly catalogRows: readonly Readonly<Record<string, unknown>>[];
   readonly environment: DeploymentEnvironment;
   readonly flightTargets: readonly string[];
-}): DeploymentTargetSelection {
+  /** GitHub `owner/name` running this workflow; the source of in-repo nodes. */
+  readonly parentRepository: string;
+  /** Exact reviewed parent checkout; never a substitute for a child catalog pin. */
+  readonly parentSourceSha?: string;
+}): FlightDeploymentTargetSelection {
+  const parentRepository = parseParentRepository(input.parentRepository);
+  if (
+    input.parentSourceSha !== undefined &&
+    !/^[a-fA-F0-9]{40}$/.test(input.parentSourceSha)
+  ) {
+    throw new Error(
+      "[deployment-targets] parentSourceSha must be a full commit SHA"
+    );
+  }
   const byName = new Map(
     input.catalogRows.map((row) => [row.name, row] as const)
   );
@@ -90,6 +169,8 @@ export function resolveDeploymentTargets(input: {
   const offCluster: string[] = [];
   const k3s: string[] = [];
   const k3sNodes: string[] = [];
+  const nodeDeploy: string[] = [];
+  const flight: string[] = [];
   const sourceRepositories: Record<string, string> = {};
   const sourceShas: Record<string, string> = {};
 
@@ -102,6 +183,14 @@ export function resolveDeploymentTargets(input: {
         `[deployment-targets] Flight target ${target} is not configured for ${input.environment}`
       );
     }
+    if (
+      row.type === "node" &&
+      isNodeOnDeployVerb({ catalog: row, environment: input.environment })
+    ) {
+      nodeDeploy.push(target);
+      continue;
+    }
+    flight.push(target);
     const provider = resolveNodeDeploymentProvider({
       catalog: row,
       environment: input.environment,
@@ -117,6 +206,18 @@ export function resolveDeploymentTargets(input: {
       sourceShas[target] = parseSourceSha(row, target);
     } else {
       k3sNodes.push(target);
+      sourceRepositories[target] = resolveNodeSourceRepository(
+        row,
+        target,
+        parentRepository
+      );
+      if (
+        row.source_repo === undefined &&
+        sourceRepositories[target] === parentRepository &&
+        input.parentSourceSha !== undefined
+      ) {
+        sourceShas[target] = input.parentSourceSha;
+      }
     }
   }
 
@@ -129,6 +230,8 @@ export function resolveDeploymentTargets(input: {
     k3sNodes,
     sourceRepositories,
     sourceShas,
+    nodeDeploy,
+    flight,
   };
 }
 
@@ -144,7 +247,10 @@ export function resolvePromoteDeploymentTargets(input: {
   readonly legacyK3sTargets: readonly string[];
   /** Run-wide preview-forward mode, decided by the caller. Off ⇒ the map is all false. */
   readonly previewForwardMode?: boolean;
+  /** GitHub `owner/name` running this workflow; the source of in-repo nodes. */
+  readonly parentRepository: string;
 }): PromoteDeploymentTargetSelection {
+  const parentRepository = parseParentRepository(input.parentRepository);
   const byName = new Map(
     input.catalogRows.map((row) => [row.name, row] as const)
   );
@@ -161,6 +267,7 @@ export function resolvePromoteDeploymentTargets(input: {
           typeof row.name === "string" ? [row.name] : []
         );
   const offCluster: string[] = [];
+  const nodeDeploy: string[] = [];
   const infra = input.requestedTargets.filter(
     (target) => byName.get(target)?.type === "infra"
   );
@@ -170,6 +277,12 @@ export function resolvePromoteDeploymentTargets(input: {
     const row = byName.get(target);
     if (!row || row.type !== "node" || !isInEnvironment(row, input.environment))
       continue;
+    // ONE_WRITER_PER_NODE_LANE (story.5137): a `node-deploy` cell is written only by the deploy
+    // verb. Exclude it from every list so no render / deploy-branch write / lease / DNS happens.
+    if (isNodeOnDeployVerb({ catalog: row, environment: input.environment })) {
+      nodeDeploy.push(target);
+      continue;
+    }
     // REMOTE_SOURCE_IS_NOT_PLACEMENT (bug: node-template prod promote,
     // story.5016) — a node whose image is built by its own repo (source_repo
     // set) needs its reviewed catalog source_sha resolved for image-tag/digest
@@ -192,6 +305,13 @@ export function resolvePromoteDeploymentTargets(input: {
     if (isOffCluster || isRemoteSource) {
       sourceRepositories[target] = parseSourceRepository(row, target);
       sourceShas[target] = parseSourceSha(row, target);
+    } else {
+      // In-repo node: its image and deploy source are this parent repository.
+      sourceRepositories[target] = resolveNodeSourceRepository(
+        row,
+        target,
+        parentRepository
+      );
     }
   }
 
@@ -199,6 +319,10 @@ export function resolvePromoteDeploymentTargets(input: {
     const row = byName.get(target);
     if (!row) {
       throw new Error(`[deployment-targets] Unknown legacy target: ${target}`);
+    }
+    if (isNodeOnDeployVerb({ catalog: row, environment: input.environment })) {
+      if (!nodeDeploy.includes(target)) nodeDeploy.push(target);
+      return false;
     }
     return (
       resolveNodeDeploymentProvider({
@@ -244,6 +368,7 @@ export function resolvePromoteDeploymentTargets(input: {
     sourceShas,
     previewForward,
     infra,
+    nodeDeploy,
   };
 }
 
@@ -291,22 +416,70 @@ function catalogScalar(value: unknown): string | number | boolean | null {
     : null;
 }
 
+/** One GitHub owner or repository name segment (shared by both repository forms). */
+const GITHUB_NAME = "[A-Za-z0-9_.-]+";
+const GITHUB_REPOSITORY = new RegExp(`^(${GITHUB_NAME})/(${GITHUB_NAME})$`);
+const GITHUB_REPOSITORY_URL = new RegExp(
+  `^https://github\\.com/(${GITHUB_NAME})/(${GITHUB_NAME}?)(?:\\.git)?$`
+);
+
+/**
+ * Canonical lowercase `owner/name`, or undefined for a `.`/`..` segment (path
+ * traversal, never a repository). Lowercase is the identity the maintenance fence
+ * compares byte-for-byte with an audited receipt's `request.sourceRepository`, so
+ * receipt writers must record the same canonical lowercase form.
+ */
+function canonicalRepository(
+  match: RegExpMatchArray | null
+): string | undefined {
+  const owner = match?.[1];
+  const name = match?.[2];
+  if (!owner || !name) return undefined;
+  if ([owner, name].some((segment) => /^\.\.?$/.test(segment)))
+    return undefined;
+  return `${owner}/${name}`.toLowerCase();
+}
+
+/** Fails closed on an empty, malformed or traversal parent repository. */
+function parseParentRepository(value: string): string {
+  const repository =
+    typeof value === "string"
+      ? canonicalRepository(value.match(GITHUB_REPOSITORY))
+      : undefined;
+  if (!repository) {
+    throw new Error(
+      "[deployment-targets] parentRepository must be a GitHub owner/name"
+    );
+  }
+  return repository;
+}
+
+function resolveNodeSourceRepository(
+  row: Readonly<Record<string, unknown>>,
+  target: string,
+  parentRepository: string
+): string {
+  return row.source_repo === undefined
+    ? parentRepository
+    : parseSourceRepository(row, target);
+}
+
 function parseSourceRepository(
   row: Readonly<Record<string, unknown>>,
   target: string
 ): string {
   if (typeof row.source_repo !== "string") {
     throw new Error(
-      `[deployment-targets] Off-cluster target ${target} requires source_repo`
+      `[deployment-targets] Target ${target} requires source_repo`
     );
   }
-  const match = row.source_repo.match(
-    /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/
+  const repository = canonicalRepository(
+    row.source_repo.match(GITHUB_REPOSITORY_URL)
   );
-  if (!match) {
+  if (!repository) {
     throw new Error(
-      `[deployment-targets] Off-cluster target ${target} has invalid source_repo`
+      `[deployment-targets] Target ${target} has invalid source_repo`
     );
   }
-  return `${match[1]}/${match[2]}`.toLowerCase();
+  return repository;
 }

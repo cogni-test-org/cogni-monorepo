@@ -13,8 +13,8 @@
 
 ## Pointers
 
-- [LangGraph Server Spec](../../docs/spec/langgraph-server.md)
-- [Graph Execution](../../docs/spec/graph-execution.md)
+- [LangGraph Server Spec](https://node-template.cognidao.org/knowledge/langgraph-server-adapter)
+- [Graph Execution](https://node-template.cognidao.org/knowledge/graph-execution-invariants)
 
 ## Boundaries
 
@@ -66,6 +66,7 @@
   - `GraphId` - Namespaced graph identifier type (format: `${providerId}:${graphName}`)
   - `GraphRunConfig` - Per-run config passed via RunnableConfig.configurable (model, toolIds, etc.)
   - `ToolExecFn`, `ToolExecResult` - Tool execution function signature and result types
+  - `ToolFailureReceipt` — bounded domain-owned nonretryable lookup metadata preserved to model JSON
 - **Files considered API:** `index.ts`, `events/*.ts`, `usage/*.ts`, `context/*.ts`, `billing/*.ts`, `tooling/*.ts`, `tooling/ports/*.ts`, `tooling/sources/*.ts`, `execution/*.ts`, `graph/*.ts`
 
 ## Ports

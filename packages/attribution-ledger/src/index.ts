@@ -7,7 +7,7 @@
  * Scope: Re-exports model types, payout computation, hashing, store port, and errors. Does not contain I/O or infrastructure code.
  * Invariants: No imports from src/ or services/. Pure domain logic only.
  * Side-effects: none
- * Links: docs/spec/attribution-ledger.md
+ * Links: https://node-template.cognidao.org/knowledge/attribution-epoch-ledger
  * @public
  */
 
@@ -136,6 +136,7 @@ export type {
   DistributionLeafRecord,
   DistributionManifestRecord,
   DistributionManifestStore,
+  EpochPageReader,
   EpochReader,
   EpochUserProjection,
   EpochWriter,
@@ -158,6 +159,7 @@ export type {
   PoolComponentInsertResult,
   PoolStore,
   ProjectionStore,
+  ReadPage,
   ReceiptClaimantsRecord,
   ReceiptStore,
   ReviewSubjectOverrideRecord,

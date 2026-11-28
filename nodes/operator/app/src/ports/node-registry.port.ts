@@ -13,12 +13,12 @@
  *     `agent-scope`); a `full-app` href is a subdomain, an `agent-scope` href is a scope-route.
  *     Graduation between kinds is invisible to consumers.
  * Side-effects: none (interface only)
- * Links: work/projects/proj.agent-registry.md (Node Registry Track), docs/spec/node-operator-contract.md
+ * Links: https://github.com/cogni-dao/cogni/blob/2321821e61dd12aa0cf75d235bd668ff65739109/work/projects/proj.agent-registry.md (Node Registry Track), https://node-template.cognidao.org/knowledge/node-sovereignty-contract
  * @public
  */
 
 /**
- * Node topology surfaced as a read-model discriminator (node-operator-contract.md):
+ * Node topology surfaced as a read-model discriminator (https://node-template.cognidao.org/knowledge/node-sovereignty-contract):
  * - `full-app`: own node_id + DB + deploy; homepage is a subdomain.
  * - `agent-scope`: an agent bundle + Dolt + DAO running as a scope inside a host node; homepage is a
  *   route within the host node's app. Graduates to `full-app` only on data/deploy/fork sovereignty.

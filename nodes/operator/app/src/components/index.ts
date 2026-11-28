@@ -12,6 +12,12 @@
  * @public
  */
 
+export {
+  DataGrid,
+  DataGridContainer,
+} from "@cogni/node-ui-kit/reui/data-grid/data-grid";
+export { DataGridColumnHeader } from "@cogni/node-ui-kit/reui/data-grid/data-grid-column-header";
+export { DataGridTable } from "@cogni/node-ui-kit/reui/data-grid/data-grid-table";
 export { Checkbox } from "@cogni/node-ui-kit/shadcn/checkbox";
 export {
   Dialog,
@@ -61,10 +67,8 @@ export {
   SidebarInset,
   SidebarMenu,
   SidebarMenuAction,
-  SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSub,
-  SidebarMenuSubButton,
   SidebarMenuSubItem,
   SidebarProvider,
   SidebarRail,
@@ -109,7 +113,12 @@ export { Reveal } from "./kit/animation/Reveal";
 export { SignInDialog } from "./kit/auth/SignInDialog";
 export { WalletConnectButton } from "./kit/auth/WalletConnectButton";
 export * from "./kit/chat";
-export { Avatar, AvatarFallback, AvatarImage } from "./kit/data-display/Avatar";
+export {
+  Avatar,
+  AvatarFallback,
+  AvatarImage,
+  ColorAvatarFallback,
+} from "./kit/data-display/Avatar";
 export { Badge } from "./kit/data-display/Badge";
 export { ExpandableTableRow } from "./kit/data-display/ExpandableTableRow";
 export {
@@ -136,6 +145,7 @@ export {
 } from "./kit/data-display/ProviderIcons";
 export { TerminalFrame } from "./kit/data-display/TerminalFrame";
 export { Alert, AlertDescription, AlertTitle } from "./kit/feedback/Alert";
+export { BrainLoading } from "./kit/feedback/BrainLoading";
 export {
   ErrorAlert,
   type ErrorAlertProps,
@@ -163,8 +173,13 @@ export { Container } from "./kit/layout/Container";
 export { PageContainer } from "./kit/layout/PageContainer";
 export { PageSkeleton } from "./kit/layout/PageSkeleton";
 export { SectionCard } from "./kit/layout/SectionCard";
+export { TopBar } from "./kit/layout/TopBar";
 export { MobileNav } from "./kit/navigation/MobileNav";
 export { NavigationLink } from "./kit/navigation/NavigationLink";
+export {
+  SidebarMenuButton,
+  SidebarMenuSubButton,
+} from "./kit/navigation/SidebarButtons";
 export { UsdcPaymentFlow } from "./kit/payments/UsdcPaymentFlow";
 export { Hero } from "./kit/sections";
 export {
@@ -175,4 +190,5 @@ export {
 } from "./kit/typography/CodeHero";
 export { HeroActionWords } from "./kit/typography/HeroActionWords";
 export { Prompt } from "./kit/typography/Prompt";
+export { ReportText } from "./kit/typography/ReportText";
 export { Markdown } from "./markdown";

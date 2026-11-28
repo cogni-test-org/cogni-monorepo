@@ -30,8 +30,23 @@ export interface OperatorIdentityAttestationRepositoryConfig {
 export type FindNodeRow = (nodeId: string) => Promise<{
   readonly id: string;
   readonly slug: string;
+  readonly repoOwner: string;
+  readonly repoUrl: string;
   readonly deployEnvs: readonly string[];
 } | null>;
+
+function registeredOwner(owner: string, repoUrl: string): string | null {
+  const normalized = owner?.trim().toLowerCase();
+  const match =
+    /^https:\/\/github\.com\/([^/\s]+)\/[^/\s]+(?:\.git)?\/?$/i.exec(
+      repoUrl?.trim() ?? ""
+    );
+  return normalized &&
+    /^[a-z0-9][a-z0-9-]*$/.test(normalized) &&
+    match?.[1]?.toLowerCase() === normalized
+    ? normalized
+    : null;
+}
 
 /**
  * Short-TTL cache for the merged-catalog read.
@@ -97,7 +112,7 @@ export class OperatorIdentityAttestationRepository
    * at 11.0s cold against 0.22s warm on candidate-a. A human reads 11s as broken; they
    * said so.
    *
-   * The projection is safe to lead with. `identity-model.md` fixes `nodes.id` AS the
+   * The projection is safe to lead with. https://cognidao.org/knowledge/identity-keys-no-overload fixes `nodes.id` AS the
    * repo-spec `node_id` — not a surrogate — so the row is keyed by the same identity the
    * request names, and `deploy_envs` is the same list the allowlist needs.
    * `catalog-registry-reconcile` re-reads merged git on a ten-minute poll, so staleness
@@ -115,6 +130,7 @@ export class OperatorIdentityAttestationRepository
         return {
           nodeId: row.id,
           slug: row.slug,
+          repoOwner: registeredOwner(row.repoOwner, row.repoUrl),
           deployEnvs: row.deployEnvs,
         };
       }
@@ -141,6 +157,7 @@ export class OperatorIdentityAttestationRepository
     return {
       nodeId: node.nodeId,
       slug: node.slug,
+      repoOwner: registeredOwner(node.repoOwner, node.repoUrl),
       deployEnvs: node.deployEnvs,
     };
   }

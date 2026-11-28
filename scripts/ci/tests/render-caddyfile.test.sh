@@ -15,6 +15,9 @@
 #   6. The derived node DB inventory includes every catalog node.
 #   7. Infra reconcile cannot inline/overlap production backups, and Postgres
 #      crash attribution remains observable.
+#   8. task.5428 mesh VM sites: one relay site + one publish path per tailnet of
+#      the VM (both candidate-a tailnets), DNS-only ACME, a both-present check,
+#      edge-only NodePorts dropped after DOCKER-USER, no deploy-infra change.
 #
 # Run: bash scripts/ci/tests/render-caddyfile.test.sh
 set -euo pipefail
@@ -165,5 +168,243 @@ grep -Fq 'OpenBao writer SA lookup remained unavailable after 3 attempts' "$DEPL
 grep -Fq 'refusing to claim the SA is absent' "$DEPLOY_INFRA" \
   || fail "unknown OpenBao writer SA lookup failures invent absence"
 pass "backup execution is candidate-gated + serialized; OpenBao login and SA lookup retries are bounded and fail-closed"
+
+echo "[8/8] mesh edge sites: relay + publish per VM tailnet, coordinator per sequencer tailnet, DNS-only ACME, hardened (task.5428 P2)"
+# shellcheck source=scripts/ci/lib/mesh-plane.sh
+source "$REPO_ROOT/scripts/ci/lib/mesh-plane.sh"
+# shellcheck source=scripts/setup/lib/cogni-deployment-identity.sh
+source "$REPO_ROOT/scripts/setup/lib/cogni-deployment-identity.sh"
+# The renderer's own all-present check, loaded by itself (the script renders when sourced whole), so the
+# negative cases below run the real function, never a missing command.
+# shellcheck source=/dev/null
+source <(sed -n '/^assert_mesh_vm_sites() {$/,/^}$/p' "$REPO_ROOT/scripts/ci/render-caddyfile.sh")
+declare -F assert_mesh_vm_sites >/dev/null || fail "assert_mesh_vm_sites not loaded from render-caddyfile.sh"
+# deploy-infra.sh calls `--domain "$DOMAIN"` only (frozen, untouched): the env derives from the domain.
+CAND="$(bash scripts/ci/render-caddyfile.sh --domain test.cognidao.org)"
+[ "$CAND" = "$(bash scripts/ci/render-caddyfile.sh --domain test.cognidao.org --env candidate-a)" ] \
+  || fail "domain-derived env differs from explicit --env candidate-a"
+[ "$(grep -c '^  local_certs$' <<<"$CAND")" = "1" ] || fail "global local_certs must stay for every proxied host"
+vm_tailnets="$(mesh_vm_tailnets candidate-a | paste -sd' ' -)"
+[ "$vm_tailnets" = "candidate-a test-candidate-a" ] \
+  || fail "candidate-a VM must serve the canonical and the test-operator tailnets (got: $vm_tailnets)"
+block_of() { awk -v h="$1 {" '$0 == h {p=1} p {print} p && /^}$/ {exit}' <<<"$2"; }
+for tailnet in $vm_tailnets; do
+  relay="$(mesh_host "$tailnet" relay)"
+  rb="$(block_of "$relay" "$CAND")"
+  [ -n "$rb" ] || fail "relay site $relay missing"
+  grep -Fq 'issuer acme' <<<"$rb" || fail "$relay must use a public ACME issuer (DNS-only)"
+  grep -Fq '@mesh path /derp /derp/* /generate_204' <<<"$rb" || fail "$relay must route only DERP paths"
+  grep -Fq "reverse_proxy host.docker.internal:$(mesh_tailnet_field "$tailnet" relay_np)" <<<"$rb" \
+    || fail "$relay upstream is not its relay NodePort"
+  grep -Fq 'respond 404' <<<"$rb" || fail "$relay does not refuse other paths"
+done
+vm_host="$(cogni_vm_host_for_env candidate-a cognidao.org cogni)"
+pb="$(block_of "$vm_host" "$CAND")"
+[ -n "$pb" ] || fail "VM alias publish site $vm_host missing"
+grep -Fq 'issuer acme' <<<"$pb" || fail "VM alias site must use a public ACME issuer (DNS-only)"
+for tailnet in $vm_tailnets; do
+  grep -Fq "handle /.well-known/cogni-mesh/${tailnet}/substrate-gw.json {" <<<"$pb" \
+    || fail "publish path for $tailnet missing"
+  grep -Fq "reverse_proxy host.docker.internal:$(mesh_tailnet_field "$tailnet" publish_np)" <<<"$pb" \
+    || fail "publish upstream for $tailnet is not its publisher NodePort"
+done
+[ "$(grep -c 'handle /.well-known/cogni-mesh/' <<<"$pb")" = "2" ] || fail "VM alias must carry exactly the two publish paths"
+# The one-writer check really fails when a tailnet's route is missing.
+assert_mesh_vm_sites candidate-a "$CAND" || fail "the full candidate-a render must pass the all-present check"
+if assert_mesh_vm_sites candidate-a "$(grep -v '^derp-test-candidate-a.cogni-testing.org {$' <<<"$CAND")" 2>/dev/null; then
+  fail "a missing relay site must fail the render"
+fi
+if assert_mesh_vm_sites candidate-a "$(grep -v 'cogni-mesh/candidate-a/' <<<"$CAND")" 2>/dev/null; then
+  fail "a missing publish path must fail the render"
+fi
+if assert_mesh_vm_sites candidate-a "$(grep -v '^mesh-test-candidate-a.cogni-testing.org {$' <<<"$CAND")" 2>/dev/null; then
+  fail "a missing coordinator site must fail the render"
+fi
+grep -A3 'cogni-mesh/candidate-a/substrate-gw.json {' <<<"$CAND" | grep -Fq 'respond @write-candidate-a 405' \
+  || fail "the publish path must accept only GET and HEAD"
+# Coordinator sites: each env's edge fronts exactly its sequencer's tailnets, client paths only.
+PROD="$(bash scripts/ci/render-caddyfile.sh --domain cognidao.org)"
+for env in production candidate-a; do
+  rendered="$PROD"; [ "$env" = candidate-a ] && rendered="$CAND"
+  for tailnet in $(mesh_coordinator_tailnets "$env"); do
+    host="$(mesh_host "$tailnet" control)"
+    cb="$(block_of "$host" "$rendered")"
+    [ -n "$cb" ] || fail "$env edge has no coordinator site for $host"
+    grep -Fq 'issuer acme' <<<"$cb" || fail "$host must use a public ACME issuer (DNS-only)"
+    grep -Fq '@mesh path /ts2021 /key /machine/* /verify' <<<"$cb" || fail "$host must route only client paths"
+    grep -Fq "reverse_proxy host.docker.internal:$(mesh_tailnet_field "$tailnet" coordinator_np)" <<<"$cb" \
+      || fail "$host upstream is not its coordinator NodePort"
+    grep -Eq '/api|/register|/swagger|/health' <<<"$cb" && fail "$host exposes a Headscale admin or health path"
+    grep -Fq 'respond 404' <<<"$cb" || fail "$host does not refuse other paths"
+  done
+done
+[ "$(mesh_coordinator_tailnets production | paste -sd' ' -)" = "candidate-a preview production" ] \
+  || fail "production's sequencer must front the canonical tailnets"
+[ "$(mesh_coordinator_tailnets candidate-a | paste -sd' ' -)" = "test-candidate-a" ] \
+  || fail "the candidate-a test operator must front only its own tailnet"
+[ "$(mesh_host test-candidate-a control)" = "mesh-test-candidate-a.cogni-testing.org" ] \
+  || fail "the test coordinator host must be in the test-fleet zone"
+grep -Fq 'mesh-candidate-a.cognidao.org {' <<<"$CAND" && fail "candidate-a edge must not front the canonical candidate-a coordinator"
+# T1p: the production VM serves the canonical production tailnet's relay + publisher. The edge site and the
+# hardener drop land BEFORE the instance that opens the NodePorts (CD6: the drop precedes the ports).
+[ "$(mesh_vm_tailnets production | paste -sd' ' -)" = "production" ] \
+  || fail "the production VM must serve exactly the production tailnet"
+pd="$(block_of derp-production.cognidao.org "$PROD")"
+grep -Fq "reverse_proxy host.docker.internal:$(mesh_tailnet_field production relay_np)" <<<"$pd" \
+  || fail "derp-production must proxy to the production derper NodePort"
+grep -Fq 'handle /.well-known/cogni-mesh/production/substrate-gw.json {' <<<"$(block_of cogni.vm.cognidao.org "$PROD")" \
+  || fail "the production VM alias must carry the production publish path"
+assert_mesh_vm_sites production "$PROD" || fail "production render must carry every production mesh route"
+# Every relay site and publish path on the production edge is the production tailnet's own: no other tailnet's.
+[ "$(grep -E '^derp-' <<<"$PROD" | grep -vxF 'derp-production.cognidao.org {' || true)" = "" ] \
+  || fail "production must render no relay site other than derp-production"
+[ "$(grep -oE 'cogni-mesh/[a-z0-9-]+/' <<<"$PROD" | sort -u | grep -vxF 'cogni-mesh/production/' || true)" = "" ] \
+  || fail "production must render no publish path other than the production tailnet's"
+# T1p: the preview VM serves the canonical preview tailnet's relay + publisher (its coordinator runs in the
+# production sequencer, so the preview edge fronts no control host). Edge site + hardener drop land BEFORE the
+# instance that opens the NodePorts (CD6).
+PREV="$(bash scripts/ci/render-caddyfile.sh --domain preview.cognidao.org)"
+[ "$(mesh_vm_tailnets preview | paste -sd' ' -)" = "preview" ] \
+  || fail "the preview VM must serve exactly the preview tailnet"
+vd="$(block_of derp-preview.cognidao.org "$PREV")"
+grep -Fq "reverse_proxy host.docker.internal:$(mesh_tailnet_field preview relay_np)" <<<"$vd" \
+  || fail "derp-preview must proxy to the preview derper NodePort"
+grep -Fq 'handle /.well-known/cogni-mesh/preview/substrate-gw.json {' <<<"$(block_of cogni-preview.vm.cognidao.org "$PREV")" \
+  || fail "the preview VM alias must carry the preview publish path"
+assert_mesh_vm_sites preview "$PREV" || fail "preview render must carry every preview mesh route"
+[ "$(grep -E '^derp-' <<<"$PREV" | grep -vxF 'derp-preview.cognidao.org {' || true)" = "" ] \
+  || fail "preview must render no relay site other than derp-preview"
+[ "$(grep -oE 'cogni-mesh/[a-z0-9-]+/' <<<"$PREV" | sort -u | grep -vxF 'cogni-mesh/preview/' || true)" = "" ] \
+  || fail "preview must render no publish path other than the preview tailnet's"
+grep -Eq '^mesh-' <<<"$PREV" && fail "preview edge must front no coordinator (preview's runs in production)"
+grep -Fq 'issuer acme' <<<"$RENDERED" && fail "template render must not carry env-specific mesh sites"
+# Hardener drops exactly the table's edge-only NodePorts, before NAT, only after DOCKER-USER is complete.
+HARDEN="infra/provision/cherry/harden-docker-public-ports.sh"
+edge_only="$(sed -n 's/^MESH_EDGE_ONLY_PORTS="\(.*\)"$/\1/p' "$HARDEN")"
+expanded=""
+IFS=, read -r -a parts <<<"$edge_only"
+for part in "${parts[@]}"; do
+  if [[ "$part" == *:* ]]; then
+    for ((p = ${part%:*}; p <= ${part#*:}; p++)); do expanded+="${expanded:+,}$p"; done
+  else
+    expanded+="${expanded:+,}$part"
+  fi
+done
+[ "$expanded" = "$(mesh_edge_only_nodeports_csv)" ] \
+  || fail "$HARDEN MESH_EDGE_ONLY_PORTS ($edge_only) != mesh-plane.sh edge-only NodePorts ($(mesh_edge_only_nodeports_csv))"
+raw_line="$(grep -n -- '-t raw -A PREROUTING -i "$PUBLIC_IFACE" -p tcp -m multiport --dports "$MESH_EDGE_ONLY_PORTS"' "$HARDEN" | cut -d: -f1)"
+drop_line="$(grep -n -- '--comment "$TAG:drop-public" -j DROP' "$HARDEN" | cut -d: -f1)"
+[ -n "$raw_line" ] || fail "edge-only ports are not dropped before NAT"
+[ "$raw_line" -gt "$drop_line" ] || fail "raw-table block must run after DOCKER-USER's public DROP (fail closed)"
+grep -Fq 'MESH_UDP' "$HARDEN" && fail "no-op UDP ACCEPT rules must not return"
+# Table invariants: unique ports and regions; NodePorts off the catalog 100-stride.
+# Canonical tailnets in the production zone; the test operator's in the isolated test-fleet zone.
+[ "$(mesh_host candidate-a relay)" = "derp-candidate-a.cognidao.org" ] || fail "canonical relay host must be in cognidao.org"
+[ "$(mesh_host test-candidate-a relay)" = "derp-test-candidate-a.cogni-testing.org" ] \
+  || fail "test-operator relay host must be in the test-fleet zone cogni-testing.org"
+[ "$(mesh_host test-candidate-a control)" = "mesh-test-candidate-a.cogni-testing.org" ] \
+  || fail "test-operator control host must be in the test-fleet zone cogni-testing.org"
+# Relay-only with STUN off (P4): the mesh plane opens no public UDP port. The table has no STUN column,
+# and substrate-gw's WireGuard port is pod-local (TS_PORT), so it may repeat across VMs.
+mesh_tailnet_field candidate-a stun_port >/dev/null 2>&1 && fail "the tailnet table must carry no STUN port (STUN off)"
+for col in coordinator_np relay_np publish_np derp_region; do
+  vals="$(for t in $(mesh_tailnets); do mesh_tailnet_field "$t" "$col"; done | grep -v '^$')"
+  [ "$(sort <<<"$vals" | uniq -d)" = "" ] || fail "duplicate $col in the mesh tailnet table"
+done
+for p in $(mesh_edge_only_nodeports_csv | tr , ' '); do
+  [ $((p % 100)) -ne 0 ] || fail "edge-only NodePort $p sits on the catalog node_port stride"
+done
+# The frozen deploy brain is untouched by the mesh plane.
+grep -Eq 'MESH_|mesh-plane' "$DEPLOY_INFRA" && fail "deploy-infra.sh must carry no mesh-plane logic"
+pass "relay + publish routes for both candidate-a tailnets, coordinator sites per sequencer, one writer with an all-present check, hardened, deploy brain untouched"
+
+echo "[9/9] edge catch-all (story.5148): static snippet embedded verbatim, imported by every site, canary on app sites only"
+CATCH_ALL="infra/compose/edge/configs/catch-all.caddy"
+for rendered in "$RENDERED" "$CAND" "$PROD"; do
+  grep -Fq "$(cat "$CATCH_ALL")" <<<"$rendered" || fail "rendered Caddyfile does not embed $CATCH_ALL verbatim"
+done
+grep -Fq 'handle_errors 502 503 504 {' "$CATCH_ALL" || fail "catch-all must filter handle_errors to 502 503 504"
+grep -Fq 'header X-Cogni-Edge caught' "$CATCH_ALL" || fail "catch-all must set X-Cogni-Edge: caught"
+grep -Fq 'header X-Cogni-Edge-Cause {err.status_code}' "$CATCH_ALL" || fail "catch-all must set X-Cogni-Edge-Cause"
+grep -Fq 'header Retry-After 30' "$CATCH_ALL" || fail "catch-all must set Retry-After"
+grep -Fq 'header Cache-Control no-store' "$CATCH_ALL" || fail "catch-all must set Cache-Control: no-store"
+grep -Fq 'HTML 503' "$CATCH_ALL" || fail "the branded page must answer 503"
+grep -Fq 'origin_unavailable' "$CATCH_ALL" || fail "the JSON branch is missing"
+# Every caught response is 503 (Cloudflare replaces origin 502/504 pages, not 503).
+if grep -Eq '^[[:space:]]*(respond .*|HTML) (502|504)$' "$CATCH_ALL"; then
+  fail "every caught response must be status 503"
+fi
+if grep -Fq 'file_server' "$CATCH_ALL"; then fail "the branded page must be inline respond, not file_server"; fi
+grep -Fq 'reverse_proxy 127.0.0.1:9' "$CATCH_ALL" || fail "canary must proxy to a closed local port"
+grep -Fqx '  handle /-/edge-probe {' "$CATCH_ALL" || fail "canary path must be /-/edge-probe (reserved /-/ system-route convention)"
+if grep -Fq '__edge' "$CATCH_ALL" || grep -Fq '__edge' <<<"$RENDERED"; then fail "the retired /__edge/caught path must not return"; fi
+if grep -Fiq 'http-equiv="refresh"' "$CATCH_ALL"; then fail "the error page must not auto-retry (meta refresh)"; fi
+# The page's only placeholder is the request uuid; any other brace in the heredoc would be read as a placeholder.
+page_text="$(sed -n '/respond <<HTML/,/HTML 503/p' "$CATCH_ALL")"
+page_open="$(printf '%s' "$page_text" | tr -cd '{' | wc -c | tr -d ' ')"
+page_close="$(printf '%s' "$page_text" | tr -cd '}' | wc -c | tr -d ' ')"
+[ "$page_open" = "1" ] && [ "$page_close" = "1" ] \
+  || fail "the error page must hold exactly one placeholder brace pair (got $page_open open, $page_close close)"
+grep -Fq 'Ref {http.request.uuid}' "$CATCH_ALL" || fail "the error page must show the request uuid"
+if grep -Fq 'catch-all' infra/compose/edge/docker-compose.yml; then
+  fail "the snippet is embedded in the rendered Caddyfile; no compose mount"
+fi
+# Every site block except the www redirect imports the snippet; only application sites carry the canary.
+for rendered in "$CAND" "$PROD"; do
+  hosts="$(awk '/^[^ #}(][^ ]* \{$/ {sub(/ \{$/, ""); print}' <<<"$rendered" | grep -v '^www\.' || true)"
+  [ -n "$hosts" ] || fail "no site blocks found"
+  # All four emitters are covered: application sites, relay (derp-*), publish (VM alias), control (mesh-*).
+  grep -q '^derp-' <<<"$hosts" || fail "relay emitter rendered no site"
+  grep -q '\.vm\.cognidao\.org$' <<<"$hosts" || fail "publish emitter rendered no site"
+  grep -q '^mesh-' <<<"$hosts" || fail "control emitter rendered no site"
+  while read -r host; do
+    b="$(block_of "$host" "$rendered")"
+    grep -Fqx '  import cogni_catch_all' <<<"$b" || fail "$host does not import cogni_catch_all"
+    case "$host" in
+      derp-* | mesh-* | *.vm.cognidao.org)
+        if grep -Fq 'cogni_edge_canary' <<<"$b"; then fail "$host (mesh site) must not expose the canary"; fi ;;
+      *)
+        grep -Fqx '  import cogni_edge_canary' <<<"$b" || fail "application site $host lacks the canary"
+        grep -Fq 'response_header_timeout 90s' <<<"$b" || fail "$host default proxy needs response_header_timeout 90s (under Cloudflare's 100s)"
+        grep -Fq 'response_header_timeout 10s' <<<"$b" || fail "$host lost the 10s timeout on /api/v1/public/*" ;;
+    esac
+  done <<<"$hosts"
+done
+pass "catch-all embedded once, imported by all site blocks, canary only on application sites, 90s proxy timeout"
+
+echo "[10/10] the real Caddy parser accepts the template and both materialized renders (story.5148)"
+# Prefer a local `caddy` binary. Otherwise use the same image the edge runs (infra/compose/edge/docker-compose.yml:
+# `caddy:2`) when docker exists AND this is CI (GitHub runners set CI=true). Never docker on a laptop: skip loudly.
+EDGE_CADDY_IMAGE="$(sed -n 's/^[[:space:]]*image: \(caddy:[^[:space:]]*\)$/\1/p' infra/compose/edge/docker-compose.yml)"
+[ -n "$EDGE_CADDY_IMAGE" ] || fail "could not read the edge caddy image from infra/compose/edge/docker-compose.yml"
+VALIDATE_DIR="$(mktemp -d -t caddy-validate.XXXXXX)"
+trap 'rm -rf "$VALIDATE_DIR"' EXIT
+chmod 755 "$VALIDATE_DIR"
+printf '%s\n' "$RENDERED" > "$VALIDATE_DIR/template.caddyfile"
+printf '%s\n' "$CAND" > "$VALIDATE_DIR/candidate-a.caddyfile"
+printf '%s\n' "$PROD" > "$VALIDATE_DIR/production.caddyfile"
+chmod 644 "$VALIDATE_DIR"/*.caddyfile
+caddy_runner=""
+if command -v caddy >/dev/null 2>&1; then
+  caddy_runner="binary"
+elif [ "${CI:-}" = "true" ] && command -v docker >/dev/null 2>&1; then
+  caddy_runner="docker"
+fi
+case "$caddy_runner" in
+  "") echo "  skip — no caddy binary, and no docker with CI=true; the real-parser check runs on GitHub runners" ;;
+  *)
+    for f in template candidate-a production; do
+      if [ "$caddy_runner" = "binary" ]; then
+        out="$(DOMAIN=validate.example.com caddy validate --config "$VALIDATE_DIR/$f.caddyfile" --adapter caddyfile 2>&1)" \
+          || fail "caddy rejects the $f Caddyfile: $out"
+      else
+        out="$(docker run --rm -e DOMAIN=validate.example.com -v "$VALIDATE_DIR/$f.caddyfile:/etc/caddy/Caddyfile:ro" \
+          "$EDGE_CADDY_IMAGE" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1)" \
+          || fail "caddy ($EDGE_CADDY_IMAGE) rejects the $f Caddyfile: $out"
+      fi
+      pass "caddy ($caddy_runner) validates the $f Caddyfile"
+    done
+    ;;
+esac
 
 echo "PASS: render-caddyfile.test.sh"

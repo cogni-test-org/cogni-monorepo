@@ -20,7 +20,7 @@
  *   assertion otherwise. No network.
  * Side-effects: fs reads under the repo's infra/catalog + nodes/<slug>/.cogni.
  * Links: src/adapters/server/node-registry/network-nodes.data.ts, infra/catalog/*.yaml,
- *   infra/catalog/_schema.json (REPO_SPEC_IS_IDENTITY_SSOT), docs/spec/ci-cd.md (task.5078),
+ *   infra/catalog/_schema.json (REPO_SPEC_IS_IDENTITY_SSOT), https://cognidao.org/knowledge/operator-pipeline-contract (task.5078),
  *   src/shared/node-app-scaffold/gens/network-nodes.ts (the publish splice this guards)
  */
 
@@ -89,6 +89,9 @@ function expectedRoster(): ExpectedNode[] {
       is_primary_host?: boolean;
     };
     if (doc?.type !== "node" || !doc.name) continue;
+    // The canonical network roster holds cogni-dao nodes only. A test-fleet row (cogni-test-org
+    // source_repo, served only by the test operator) is not a network node (story.5137).
+    if (/github\.com\/cogni-test-org\//i.test(doc.source_repo ?? "")) continue;
     nodes.push({
       name: doc.name,
       nodeId: resolveNodeId(doc.name, doc),
@@ -140,7 +143,7 @@ describe("adapters/node-registry/network-nodes.data ↔ identity SSoT drift (TOT
     }
   });
 
-  it("the catalog contains a web node (sanity: the fs path resolved)", () => {
-    expect(expectedRoster().length).toBeGreaterThan(0);
+  it("the catalog actually exists and is non-trivial (sanity: the fs path resolved)", () => {
+    expect(expectedRoster().length).toBeGreaterThanOrEqual(2);
   });
 });

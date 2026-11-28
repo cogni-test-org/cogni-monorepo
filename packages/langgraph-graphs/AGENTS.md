@@ -13,10 +13,10 @@ LangGraph graph definitions and runtime utilities for agentic AI execution. Cont
 
 ## Pointers
 
-- [LangGraph AI Guide](../../docs/spec/langgraph-patterns.md)
-- [Graph Execution](../../docs/spec/graph-execution.md)
-- [Tool Use Spec](../../docs/spec/tool-use.md)
-- [Packages Architecture](../../docs/spec/packages-architecture.md)
+- [LangGraph AI Guide](https://node-template.cognidao.org/knowledge/graph-execution-invariants)
+- [Graph Execution](https://node-template.cognidao.org/knowledge/graph-execution-invariants)
+- [Tool Use Spec](https://node-template.cognidao.org/knowledge/tool-use-contract)
+- [Packages Architecture](https://node-template.cognidao.org/knowledge/package-isolation-rules)
 
 ## Boundaries
 
@@ -43,7 +43,7 @@ LangGraph graph definitions and runtime utilities for agentic AI execution. Cont
 - **Exports (subpaths):**
   - `@cogni/langgraph-graphs` — Barrel re-export of common types plus:
     - `LANGGRAPH_CATALOG` / `NODE_LANGGRAPH_CATALOG` — Node-safe graph catalog with registered graphs and metadata
-    - `OPERATOR_LANGGRAPH_CATALOG` — Operator-only superset that includes lifecycle/VCS graphs such as PR Manager
+    - `OPERATOR_LANGGRAPH_CATALOG` — Operator-only superset that includes lifecycle/VCS graphs such as PR Review
     - `McpToolSource` — ToolSourcePort implementation for MCP-discovered tools
     - `loadMcpTools()`, `parseMcpConfigFromEnv()` — MCP client connection + config parsing
     - `McpHttpServerConfig`, `McpSseServerConfig`, `McpStdioServerConfig` — Transport config types
@@ -62,7 +62,8 @@ LangGraph graph definitions and runtime utilities for agentic AI execution. Cont
     - `createPoetGraph()`, `createPondererGraph()` — React agent factories (TYPE_TRANSPARENT_RETURN)
     - `createBrainGraph()` — Code-aware ReAct agent with repo tools (list, search, open)
     - `createResearchGraph()` — 3-node MVP research graph (plan_queries → web_search_fanout → rank_and_report)
-    - `createPrReviewGraph()` — Single-call structured output graph for PR review (no tools, `responseFormat` for typed metrics)
+    - `createPrReviewGraph()` — Grounded PR review (story.5102, OPERATOR catalog only): gather (read-only hub + PR-head code tools, `PR_REVIEW_TOOL_IDS`) → structured verdict (no tools) → finalize (host `evidence` from paired ToolMessages, `uncited`, `buildSha`). Catalog entry declares `codeSubject: true`.
+    - `buildHostPreamble()` / `buildHostPreambleText()` — the shared host-owned grounding preamble (`cogni` + `pr-review`; `requireIndex` only for pr-review)
     - `createBrowserGraph()` — Browser automation agent via Playwright MCP (mcpServerIds: ["playwright"])
     - `createFrontendTesterGraph()` — QA agent for UI testing via Playwright MCP
     - `POET_GRAPH_NAME`, `PONDERER_GRAPH_NAME`, `BRAIN_GRAPH_NAME`, `RESEARCH_GRAPH_NAME`, `PR_REVIEW_GRAPH_NAME`, `BROWSER_GRAPH_NAME`, `FRONTEND_TESTER_GRAPH_NAME` — Graph name constants

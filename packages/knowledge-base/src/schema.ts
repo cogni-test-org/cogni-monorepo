@@ -15,10 +15,12 @@
  *   - ENTRY_HAS_DOMAIN: every `knowledge` row's `domain` matches a registered row in `domains`.
  *   - DELETE_IS_CLEAN: dead/retired knowledge is DELETEd (Dolt history preserves content + commits + attribution); supersession is refine-in-place. `status='deprecated'` retained only for the EDO temporal hypothesis lifecycle.
  *   - CONFIDENCE_EVERYWHERE: every row in every knowledge table has `confidence_pct` (integer 0-100). New rows default to 40 — start low, raise as evidence accumulates. 100 is reserved for "factual and works" (objectively verifiable + currently functioning). See seed `cogni-meta-confidence-convention`.
+ *   - WORK_ITEM_MOVES: work_items.moves stores at most 3 declared metric moves with a server-pinned baseline (story.0033); work-items owns validation. Migrate the column before any reader runs the new package.
+ *   - WORK_ITEM_ARTIFACTS_INSERT_ONLY (task.0028): `work_item_artifacts` is insert-only. No route or adapter path updates or deletes a row; Dolt history proves it. work-items owns the contract (kinds, subject formats, verdicts, scorecard rows, note and body bounds) and the PASS-grade rule.
  *   - No FK references to Postgres tables (different database server).
  *   - No RLS — access control via Doltgres roles (knowledge_reader / knowledge_writer).
  * Side-effects: none
- * Links: docs/spec/knowledge-data-plane.md, docs/spec/knowledge-syntropy.md, work/items/task.0425.knowledge-contribution-api.md
+ * Links: https://node-template.cognidao.org/knowledge/knowledge-data-plane, https://node-template.cognidao.org/knowledge/knowledge-recall-path
  * @public
  */
 
@@ -106,7 +108,7 @@ export const knowledge = pgTable(
     sourceRef: text("source_ref"),
     sourceNode: text("source_node"),
     tags: jsonb("tags").$type<string[]>(),
-    // Hypothesis-loop columns (knowledge-syntropy.md § The Hypothesis Loop)
+    // Hypothesis-loop columns (https://node-template.cognidao.org/knowledge/knowledge-recall-path § The Hypothesis Loop)
     // evaluateAt: REQUIRED for entry_type='hypothesis'; null otherwise.
     // Enforced at the adapter layer (HYPOTHESIS_HAS_EVALUATE_AT).
     evaluateAt: timestamp("evaluate_at", { withTimezone: true }),
@@ -114,6 +116,10 @@ export const knowledge = pgTable(
     // automation (cron skips). v0 non-null value: 'agent'. Future kinds
     // (market:<id>, metric:<query>, http:<url>, deadline) add new values.
     resolutionStrategy: text("resolution_strategy"),
+    // Goal metrics (@cogni-dao/metrics 0.3.0): a `metric` row's definition and a
+    // goal/hypothesis's KPI bindings. Shapes are owned by the metrics package.
+    metricSpec: jsonb("metric_spec").$type<Record<string, unknown>>(),
+    kpiBindings: jsonb("kpi_bindings").$type<Record<string, unknown>[]>(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -275,6 +281,16 @@ export const workItems = pgTable(
     priority: integer("priority"),
     rank: integer("rank"),
     estimate: integer("estimate"),
+    // Do-it-now scores (story.5111): { "<axis id>": { v: 0–5, ev?: url } }.
+    // Axis ids are config (hub `work-item-scores-design`), so no column per axis.
+    // Recorded one-line literal port (hub `port-node-source-once`) of
+    // cogni-dao/node-template#198 packages/knowledge-base/src/schema.ts; bounds
+    // live in `parseWorkItemScores` (@cogni-dao/work-items 0.2.3).
+    scores: jsonb("scores"),
+    // Metrics this item moves (story.0033): [{ metricId, direction, baselineObservationId }].
+    // NULL = no declaration; [] = declared to move nothing. work-items owns validation and the
+    // pinned baseline. Literal port of cogni-dao/node-template#323 packages/knowledge-base/src/schema.ts.
+    moves: jsonb("moves"),
 
     // Free-text
     summary: text("summary"),
@@ -285,6 +301,9 @@ export const workItems = pgTable(
     pr: text("pr"),
     reviewer: text("reviewer"),
     revision: integer("revision").notNull().default(0),
+    // The revision at which the item entered its current status (task.0122): an exit artifact counts only when its
+    // `item_revision` is at or after it. The adapter stamps it on every status change; a migration backfills it to `revision`.
+    statusRevision: integer("status_revision").notNull().default(0),
     blockedBy: text("blocked_by"),
     deployVerified: boolean("deploy_verified").notNull().default(false),
 
@@ -320,6 +339,53 @@ export const workItems = pgTable(
     index("idx_work_items_project_id").on(t.projectId),
   ]
 );
+
+/**
+ * work_item_artifacts — immutable, typed verdicts on one revision of a work item (task.0028).
+ *
+ * One row per triage, review or validation: `kind` is `triage`, `design_review`,
+ * `implementation_review` or `validation`. `subject` pins what was judged; `verdict` and `rows`
+ * (validation only, the canonical scorecard rows) say what was found; `note` is one line (the
+ * triage measurement gap or the main change requested); `body` holds the full review when no PR
+ * comment does (an inbox has none); `url` points at the comment or scorecard that does;
+ * `seq` is the artifact's place in its item's sequence (1, 2, 3...), assigned by the server
+ * inside the writer lock as the item's highest `seq` plus one, and unique per item: the highest
+ * `seq` of a kind is the latest, never the clock (timestamps tie); `item_revision` is the item's
+ * revision when written, stamped by the server in the same place; `author` is the principal the
+ * server stamped. Insert-only: a later verdict is a new row, never an edit, and the latest decides. `item_id` has no FK: work_items rows are patched in
+ * place and a verdict must survive any edit of its item.
+ */
+export const workItemArtifacts = pgTable(
+  "work_item_artifacts",
+  {
+    id: text("id").primaryKey(),
+    itemId: text("item_id").notNull(),
+    // seq and item_revision came in migration 0007 on top of 0006 (already applied on candidate-a): the DEFAULT 0
+    // protects any row written before it. The server always writes seq >= 1 and the item's real revision.
+    seq: integer("seq").notNull().default(0),
+    itemRevision: integer("item_revision").notNull().default(0),
+    kind: text("kind").notNull(),
+    subject: text("subject").notNull(),
+    verdict: text("verdict").notNull(),
+    // validation only: [{ tweak, human, ai, loki, trace, overall, reason? }]
+    rows: jsonb("rows"),
+    // at most 240 characters, one line; at most 16000 characters for body (work-items owns both bounds)
+    note: text("note"),
+    body: text("body"),
+    url: text("url"),
+    author: text("author").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    index("idx_work_item_artifacts_item_created").on(t.itemId, t.createdAt),
+    uniqueIndex("uniq_work_item_artifacts_item_seq").on(t.itemId, t.seq),
+  ]
+);
+
+export type WorkItemArtifactRow = typeof workItemArtifacts.$inferSelect;
+export type NewWorkItemArtifactRow = typeof workItemArtifacts.$inferInsert;
 
 export type WorkItemRow = typeof workItems.$inferSelect;
 export type NewWorkItemRow = typeof workItems.$inferInsert;

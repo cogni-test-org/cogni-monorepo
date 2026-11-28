@@ -13,8 +13,7 @@ Pure TypeScript package for Cogni-owned contract ABIs, bytecode, and addresses. 
 
 ## Pointers
 
-- [Node Formation Spec](../../docs/spec/node-formation.md)
-- [Chain Deployment Tech Debt](../../work/projects/proj.chain-deployment-refactor.md)
+- [Node Formation Spec](https://cognidao.org/knowledge/node-formation-contract)
 
 ## Boundaries
 

@@ -7,7 +7,7 @@
  * Scope: In-memory exact-match decisions over AuthzCheckParams. Does not model local roles or production policy.
  * Invariants: Fake defaults to deny; unavailable can be configured distinctly from deny.
  * Side-effects: none
- * Links: docs/spec/rbac.md
+ * Links: https://cognidao.org/knowledge/authz-port-contract
  * @public
  */
 
@@ -33,6 +33,7 @@ function keyFor(params: AuthzCheckParams): string {
     resource: params.resource,
     tenantId: params.context.tenantId,
     graphId: params.context.graphId ?? null,
+    nodeId: params.context.nodeId ?? null,
   });
 }
 
@@ -78,7 +79,20 @@ export class FakeAuthorizationAdapter implements AuthorizationPort {
   }
 
   async check(params: AuthzCheckParams): Promise<AuthzDecision> {
-    const decision = this.decisions.get(keyFor(params)) ?? "authz_denied";
+    // Explicit decisions win; otherwise a directly-held role tuple (written via
+    // writeRelation, removed via deleteRelation) allows — grant/revoke in tests.
+    const decision =
+      this.decisions.get(keyFor(params)) ??
+      (!params.subjectId &&
+      this.relations.has(
+        relationKey({
+          user: params.actorId,
+          relation: relationForAuthzAction(params.action),
+          object: params.resource,
+        })
+      )
+        ? "allow"
+        : "authz_denied");
     const checks = checksFor(params);
 
     if (decision === "allow") {
@@ -116,6 +130,25 @@ export class FakeAuthorizationAdapter implements AuthorizationPort {
 
   hasRelation(tuple: AuthzRelationTuple): boolean {
     return this.relations.has(relationKey(tuple));
+  }
+
+  async listRelationsByObject(
+    object: string,
+    relation?: string
+  ): Promise<AuthzListDecision> {
+    if (this.listUnavailableReason !== undefined) {
+      const reason = this.listUnavailableReason;
+      this.listUnavailableReason = undefined;
+      return { decision: "failure", code: "authz_list_unavailable", reason };
+    }
+    const tuples = [...this.relations]
+      .map((key) => JSON.parse(key) as AuthzRelationTuple)
+      .filter(
+        (tuple) =>
+          tuple.object === object &&
+          (relation === undefined || tuple.relation === relation)
+      );
+    return { decision: "success", code: "authz_list_success", tuples };
   }
 
   /** Set the next listRelations() to fail-closed (authz_list_unavailable). */
