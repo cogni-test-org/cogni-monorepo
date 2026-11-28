@@ -5,7 +5,7 @@
 ## Metadata
 
 - **Owners:** @derekg1729
-- **Last reviewed:** 2026-09-15
+- **Last reviewed:** 2026-11-04
 - **Status:** draft
 
 ## Purpose
@@ -15,7 +15,7 @@ Single source of truth for environment variables. Lazy validation with Zod preve
 ## Pointers
 
 - [Root AGENTS.md](../../../../../AGENTS.md)
-- [Architecture](../../../../../docs/spec/architecture.md)
+- [Architecture](https://node-template.cognidao.org/knowledge/hexagonal-layering-contract)
 
 ## Boundaries
 
@@ -61,15 +61,18 @@ Single source of truth for environment variables. Lazy validation with Zod preve
 
 **Server-only (`server.ts`)**
 
+- Workload routing: `NODE_DEPLOY_WORKLOAD_ZONE` is required explicitly by the operator deploy binding, separate from auth `DOMAIN` and shared substrate `FORK_DOMAIN_ROOT`.
 - Runtime: `NODE_ENV`, `APP_ENV`, `SERVICE_NAME`, `DEPLOY_ENVIRONMENT`, `PORT`, `PINO_LOG_LEVEL`
 - Database: `DATABASE_URL`, `DATABASE_SERVICE_URL`; both are explicit DSNs, no component-piece fallback, startup rejects same-user/superuser DSNs
 - LLM/billing/ops: `LITELLM_BASE_URL`, `LITELLM_MASTER_KEY`, `LITELLM_MVP_API_KEY`, `OPENROUTER_API_KEY`, `BILLING_INGEST_TOKEN`, `SCHEDULER_API_TOKEN`, `INTERNAL_OPS_TOKEN`
 - Auth/session: `AUTH_SECRET`
+- Node-admin sync: `NODE_ADMIN_SYNC_WRITE` (default `false` = report-only; `true` = the sync writes `node:<id>#admin` and the legacy catalog owner writer is skipped, task.5494)
 - Authorization: `OPENFGA_API_URL`, `OPENFGA_STORE_ID`, `OPENFGA_AUTHORIZATION_MODEL_ID`, `OPENFGA_API_TOKEN`; `OPENFGA_STORE_ID` is required when OpenFGA activation vars are present
 - Metrics/analytics: `METRICS_TOKEN`, `PROMETHEUS_REMOTE_WRITE_URL`, `PROMETHEUS_QUERY_URL`, `PROMETHEUS_READ_USERNAME`, `PROMETHEUS_READ_PASSWORD`, `ANALYTICS_K_THRESHOLD`, `ANALYTICS_QUERY_TIMEOUT_MS`
 - Temporal: `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_TASK_QUEUE`
 - Repo access: `COGNI_REPO_PATH`, `COGNI_REPO_SHA`; `COGNI_REPO_ROOT` is derived from `COGNI_REPO_PATH`
 - Fleet identity: `IDENTITY_ATTESTATION_PRIVATE_KEY` (operator-only Ed25519 seed; nodes consume its public JWKS)
+- Git-review signing: `GIT_REVIEW_SIGNING_SEED` (operator-only 64-hex Ed25519 seed for git-review's per-call assertions to linked nodes, task.5448; public half beside the attestation key in JWKS; unset = a review of another node is refused with a typed 503)
 - DoltHub: `DOLTHUB_OWNER`, `DOLTHUB_API_TOKEN`, `DOLTHUB_OAUTH_CLIENT_ID`, `DOLTHUB_OAUTH_CLIENT_SECRET`
 
 **Public client (`client.ts`)**

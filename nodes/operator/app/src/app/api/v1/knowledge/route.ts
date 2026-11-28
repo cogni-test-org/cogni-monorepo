@@ -7,7 +7,7 @@
  * Scope: Any authenticated principal (cookie-session human OR bearer agent). Reads via container.knowledgeStorePort: listDomains then per-domain listKnowledge.
  * Invariants: VALIDATE_IO, AUTH_VIA_GETSESSIONUSER, KNOWLEDGE_READ_REQUIRES_PRINCIPAL.
  * Side-effects: IO (HTTP response, Doltgres reads via container port)
- * Links: docs/spec/knowledge-syntropy.md
+ * Links: https://node-template.cognidao.org/knowledge/knowledge-recall-path
  * @public
  */
 
@@ -49,6 +49,8 @@ export const GET = wrapRouteHandlerWithLogging(
       limit: url.searchParams.get("limit")
         ? Number(url.searchParams.get("limit"))
         : undefined,
+      // Opt-in only: EDO rows are hidden unless `includeEdo=true`.
+      includeEdo: url.searchParams.get("includeEdo") === "true",
     });
     if (!parsed.success) {
       return NextResponse.json(

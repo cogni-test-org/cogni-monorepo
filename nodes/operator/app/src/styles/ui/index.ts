@@ -8,7 +8,7 @@
  * Invariants: Explicit exports only (no export *); maintains backward compatibility; prevents circular dependencies.
  * Side-effects: none
  * Notes: Replaces monolithic ui.ts with domain-split architecture per AGENTS.md guidance.
- * Links: docs/spec/ui-implementation.md, src/styles/AGENTS.md
+ * Links: https://node-template.cognidao.org/knowledge/frontend-development, src/styles/AGENTS.md
  * @public
  */
 
@@ -51,11 +51,18 @@ export {
   pageShell,
   row,
   section,
+  topBar,
   twoColumn,
 } from "./layout";
 
 // Overlay components
 export {
+  brainLoading,
+  brainLoadingGraphic,
+  brainLoadingMark,
+  brainLoadingOrbit,
+  brainLoadingSpectrum,
+  brainLoadingTrack,
   chatContainer,
   chatDivider,
   chatForm,
@@ -87,5 +94,6 @@ export {
   paragraph,
   prompt,
   prose,
+  reportText,
   textAccent,
 } from "./typography";

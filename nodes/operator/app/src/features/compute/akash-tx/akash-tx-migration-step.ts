@@ -13,13 +13,13 @@
  *   longer allowed to stop the other.
  * Scope: One bounded, NON-THROWING attempt per call: translate the caller's step into the
  *   per-digest migration contract, ask the migration port once, answer with a phase. Does NOT
- *   watch, poll, sleep, retry, hold state, or refuse anything — the caller (Crossplane, via the
- *   actuator's observe) owns requeue and backoff exactly as it does for every other tick.
+ *   watch, poll, sleep, retry, hold state, or refuse anything — the caller (via the actuator's
+ *   observe) owns requeue and backoff exactly as it does for every other tick.
  * Invariants:
  *   - NEVER_REFUSES: there is no failure path that throws. Every outcome — including an
  *     unreachable prover and a missing capability — is a PHASE. A thrown error here would
- *     re-create the coupling this module was rewritten to delete, because observe is the call
- *     Crossplane uses to decide whether to create the lease at all.
+ *     re-create the coupling this module was rewritten to delete, because observe is the call a
+ *     caller uses to decide whether to create the lease at all.
  *   - COMMANDS_ARE_NOT_CALLER_SUPPLIED: the migration commands live here, keyed by
  *     runtimeProfile. A caller-supplied command would let anyone who can reach the actuator run
  *     an arbitrary container against the environment's database under its service account.
@@ -73,7 +73,7 @@ import type { AkashTxLogger } from "./akash-tx-actuator";
  *
  * TWINS, kept byte-identical on purpose: `cogniNodeAppMigrationPhases()` in the frozen
  * the retired `compute-workload-reconciler`, and this. That controller is DELETED (task.5098),
- * docs/spec/cicd-platform-boundary.md), so the policy is restated here rather than moved out
+ * https://cognidao.org/knowledge/operator-plane-contract), so the policy is restated here rather than moved out
  * of it; the test pins the exact strings so a change to either is a deliberate, reviewed diff.
  */
 export function cogniNodeAppMigrationPhases(input: {

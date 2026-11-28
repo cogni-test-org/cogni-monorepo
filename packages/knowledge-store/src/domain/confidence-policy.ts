@@ -11,7 +11,7 @@
  *   - DERIVED_INIT_THEN_RECOMPUTE: derived rows init to min-of-cited when a basis
  *     is supplied, else a conservative baseline; never NULL, never throws.
  * Side-effects: none
- * Links: docs/spec/knowledge-syntropy.md
+ * Links: https://node-template.cognidao.org/knowledge/knowledge-recall-path
  * @public
  */
 
@@ -84,6 +84,19 @@ export function initializeConfidence(
     applyPrincipalCap(raw, context),
     basisFor(entry, explicit, context.citations ?? [])
   );
+}
+
+/**
+ * Entry types whose confidence is NOT moved by citations. A DAO `goal` is a
+ * human commitment, not a claim agents can prove or erode by citing it.
+ */
+export const CONFIDENCE_EXEMPT_ENTRY_TYPES: readonly string[] = ["goal"];
+
+/** True when citation-driven recompute must leave this row's confidence alone. */
+export function isConfidenceExempt(
+  entryType: string | null | undefined
+): boolean {
+  return CONFIDENCE_EXEMPT_ENTRY_TYPES.includes(entryType ?? "");
 }
 
 export function recomputeConfidence(

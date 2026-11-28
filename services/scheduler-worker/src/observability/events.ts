@@ -7,7 +7,7 @@
  * Scope: Define valid worker event names as const registry. Does not define full payload schemas.
  * Invariants: All event names registered here; logWorkerEvent() enforces `event` field presence.
  * Side-effects: none
- * Links: docs/spec/observability.md, src/shared/observability/events/index.ts (main app pattern)
+ * Links: https://node-template.cognidao.org/knowledge/observability-logging-contract, src/shared/observability/events/index.ts (main app pattern)
  * @public
  */
 
@@ -28,6 +28,9 @@ export const WORKER_EVENT_NAMES = {
   ACTIVITY_GRAPH_ERROR: "worker.activity.graph_error",
   ACTIVITY_RUN_UPDATED: "worker.activity.run_updated",
   ACTIVITY_SWEEP_RESULT: "worker.activity.sweep_result",
+
+  // Review activities — activities/review.ts (story.5102)
+  REVIEW_COULD_NOT_EVALUATE: "review.could_not_evaluate",
 
   // Ledger activities — activities/ledger.ts
   LEDGER_EPOCH_ENSURED: "worker.ledger.epoch_ensured",

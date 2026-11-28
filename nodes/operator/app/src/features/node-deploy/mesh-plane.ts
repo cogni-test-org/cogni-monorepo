@@ -1,0 +1,758 @@
+// SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
+// SPDX-FileCopyrightText: 2026 Cogni-DAO
+
+/**
+ * Module: `@features/node-deploy/mesh-plane`
+ * Purpose: The seed-and-approval loop for ONE env's Headscale (task.5429, connectivity decision
+ *   task.5384): reconcile the derived policy, approve the env VM's `substrate-gw` over its published
+ *   request, mint one key per attempt, revoke an attempt, and sweep keys no live attempt stores.
+ * Scope: Logic over `NodeMeshPort` only. Does not wire, touch Kubernetes or log: every outcome is returned
+ *   so the sequencer (slice T4) records it through its one emit helper.
+ * Invariants:
+ *   - FAIL_CLOSED_BEFORE_MINT (HR 4): no key is minted and no device is approved until a policy readback
+ *     in this process matched the derivation. An absent or different policy is first replaced by the
+ *     deny-all seed, then by the derived policy, then read back.
+ *   - SWEEP_BEFORE_MINT (HR 5): after a process start or any failed Headscale call, a mint is refused until
+ *     a sweep that STARTED after that failure has succeeded (a failure counter, so an in-flight sweep
+ *     cannot reopen minting after a concurrent failure).
+ *   - ONE_TRY_PER_MINT (HR 5, CD8): a mint that fails or loses its response is never retried inside the
+ *     call. The unstored key, if Headscale made one, grants nothing (its value reached no lease) and is
+ *     expired once it is older than one pass: by the sweep, or by the next mint for that node tag.
+ *   - FRESH_KEYS_ARE_NOT_ORPHANS (CD8): neither the sweep nor a mint expires a key younger than one pass,
+ *     so a sibling workload's key that is minted but not yet stored is never expired by a concurrent mint.
+ *   - EXPIRE_THEN_DELETE (HR 6): revoke and sweep expire the key first and delete its devices only after
+ *     the expire succeeded; a reusable key that still works would re-join a deleted device.
+ *   - NODE_SCOPE_ONLY: revoke and sweep act only on keys and devices whose tags are all `tag:node-*`.
+ *     They never touch `tag:substrate` or any other tag. A node-tagged device with no key is anomalous:
+ *     the sweep skips and counts it (`unkeyedNodeDevices`) instead of deleting it.
+ *   - VERIFIED_APPROVAL (HR 11): approve only a fresh verified `{authId, publishedAt}` (older than 5
+ *     minutes is refused). The auth id binds the approval to the machine that asked, so no machine or
+ *     node key is compared and there is no second stage (design section 2, Pareto cut). A new device
+ *     whose tags are not exactly `[tag:substrate]` is deleted at once (`node_mesh_substrate_mismatch`).
+ *   - ONE_GATEWAY_RECOMPUTED (HR 10, HR 11 self-heal; review B1), stateless, run every pass over one device
+ *     read of the current epoch. A wrong-tag `tag:substrate` device is deleted as a mismatch. Among
+ *     exact-tag gateways:
+ *     1. Two or more ONLINE: keep the one this pass approved from a verified request (`approved`), else
+ *        the OLDEST online one; delete the other online ones as a mismatch (a hand-registered newer device
+ *        never evicts the real gateway).
+ *     2. An OFFLINE gateway older than the kept online one is superseded (deleted): the VM lost its state
+ *        and re-enrolled. Nothing is deleted when no gateway is online, so the only online gateway is
+ *        never deleted.
+ *     The call holds no state: a restart or a failed delete is recomputed and retried by the next pass.
+ *   - GATEWAY_BEFORE_MINT (HR 23, task.5431): no attempt key is minted unless the coordinator epoch read
+ *     by the last reconcile is still the owner's creation time AND the tailnet has exactly one
+ *     `tag:substrate` device, tagged exactly `[tag:substrate]` and online. Otherwise the mint is refused
+ *     before any write: a lease with no gateway would pay and then fail its proof.
+ *   - ZERO_API_KEYS (HR 12): `checkAdminSurface` passes only when Headscale lists no API key.
+ *   - NETWORK_ONLY (HR 13): every id here is a namespaced provider id; none is a Cogni identity key.
+ *   - COORDINATOR_EPOCH (HR 23, task.5431): a wiped Headscale restarts its key and device ids at 1, so a
+ *     stored id alone names nothing. The epoch is the creation time of the env owner `cogni-mesh-<env>`,
+ *     read on every reconcile (a wipe re-creates the owner). A mint returns the epoch and the key's own
+ *     creation time; `revokeAttempt` with that generation is `void` (no call is made) when the epoch or the
+ *     listed key's creation time differs, so a stale id never expires or deletes a newer key or device.
+ * Side-effects: IO
+ * Links: mesh-policy.ts, ports/node-mesh.port.ts
+ * @public
+ */
+
+import {
+  type HeadscaleDeviceId,
+  type HeadscaleKeyId,
+  type HeadscaleUser,
+  isNodeMeshError,
+  type MeshDevice,
+  type NodeMeshErrorReason,
+  type NodeMeshPort,
+} from "@/ports";
+
+import {
+  denyAllPolicy,
+  deriveMeshPolicy,
+  isNodeTag,
+  type MeshPolicyDocument,
+  meshOwner,
+  type NodeSubstrateGrant,
+  nodeTag,
+  policyMatches,
+  policyNodeTags,
+  SUBSTRATE_TAG,
+  serializeMeshPolicy,
+} from "./mesh-policy";
+
+/** A published `substrate-gw` request older than this is ignored (design section 2). */
+export const SUBSTRATE_REQUEST_MAX_AGE_MS = 5 * 60_000;
+/** A request "published" further in the future than this is refused too (clock skew bound). */
+export const SUBSTRATE_REQUEST_MAX_SKEW_MS = 60_000;
+/** The sweep skips keys newer than one sequencer pass (design section 3). */
+export const DEFAULT_SWEEP_MIN_AGE_MS = 60_000;
+/**
+ * "No time ceiling" (design section 3). Headscale v0.29.7 stores an absent expiration as the zero time,
+ * which is already expired, so the attempt key carries a far-future date and the attempt close expires it.
+ */
+export const ATTEMPT_KEY_EXPIRATION = new Date(Date.UTC(2100, 0, 1));
+export const SUBSTRATE_MISMATCH_ALERT = "node_mesh_substrate_mismatch";
+/** Bound on `approvedAuthIds` (a publish-lag guard, not a ledger). */
+const MAX_REMEMBERED_AUTH_IDS = 64;
+
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+/** The admission policy's delete allow-list for attempt mesh Secrets (design section 3). */
+export const MESH_SECRET_NAME_PATTERN = new RegExp(
+  `^nd-[0-9a-f]{8}-[a-z0-9-]+-mesh-${UUID}-a[0-9]+$`
+);
+
+/** `nd-<nodeId8>-<workload>-mesh-<releaseId>-a<attempt>`: the create-once Secret for one attempt key. */
+export const meshSecretName = (input: {
+  readonly nodeId: string;
+  readonly workload: string;
+  readonly releaseId: string;
+  readonly attempt: number;
+}): string => {
+  const name =
+    `nd-${input.nodeId.replace(/-/g, "").slice(0, 8)}-${input.workload}-mesh-${input.releaseId}-a${input.attempt}`.toLowerCase();
+  if (!MESH_SECRET_NAME_PATTERN.test(name))
+    throw new Error(`attempt mesh secret name is not admissible: ${name}`);
+  return name;
+};
+
+export type ReconcileOutcome =
+  /** The stored policy already matched. */
+  | "matched"
+  /** We wrote deny-all then the derivation, and the readback matched. */
+  | "written"
+  /** We wrote, but the readback differs: not ready. */
+  | "readback_mismatch"
+  /** A Headscale call failed: not ready. */
+  | "coordinator_failed";
+
+export interface ReconcileResult {
+  readonly outcome: ReconcileOutcome;
+  /** True only when a readback in this call matched the derivation. */
+  readonly ready: boolean;
+  /** True when a policy existed and differed from the derivation (log `node_mesh_policy_drift`). */
+  readonly drift: boolean;
+  /** True when Headscale had no stored policy at all (fresh or wiped). */
+  readonly wasAbsent: boolean;
+  readonly reason?: NodeMeshErrorReason;
+}
+
+export interface SubstrateRequest {
+  /** Empty once the device is registered (nothing to approve). */
+  readonly authId: string;
+  /** Epoch ms of the publish, from the verified VM channel. */
+  readonly publishedAt: number;
+}
+
+export type ApprovalResult =
+  | {
+      readonly outcome: "approved";
+      readonly headscaleDeviceId: HeadscaleDeviceId;
+      /** The design's tagged-device rule: a `substrate-gw` device never expires. */
+      readonly expiryDisabled: boolean;
+      /** ONE_GATEWAY_RECOMPUTED run at once; a failure here is retried by the next pass. */
+      readonly supersede: SupersedeResult;
+    }
+  | {
+      readonly outcome: "refused";
+      readonly reason:
+        | "policy_not_ready"
+        | "stale"
+        | "future"
+        | "malformed"
+        | NodeMeshErrorReason;
+    }
+  | {
+      readonly outcome: "mismatch";
+      readonly alert: typeof SUBSTRATE_MISMATCH_ALERT;
+      readonly headscaleDeviceId: HeadscaleDeviceId;
+      /** The new device is not exactly `[tag:substrate]`. */
+      readonly reason: "tags";
+      /** False when the delete failed; the next pass's `supersedeGateways` deletes it. */
+      readonly deleted: boolean;
+    };
+
+export interface SupersedeResult {
+  /** False when the device read or a delete failed; the next pass recomputes and retries. */
+  readonly ok: boolean;
+  /** The online exact-tag gateway kept, or null when no gateway is online. */
+  readonly kept: HeadscaleDeviceId | null;
+  /** Offline exact-tag gateways older than the kept one, deleted (the VM re-enrolled). */
+  readonly superseded: readonly HeadscaleDeviceId[];
+  /** Wrong-tag `tag:substrate` devices and surplus online gateways, deleted as a mismatch. */
+  readonly mismatched: readonly HeadscaleDeviceId[];
+  /** Deletes that failed this pass. */
+  readonly failed: readonly HeadscaleDeviceId[];
+  readonly reason?: NodeMeshErrorReason;
+}
+
+const isExactGateway = (d: MeshDevice): boolean =>
+  d.tags.length === 1 && d.tags[0] === SUBSTRATE_TAG;
+
+/** Oldest first: `createdAt` (unknown = oldest), then the smaller id (Headscale ids only grow). */
+const oldestFirst = (a: MeshDevice, b: MeshDevice): number =>
+  (a.createdAt ? Date.parse(a.createdAt) : 0) -
+    (b.createdAt ? Date.parse(b.createdAt) : 0) ||
+  a.headscaleDeviceId.localeCompare(b.headscaleDeviceId, undefined, {
+    numeric: true,
+  });
+
+/** Why GATEWAY_BEFORE_MINT refuses a mint. */
+export type GatewayRefusal =
+  | "gateway_absent"
+  | "gateway_offline"
+  | "gateway_multiple"
+  | "gateway_tags";
+
+/**
+ * GATEWAY_BEFORE_MINT over one device read: null when the tailnet has exactly one `tag:substrate` device,
+ * tagged exactly `[tag:substrate]` and online; otherwise the reason.
+ */
+export function gatewayRefusal(
+  devices: readonly MeshDevice[]
+): GatewayRefusal | null {
+  const substrate = devices.filter((d) => d.tags.includes(SUBSTRATE_TAG));
+  if (substrate.length === 0) return "gateway_absent";
+  if (substrate.length > 1) return "gateway_multiple";
+  const [gateway] = substrate;
+  if (!gateway || gateway.tags.length !== 1) return "gateway_tags";
+  return gateway.online ? null : "gateway_offline";
+}
+
+export interface AttemptRef {
+  readonly nodeId: string;
+  readonly workload: string;
+  readonly releaseId: string;
+  readonly attempt: number;
+}
+
+export type MintResult =
+  | {
+      readonly outcome: "minted";
+      readonly headscaleKeyId: HeadscaleKeyId;
+      /** The key value. Store it create-once under `secretName` BEFORE the paid create. */
+      readonly key: string;
+      readonly secretName: string;
+      /** Unstored keys of this node tag expired before the mint (log them). */
+      readonly expiredOrphans: readonly HeadscaleKeyId[];
+      /** COORDINATOR_EPOCH: store both with the key id; revoke passes them back. */
+      readonly epoch: string;
+      readonly keyCreatedAt: string | null;
+    }
+  | {
+      readonly outcome: "refused";
+      readonly reason:
+        | "policy_not_ready"
+        | "sweep_pending"
+        | "node_not_in_policy"
+        | "epoch_unknown"
+        /** The owner's creation time is not the epoch the last reconcile read (a wipe since then). */
+        | "epoch_changed"
+        | GatewayRefusal;
+    }
+  /** The mint failed or its response was lost. Nothing is stored; the sweep expires any unstored key. */
+  | { readonly outcome: "failed"; readonly reason: NodeMeshErrorReason };
+
+export type RevokeResult =
+  | {
+      readonly outcome: "revoked";
+      readonly deletedDevices: readonly HeadscaleDeviceId[];
+    }
+  | { readonly outcome: "refused"; readonly reason: "not_a_node_key" }
+  /** The key belongs to an older coordinator epoch (or is gone): nothing of ours to revoke; no call made. */
+  | { readonly outcome: "void" }
+  | {
+      readonly outcome: "failed";
+      /** `expire` failed: nothing was deleted. `delete` or `readback`: the key is already expired. */
+      readonly stage: "expire" | "delete" | "readback";
+      readonly reason: NodeMeshErrorReason | "devices_remain" | "key_live";
+    };
+
+export interface SweepResult {
+  readonly ok: boolean;
+  readonly expiredKeys: readonly HeadscaleKeyId[];
+  readonly deletedDevices: readonly HeadscaleDeviceId[];
+  /** Node-tagged devices Headscale reports with no key: skipped, never deleted (log them). */
+  readonly unkeyedNodeDevices: readonly HeadscaleDeviceId[];
+  readonly reason?: NodeMeshErrorReason;
+}
+
+/** Every tag is a node tag, and there is at least one. The sequencer's whole scope. */
+const nodeScoped = (tags: readonly string[]): boolean =>
+  tags.length > 0 && tags.every(isNodeTag);
+
+/**
+ * Headscale stamps an expire with ITS clock during the call, a moment after the caller read `now`. Our
+ * keys are minted to expire in 2100, so an expiration within this slack of `now` is our expire landing.
+ */
+export const EXPIRY_READBACK_SLACK_MS = 60_000;
+
+const isExpired = (expiration: string | null, now: number): boolean =>
+  expiration !== null &&
+  Date.parse(expiration) <= now + EXPIRY_READBACK_SLACK_MS;
+
+const reasonOf = (error: unknown): NodeMeshErrorReason => {
+  if (isNodeMeshError(error)) return error.reason;
+  throw error;
+};
+
+export class MeshPlane {
+  readonly owner: HeadscaleUser;
+  /** The policy the last readback in this process matched; null = minting and approval are closed. */
+  private matched: MeshPolicyDocument | null = null;
+  /** A sweep succeeded since process start and since the last failed call. */
+  private swept = false;
+  /** Bumped by every failed call; a sweep or reconcile opens the gate only if it saw no failure. */
+  private failures = 0;
+  /** The owner object's creation time seen by the last reconcile (COORDINATOR_EPOCH); null = unknown. */
+  private epochValue: string | null = null;
+  /** Auth ids this process approved: a publish that still names one (lag) is not registered again. */
+  private readonly approvedAuthIds = new Set<string>();
+
+  constructor(
+    private readonly mesh: NodeMeshPort,
+    readonly env: string,
+    private readonly sweepMinAgeMs: number = DEFAULT_SWEEP_MIN_AGE_MS
+  ) {
+    this.owner = meshOwner(env);
+  }
+
+  /** Any failed call closes minting and approval until the next good reconcile and sweep. */
+  private fail(error: unknown): NodeMeshErrorReason {
+    this.failures += 1;
+    this.matched = null;
+    this.swept = false;
+    return reasonOf(error);
+  }
+
+  /** Mint and approve are open only after a matched readback and a sweep. */
+  get mintAllowed(): boolean {
+    return this.matched !== null && this.swept;
+  }
+
+  /** Create the env owner object if Headscale has none (a fresh or wiped database). */
+  private async ensureOwner(): Promise<void> {
+    const users = await this.mesh.listUsers();
+    const owner =
+      users.find((u) => u.headscaleUser === this.owner) ??
+      (await this.mesh.createUser(this.owner));
+    this.epochValue = owner.createdAt;
+  }
+
+  /** COORDINATOR_EPOCH: the current Headscale database generation, or null before a reconcile read it. */
+  get epoch(): string | null {
+    return this.epochValue;
+  }
+
+  /**
+   * Read the policy; when absent or different, write deny-all and then the derivation; read back.
+   * Ready only when a readback in this call equals the derivation.
+   */
+  async reconcilePolicy(
+    grants: readonly NodeSubstrateGrant[]
+  ): Promise<ReconcileResult> {
+    const derived = deriveMeshPolicy({ owner: this.owner, grants });
+    const generation = this.failures;
+    let wasAbsent = false;
+    let drift = false;
+    try {
+      await this.ensureOwner();
+      const read = await this.mesh.getPolicy();
+      wasAbsent = read === null;
+      if (read && policyMatches(read.policy, derived)) {
+        if (this.failures === generation) this.matched = derived;
+        return {
+          outcome: "matched",
+          ready: this.failures === generation,
+          drift,
+          wasAbsent,
+        };
+      }
+      drift = read !== null;
+      this.matched = null;
+      await this.mesh.setPolicy(serializeMeshPolicy(denyAllPolicy(this.owner)));
+      await this.mesh.setPolicy(serializeMeshPolicy(derived));
+      const back = await this.mesh.getPolicy();
+      if (!back || !policyMatches(back.policy, derived))
+        return { outcome: "readback_mismatch", ready: false, drift, wasAbsent };
+      if (this.failures === generation) this.matched = derived;
+      return {
+        outcome: "written",
+        ready: this.failures === generation,
+        drift,
+        wasAbsent,
+      };
+    } catch (error) {
+      return {
+        outcome: "coordinator_failed",
+        ready: false,
+        drift,
+        wasAbsent,
+        reason: this.fail(error),
+      };
+    }
+  }
+
+  /** True when this process already approved `authId` (the VM's publish lags its registration). */
+  approvedAuthId(authId: string): boolean {
+    return this.approvedAuthIds.has(authId);
+  }
+
+  /** Approve the env VM's published `substrate-gw` request, then verify what Headscale registered. */
+  async approveSubstrateGateway(
+    request: SubstrateRequest,
+    now: number
+  ): Promise<ApprovalResult> {
+    if (!this.matched)
+      return { outcome: "refused", reason: "policy_not_ready" };
+    if (!request.authId || !Number.isFinite(request.publishedAt))
+      return { outcome: "refused", reason: "malformed" };
+    if (now - request.publishedAt > SUBSTRATE_REQUEST_MAX_AGE_MS)
+      return { outcome: "refused", reason: "stale" };
+    if (request.publishedAt - now > SUBSTRATE_REQUEST_MAX_SKEW_MS)
+      return { outcome: "refused", reason: "future" };
+
+    let device: MeshDevice;
+    try {
+      device = await this.mesh.authRegister({
+        headscaleUser: this.owner,
+        authId: request.authId,
+      });
+    } catch (error) {
+      return { outcome: "refused", reason: this.fail(error) };
+    }
+
+    const id = device.headscaleDeviceId;
+    if (!isExactGateway(device))
+      return {
+        outcome: "mismatch",
+        alert: SUBSTRATE_MISMATCH_ALERT,
+        headscaleDeviceId: id,
+        reason: "tags",
+        deleted: (await this.deleteDevice(id)) === true,
+      };
+    if (this.approvedAuthIds.size >= MAX_REMEMBERED_AUTH_IDS)
+      this.approvedAuthIds.clear();
+    this.approvedAuthIds.add(request.authId);
+    return {
+      outcome: "approved",
+      headscaleDeviceId: id,
+      expiryDisabled: device.expiry === null,
+      // A verified approval of this pass is kept when two gateways are online.
+      supersede: await this.supersedeGateways(id),
+    };
+  }
+
+  /**
+   * Delete a gateway device: `true`, or the failure reason (which closes minting). An already absent
+   * device counts as deleted.
+   */
+  private async deleteDevice(
+    id: HeadscaleDeviceId
+  ): Promise<true | NodeMeshErrorReason> {
+    try {
+      await this.mesh.deleteNode(id);
+      return true;
+    } catch (error) {
+      if (isNodeMeshError(error) && error.reason === "node_not_found")
+        return true;
+      return this.fail(error);
+    }
+  }
+
+  /**
+   * ONE_GATEWAY_RECOMPUTED from one device read (no state). `approved` is the device this pass approved
+   * from a verified request, if any.
+   */
+  async supersedeGateways(
+    approved?: HeadscaleDeviceId
+  ): Promise<SupersedeResult> {
+    let devices: readonly MeshDevice[];
+    try {
+      devices = await this.mesh.listNodes();
+    } catch (error) {
+      return {
+        ok: false,
+        kept: null,
+        superseded: [],
+        mismatched: [],
+        failed: [],
+        reason: this.fail(error),
+      };
+    }
+    const substrate = devices.filter((d) => d.tags.includes(SUBSTRATE_TAG));
+    const exact = substrate.filter(isExactGateway).sort(oldestFirst);
+    const online = exact.filter((d) => d.online);
+    const kept =
+      online.find((d) => d.headscaleDeviceId === approved) ?? online[0];
+    const doomed: { device: MeshDevice; as: "superseded" | "mismatched" }[] =
+      [];
+    for (const d of substrate) {
+      if (d === kept) continue;
+      if (!isExactGateway(d)) doomed.push({ device: d, as: "mismatched" });
+      else if (d.online)
+        doomed.push({ device: d, as: "mismatched" }); // 2+ online: not the kept one
+      else if (kept && oldestFirst(d, kept) < 0)
+        doomed.push({ device: d, as: "superseded" });
+      // An offline gateway newer than the kept one, or no gateway online: no delete.
+    }
+    const superseded: HeadscaleDeviceId[] = [];
+    const mismatched: HeadscaleDeviceId[] = [];
+    const failed: HeadscaleDeviceId[] = [];
+    let reason: NodeMeshErrorReason | undefined;
+    for (const { device, as } of doomed) {
+      const deleted = await this.deleteDevice(device.headscaleDeviceId);
+      if (deleted === true)
+        (as === "superseded" ? superseded : mismatched).push(
+          device.headscaleDeviceId
+        );
+      else {
+        failed.push(device.headscaleDeviceId);
+        reason = deleted;
+      }
+    }
+    return {
+      ok: failed.length === 0,
+      kept: kept?.headscaleDeviceId ?? null,
+      superseded,
+      mismatched,
+      failed,
+      ...(reason ? { reason } : {}),
+    };
+  }
+
+  /**
+   * Mint the one reusable, ephemeral `tag:node-<nodeId>` key for this attempt. First expire every
+   * still-usable key of this node tag that no live attempt stores AND that is older than one pass (the
+   * orphan of a lost mint response). A younger unstored key may belong to a sibling workload whose mint
+   * has not been stored yet, so it is left alone. Exactly one create call; a failure or a lost response
+   * is reported, never retried here. GATEWAY_BEFORE_MINT is checked first, before any write.
+   */
+  async mintAttemptKey(
+    attempt: AttemptRef,
+    liveKeyIds: ReadonlySet<HeadscaleKeyId>,
+    now: number
+  ): Promise<MintResult> {
+    if (!this.matched)
+      return { outcome: "refused", reason: "policy_not_ready" };
+    if (!this.swept) return { outcome: "refused", reason: "sweep_pending" };
+    const epoch = this.epochValue;
+    if (!epoch) return { outcome: "refused", reason: "epoch_unknown" };
+    const tag = nodeTag(attempt.nodeId);
+    if (!policyNodeTags(this.matched).has(tag))
+      return { outcome: "refused", reason: "node_not_in_policy" };
+    const secretName = meshSecretName(attempt);
+    try {
+      // GATEWAY_BEFORE_MINT: the epoch is still the owner's, and one online substrate-gw serves it.
+      const owner = (await this.mesh.listUsers()).find(
+        (u) => u.headscaleUser === this.owner
+      );
+      if (owner?.createdAt !== epoch)
+        return { outcome: "refused", reason: "epoch_changed" };
+      const refusal = gatewayRefusal(await this.mesh.listNodes());
+      if (refusal) return { outcome: "refused", reason: refusal };
+    } catch (error) {
+      return { outcome: "failed", reason: this.fail(error) };
+    }
+    const expiredOrphans: HeadscaleKeyId[] = [];
+    try {
+      for (const key of await this.mesh.listPreAuthKeys()) {
+        const orphan =
+          key.tags.length === 1 &&
+          key.tags[0] === tag &&
+          !liveKeyIds.has(key.headscaleKeyId) &&
+          !this.isFresh(key.createdAt, now) &&
+          !isExpired(key.expiration, now);
+        if (!orphan) continue;
+        await this.mesh.expirePreAuthKey(key.headscaleKeyId);
+        expiredOrphans.push(key.headscaleKeyId);
+      }
+    } catch (error) {
+      return { outcome: "failed", reason: this.fail(error) };
+    }
+    try {
+      const minted = await this.mesh.createPreAuthKey({
+        tags: [tag],
+        reusable: true,
+        ephemeral: true,
+        expiration: ATTEMPT_KEY_EXPIRATION,
+      });
+      return {
+        outcome: "minted",
+        headscaleKeyId: minted.headscaleKeyId,
+        key: minted.key,
+        secretName,
+        expiredOrphans,
+        epoch,
+        keyCreatedAt: minted.createdAt,
+      };
+    } catch (error) {
+      return { outcome: "failed", reason: this.fail(error) };
+    }
+  }
+
+  /** A key created within one pass of `now` (unknown creation time counts as old). */
+  private isFresh(createdAt: string | null, now: number): boolean {
+    const created = createdAt ? Date.parse(createdAt) : 0;
+    return now - created < this.sweepMinAgeMs;
+  }
+
+  /** Expire every given key, then delete every node-scoped device that `isDoomed` names. */
+  private async expireThenDelete(
+    expire: readonly HeadscaleKeyId[],
+    isDoomed: (device: MeshDevice) => boolean,
+    unkeyed: HeadscaleDeviceId[] = []
+  ): Promise<HeadscaleDeviceId[]> {
+    for (const id of expire) await this.mesh.expirePreAuthKey(id);
+    const deleted: HeadscaleDeviceId[] = [];
+    for (const device of await this.mesh.listNodes()) {
+      if (!nodeScoped(device.tags)) continue;
+      if (device.headscaleKeyId === null) {
+        unkeyed.push(device.headscaleDeviceId);
+        continue;
+      }
+      if (!isDoomed(device)) continue;
+      try {
+        await this.mesh.deleteNode(device.headscaleDeviceId);
+      } catch (error) {
+        if (!(isNodeMeshError(error) && error.reason === "node_not_found"))
+          throw error;
+      }
+      deleted.push(device.headscaleDeviceId);
+    }
+    return deleted;
+  }
+
+  /**
+   * Revoke one attempt: expire its key FIRST, then delete every device that joined with it, then read
+   * both back. Refuses a key that is not node-scoped.
+   */
+  async revokeAttempt(
+    keyId: HeadscaleKeyId,
+    now: number,
+    /** COORDINATOR_EPOCH: the stored generation; a mismatch is `void`. Absent = trust the id (same process). */
+    generation?: {
+      readonly epoch: string;
+      readonly keyCreatedAt: string | null;
+    }
+  ): Promise<RevokeResult> {
+    if (generation && generation.epoch !== this.epochValue)
+      return { outcome: "void" };
+    let stage: "expire" | "delete" | "readback" = "expire";
+    try {
+      const key = (await this.mesh.listPreAuthKeys()).find(
+        (k) => k.headscaleKeyId === keyId
+      );
+      if (
+        generation &&
+        (!key ||
+          (generation.keyCreatedAt !== null &&
+            key.createdAt !== generation.keyCreatedAt))
+      )
+        return { outcome: "void" };
+      if (key && !nodeScoped(key.tags))
+        return { outcome: "refused", reason: "not_a_node_key" };
+      await this.mesh.expirePreAuthKey(keyId);
+      stage = "delete";
+      const deletedDevices = await this.expireThenDelete(
+        [],
+        (d) => d.headscaleKeyId === keyId
+      );
+      stage = "readback";
+      const after = (await this.mesh.listPreAuthKeys()).find(
+        (k) => k.headscaleKeyId === keyId
+      );
+      if (after && !isExpired(after.expiration, now))
+        return { outcome: "failed", stage, reason: "key_live" };
+      const remaining = (await this.mesh.listNodes()).filter(
+        (d) => d.headscaleKeyId === keyId && nodeScoped(d.tags)
+      );
+      if (remaining.length > 0)
+        return { outcome: "failed", stage, reason: "devices_remain" };
+      return { outcome: "revoked", deletedDevices };
+    } catch (error) {
+      return { outcome: "failed", stage, reason: this.fail(error) };
+    }
+  }
+
+  /**
+   * Expire every node-scoped key no live attempt stores (skipping keys newer than one pass), then delete
+   * every node-scoped device whose key is not live. A success opens minting again.
+   */
+  async sweep(
+    liveKeyIds: ReadonlySet<HeadscaleKeyId>,
+    now: number
+  ): Promise<SweepResult> {
+    const expiredKeys: HeadscaleKeyId[] = [];
+    const unkeyedNodeDevices: HeadscaleDeviceId[] = [];
+    const generation = this.failures;
+    try {
+      const keys = await this.mesh.listPreAuthKeys();
+      const live = new Set(liveKeyIds);
+      for (const key of keys) {
+        if (!nodeScoped(key.tags) || live.has(key.headscaleKeyId)) continue;
+        if (this.isFresh(key.createdAt, now)) {
+          // Too new to judge: its device (if any) must survive this pass too.
+          live.add(key.headscaleKeyId);
+          continue;
+        }
+        if (!isExpired(key.expiration, now))
+          expiredKeys.push(key.headscaleKeyId);
+      }
+      const deletedDevices = await this.expireThenDelete(
+        expiredKeys,
+        (d) => d.headscaleKeyId !== null && !live.has(d.headscaleKeyId),
+        unkeyedNodeDevices
+      );
+      // Only a sweep that saw no concurrent failure may reopen minting.
+      const clean = this.failures === generation;
+      if (clean) this.swept = true;
+      return clean
+        ? { ok: true, expiredKeys, deletedDevices, unkeyedNodeDevices }
+        : {
+            ok: false,
+            expiredKeys,
+            deletedDevices,
+            unkeyedNodeDevices,
+            reason: "other",
+          };
+    } catch (error) {
+      return {
+        ok: false,
+        expiredKeys,
+        deletedDevices: [],
+        unkeyedNodeDevices,
+        reason: this.fail(error),
+      };
+    }
+  }
+
+  /**
+   * Every device Headscale lists (task.5431 device check). A failed read closes minting like any other
+   * failed call, and the caller counts it as a failed read (HR 8: failed reads roll nothing).
+   */
+  async listDevices(): Promise<
+    | { readonly ok: true; readonly devices: readonly MeshDevice[] }
+    | { readonly ok: false; readonly reason: NodeMeshErrorReason }
+  > {
+    try {
+      return { ok: true, devices: await this.mesh.listNodes() };
+    } catch (error) {
+      return { ok: false, reason: this.fail(error) };
+    }
+  }
+
+  /** HR 12: Headscale holds no API key. */
+  async checkAdminSurface(): Promise<
+    | { readonly ok: true }
+    | { readonly ok: false; readonly apiKeys: number }
+    | { readonly ok: false; readonly reason: NodeMeshErrorReason }
+  > {
+    try {
+      const keys = await this.mesh.listApiKeys();
+      return keys.length === 0
+        ? { ok: true }
+        : { ok: false, apiKeys: keys.length };
+    } catch (error) {
+      return { ok: false, reason: this.fail(error) };
+    }
+  }
+}

@@ -9,15 +9,17 @@
  *   Reads via container.knowledgeStorePort.getKnowledge.
  * Invariants: VALIDATE_IO, AUTH_VIA_GETSESSIONUSER, KNOWLEDGE_READ_REQUIRES_PRINCIPAL.
  * Side-effects: IO (HTTP response, Doltgres read via container port)
- * Links: docs/spec/knowledge-syntropy.md
+ * Links: https://node-template.cognidao.org/knowledge/knowledge-recall-path
  * @public
  */
 
 import { KnowledgeRowSchema } from "@cogni/node-contracts";
+import { toKnowledgeRow } from "@cogni/shared-knowledge-store";
 import { NextResponse } from "next/server";
 import { getSessionUser } from "@/app/_lib/auth/session";
 import { getContainer } from "@/bootstrap/container";
 import { wrapRouteHandlerWithLogging } from "@/bootstrap/http";
+import { countAgentRead } from "../_usage";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -29,7 +31,7 @@ export const GET = wrapRouteHandlerWithLogging<{
     routeId: "knowledge.get",
     auth: { mode: "required", getSessionUser },
   },
-  async (ctx, _request, sessionUser, context) => {
+  async (ctx, request, sessionUser, context) => {
     if (!sessionUser) {
       return NextResponse.json({ error: "unauthorized" }, { status: 401 });
     }
@@ -49,27 +51,13 @@ export const GET = wrapRouteHandlerWithLogging<{
     const { id } = await context.params;
 
     const entry = await port.getKnowledge(id);
+    countAgentRead(request, sessionUser, id, entry ? "ok" : "fail");
     if (!entry) {
       return NextResponse.json({ error: "not found" }, { status: 404 });
     }
 
     ctx.log.info({ id }, "knowledge.get_success");
 
-    return NextResponse.json(
-      KnowledgeRowSchema.parse({
-        id: entry.id,
-        domain: entry.domain,
-        entityId: entry.entityId ?? null,
-        title: entry.title,
-        content: entry.content,
-        useWhen: entry.useWhen ?? null,
-        entryType: entry.entryType ?? "finding",
-        confidencePct: entry.confidencePct ?? null,
-        sourceType: entry.sourceType,
-        sourceRef: entry.sourceRef ?? null,
-        tags: entry.tags ?? null,
-        createdAt: entry.createdAt ? entry.createdAt.toISOString() : null,
-      })
-    );
+    return NextResponse.json(KnowledgeRowSchema.parse(toKnowledgeRow(entry)));
   }
 );

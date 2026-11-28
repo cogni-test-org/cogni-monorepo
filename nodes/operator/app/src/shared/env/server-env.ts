@@ -80,8 +80,7 @@ export const serverSchema = z.object({
   APP_ENV: z.enum(["test", "production"]),
   APP_BASE_URL: z.string().url().optional(),
   DOMAIN: z.string().optional(),
-  // Public workload zone owned by this fleet. Canonical deployments omit it and keep cognidao.org;
-  // the isolated test operator sets cogni-testing.org for generated node routes and overlays.
+  // Shared substrate root. Keep this distinct from NODE_DEPLOY_WORKLOAD_ZONE and auth DOMAIN.
   FORK_DOMAIN_ROOT: z.string().min(1).optional(),
 
   // Deployment environment (for observability labels and analytics filtering)
@@ -93,6 +92,12 @@ export const serverSchema = z.object({
   // (e.g. cogni-test-org) sets this to its own control env (candidate-a) so the env-membership
   // verb's PR-authoring targets appsets/<control-env>/ instead of the nonexistent appsets/production/.
   FLEET_CONTROL_ENV: z.string().optional(),
+
+  // Envs this deployment's node-deploy sequencer serves (comma-separated; story.5137 ONE FRONT DOOR). The
+  // production operator serves `candidate-a,preview,production`. Unset => only DEPLOY_ENVIRONMENT.
+  NODE_DEPLOY_ENVS: z.string().optional(),
+  // Explicit fleet-owned workload DNS zone. Never DOMAIN (auth) or FORK_DOMAIN_ROOT (substrate).
+  NODE_DEPLOY_WORKLOAD_ZONE: z.string().optional(),
 
   // Build SHA for observability (canonical source for /metrics, /readyz, agent.json)
   APP_BUILD_SHA: z.string().optional(),
@@ -118,7 +123,7 @@ export const serverSchema = z.object({
   // Billing (Stage 6.5)
   // SPEND-side LLM markup (calculateLlmUserCharge). The PURCHASE-side markup +
   // system-tenant revenue share are governance config in repo-spec payments_in
-  // (markup_factor / revenue_share), not env. See docs/spec/chain-config.md.
+  // (markup_factor / revenue_share), not env. See https://node-template.cognidao.org/knowledge/chain-config-governance.
   USER_PRICE_MARKUP_FACTOR: z.coerce.number().min(1.0).default(2.0),
 
   // Database connections — both required, no component-piece fallback.
@@ -169,8 +174,18 @@ export const serverSchema = z.object({
   // Node env-membership verb (story.5020 W4): flag-gated DNS reverse/forward reconcile seam.
   // v0 ships OFF — a node-env add/remove only LOGS the intended Cloudflare change (a removed node's
   // A record lingers until TTL). vNext (W3b) wires the live CloudflareAdapter prune/upsert.
-  // Default: false. See docs/design/operator-fleet-safety.md.
+  // Default: false. See https://cognidao.org/knowledge/fleet-capacity-design.
   DNS_REVERSE_RECONCILE: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+
+  // Node-admin sync (task.5494, ONE_ADMIN_ANSWER): false = REPORT-ONLY. The sync reads every
+  // node's repo-spec approvers and logs the OpenFGA `node:<id>#admin` diff, writing nothing, and
+  // the legacy boot-time owner writer keeps running. true = the sync writes the diff and the
+  // legacy writer is skipped, so exactly one admin writer runs in each mode.
+  // Default: false. The change that flips it in production also deletes the legacy writer.
+  NODE_ADMIN_SYNC_WRITE: z
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
@@ -221,6 +236,7 @@ export const serverSchema = z.object({
   NODE_SUBMODULE_PARENT_REPO: optionalString,
   // Which repo's infra/catalog/ defines this env's nodes. Defaults to the submodule
   // parent; set separately where the pin-PR target is a throwaway org (bug.5073).
+  NODE_REGISTRY_WORKLOAD_ZONE: z.string().optional(),
   NODE_REGISTRY_CATALOG_OWNER: optionalString,
   NODE_REGISTRY_CATALOG_REPO: optionalString,
 
@@ -262,6 +278,9 @@ export const serverSchema = z.object({
   // Optional: when unset the compute capability returns no balances (graceful degradation)
   // until ESO surfaces the token onto the operator runtime.
   CHERRY_AUTH_TOKEN: optionalString,
+  // The Cherry team whose credit the Financials page reports. The token can see several teams;
+  // the report binds to this id and shows UNKNOWN when it is absent or not found (never teams[0]).
+  CHERRY_TEAM_ID: optionalString,
   // NOTE: AKASH_CONSOLE_API_KEY is deliberately GONE (task.5138). One Console account has ONE
   // key and it belongs to that account's actuator (hub `akash-actuator-wallet-cutover`). The
   // app's Akash awareness is the actuator's own ledger (akashSpend on /compute/balances,
@@ -279,9 +298,9 @@ export const serverSchema = z.object({
   // by its own ExternalSecret. serverEnv() is the PUBLIC operator app's env contract — declaring
   // the key here would invite a future wiring that reads a wallet the app must never hold.
   // The actuator reads it as a file in @bootstrap/akash-tx-actuator, not through serverEnv.
-  // Comma-separated Akash provider addresses whose egress IPs the substrate firewall
-  // allowlists (harden-docker-public-ports.sh compute-egress-allowlist). The adapter holds
-  // the bid window for these before falling back to the cheapest stranger.
+  // Comma-separated Akash provider addresses the adapter prefers: it holds the bid window for
+  // these before falling back to the cheapest stranger. Preference only; since task.5428 no
+  // substrate firewall row depends on the provider.
   AKASH_PREFERRED_PROVIDERS: optionalString,
   COMPUTE_BALANCE_QUERY_TIMEOUT_MS: z.coerce
     .number()
@@ -348,6 +367,11 @@ export const serverSchema = z.object({
   COGNI_REPO_PATH: optionalString,
   // SHA override for mounts without .git (e.g., git-sync worktree)
   COGNI_REPO_SHA: optionalString,
+  // owner/repo of this node's repository: only a pull request there is a code deliverable of a work item (task.0122).
+  // Optional: one or more comma-separated owner/repo; when set, only a pull request of those repositories is a code
+  // deliverable. Unset, the gate accepts a PR of any
+  // github.com repository and the container logs `adapter.work_items.pr_repo_unpinned` once at boot. No default.
+  WORK_ITEMS_PR_REPO: optionalString,
 
   // TigerBeetle (Financial Ledger) - Optional
   // Required only when double-entry ledger is enabled.
@@ -356,13 +380,13 @@ export const serverSchema = z.object({
 
   // Privy (Operator Wallet) - Optional
   // Required only when operator wallet features are enabled.
-  // Per operator-wallet.md: KEY_NEVER_IN_APP — Privy HSM holds signing keys.
+  // Per https://node-template.cognidao.org/knowledge/operator-wallet-custody-boundary: KEY_NEVER_IN_APP — Privy HSM holds signing keys.
   PRIVY_APP_ID: optionalString,
   PRIVY_APP_SECRET: optionalString,
   PRIVY_SIGNING_KEY: optionalString,
 
   // Operator wallet top-up cap (USD)
-  // Per operator-wallet.md: MAX_TOPUP_CAP — per-tx ceiling for OpenRouter top-ups.
+  // Per https://node-template.cognidao.org/knowledge/operator-wallet-custody-boundary: MAX_TOPUP_CAP — per-tx ceiling for OpenRouter top-ups.
   OPERATOR_MAX_TOPUP_USD: z.coerce.number().positive().default(500),
 
   // OpenRouter API key — optional. Provider funding disabled when not set.
@@ -399,7 +423,7 @@ export const serverSchema = z.object({
   OPENBAO_SA_TOKEN_PATH: z.string().default("/var/run/secrets/openbao/token"),
 
   // PostHog product analytics — required
-  // See docs/guides/posthog-setup.md for setup
+  // See https://node-template.cognidao.org/knowledge/configure-posthog for setup
   // PostHog Cloud free tier: 1M events/month at https://us.i.posthog.com
   POSTHOG_API_KEY: optionalString,
   POSTHOG_HOST: optionalUrl,
@@ -409,6 +433,11 @@ export const serverSchema = z.object({
   // Optional in schema for build/local; issuance 503s when unset. APP_BASE_URL
   // is the configured canonical issuer.
   IDENTITY_ATTESTATION_PRIVATE_KEY: optionalString,
+
+  // git-review signs per-call assertions to linked nodes (task.5448): operator-only Ed25519
+  // seed, 64 hex characters. Separate from the attestation key. A review of another node is
+  // refused with a typed 503 when unset; the operator's own reviews never read it.
+  GIT_REVIEW_SIGNING_SEED: optionalString,
 
   // GitHub OAuth client used by the identity broker to AUTHENTICATE a GitHub
   // account for a relying node. One credential pair PER ENVIRONMENT — never per

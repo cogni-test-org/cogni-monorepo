@@ -13,14 +13,15 @@
  *   - SUBJECT_NEVER_FROM_SESSION: `github` is populated ONLY from the GitHub authorization
  *     response for this exact `state`. There is no operator session in this flow (task.5024).
  * Side-effects: none
- * Links: docs/spec/decentralized-user-identity.md, task.5024
+ * Links: https://cognidao.org/knowledge/identity-attestation-v1, task.5024
  * @public
  */
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { decode, encode } from "next-auth/jwt";
 
 export const BROKER_STATE_COOKIE = "identity_broker_state";
-/** Scoped so the cookie is only ever sent to the broker legs. */
+/** Shared across the broker pages and routes. */
 export const BROKER_STATE_COOKIE_PATH = "/";
 const BROKER_STATE_SALT = "identity-broker-state";
 /** Mirrors the link-transaction window in `api/auth/link/[provider]`. */
@@ -127,4 +128,20 @@ export async function decodeBrokerState(
     returnTo,
     ...(resolved ? { github: resolved } : {}),
   };
+}
+
+/** Correlates an authenticated rendered snapshot with the exact opaque cookie. */
+export function consentBinding(token: string): string {
+  return createHash("sha256")
+    .update("identity-broker-consent-v1\0")
+    .update(token)
+    .digest("hex");
+}
+
+export function matchesConsentBinding(token: string, value: unknown): boolean {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) return false;
+  return timingSafeEqual(
+    Buffer.from(consentBinding(token), "hex"),
+    Buffer.from(value, "hex")
+  );
 }

@@ -43,6 +43,11 @@ const createGraphOption = (
 
 const AVAILABLE_GRAPHS: readonly GraphOption[] = [
   {
+    graphId: "langgraph:cogni" satisfies GraphId,
+    name: "Cogni",
+    description: "Hub-grounded read-only mission agent",
+  },
+  {
     graphId: "langgraph:poly-brain" satisfies GraphId,
     name: "Poly Brain",
     description: "Prediction market analyst with live market data",
@@ -97,11 +102,6 @@ const AVAILABLE_GRAPHS: readonly GraphOption[] = [
     name: "Operating Review",
     description:
       "Periodic review — triages backlog, flags risks, produces structured briefs",
-  },
-  {
-    graphId: "langgraph:pr-manager" satisfies GraphId,
-    name: "PR Manager",
-    description: "VCS flight capability for PRs",
   },
 ];
 

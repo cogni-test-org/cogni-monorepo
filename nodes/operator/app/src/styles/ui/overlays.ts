@@ -8,13 +8,30 @@
  * Invariants: All variants use design tokens; factories return valid Tailwind class strings; maintains z-index hierarchy.
  * Side-effects: none
  * Notes: Terminal components serve as reference for overlay patterns.
- * Links: docs/spec/ui-implementation.md
+ * Links: https://node-template.cognidao.org/knowledge/frontend-development
  * @public
  */
 
 import { cva } from "class-variance-authority";
 
 import type { SizeKey } from "@/styles/theme";
+
+export const brainLoading = cva(
+  "flex min-h-0 w-full flex-1 items-center justify-center"
+);
+export const brainLoadingGraphic = cva(
+  "relative grid size-20 shrink-0 place-items-center"
+);
+export const brainLoadingOrbit = cva(
+  "brain-loading-orbit absolute inset-0 size-20 motion-safe:animate-spin"
+);
+export const brainLoadingSpectrum = cva(
+  "brain-loading-spectrum block size-full motion-safe:animate-spin"
+);
+export const brainLoadingTrack = cva(
+  "absolute inset-0 size-20 text-foreground/70"
+);
+export const brainLoadingMark = cva("brain-loading-mark size-12");
 
 const terminalFrameSurfaceVariants = {
   default: "bg-card text-card-foreground",

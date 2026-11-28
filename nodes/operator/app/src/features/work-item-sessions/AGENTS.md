@@ -14,8 +14,8 @@ Pure policy for operator work-item execution sessions: deadline math, DTO mappin
 ## Pointers
 
 - [Root AGENTS.md](../../../../../../../AGENTS.md)
-- [Development Lifecycle spec](../../../../../../../docs/spec/development-lifecycle.md) (`nextActionForWorkItem` is the operator's pushback channel referenced by the spec)
-- [Operator Dev Lifecycle Coordinator design](../../../../../../../docs/design/operator-dev-lifecycle-coordinator.md)
+- [Development Lifecycle spec](https://node-template.cognidao.org/knowledge/work-item-status-machine) (`nextActionForWorkItem` is the operator's pushback channel referenced by the spec)
+- [Operator Dev Lifecycle Coordinator design](https://cognidao.org/knowledge/validation-hold-design)
 - [Sessions Zod contract](../../contracts/work-item-sessions.v1.contract.ts)
 - [App-layer facade](../../app/_facades/work/coordination.server.ts) (binds session user + container, calls policy)
 - [HTTP routes](../../app/api/v1/work/items/%5Bid%5D/) — `claims`, `heartbeat`, `pr`, `coordination`
@@ -38,7 +38,7 @@ Pure policy for operator work-item execution sessions: deadline math, DTO mappin
   - `deadlineFromNow(now, ttlSeconds)` — pure deadline calculator
   - `effectiveSessionStatus(session, now)` — collapses `active` to `idle` when deadline elapsed
   - `toWorkItemSessionDto(session, now)` — `WorkItemSessionRecord` → `WorkItemSessionDto`
-  - `nextActionForWorkItem({ workItem, session, now, conflict? })` — operator pushback text driving `/coordination` responses (e.g. demands `/validate-candidate` when `status=needs_merge|done` and `deployVerified=false`)
+  - `nextActionForWorkItem({ workItem, session, now, conflict? })` — operator pushback text driving `/coordination` responses. Once a PR is linked it names the hub ladder order: `needs_implement` moves to `needs_implementation_review`, which starts a fresh `/review-implementation` while CI runs; `needs_validation` flights the approved head and runs `/validate-candidate` (the PR scorecard for the head SHA is the only validation signal); `needs_merge` is the operator merge (`POST /api/v1/vcs/merge`) and a PATCH to `needs_closeout`; `needs_closeout` records the closeout artifact, then `done`. Each forward move needs the exit artifact or fact of the stage it leaves (task.0122).
 - **Routes (if any):** none — this directory is policy only. Routes live under `app/api/v1/work/items/[id]/{claims,heartbeat,pr,coordination}/`.
 - **Env/Config keys:** none
 

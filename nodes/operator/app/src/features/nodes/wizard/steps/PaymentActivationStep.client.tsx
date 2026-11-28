@@ -6,8 +6,11 @@
  * Purpose: Wizard-native payment activation for an external node.
  * Scope: Deploys the payment Split with the connected wallet, records it on the node row, then asks
  *   the operator GitHub App to open the node-repo PR that writes payment config into `.cogni/repo-spec.yaml`.
- * Side-effects: IO (wagmi transaction, PATCH node row, POST activation route, clipboard)
- * Links: src/app/api/v1/nodes/[id]/activate-payments/route.ts, src/features/nodes/wizard/step-registry.tsx
+ *   Before that, "Read node repo-spec" asks the operator to read the wallet + DAO the node declares in its own
+ *   repo-spec on main (POST payment-prereqs); the wizard never takes an address from the browser (bug.5656).
+ * Side-effects: IO (wagmi transaction, PATCH node row, POST payment-prereqs + activation routes, clipboard)
+ * Links: src/app/api/v1/nodes/[id]/payment-prereqs/route.ts, src/app/api/v1/nodes/[id]/activate-payments/route.ts,
+ *   src/features/nodes/wizard/step-registry.tsx
  * @public
  */
 
@@ -31,6 +34,7 @@ import {
   Wallet,
   XCircle,
 } from "lucide-react";
+import { useRouter } from "next/navigation";
 import type { ReactElement } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Address } from "viem";
@@ -46,6 +50,7 @@ import { Button } from "@/components";
 import { LaunchPackCopyButton } from "../LaunchPackCopyButton.client";
 import { StepSection } from "../StepSection";
 import type { WizardStepProps } from "../types";
+import { NodeWalletCreate } from "./NodeWalletCreate.client";
 
 /** Default payment activation economics: 95% provider top-up / 5% DAO margin. */
 const DEFAULT_MARKUP_FACTOR = 1.10803324099723;
@@ -93,6 +98,39 @@ async function readActivationResponse(
   return { rawText: text };
 }
 
+interface GitPrereqAddresses {
+  readonly operatorWalletAddress?: string;
+  readonly daoAddress?: string;
+}
+
+interface PrereqResponseBody {
+  readonly error?: unknown;
+  readonly reason?: unknown;
+  readonly missingKey?: unknown;
+  readonly invalidKey?: unknown;
+  readonly git?: GitPrereqAddresses;
+}
+
+function describePrereqError(status: number, body: PrereqResponseBody): string {
+  if (typeof body.missingKey === "string") {
+    return `The node repo-spec on main is missing "${body.missingKey}". Add it, merge it to main, then read again.`;
+  }
+  if (typeof body.invalidKey === "string") {
+    return `"${body.invalidKey}" in the node repo-spec is not usable${
+      typeof body.reason === "string" ? ` (${body.reason})` : ""
+    }. Fix it on main, then read again.`;
+  }
+  if (body.error === "repo_spec_invalid") {
+    return "The node repo-spec on main could not be parsed. Fix it on main, then read again.";
+  }
+  if (body.error === "prereq_mismatch") {
+    return "The node repo-spec on main disagrees with the addresses already recorded for this node. The operator never overwrites them; compare the addresses below.";
+  }
+  if (typeof body.reason === "string") return body.reason;
+  if (typeof body.error === "string") return body.error;
+  return `HTTP ${status}`;
+}
+
 function formatPercent(allocation: bigint): string {
   return `${Number(allocation) / 1e4}%`;
 }
@@ -110,18 +148,18 @@ Node id: ${input.nodeId}
 Node repo: ${input.nodeRepoUrl ?? "open the node dashboard for the repo link"}
 Repo spec: ${input.repoSpecUrl ?? ".cogni/repo-spec.yaml in the node repo"}
 
-Goal: provision a node-owned Privy operator wallet, store its secrets for the node, write the public operator wallet address into .cogni/repo-spec.yaml and the operator node registry, then return me to the node dashboard so I can deploy the payment Split.
+Goal: provision a node-owned Privy operator wallet, store its secrets for the node, write the public operator wallet address into the node's own .cogni/repo-spec.yaml and merge it to main, then return me to the node dashboard so I can click "Read node repo-spec" and deploy the payment Split.
 
 Human steps:
 1. Open the Privy dashboard and create or select the dedicated operator-wallet app for this node.
 2. Copy the app id, app secret, and wallet signing key into a local env file for the AI dev only. Do not paste secret values into chat.
 
 AI dev steps:
-1. Read docs/guides/operator-wallet-setup.md and docs/guides/secrets-add-new.md.
+1. Read https://node-template.cognidao.org/knowledge/set-up-operator-wallet and https://cognidao.org/knowledge/break-glass-secret-write.
 2. Add the node's PRIVY_APP_ID, PRIVY_APP_SECRET, and PRIVY_SIGNING_KEY to candidate-a secrets.
 3. Provision or resolve the Privy-managed operator wallet.
-4. Update .cogni/repo-spec.yaml with operator_wallet.address.
-5. Ensure the operator node registry row has operator_wallet_address for this node.
+4. Write operator_wallet.address in the node's own .cogni/repo-spec.yaml and merge that change to main.
+5. Tell the human to click "Read node repo-spec" on the node dashboard. The operator copies the address from your repo-spec on main; do not edit the operator's database or node registry.
 6. Run the required checks and flight, then send the human back to the node dashboard.
 
 Never log, commit, or paste secret values.`;
@@ -145,9 +183,9 @@ Activation PR: ${input.activationPrUrl ?? "open the node repo and find the payme
 Goal: merge the activation PR, promote the resulting node build to production, and verify the production /version build serves the activated repo-spec.
 
 Read first:
-- docs/guides/payments-setup.md
-- docs/guides/multi-node-deploy.md
-- docs/runbooks/dolthub-remote-bootstrap.md if DoltHub or knowledge mirror config appears in the diff
+- https://node-template.cognidao.org/knowledge/set-up-usdc-topups
+- .claude/skills/deploy-node/SKILL.md (POST /api/v1/deploy/workloads)
+- https://cognidao.org/knowledge/dolthub-mirror-bootstrap if DoltHub or knowledge mirror config appears in the diff
 
 Do:
 1. Review the activation PR and confirm .cogni/repo-spec.yaml contains the Split receiving address and operator wallet.
@@ -234,6 +272,7 @@ function AddressRows({
 
 export function PaymentActivationStep({ node }: WizardStepProps): ReactElement {
   const { address: walletAddress } = useAccount();
+  const router = useRouter();
   const patchedRef = useRef(false);
   const activationRequestedRef = useRef(false);
 
@@ -244,6 +283,13 @@ export function PaymentActivationStep({ node }: WizardStepProps): ReactElement {
     useState<ActivationResult | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState<"setup" | "handoff" | null>(null);
+  const [readPhase, setReadPhase] = useState<"IDLE" | "READING" | "ERROR">(
+    "IDLE"
+  );
+  const [readError, setReadError] = useState<string | null>(null);
+  const [gitAddresses, setGitAddresses] = useState<GitPrereqAddresses | null>(
+    null
+  );
 
   const {
     writeContract,
@@ -258,7 +304,13 @@ export function PaymentActivationStep({ node }: WizardStepProps): ReactElement {
 
   const hasOperator = !!node.operatorWalletAddress;
   const hasTreasury = !!node.daoAddress;
-  const isReady = hasOperator && hasTreasury;
+  // bug.5656: ready means the operator READ the wallet from the node repo-spec (row is wallet_ready or
+  // later), not merely that the row has an address.
+  const walletRead =
+    node.status === "wallet_ready" ||
+    node.status === "payments_ready" ||
+    node.status === "active";
+  const isReady = hasOperator && hasTreasury && walletRead;
   const isInFlight =
     splitPhase === "DEPLOYING" || splitPhase === "AWAITING_CONFIRMATION";
   const effectiveSplitAddress = splitAddress ?? node.splitAddress;
@@ -284,7 +336,7 @@ export function PaymentActivationStep({ node }: WizardStepProps): ReactElement {
   const canDeploySplit =
     isReady &&
     splitPhase === "IDLE" &&
-    (node.status === "published" || node.status === "wallet_ready") &&
+    node.status === "wallet_ready" &&
     !!walletAddress;
 
   const { operatorAllocation, treasuryAllocation } = calculateSplitAllocations(
@@ -315,6 +367,38 @@ export function PaymentActivationStep({ node }: WizardStepProps): ReactElement {
       }),
     [activationPrUrl, node.id, node.nodeRepoUrl, node.repoSpecUrl, node.slug]
   );
+
+  const readNodeRepoSpec = useCallback(async () => {
+    setReadPhase("READING");
+    setReadError(null);
+    try {
+      const response = await fetch(`/api/v1/nodes/${node.id}/payment-prereqs`, {
+        method: "POST",
+      });
+      let body: PrereqResponseBody = {};
+      try {
+        const parsed: unknown = JSON.parse(await response.text());
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          body = parsed as PrereqResponseBody;
+        }
+      } catch {
+        // Non-JSON body: fall back to the HTTP status below.
+      }
+      if (body.git) setGitAddresses(body.git);
+      if (!response.ok) {
+        setReadError(describePrereqError(response.status, body));
+        setReadPhase("ERROR");
+        return;
+      }
+      setReadPhase("IDLE");
+      router.refresh();
+    } catch (error) {
+      setReadError(
+        error instanceof Error ? error.message : "could not read repo-spec"
+      );
+      setReadPhase("ERROR");
+    }
+  }, [node.id, router]);
 
   const openActivationPr = useCallback(async () => {
     if (activationRequestedRef.current) {
@@ -398,7 +482,9 @@ export function PaymentActivationStep({ node }: WizardStepProps): ReactElement {
           totalAllocation: SPLIT_TOTAL_ALLOCATION,
           distributionIncentive: 0,
         },
-        operator,
+        // SPLIT_CONTROLLER_IS_DAO (node-formation-contract invariant 5): the node DAO controls the Split,
+        // not the operator wallet. The operator wallet is a recipient only.
+        treasury,
         walletAddress as Address,
       ],
     });
@@ -621,11 +707,11 @@ export function PaymentActivationStep({ node }: WizardStepProps): ReactElement {
         <ol className="space-y-4 rounded-md border border-border bg-muted/20 p-4">
           <ChecklistRow
             state={prereqState}
-            title="Operator wallet ready"
+            title="Wallet address declared"
             detail={
               isReady
-                ? "Wallet, DAO treasury, and repo-spec are available."
-                : "Set wallet secrets and write the operator address first."
+                ? "Wallet and DAO treasury were read from the node repo-spec on main."
+                : "Create the node wallet here (its repo-spec PR writes operator_wallet.address), merge it to main, then read it here."
             }
           />
           <ChecklistRow
@@ -672,18 +758,49 @@ export function PaymentActivationStep({ node }: WizardStepProps): ReactElement {
                   Payment prerequisites are not ready yet
                 </p>
                 <p>
-                  The operator must know this node's DAO treasury and node-owned
-                  operator wallet before it can deploy a Split.
+                  The node declares its own operator wallet in its repo-spec.
+                  The operator reads it from main; it never takes an address
+                  from this page.
                 </p>
               </div>
             </div>
 
             <AddressRows
-              operatorWalletAddress={node.operatorWalletAddress}
-              daoTreasuryAddress={node.daoAddress}
+              operatorWalletAddress={
+                gitAddresses?.operatorWalletAddress ??
+                node.operatorWalletAddress
+              }
+              daoTreasuryAddress={gitAddresses?.daoAddress ?? node.daoAddress}
               operatorAllocation={operatorAllocation}
               treasuryAllocation={treasuryAllocation}
             />
+
+            {readError ? (
+              <p className="text-destructive" role="alert">
+                {readError}
+              </p>
+            ) : null}
+
+            {node.status === "published" && !node.operatorWalletAddress ? (
+              <NodeWalletCreate
+                nodeId={node.id}
+                slug={node.slug}
+                nodeRepoUrl={node.nodeRepoUrl}
+                pendingWalletAddress={node.pendingNodeWalletAddress ?? null}
+              />
+            ) : null}
+
+            <Button
+              type="button"
+              onClick={readNodeRepoSpec}
+              disabled={readPhase === "READING"}
+              className="w-full gap-2"
+            >
+              {readPhase === "READING" ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : null}
+              Read node repo-spec
+            </Button>
 
             <div className="flex flex-col gap-2 sm:flex-row">
               <Button
@@ -720,9 +837,10 @@ export function PaymentActivationStep({ node }: WizardStepProps): ReactElement {
                   <p className="font-medium">What your wallet confirms</p>
                   <p className="text-muted-foreground">
                     One Base transaction deploys a 0xSplits contract. Your
-                    wallet pays gas and is recorded as the creator; the node
-                    operator wallet becomes the Split controller. This does not
-                    make your wallet the node owner or treasury.
+                    wallet pays gas and is recorded as the creator; the node DAO
+                    becomes the Split controller and the node wallet is a
+                    recipient. This does not make your wallet the node owner or
+                    treasury.
                   </p>
                 </div>
               </div>

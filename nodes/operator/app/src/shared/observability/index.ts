@@ -14,20 +14,50 @@ import { EVENT_NAMES as NODE_SHARED_EVENT_NAMES } from "@cogni/node-shared";
 
 export const EVENT_NAMES = {
   ...NODE_SHARED_EVENT_NAMES,
+  // task.5474 / story.5156: revocable hashed v2 agent keys. Ids + reasons only, never a key or hash.
+  AGENT_CREDENTIAL_UPGRADED: "agent.credential.upgraded",
+  AGENT_CREDENTIAL_ROTATED: "agent.credential.rotated",
+  AGENT_CREDENTIAL_CONFIRMED: "agent.credential.confirmed",
+  AGENT_CREDENTIAL_REVOKED: "agent.credential.revoked",
+  AGENT_CREDENTIAL_REFUSED: "agent.credential.refused",
+  AGENT_CREDENTIAL_STORE_UNAVAILABLE: "agent.credential.store_unavailable",
+  AGENT_CREDENTIAL_V1_SUPERSEDED_DENIED:
+    "agent.credential.v1_superseded_denied",
+  AGENT_CREDENTIAL_INVALID_DENIED: "agent.credential.invalid_denied",
+  AGENT_CREDENTIAL_RATE_LIMITED: "agent.credential.rate_limited",
+  FINANCE_REPORT_READ: "finance.report.read",
+  ADAPTER_GITHUB_NODE_CODE_ERROR: "adapter.github_node_code.error",
   ADAPTER_GITHUB_REPO_WRITE_ERROR: "adapter.github_repo_write.error",
   NODE_PUBLISH_SECRET_SHAPE_GENERATED:
     "feature.node_publish.secret_shape_generated",
   NODE_ACCESS_REQUEST_COMPLETE: "feature.node_access_request.complete",
   NODE_SECRET_WRITE_COMPLETE: "feature.node_secret_write.complete",
+  // bug.5254: the release facade's generated-key outcome (generated | present | skipped | failed),
+  // key names + KV version only, never values.
+  NODE_DEPLOY_SECRET_GENERATION: "feature.node_deploy.secret_generation",
   NODE_PREVIEW_PROMOTE_COMPLETE: "feature.node_preview_promote.complete",
+  // task.5491: audit of a destroy of retained state (`DELETE /deploy/workloads` with the confirm fields).
+  // Ids and the dseq only. The durable record is `desired.stop` plus the attempt's `retained_destroy` step.
+  NODE_WORKLOAD_DESTROY_REQUESTED: "feature.node_workload_destroy.requested",
+  // Merge-queue push → head review verdict copied onto the queue commit (task.5438). One event per
+  // handled queue push; `outcome` is copied_success | copied_failure | not_reviewed | skipped_exists | error.
+  REVIEW_QUEUE_VERDICT_COMPLETE: "feature.review_queue_verdict.complete",
   // Env-membership merge → lane reconcile (task.5132). One terminal event per merged
   // `cogni-operator/node-env-<slug>-<env>` PR, including the no-dispatch outcomes. Adding a
   // PRE-PROD lane can dispatch a PRODUCTION promote (the custodian owns the lane's substrate),
   // so this name is how that is found in Loki — never a mystery deploy.
-  LANE_ONBOARD_COMPLETE: "feature.lane_onboard.complete",
+  DEPLOY_MAINTENANCE_CANCEL_COMPLETE: "deploy.maintenance_cancel_complete",
+  DEPLOY_MAINTENANCE_CANCEL_REFUSED: "deploy.maintenance_cancel_refused",
   DEPLOY_INFRA_RECONCILE_COMPLETE: "deploy.infra_reconcile.complete",
   NODE_SCHEDULES_SYNC_COMPLETE: "feature.node_schedules_sync.complete",
   NODE_RELIABILITY_STATUS_COMPLETE: "feature.node_reliability_status.complete",
+  // GET /api/v1/nodes/{id}/observability/health terminal event (bug.5528) — distinct from the
+  // actuator sweep's per-target NODE_RELIABILITY_STATUS_COMPLETE so route reads never inflate it.
+  NODE_OBSERVABILITY_HEALTH_COMPLETE:
+    "feature.node_observability_health.complete",
+  // POST readmission terminal event on the same route (bug.5528).
+  NODE_OBSERVABILITY_HEALTH_READMIT_COMPLETE:
+    "feature.node_observability_health.readmit_complete",
   NODE_RELIABILITY_TRANSITION: "feature.node_reliability.transition",
   NODE_RELIABILITY_SWEEP_STARTED: "feature.node_reliability.sweep_started",
   NODE_RELIABILITY_SWEEP_COMPLETE: "feature.node_reliability.sweep_complete",
@@ -40,6 +70,14 @@ export const EVENT_NAMES = {
   NODE_DISTRIBUTION_ACTIVATION_COMPLETE:
     "feature.node_distribution_activation.complete",
   NODE_DAO_RESET_COMPLETE: "feature.node_dao_reset.complete",
+  // POST /api/v1/nodes/{id}/payment-prereqs (bug.5656): ONE terminal event per call. Fields: nodeId, outcome
+  // (recorded | unchanged | no_change | error), missingKey (only for prereq_missing), previousStatus, nextStatus,
+  // status (HTTP), durationMs. Never an address, a URL or a repo-spec body.
+  NODE_PAYMENT_PREREQS_COMPLETE: "node.payment_prereqs.complete",
+  // POST /api/v1/nodes/{id}/node-wallet (story.0083): ONE terminal event per call. Fields: nodeId, actorUserId,
+  // outcome (created | adopted | existing | error), walletAddress (public, only when a wallet exists), status (HTTP),
+  // errorCode, durationMs. Never the owner public key, its hash, a Privy id or err.message (err.name only).
+  NODE_WALLET_CREATE_COMPLETE: "node.wallet_create.complete",
   // defineScheduledJob dispatcher: one cron fire of a registered scheduled job.
   SCHEDULED_JOB_DISPATCH_RECEIVED: "feature.scheduled_job.dispatch_received",
   SCHEDULED_JOB_DISPATCH_COMPLETE: "feature.scheduled_job.dispatch_complete",
@@ -57,8 +95,38 @@ export const EVENT_NAMES = {
   IDENTITY_BROKER_AUTHENTICATED: "feature.identity_broker.authenticated",
   IDENTITY_BROKER_COMPLETE: "feature.identity_broker.complete",
   IDENTITY_BROKER_REJECTED: "feature.identity_broker.rejected",
+  // Node-admin sync (task.5494): one event per node per 2-min tick. `outcome` is
+  // ok | unavailable | empty | refused, `mode` is report | write, with adds/deletes counts.
+  // Every non-ok outcome carries a closed-enum `reason` (NODE_ADMIN_SYNC_REASONS). User ids only,
+  // never wallet addresses.
+  IDENTITY_NODE_ADMIN_SYNC: "identity.node_admin_sync",
+  // One per tick, even with zero node rows: mode, nodes, and a count per outcome. Absence of this
+  // event means the tick did not run.
+  IDENTITY_NODE_ADMIN_SYNC_TICK: "identity.node_admin_sync.tick",
+  // One per HTTP request git-review sends to a linked node's hub (task.5448), plus one per access ask. Fields: alias, route
+  // (knowledge.get | knowledge.list | knowledge.index | enrollment), status (HTTP status, null when unreachable), kid (the
+  // public key id of the signed assertion), outcome, durationMs. Never a URL, a knowledge id, a header or a token.
+  REVIEW_REMOTE_READ: "review.remote_read",
   DNS_REVERSE_RECONCILE_SKIPPED: "dns.reverse_reconcile.skipped",
   DNS_FORWARD_RECONCILE_SKIPPED: "dns.forward_reconcile.skipped",
+  // Goal metrics (@cogni-dao/metrics, story.0021): one refresh tick and one goals read.
+  METRIC_REFRESH_COMPLETE: "metric.refresh_complete",
+  GOALS_PROGRESS_READ: "goals.progress_read",
+  // GET /api/v1/work/items/{id}/expectations: one terminal event per read (EDO hypotheses a work item tracks).
+  WORK_EXPECTATIONS_READ: "work.expectations.read",
+  // Edge catch-all counter (story.5148, `edge.caught@1`): ONE terminal event per host and 300 s window, a number or
+  // unknown with a stable `reason`. A Grafana alert reads it from Loki. Fields: env, host, outcome, caught, reason.
+  EDGE_CAUGHT_WINDOW: "edge_caught_window",
+  // Lease metrics (bug.5641): one event per FAILED discovery read (`reason` lanes_unavailable | lanes_truncated) or
+  // FAILED lane relay (nodeId, env, workload, bounded `reason`, upstreamStatus). Never a token, a host or a body.
+  LEASE_METRICS_SCRAPE: "lease_metrics_scrape",
+  // Node metrics read (story.5169): ONE warn per refused or failed `/api/metrics/read` request. Fields: nodeId (only
+  // when the credential parsed), env, kind, reason (bounded enum), upstreamStatus, queryChars. Never a token or query text.
+  NODE_METRICS_READ: "node_metrics_read",
+  // GET /api/v1/nodes/{id}/observability/metrics (bug.5641 follow-up): ONE terminal event per request. Fields: outcome,
+  // status, errorCode, nodeId, env, kind, preset, queryChars, durationMs. Never query text or results.
+  NODE_OBSERVABILITY_METRICS_COMPLETE:
+    "feature.node_observability_metrics.complete",
 } as const;
 
 export type EventName = (typeof EVENT_NAMES)[keyof typeof EVENT_NAMES];
@@ -81,6 +149,7 @@ export {
   type PaymentsStatusReadEvent,
   type PaymentsVerifiedEvent,
   type RequestContext,
+  WORK_ITEMS_LIST_ERROR_CODES,
 } from "@cogni/node-shared";
 // --- App-local: server logger/metrics/redact (pino + prom-client runtime deps) ---
 export * from "./server";

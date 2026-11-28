@@ -45,7 +45,7 @@
  */
 
 import type { Database } from "@cogni/db-client";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
 import type {
   AkashTxAllocationLedgerPort,
@@ -134,8 +134,8 @@ export class DrizzleAkashTxAllocationLedger
    * @param walletScope opaque identity of the Console wallet this ledger serializes. One
    *   scope = one writer. Two actuators pointed at the SAME Console wallet MUST share a
    *   scope and a database, or cursor-based recovery is unsound. Callers MUST obtain this
-   *   from `resolveAkashTxWallet`, which refuses any credential the legacy ComputeWorkload
-   *   controller already spends from (ONE_WALLET_ONE_WRITER).
+   *   from `resolveAkashTxWallet`, which holds exactly one wallet and has no input for the
+   *   retired controller's key (THE_ACTUATOR_HOLDS_EXACTLY_ONE_WALLET, ONE_WALLET_ONE_WRITER).
    */
   constructor(
     private readonly getDb: () => Promise<Database>,
@@ -609,7 +609,11 @@ export class DrizzleAkashTxAllocationLedger
    * does NOT require a handle, so a lease that is BOOTING but not yet `allocated` — and would
    * otherwise be closed on its BootDeadline before the pump ever enumerated it — is visible for
    * log tailing, and a live handleless receipt is loggable rather than invisibly absent. Same
-   * scoping/ordering/limit discipline as `listAllocated`; a pure read that decides nothing.
+   * scoping/limit discipline as `listAllocated`; a pure read that decides nothing.
+   *
+   * NEWEST-touched first (task.5420): ascending order plus a small limit returned only the
+   * oldest receipts — dead rows (refused creates, closed leases) that never age out — so every
+   * newer node-deploy lease fell past the limit and was never tailed.
    */
   async listActive(input: {
     nodeId?: string;
@@ -632,16 +636,16 @@ export class DrizzleAkashTxAllocationLedger
             : [])
         )
       )
-      .orderBy(akashTxAllocations.updatedAt)
+      .orderBy(desc(akashTxAllocations.updatedAt))
       .limit(input.limit);
     return rows.map(toRecord);
   }
 
   /**
-   * Every-state enumeration for generation derivation (task.5132) — same scoping as
-   * `listAllocated` (walletScope always, optional `(node_id, environment)` narrowing), no state
-   * or handle predicate: terminal `released`/`failed` receipts are exactly the evidence
-   * `requiredLeaseGeneration` exists to count, and the allocated-only view hid them.
+   * Every-state enumeration (task.5132) — same scoping as `listAllocated` (walletScope always,
+   * optional `(node_id, environment)` narrowing), no state or handle predicate: terminal
+   * `released`/`failed` receipts are evidence the allocated-only view hides (the actuator's
+   * recovery tried-set and the deploy-state route read them).
    */
   async listReceipts(input: {
     nodeId?: string;

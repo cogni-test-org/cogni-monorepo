@@ -7,7 +7,7 @@
  * Scope: Pure validation schemas. Does not contain I/O or side effects.
  * Invariants: SCHEMA_GENERIC_CONTENT_SPECIFIC — domain specificity in `domain` field + `tags`, not schema structure.
  * Side-effects: none
- * Links: docs/spec/knowledge-data-plane.md, docs/spec/knowledge-syntropy.md
+ * Links: https://node-template.cognidao.org/knowledge/knowledge-data-plane, https://node-template.cognidao.org/knowledge/knowledge-recall-path
  * @public
  */
 
@@ -29,13 +29,13 @@ export type SourceType = z.infer<typeof SourceTypeSchema>;
 // ---------------------------------------------------------------------------
 // Entry type — what KIND of knowledge a row represents within its domain.
 // The DB column is plain `text` (default 'finding'); this enum is the
-// recommended set per docs/spec/knowledge-syntropy.md § Seed Schema +
+// recommended set per https://node-template.cognidao.org/knowledge/knowledge-recall-path § Seed Schema +
 // § The Hypothesis Loop. Adding values here is a doc + UI change, not a
 // schema migration.
 // ---------------------------------------------------------------------------
 
 export const EntryTypeSchema = z.enum([
-  // Four-beat hypothesis loop (codename EDO; see knowledge-syntropy.md)
+  // Four-beat hypothesis loop (codename EDO; see https://node-template.cognidao.org/knowledge/knowledge-recall-path)
   "event",
   "hypothesis",
   "decision",
@@ -49,8 +49,28 @@ export const EntryTypeSchema = z.enum([
   "skill",
   "guide",
   "html",
+  // DAO goal — a human commitment (Statement · KPI · Target · By), not a
+  // prediction: admin-merged via a plain contribution insert, excluded from
+  // confidence recompute, read through `listActiveGoals` (dao-goals-design).
+  "goal",
 ]);
 export type EntryType = z.infer<typeof EntryTypeSchema>;
+
+/**
+ * Entry types that MUST carry `evaluate_at` (HYPOTHESIS_HAS_EVALUATE_AT): a
+ * hypothesis's appointment with truth, a goal's `By:` deadline.
+ */
+export const EVALUATE_AT_REQUIRED_ENTRY_TYPES: readonly string[] = [
+  "hypothesis",
+  "goal",
+];
+
+/** True when a row of this entry type must declare `evaluate_at`. */
+export function requiresEvaluateAt(
+  entryType: string | null | undefined
+): boolean {
+  return EVALUATE_AT_REQUIRED_ENTRY_TYPES.includes(entryType ?? "");
+}
 
 /**
  * Entry types that MUST go through atomic `core__edo_*` tools.
@@ -64,6 +84,26 @@ export const RAW_WRITE_REJECTS_TYPES: readonly EntryType[] = [
   "outcome",
 ];
 
+/**
+ * EDO machinery entry types (SCHEMA_REFINED_BY_READ_FILTER, R1
+ * LibrarianReadFilter). Default "what does this node know" reads —
+ * `searchKnowledge` / `listKnowledge` — exclude these rows unless the caller
+ * passes `includeEdo: true`. Chain/audit surfaces (`EdoCapability.getChain`,
+ * `/api/v1/edo/*`, the resolver) read EDO rows directly and are unaffected.
+ * Fail-closed enumeration: a new EDO beat must be added here explicitly.
+ */
+export const EDO_ENTRY_TYPES: readonly EntryType[] = [
+  "event",
+  "hypothesis",
+  "decision",
+  "outcome",
+];
+
+/** True when `entryType` is EDO machinery hidden from default reads. */
+export function isEdoEntryType(entryType: string | null | undefined): boolean {
+  return EDO_ENTRY_TYPES.includes((entryType ?? "") as EntryType);
+}
+
 // ---------------------------------------------------------------------------
 // Citation type — relationship between two knowledge rows
 // ---------------------------------------------------------------------------
@@ -76,7 +116,7 @@ export const CitationTypeSchema = z.enum([
   "supersedes",
   // Cross-plane work item ↔ knowledge tracking edge
   "tracks",
-  // Hypothesis loop edges (see knowledge-syntropy.md § The Hypothesis Loop)
+  // Hypothesis loop edges (see https://node-template.cognidao.org/knowledge/knowledge-recall-path § The Hypothesis Loop)
   "evidence_for", // event/observation/finding → hypothesis (or decision)
   "derives_from", // decision → hypothesis (strict)
   "validates", // outcome → hypothesis (strict)
@@ -109,6 +149,16 @@ export const HYPOTHESIS_TARGETED_EDGES: readonly CitationType[] = [
   "validates",
   "invalidates",
 ];
+
+/**
+ * Entry types each hypothesis-targeted edge may cite. A DAO goal (`entry_type
+ * 'goal'`, dao-goals-design) is the root a decision acts on, so `derives_from`
+ * may cite a goal as well as a hypothesis; `validates`/`invalidates` stay
+ * hypothesis-only (goal outcomes resolve through the goal layer).
+ */
+export function citedEntryTypesFor(type: CitationType): readonly string[] {
+  return type === "derives_from" ? ["hypothesis", "goal"] : ["hypothesis"];
+}
 
 // ---------------------------------------------------------------------------
 // Resolution strategy — namespaced text on hypothesis rows
@@ -150,6 +200,10 @@ export const KnowledgeSchema = z.object({
   tags: z.array(z.string()).nullable().optional(),
   evaluateAt: z.date().nullable().optional(),
   resolutionStrategy: z.string().nullable().optional(),
+  // Goal metrics (@cogni-dao/metrics): a `metric` row's spec and a goal/hypothesis's KPI bindings.
+  // Shapes are validated by the metrics package at the node boundary, never here.
+  metricSpec: z.record(z.string(), z.unknown()).nullable().optional(),
+  kpiBindings: z.array(z.record(z.string(), z.unknown())).nullable().optional(),
   createdAt: z.date().optional(),
 });
 

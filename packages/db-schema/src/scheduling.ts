@@ -12,7 +12,7 @@
  * - Per SCHEDULER_SPEC.md: job_key = scheduleId:scheduledFor for Graphile Worker
  * - UNIQUE(schedule_id, scheduled_for) WHERE schedule_id IS NOT NULL on graph_runs prevents duplicate run records per slot
  * Side-effects: none (schema definitions only)
- * Links: docs/spec/scheduler.md, docs/spec/unified-graph-launch.md, types/scheduling.ts
+ * Links: https://node-template.cognidao.org/knowledge/scheduled-run-grant-contract, https://node-template.cognidao.org/knowledge/graph-run-launch-contract, types/scheduling.ts
  * @public
  */
 
@@ -155,7 +155,7 @@ export const schedules = pgTable(
 /**
  * Graph runs — single canonical run ledger for all execution types.
  * Per SINGLE_RUN_LEDGER: promoted from schedule_runs. One table for API, scheduled, and webhook runs.
- * Per unified-graph-launch.md: trigger provenance stored per run.
+ * Per https://node-template.cognidao.org/knowledge/graph-run-launch-contract: trigger provenance stored per run.
  * UNIQUE(schedule_id, scheduled_for) WHERE schedule_id IS NOT NULL prevents duplicate scheduled run records.
  */
 export const graphRuns = pgTable(
@@ -260,4 +260,10 @@ export const executionRequests = pgTable("execution_requests", {
     .defaultNow(),
   /** Graph claim lease; null after finalization or for non-leased generic jobs */
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  /**
+   * VERDICT_SURVIVES_REPLAY (story.5102): the graph's structured output, written at finalize
+   * and returned by every cached replay. Nullable; bounded to 64 KB of JSON by the writer
+   * (larger outputs are stored as null, and the run reads as "no structured output").
+   */
+  structuredOutput: jsonb("structured_output").$type<Record<string, unknown>>(),
 });

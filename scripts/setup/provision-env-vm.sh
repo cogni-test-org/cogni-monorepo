@@ -373,7 +373,7 @@ for node in "${NODE_TARGETS[@]}"; do
     log_error "Generate your fork's identity via the operator DAO setup wizard:"
     log_error "  https://cognidao.org/setup/dao"
     log_error "Then commit the generated .cogni/repo-spec.yaml to this fork's main + re-run."
-    log_error "(Runbook step: docs/runbooks/fork-quickstart.md §4.5)"
+    log_error "(Runbook step: https://cognidao.org/knowledge/fork-quickstart-guide §4.5)"
     exit 2
   fi
   # Upstream-inheritance check: a fork running with upstream's UUID is also
@@ -394,7 +394,7 @@ for node in "${NODE_TARGETS[@]}"; do
       log_error "Generate your fork's own identity via the operator DAO setup wizard:"
       log_error "  https://cognidao.org/setup/dao"
       log_error "Then commit the generated .cogni/repo-spec.yaml to this fork's main + re-run."
-      log_error "(Runbook step: docs/runbooks/fork-quickstart.md §4.5)"
+      log_error "(Runbook step: https://cognidao.org/knowledge/fork-quickstart-guide §4.5)"
       exit 2
     fi
   fi
@@ -439,12 +439,26 @@ log_step "Phase 3: Provision VM"
 VM_NAME_PREFIX=$(echo "${GH_REPO//\//-}" | tr '[:upper:]' '[:lower:]')
 log_info "VM/SSH-key prefix: ${VM_NAME_PREFIX} (from \$GH_REPO=${GH_REPO})"
 
+# story.5084 — production hosts the fleet control plane plus the shared substrate for
+# every Akash lane in every env; on the 6GB shared VPS it swapped its databases out
+# (Doltgres/Temporal major faults, 10-65% iowait for 60 days). Production gets a 16GB
+# dedicated-core Cloud VDS; other envs keep the 6GB VPS. VM_PLAN overrides for one run.
+# bug.5608 — candidate-a (k3s + every candidate flight + the candidate substrate) swapped on the
+# 6GB VPS too: scheduler-worker could not restart and Postgres crash-recovered under swap I/O.
+# It moved to the same 16GB VDS on 2026-11-17.
+case "$DEPLOY_ENV" in
+  production | candidate-a) VM_PLAN_DEFAULT="G1-4-16gb-100nv-ded" ;;
+  *) VM_PLAN_DEFAULT="B1-6-6gb-100s-shared" ;;
+esac
+VM_PLAN="${VM_PLAN:-$VM_PLAN_DEFAULT}"
+log_info "Cherry plan: ${VM_PLAN} (env=${DEPLOY_ENV})"
+
 TFVARS="$PROVISION_DIR/terraform.${WORKSPACE}.tfvars"
 cat > "$TFVARS" << EOF
 environment          = "${DEPLOY_ENV}"
 vm_name_prefix       = "${VM_NAME_PREFIX}"
 project_id           = "${CHERRY_PROJECT_ID}"
-plan                 = "B1-6-6gb-100s-shared"
+plan                 = "${VM_PLAN}"
 region               = "LT-Siauliai"
 public_key_path      = "keys/cogni_${DEPLOY_ENV}_deploy.pub"
 ghcr_deploy_username = "${GHCR_USERNAME}"
@@ -1234,8 +1248,7 @@ phase_5b_timeout() {
 # Cogni's slice of Argo's core `argocd-cm` is delivered as an ADDITIVE JSON MERGE
 # PATCH, never as an owned GitOps resource. It carries the identity labels Argo's
 # own informer selects on (`app.kubernetes.io/part-of: argocd`),
-# `kustomize.buildOptions: --enable-helm` for the kustomize-with-helm substrate,
-# and the ComputeWorkload health rule (ci-cd.md Axiom 26).
+# and `kustomize.buildOptions: --enable-helm` for the kustomize-with-helm substrate.
 #
 # bug.5095: an Argo Application that declared `argocd-cm` in Git took ownership of
 # the object and server-side apply REPLACED `metadata.labels` with Argo's tracking
@@ -1250,7 +1263,7 @@ phase_5b_timeout() {
 # The copy+patch lives in scripts/setup/lib/argocd-cm-patch.sh so day-two recovery
 # (reconcile-env-substrate.sh, run by `provision-env.yml mode=substrate-only`)
 # applies the exact same patch — a wedged live env is repaired with no re-provision.
-log_info "Merge-patching argocd-cm (part-of label + kustomize --enable-helm + ComputeWorkload health)..."
+log_info "Merge-patching argocd-cm (part-of label + kustomize --enable-helm)..."
 apply_argocd_cm_runtime_patch "$REPO_ROOT" "$VM_IP" "$SSH_OPTS" \
   || phase_5b_timeout "argocd-cm merge patch failed"
 
@@ -1438,8 +1451,8 @@ HCL
   #
   # Policy is per-LANE, not per-env (bug.5206). Writers on this env cannot touch another
   # CLUSTER's vault — OpenBao is per-cluster, so that is structural — but the PAYING cluster
-  # must write every lane it reconciles, because the Composition interpolates each lane's
-  # secrets into the lease its Console account is billed for. Same lane set #2290 gave
+  # must write every lane it reconciles, because each lane's secrets go into the lease its
+  # Console account is billed for. Same lane set #2290 gave
   # node-secrets-writer; they had drifted, and `production-writer` (the role
   # secret-materialize.sh mints) still could not write cogni/data/candidate-a/*.
   # This WIDENS AN EXISTING IDENTITY rather than adding one: NS3 allows exactly one writer
@@ -1475,7 +1488,7 @@ HCL
   log_info "  ${DEPLOY_ENV}-writer role bound — operator: kubectl create token openbao-operator -n default | bao login -method=kubernetes role=${DEPLOY_ENV}-writer"
 
   # ── 5b.4c db-provisioner reader role (deploy-infra single-source read path) ─
-  # secrets-management.md Invariant 15 / DB-cred migration Phase 1: deploy-infra
+  # https://cognidao.org/knowledge/secrets-management Invariant 15 / DB-cred migration Phase 1: deploy-infra
   # runs on THIS VM with kubectl and must read pod-consumed DB role passwords from
   # OpenBao — the SAME values ESO syncs — instead of a GH-secret-rendered .env, so
   # the DB role and the pod can never diverge (bug.5002). It is NOT a writer and
@@ -1510,7 +1523,7 @@ HCL
   log_info "  ${DEPLOY_ENV}-db-reader role bound — deploy-infra: kubectl create token db-provisioner -n default | bao login -method=kubernetes role=${DEPLOY_ENV}-db-reader (read-only)"
 
   # ── 5b.4b GitHub Actions OIDC writer role (day-2, zero-laptop-cred path) ───
-  # Ships spec secrets-management.md Invariant 9 Entry 2 (previously DEFERRED):
+  # Ships spec https://cognidao.org/knowledge/secrets-management Invariant 9 Entry 2 (previously DEFERRED):
   # the `.github/workflows/secret-set.yml` workflow_dispatch federates a
   # short-lived GitHub Actions OIDC token into a job-scoped OpenBao token via
   # this `jwt` auth method — no kubeconfig, no PAT, no root token on a laptop
@@ -1564,13 +1577,13 @@ HCL
   # mirror nodes/operator/app/src/shared/secrets/secrets-lane-trust.data.ts
   # (SECRETS_LANE_TRUST); the route check is only a fast-fail, THIS is the gate.
   #   production  -> candidate-a, preview, production   (the PAYING cluster custodies every
-  #                  lane, because the Crossplane Composition interpolates each lane's
-  #                  secrets into the lease production's Console account is billed for)
+  #                  lane, because each lane's secrets go into a lease production's
+  #                  Console account is billed for)
   #   preview     -> preview only
   #   candidate-a -> candidate-a only
   # Up-trust is refused forever: no pre-prod env gains a production path here. OpenBao is
   # per-CLUSTER, so a lane prefix is a LABEL inside this env's own vault, never a reach into
-  # another cluster's vault. Per secrets-management.md Invariant 1 the blast-radius boundary
+  # another cluster's vault. Per https://cognidao.org/knowledge/secrets-management Invariant 1 the blast-radius boundary
   # is <service>; widening the lane set does not widen that boundary.
   # The two _system/_shared denies are carried onto EVERY lane gained, data AND metadata —
   # a per-node grant must never reach a shared path in ANY lane.
@@ -1746,7 +1759,7 @@ else
   seed_kv _shared TEMPORAL_DB_PASSWORD "$TEMPORAL_DB_PASSWORD"
 
   # DOLTGRES_PASSWORD — the doltgres `postgres` superuser, baked into the volume at
-  # first-init and IMMUTABLE post-init (doltgres can't ALTER the superuser; databases.md
+  # first-init and IMMUTABLE post-init (doltgres can't ALTER the superuser; https://node-template.cognidao.org/knowledge/database-migration-contract
   # §5.2). Same shared-infra DB-cred class as OPENFGA/TEMPORAL above and MUST be seeded the
   # same SET-ONCE way. It was the one left out: deploy-infra falls back to
   # `derive_secret doltgres-root` = sha256(POSTGRES_ROOT_PASSWORD) when OpenBao is empty, so
@@ -2006,7 +2019,7 @@ log_step "Phase 6: Apply ExternalSecret manifests"
 # canonical pattern called out in .claude/skills/cicd-secrets-expert
 # anti-patterns ("ssh root@vm kubectl ... — use local kubectl").
 #
-# Leaves are enumerated from the single SSOT tree per secrets-classification.md:
+# Leaves are enumerated from the single SSOT tree per https://node-template.cognidao.org/knowledge/secrets-routing-tiers:
 #   - nodes/<node>/k8s/external-secrets/<env>/           (node-domain, A2)
 # Every node carries its own ExternalSecret leaf in-repo (north-star per-node
 # substrate). The pre-wizard operator-domain tree was purged; there is now ONE
@@ -2124,7 +2137,7 @@ log_info "All ApplicationSets applied — Argo syncing from deploy/* branches"
 # Gate 1 — honest allocatable: the kubelet system-reserved reservation must be in
 # effect on the fresh node (bootstrap.sh asserts it inline at first boot; re-assert
 # here from the provisioner so the gate is explicit, not only a bootstrap.ok
-# side-channel). See docs/design/operator-fleet-safety.md SLA#1.
+# side-channel). See https://cognidao.org/knowledge/fleet-capacity-design SLA#1.
 log_info "Gate 1: honest allocatable (system-reserved in effect)..."
 scp $SSH_OPTS "$REPO_ROOT/scripts/ci/assert-honest-allocatable.sh" root@"$VM_IP":/tmp/assert-honest-allocatable.sh
 if ! ssh $SSH_OPTS root@"$VM_IP" 'rc=0; bash /tmp/assert-honest-allocatable.sh || rc=$?; rm -f /tmp/assert-honest-allocatable.sh; exit $rc'; then
@@ -2164,7 +2177,7 @@ echo "════════════════════════�
 echo "  DEPLOYMENT STATUS REPORT"
 echo "═══════════════════════════════════════════════════════════════════"
 echo ""
-echo "  Environment: ${APP_ENV} | VM: ${VM_IP} | Plan: B1-6-6gb-100s-shared"
+echo "  Environment: ${APP_ENV} | VM: ${VM_IP} | Plan: ${VM_PLAN}"
 echo "  Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "  Branch: ${BRANCH}"
 echo ""

@@ -21,7 +21,7 @@ The GitHub UI accepts changes anywhere — these files are not auto-applied. The
 | `merge-queue-ruleset.json` | **canonical** | `merge_queue` repository-ruleset payload — the queue requirement, config-as-code (no manual UI step).  |
 | `setup-main-branch.sh`     | **canonical** | One-command apply for any node-shaped fork: `bash infra/github/setup-main-branch.sh [<owner>/<repo>]`. |
 
-Spec: [`docs/spec/node-ci-cd-contract.md#repo-setup-fixture`](../../docs/spec/node-ci-cd-contract.md#repo-setup-fixture).
+Spec: [`node-ci-sovereignty`](https://node-template.cognidao.org/knowledge/node-ci-sovereignty).
 
 ## Apply procedure
 
@@ -39,13 +39,24 @@ The script applies the full config in three API steps — no manual UI step:
 2. `PUT /repos/{repo}/branches/main/protection` — required status checks `["unit","component","static","manifest"]`.
 3. `POST`/`PUT /repos/{repo}/rulesets` — the `merge_queue` ruleset (idempotent: find-by-name, then update or create).
 
-**Why a ruleset for the queue:** classic protection's `PUT .../protection` silently drops `required_merge_queue` (verified against `cogni-dao/test-repo`, 2026-04-28) — which is why this used to be a manual UI click. The **rulesets** API _does_ carry the queue (a `merge_queue` rule is REST-settable; the same 2026-04-28 experiment enabled it this way). The ruleset carries **only** the queue requirement; the required-status-checks set stays in classic protection (the "rulesets for event-specific required-checks lists" idea was tested and rejected — see `merge-queue-config.md`). The two layers are orthogonal and compose: a PR must pass the checks **and** merge through the queue.
+**Why a ruleset for the queue:** classic protection's `PUT .../protection` silently drops `required_merge_queue` (verified against `cogni-dao/test-repo`, 2026-04-28) — which is why this used to be a manual UI click. The **rulesets** API _does_ carry the queue (a `merge_queue` rule is REST-settable; the same 2026-04-28 experiment enabled it this way). The ruleset carries **only** the queue requirement; the required-status-checks set stays in classic protection (the "rulesets for event-specific required-checks lists" idea was tested and rejected — see https://cognidao.org/knowledge/merge-queue-required-checks). The two layers are orthogonal and compose: a PR must pass the checks **and** merge through the queue.
 
 ## Why these specific required checks
 
 The required-status-checks set is intentionally narrow because of an empirical constraint: **GitHub Merge Queue waits forever for required checks whose workflows lack a `merge_group:` trigger** (validated on `cogni-dao/test-repo` PR #53). Any check added to this list MUST be produced by a workflow that fires on both `pull_request:` AND `merge_group:` events.
 
-This forces a clear policy: **PR-only workflows (CodeQL default-setup, Validate PR title, etc.) cannot be required.** They run on PRs as advisory signal only. The deeper rationale and the alternatives considered (stub-job pattern, Rulesets) live in [`docs/spec/merge-queue-config.md`](../../docs/spec/merge-queue-config.md).
+This forces a clear policy: **PR-only workflows (CodeQL default-setup, Validate PR title, etc.) cannot be required.** They run on PRs as advisory signal only. The deeper rationale and the alternatives considered (stub-job pattern, Rulesets) live in [`merge-queue-required-checks`](https://cognidao.org/knowledge/merge-queue-required-checks).
+
+## Operator repo only: require the PR review (task.5438)
+
+`Cogni Git PR Review` is required on the **operator repo only**, restricted to the review App's integration id. The operator's complete required set is the declarative fixture [`branch-protection.operator.json`](./branch-protection.operator.json); `setup-main-branch.sh` and `branch-protection.json` stay the unchanged node-shape set. One admin command applies it:
+
+```bash
+jq 'with_entries(select(.key | startswith("_") | not))' infra/github/branch-protection.operator.json \
+  | gh api -X PATCH repos/cogni-dao/cogni/branches/main/protection/required_status_checks --input -
+```
+
+The check satisfies the "reports on the queue ref" rule above through the operator webhook: on a push to `gh-readonly-queue/main/pr-<N>-…` it copies the PR head's review verdict (same check name, written by the same App) onto the queue commit; no head verdict, or one that is not `success`, is written as `failure` ("PR Review: NOT REVIEWED AT HEAD"). Apply this **after** that webhook code is deployed. Re-apply it after any run of `setup-main-branch.sh` on the operator repo, because that script PUTs the four generic contexts only.
 
 ## Drift detection
 
@@ -72,7 +83,6 @@ Revisit if drift becomes a recurring issue or if change frequency rises.
 
 ## Related
 
-- [docs/spec/node-ci-cd-contract.md](../../docs/spec/node-ci-cd-contract.md) — node sovereignty + merge-gate composition; this directory is referenced from the `## Repo Setup Fixture` section.
-- [docs/spec/merge-queue-config.md](../../docs/spec/merge-queue-config.md) — required-checks policy + the rejected "Rulesets for event-specific required-checks lists" path + empirical findings (the queue itself now uses a minimal `merge_queue` ruleset; the rejection was only about the checks list).
-- [docs/spec/development-lifecycle.md](../../docs/spec/development-lifecycle.md) — where merge queue fits in the contributor flow.
-- [work/items/task.0391.enable-merge-queue.md](../../work/items/task.0391.enable-merge-queue.md) — original adoption rationale.
+- [`node-ci-sovereignty`](https://node-template.cognidao.org/knowledge/node-ci-sovereignty) — node sovereignty + merge-gate composition; this directory is referenced from the `## Repo Setup Fixture` section.
+- [`merge-queue-required-checks`](https://cognidao.org/knowledge/merge-queue-required-checks) — required-checks policy + the rejected "Rulesets for event-specific required-checks lists" path + empirical findings (the queue itself now uses a minimal `merge_queue` ruleset; the rejection was only about the checks list).
+- [`work-item-status-machine`](https://node-template.cognidao.org/knowledge/work-item-status-machine) — where merge queue fits in the contributor flow.

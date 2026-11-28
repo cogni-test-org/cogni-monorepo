@@ -4,13 +4,13 @@
 /**
  * Module: `@tests/contract/app/nodes.developers`
  * Purpose: Contract tests for owner-gated node developer approval — OpenFGA tuple writes AND the
- *   rbac.md §6a GitHub branch-push provisioning side-effect.
+ *   https://cognidao.org/knowledge/authz-port-contract §6a GitHub branch-push provisioning side-effect.
  * Scope: Verifies POST /api/v1/nodes/[id]/developers validates ownership before OpenFGA writes, and
  *   that approval provisions / rejection de-provisions a node-repo collaborator for the agent's bound
  *   (or owner-attested) GitHub login — skipping safely when no login is resolvable.
  * Invariants: OWNER_GATING, OPENFGA_IS_AUTHORITY, TRUST_BOUNDARY_IS_MERGE_NOT_PUSH, PUSH_LOGIN_FROM_BINDING.
  * Side-effects: none
- * Links: nodes/operator/app/src/app/api/v1/nodes/[id]/developers/route.ts, docs/spec/rbac.md §6a
+ * Links: nodes/operator/app/src/app/api/v1/nodes/[id]/developers/route.ts, https://cognidao.org/knowledge/authz-port-contract §6a
  * @internal
  */
 
@@ -411,6 +411,53 @@ describe("POST /api/v1/nodes/[id]/developers", () => {
     expect(deployPlane.setNodeCollaborator).not.toHaveBeenCalled();
   });
 
+  it("refuses to approve admin (task.5494): nobody grants it, the node-admin sync does", async () => {
+    await testApiHandler({
+      appHandler,
+      params: { id: NODE_ID },
+      async test({ fetch }) {
+        const res = await fetch({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            agentUserId: AGENT_USER_ID,
+            decision: "approve",
+            role: "admin",
+          }),
+        });
+        expect(res.status).toBe(400);
+      },
+    });
+
+    expect(authz.writeRelation).not.toHaveBeenCalled();
+  });
+
+  it("still lets the owner reject (revoke) a legacy admin row", async () => {
+    await testApiHandler({
+      appHandler,
+      params: { id: NODE_ID },
+      async test({ fetch }) {
+        const res = await fetch({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            agentUserId: AGENT_USER_ID,
+            decision: "reject",
+            role: "admin",
+          }),
+        });
+        expect(res.status).toBe(200);
+      },
+    });
+
+    expect(authz.deleteRelation).toHaveBeenCalledWith({
+      user: `user:${AGENT_USER_ID}`,
+      relation: "admin",
+      object: `node:${NODE_ID}`,
+    });
+    expect(authz.writeRelation).not.toHaveBeenCalled();
+  });
+
   it("rejects by removing the developer tuple AND de-provisioning branch-push", async () => {
     dbState.requestedGithubLogin = "flock-leader";
 
@@ -445,7 +492,7 @@ describe("POST /api/v1/nodes/[id]/developers", () => {
   });
 
   it("reject without a resolvable login skips de-provision (no orphaned removeNodeCollaborator)", async () => {
-    // V0 owner-attest gap (rbac.md §6a): no `github` binding + no githubLogin on the reject ⇒ the
+    // V0 owner-attest gap (https://cognidao.org/knowledge/authz-port-contract §6a): no `github` binding + no githubLogin on the reject ⇒ the
     // collaborator can't be auto-removed. The tuple delete is still authoritative; branch-push de-prov
     // is skipped + warned, never a silent wrong-arg removeNodeCollaborator call.
     await testApiHandler({

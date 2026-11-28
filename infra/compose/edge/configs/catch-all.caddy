@@ -1,0 +1,97 @@
+# Cogni edge catch-all (story.5148). STATIC — hand-edited, never generated.
+#
+# render-caddyfile.sh emits this file verbatim once (after the global options
+# block) and every site block carries `import cogni_catch_all`. Nothing here is
+# env-specific, so the same text serves every env and every host.
+#
+# What it does
+#   - Caddy itself generates a 502/503/504 (upstream refused, timed out, or no
+#     healthy upstream). `handle_errors` runs ONLY for errors Caddy raised. An
+#     upstream app that answers its own 503 passes through byte-for-byte.
+#   - A caught error gets the `X-Cogni-Edge: caught` marker (grep-able in the
+#     access log and from the client), `X-Cogni-Edge-Cause` (the original Caddy
+#     status), `Retry-After`, and `Cache-Control: no-store`.
+#   - Every caught response is 503: Cloudflare keeps an origin 503 body but
+#     replaces origin 502/504 pages with its own.
+#   - A browser navigation (Accept has text/html, path not under /api/) gets one
+#     small self-contained page (no auto-retry, no product name: the edge serves many hosts). Every other client gets a JSON body. Both are 503.
+#   - `/-/edge-probe` (snippet cogni_edge_canary) is a canary (the `/-/` prefix is the GitLab-style reserved system-route convention): it proxies to a closed
+#     local port, so it always raises a Caddy 502 and exercises the branch above
+#     without touching any app. Only application sites import it; the mesh sites
+#     expose just their listed paths and import cogni_catch_all alone.
+#
+# Escaping: the JSON body and the page use `\{` before a literal brace so Caddy
+# does not read it as a placeholder. The page uses style attributes only (no
+# <style> block), so it has no CSS braces to escape.
+#
+# Docs (Caddy v2): https://caddyserver.com/docs/caddyfile/directives/handle_errors ·
+# https://caddyserver.com/docs/caddyfile/directives/respond ·
+# https://caddyserver.com/docs/caddyfile/directives/header ·
+# https://caddyserver.com/docs/caddyfile/directives/handle ·
+# https://caddyserver.com/docs/caddyfile/matchers · https://caddyserver.com/docs/caddyfile/concepts
+
+(cogni_edge_canary) {
+  handle /-/edge-probe {
+    reverse_proxy 127.0.0.1:9
+  }
+}
+
+(cogni_catch_all) {
+  handle_errors 502 503 504 {
+    header X-Cogni-Edge caught
+    header X-Cogni-Edge-Cause {err.status_code}
+    header Retry-After 30
+    header Cache-Control no-store
+
+    @cogni_nav {
+      header Accept *text/html*
+      not path /api/*
+    }
+    handle @cogni_nav {
+      header Content-Type "text/html; charset=utf-8"
+      respond <<HTML
+        <!doctype html>
+        <html lang="en">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="robots" content="noindex">
+        <meta name="color-scheme" content="dark">
+        <title>Service unavailable</title>
+        </head>
+        <body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#000000;color:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;text-align:center">
+        <main style="padding:24px;max-width:420px">
+        <svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 112 112" fill="none" stroke="#b6c0ce" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label="Sad Cogni robot">
+        <path d="M30 40 C26 28 36 18 46 22 C50 14 62 14 66 22 C76 18 86 28 82 40"/>
+        <path d="M56 19 V40"/>
+        <path d="M40 31 Q45 27 49 31"/>
+        <path d="M63 31 Q67 27 72 31"/>
+        <rect x="24" y="40" width="64" height="44" rx="12"/>
+        <line x1="17" y1="60" x2="24" y2="60"/>
+        <line x1="88" y1="60" x2="95" y2="60"/>
+        <path d="M35 55 L45 51"/>
+        <path d="M77 55 L67 51"/>
+        <circle cx="41" cy="62" r="3.5"/>
+        <circle cx="71" cy="62" r="3.5"/>
+        <path d="M44 77 Q56 69 68 77"/>
+        <line x1="44" y1="84" x2="44" y2="94"/>
+        <line x1="68" y1="84" x2="68" y2="94"/>
+        </svg>
+
+
+        <h1 style="font-size:24px;font-weight:600;margin:16px 0 8px">Service unavailable</h1>
+        <p style="font-size:16px;line-height:1.5;color:#b6c0ce;margin:0 0 24px">The server didn't respond. Please try again in a moment.</p>
+        <a href="" style="display:inline-block;padding:8px 16px;border:1px solid #1e293b;border-radius:6px;background:#1e293b;color:#f8fafc;text-decoration:none;font-size:14px;font-weight:500">Try again</a>
+        <p style="font-size:12px;color:#b6c0ce;margin:24px 0 0">Error 503 · Ref {http.request.uuid}</p>
+        </main>
+        </body>
+        </html>
+        HTML 503
+    }
+
+    handle {
+      header Content-Type application/json
+      respond `\{"error":"origin_unavailable","host":"{http.request.host}"}` 503
+    }
+  }
+}

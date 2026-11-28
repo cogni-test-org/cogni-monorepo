@@ -1,0 +1,760 @@
+// SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
+// SPDX-FileCopyrightText: 2026 Cogni-DAO
+
+/**
+ * Module: `@features/node-deploy/declarations.test`
+ * Purpose: Prove that the operator's REAL checked-in canary workload manifest
+ *   (`.cogni/workloads/canary.yaml`) resolves to its release spec for every environment, and that the
+ *   resolver keeps the node-identity check and surfaces manifest refusals (task.5400, story.5137).
+ *   The per-rule refusals and the byte-identical lowering are proven in packages/repo-spec/tests.
+ * Side-effects: filesystem read of the root `.cogni/repo-spec.yaml` and `.cogni/workloads/canary.yaml`
+ */
+
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  COGNI_NODE_APP_V1_REQUIRED_SECRET_KEYS,
+  extractNodeServices,
+  hasDeclaredNodeDeployment,
+  parseRepoSpec,
+  RETIRED_SECRET_REFS_MESSAGE,
+} from "@cogni/repo-spec";
+import { describe, expect, it } from "vitest";
+import { parse, stringify } from "yaml";
+import {
+  DeclarationError,
+  hostForEnv,
+  REFUSAL,
+  resolveWorkloadDeclaration,
+} from "./declarations";
+import { WORKLOAD_ZONE } from "./testing";
+
+const NODE_ID = "4ff8eac1-4eba-4ed0-931b-b1fe4f64713d";
+const here = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(here, "../../../../../..");
+const ROOT_SPEC = readFileSync(
+  path.join(ROOT, ".cogni/repo-spec.yaml"),
+  "utf8"
+);
+const CANARY = {
+  path: ".cogni/workloads/canary.yaml",
+  text: readFileSync(path.join(ROOT, ".cogni/workloads/canary.yaml"), "utf8"),
+};
+
+const resolve = (
+  over: Partial<Parameters<typeof resolveWorkloadDeclaration>[0]> = {}
+) =>
+  resolveWorkloadDeclaration({
+    workloadZone: WORKLOAD_ZONE,
+    nodeSlug: "operator",
+    repoSpecText: ROOT_SPEC,
+    manifests: [CANARY],
+    nodeId: NODE_ID,
+    env: "production",
+    workload: "canary",
+    ...over,
+  });
+
+describe("the operator's checked-in canary workload manifest", () => {
+  it("repo-spec no longer declares workloads and is not an app-tier deployment", () => {
+    const spec = parseRepoSpec(ROOT_SPEC);
+    expect(hasDeclaredNodeDeployment(spec)).toBe(false);
+    expect(extractNodeServices(spec).map((s) => s.name)).toEqual(["app"]);
+  });
+
+  it("canary-db: the dedicated postgres state, TLS on, 2Gi persistent, tcp 5432 global", () => {
+    const w = resolve({ workload: "canary-db" });
+    expect(w).toMatchObject({
+      kind: "state",
+      port: 5432,
+      cpu: 0.5,
+      memoryMi: 512,
+      expose: { tcp: { global: true } },
+      persistent: { sizeMi: 2048, mountPath: "/var/lib/postgresql/data" },
+      exclusive: false,
+    });
+    expect(w.image).toMatch(/^postgres:16@sha256:[0-9a-f]{64}$/);
+    expect(w.command?.join(" ")).toContain("ssl=on");
+  });
+
+  it("canary: port 8080 behind the route, bound to canary-db, health /version + /readyz", () => {
+    const w = resolve();
+    expect(w).toMatchObject({
+      kind: "app",
+      port: 8080,
+      cpu: 0.25,
+      memoryMi: 256,
+      storageMi: 256,
+      exclusive: false,
+      bindings: [{ env: "DATABASE_URL", workload: "canary-db" }],
+      health: { version: "/version", ready: "/readyz" },
+    });
+    expect(w.command?.[2]).toContain('("0.0.0.0", 8080)');
+  });
+
+  it("hosts follow the environment: production / -test / -preview / -dev", () => {
+    const host = (env: string) => {
+      const w = resolve({ env });
+      return "http" in w.expose ? w.expose.http.host : undefined;
+    };
+    expect(host("production")).toBe("node-deploy-canary.cognidao.org");
+    expect(host("candidate-a")).toBe("node-deploy-canary-test.cognidao.org");
+    expect(host("preview")).toBe("node-deploy-canary-preview.cognidao.org");
+    expect(host("dev")).toBe("node-deploy-canary-dev.cognidao.org");
+    expect(() => hostForEnv("a.example.org", "mars")).toThrow(
+      /unknown environment/
+    );
+  });
+
+  it("a v1 request for a test env key is workload_not_declared: v1 cannot create a test env (story.5159)", () => {
+    expect(() => resolve({ workload: "teqwkzmx" })).toThrow(
+      expect.objectContaining({ code: "workload_not_declared" })
+    );
+  });
+
+  it.each([
+    "teqwkzmx",
+    "main",
+  ])('refuses a manifest that declares the reserved name "%s" (story.5159)', (name) => {
+    const text = CANARY.text.replace(/^ {2}name: canary$/m, `  name: ${name}`);
+    expect(text).not.toBe(CANARY.text);
+    const manifests = [{ path: `.cogni/workloads/${name}.yaml`, text }];
+    // whether or not the reserved workload is the one requested, the whole set is refused
+    for (const workload of [name, "canary-db"])
+      expect(() => resolve({ manifests, workload })).toThrow(
+        expect.objectContaining({
+          code: "workload_manifest_refused",
+          message: expect.stringContaining(`"${name}"`),
+        })
+      );
+  });
+
+  it("an ordinary near-miss name still resolves (te-key shape is exact)", () => {
+    for (const name of ["teqwkzm", "teqwkzmxy", "te-qwkzmx"]) {
+      const text = CANARY.text.replace(
+        /^ {2}name: canary$/m,
+        `  name: ${name}`
+      );
+      expect(() =>
+        resolve({
+          manifests: [{ path: `.cogni/workloads/${name}.yaml`, text }],
+          workload: name,
+        })
+      ).not.toThrow(
+        expect.objectContaining({ code: "workload_manifest_refused" })
+      );
+    }
+  });
+
+  it('refuses a manifest with cogni.dev/exclusive: "true" and returns the issue (CD6)', () => {
+    const text = CANARY.text.replace(
+      'cogni.dev/exclusive: "false"',
+      'cogni.dev/exclusive: "true"'
+    );
+    expect(text).not.toBe(CANARY.text);
+    expect(() => resolve({ manifests: [{ ...CANARY, text }] })).toThrow(
+      expect.objectContaining({
+        code: "workload_manifest_refused",
+        issues: [
+          expect.objectContaining({
+            code: "exclusive_unsupported",
+            file: CANARY.path,
+          }),
+        ],
+      })
+    );
+  });
+
+  it('an image of "." lowers to the supplied built image, and is refused without one (story.5127)', () => {
+    const built = {
+      ...CANARY,
+      text: CANARY.text.replace(/^ {4}image: .*$/m, '    image: "."'),
+    };
+    expect(built.text).not.toBe(CANARY.text);
+    const digest = `ghcr.io/cogni-dao/toks5@sha256:${"ab".repeat(32)}`;
+    expect(resolve({ manifests: [built], builtImage: digest }).image).toBe(
+      digest
+    );
+    expect(() => resolve({ manifests: [built] })).toThrow(
+      expect.objectContaining({
+        code: "workload_manifest_refused",
+        issues: [expect.objectContaining({ code: "built_image_unresolved" })],
+      })
+    );
+    // ALWAYS_DEFER (story.5137): the caller can defer the digest; the app is then pending on its tag
+    const tag = `ghcr.io/cogni-dao/toks5:sha-${"a".repeat(40)}`;
+    const pending = resolve({ manifests: [built], pendingImage: tag });
+    expect(pending.image).toBe(tag);
+    expect(pending.imagePending).toBe(true);
+    // a digest, when supplied, wins over a deferred ref and the spec is not pending
+    const pinned = resolve({
+      manifests: [built],
+      builtImage: digest,
+      pendingImage: tag,
+    });
+    expect(pinned.image).toBe(digest);
+    expect(pinned.imagePending).toBeUndefined();
+  });
+
+  it("refuses another node's id, an undeclared workload, no manifests and an unparseable repo-spec", () => {
+    expect(() =>
+      resolve({ nodeId: "00000000-0000-4000-8000-000000000001" })
+    ).toThrow(expect.objectContaining({ code: "node_mismatch" }));
+    expect(() => resolve({ workload: "nope" })).toThrow(
+      expect.objectContaining({ code: "workload_not_declared" })
+    );
+    expect(() => resolve({ manifests: [] })).toThrow(
+      expect.objectContaining({ code: "workload_not_declared" })
+    );
+    expect(() => resolve({ repoSpecText: "{{ not yaml" })).toThrow(
+      DeclarationError
+    );
+  });
+});
+
+describe("declared secret keys on an app release (task.5405, bug.5254)", () => {
+  /** A node catalog entry (`source: human`) that names the app service, so the key reaches the app. */
+  const catalogFor = (keys: string[]) =>
+    `secrets:\n${keys
+      .map(
+        (key) => `  - name: ${key}
+    tier: A2
+    source: human
+    workloads: [app]
+    required: true
+    category: Node
+    description: Node-owned key.
+    steps: []
+`
+      )
+      .join("")}`;
+  const PROFILE = [...COGNI_NODE_APP_V1_REQUIRED_SECRET_KEYS];
+
+  it("an app carries the profile keys; a state workload carries none", () => {
+    expect(resolve().secretKeys).toEqual(PROFILE);
+    expect(resolve({ workload: "canary-db" }).secretKeys).toBeUndefined();
+  });
+
+  it("a catalog key naming the app is added after the profile keys (poly's PAPER_ENFORCE_MODE)", () => {
+    const w = resolve({
+      secretsCatalogText: catalogFor(["PAPER_ENFORCE_MODE"]),
+    });
+    expect(w.secretKeys).toEqual([...PROFILE, "PAPER_ENFORCE_MODE"]);
+    // a key merely present in some bucket is never listed: only declarations are
+    expect(w.secretKeys).not.toContain("GH_WEBHOOK_SECRET");
+  });
+
+  it("refuses a catalog key that is an operator/fleet credential, naming the key", () => {
+    for (const key of ["LITELLM_MASTER_KEY", "CLOUDFLARE_API_TOKEN"])
+      expect(() => resolve({ secretsCatalogText: catalogFor([key]) })).toThrow(
+        expect.objectContaining({
+          code: "secrets_catalog_refused",
+          message: expect.stringContaining(key),
+        })
+      );
+  });
+
+  it("refuses a repo-spec carrying secret_refs with the fixed catalog message (bug.5254)", () => {
+    expect(() =>
+      resolve({ repoSpecText: `${ROOT_SPEC}\nsecret_refs:\n  - key: X_KEY\n` })
+    ).toThrow(
+      expect.objectContaining({
+        code: "secret_ref_refused",
+        message: RETIRED_SECRET_REFS_MESSAGE,
+      })
+    );
+  });
+});
+
+describe("service partition: an app workload with companions and its separate workers (bug.5666)", () => {
+  const POLY_ID = "4b06359a-a859-4399-888e-a8c7a6696f7e";
+  const service = (over: Record<string, unknown>) => ({
+    artifact: { name: over.name, context: ".", dockerfile: "Dockerfile" },
+    port: 3200,
+    visibility: "private",
+    bindings: {},
+    bind_host: "0.0.0.0",
+    resources: { cpu_units: 1, memory_mi: 512, storage_mi: 1024 },
+    ...over,
+  });
+  const APP = service({
+    name: "app",
+    visibility: "public",
+    runtime_profile: "cogni-node-app-v1",
+  });
+  const TRADER = service({ name: "paper-trader", port: 9100 });
+  const SANDBOX = service({ name: "sandbox", port: 8080 });
+  const specText = (services: Record<string, unknown>[]) =>
+    stringify({
+      ...(parse(ROOT_SPEC) as Record<string, unknown>),
+      node_id: POLY_ID,
+      deployment: { services },
+    });
+  const route = (host: string, port: number) => `service:
+  ports:
+    web: {port: 80, targetPort: ${port}}
+resources:
+  web:
+    type: route
+    params: {host: ${host}, path: /, port: 80}
+`;
+  const QUALIFIED = `    cogni.dev/qualification-path: /api/v1/deploy/qualification
+    cogni.dev/qualification-timeout-ms: "20000"
+`;
+  const manifest = (
+    name: string,
+    containers: string,
+    host: string,
+    port: number,
+    qualified = false
+  ) => ({
+    path: `.cogni/workloads/${name}.yaml`,
+    text: `apiVersion: score.dev/v1b1
+metadata:
+  name: ${name}
+  annotations:
+    cogni.dev/exclusive: "false"
+${qualified ? QUALIFIED : ""}containers:
+${containers}${route(host, port)}`,
+  });
+  const container = (key: string, port: number, image = ".") => `  ${key}:
+    image: ${image}
+    resources:
+      requests: {cpu: "1", memory: 512Mi}
+    readinessProbe:
+      httpGet: {path: /readyz, port: ${port}}
+`;
+  const DIGEST_IMAGE = `ghcr.io/cogni-dao/poly-sandbox@sha256:${"d".repeat(64)}`;
+  /** The app workload: container `app` plus the private `paper-trader` companion, with a qualification. */
+  const POLY = manifest(
+    "poly",
+    container("app", 3200) + container("paper-trader", 9100),
+    "poly.cognidao.org",
+    3200,
+    true
+  );
+  /** A plain app workload (one container, no qualification). */
+  const POLY_PLAIN = manifest(
+    "poly",
+    container("app", 3200),
+    "poly.cognidao.org",
+    3200
+  );
+  const SANDBOX_MANIFEST = manifest(
+    "sandbox",
+    container("sandbox", 8080, DIGEST_IMAGE),
+    "poly-sandbox.cognidao.org",
+    8080
+  );
+  /** node-template's shape: a second app workload (container `app`) that claims no repo-spec service. */
+  const CANARY_MANIFEST = manifest(
+    "canary",
+    container("app", 3200, DIGEST_IMAGE),
+    "poly-canary.cognidao.org",
+    3200
+  );
+  const resolvePoly = (
+    over: Partial<Parameters<typeof resolveWorkloadDeclaration>[0]> & {
+      services?: Record<string, unknown>[];
+    } = {}
+  ) => {
+    const { services, ...rest } = over;
+    return resolveWorkloadDeclaration({
+      workloadZone: WORKLOAD_ZONE,
+      nodeSlug: "poly",
+      repoSpecText: specText(services ?? [APP, TRADER, SANDBOX]),
+      manifests: [POLY, SANDBOX_MANIFEST],
+      nodeId: POLY_ID,
+      env: "candidate-a",
+      workload: "poly",
+      pendingImage: `ghcr.io/cogni-dao/poly:sha-${"a".repeat(40)}`,
+      sourceRepository: "cogni-dao/poly",
+      ...rest,
+    });
+  };
+  const refusal = (message: string) =>
+    expect.objectContaining({ code: "workload_manifest_refused", message });
+
+  it("app only: a plain app workload skips the check, so extra repo-spec services are not examined", () => {
+    const w = resolvePoly({ manifests: [POLY_PLAIN] });
+    expect(w.companions).toBeUndefined();
+    expect(w.artifactPlan).toBeUndefined();
+  });
+
+  it("app + companion: the frozen plan lists the services and the companion ships in the lease", () => {
+    const w = resolvePoly({ services: [APP, TRADER], manifests: [POLY] });
+    expect(w.companions?.map((c) => c.name)).toEqual(["paper-trader"]);
+    expect(w.artifactPlan?.services.map((s) => s.name)).toEqual([
+      "app",
+      "paper-trader",
+    ]);
+  });
+
+  it.each([
+    ["app workload first", [POLY, SANDBOX_MANIFEST]],
+    ["worker first", [SANDBOX_MANIFEST, POLY]],
+  ])("app + companion + worker, %s: both workloads resolve from declarations alone", (_label, manifests) => {
+    const app = resolvePoly({ manifests });
+    expect(app.companions?.map((c) => c.name)).toEqual(["paper-trader"]);
+    // The whole frozen service list stays on the release; the worker is not in this lease.
+    expect(app.artifactPlan?.services.map((s) => s.name)).toEqual([
+      "app",
+      "paper-trader",
+      "sandbox",
+    ]);
+    const worker = resolvePoly({ manifests, workload: "sandbox" });
+    expect(worker.name).toBe("sandbox");
+    expect(worker.runtimeProfile).toBe("worker");
+    expect(worker.artifactPlan).toBeUndefined();
+    expect(worker.image).toBe(DIGEST_IMAGE);
+    expect(worker.expose).toEqual({
+      http: { host: "poly-sandbox-test.cognidao.org" },
+    });
+  });
+
+  it("production gates the companion out but still admits the worker beside the app", () => {
+    const app = resolvePoly({ env: "production" });
+    expect(app.artifactPlan?.services).toHaveLength(3);
+    expect(resolvePoly({ env: "production", workload: "sandbox" }).name).toBe(
+      "sandbox"
+    );
+  });
+
+  it("a plain second app workload that claims no service is accepted beside the app workload (canary)", () => {
+    const manifests = [POLY, SANDBOX_MANIFEST, CANARY_MANIFEST];
+    expect(resolvePoly({ manifests }).companions).toHaveLength(1);
+    expect(resolvePoly({ manifests, workload: "canary" }).name).toBe("canary");
+  });
+
+  type PoyOver = Parameters<typeof resolvePoly>[0];
+  const REFUSAL_CASES: [string, PoyOver, string][] = [
+    [
+      "an undeclared extra service",
+      {
+        services: [
+          APP,
+          TRADER,
+          SANDBOX,
+          service({ name: "stray", port: 7000 }),
+        ],
+      },
+      REFUSAL.noWorkload,
+    ],
+    [
+      "a worker service with no manifest",
+      { manifests: [POLY] },
+      REFUSAL.noWorkload,
+    ],
+    [
+      "a workload named for neither its service nor any service",
+      {
+        manifests: [
+          POLY,
+          manifest(
+            "sbx",
+            container("sandbox", 8080, DIGEST_IMAGE),
+            "poly-sbx.cognidao.org",
+            8080
+          ),
+        ],
+      },
+      REFUSAL.noWorkload,
+    ],
+    [
+      "a service in the app workload that another workload also claims",
+      {
+        manifests: [
+          POLY,
+          SANDBOX_MANIFEST,
+          manifest(
+            "paper-trader",
+            container("paper-trader", 9100, DIGEST_IMAGE),
+            "poly-paper-trader.cognidao.org",
+            9100
+          ),
+        ],
+      },
+      REFUSAL.doubleClaim,
+    ],
+    [
+      "a worker whose container key is not its service name",
+      {
+        manifests: [
+          POLY,
+          manifest(
+            "sandbox",
+            container("box", 8080, DIGEST_IMAGE),
+            "poly-sandbox.cognidao.org",
+            8080
+          ),
+        ],
+      },
+      REFUSAL.workerShape,
+    ],
+    [
+      "a worker service that carries a sibling binding",
+      {
+        services: [
+          APP,
+          TRADER,
+          service({
+            name: "sandbox",
+            port: 8080,
+            bindings: { X: "paper-trader" },
+          }),
+        ],
+      },
+      REFUSAL.workerShape,
+    ],
+    [
+      "an app binding that targets a separate worker",
+      {
+        services: [
+          service({
+            name: "app",
+            visibility: "public",
+            runtime_profile: "cogni-node-app-v1",
+            bindings: { SANDBOX_URL: "sandbox" },
+          }),
+          TRADER,
+          SANDBOX,
+        ],
+      },
+      REFUSAL.bindingToWorker,
+    ],
+    [
+      "a companion binding that targets a separate worker",
+      {
+        services: [
+          APP,
+          service({
+            name: "paper-trader",
+            port: 9100,
+            bindings: { S: "sandbox" },
+          }),
+          SANDBOX,
+        ],
+      },
+      REFUSAL.bindingToWorker,
+    ],
+    [
+      "a second app workload with companions or a qualification",
+      {
+        manifests: [
+          POLY,
+          SANDBOX_MANIFEST,
+          manifest(
+            "canary",
+            container("app", 3200, DIGEST_IMAGE),
+            "poly-canary.cognidao.org",
+            3200,
+            true
+          ),
+        ],
+      },
+      REFUSAL.twoApps,
+    ],
+  ];
+  /** Requesting the worker also refuses (the whole set is checked), unless its manifest is the missing one. */
+  const declaresSandbox = (over: PoyOver) =>
+    (over?.manifests ?? [POLY, SANDBOX_MANIFEST]).some(
+      (m) => m.path === ".cogni/workloads/sandbox.yaml"
+    );
+
+  it.each(
+    REFUSAL_CASES
+  )("refuses %s with its own fixed message, before any paid create", (_label, over, message) => {
+    expect(() => resolvePoly(over)).toThrow(refusal(message));
+    expect(() => resolvePoly({ ...over, workload: "sandbox" })).toThrow(
+      declaresSandbox(over)
+        ? refusal(message)
+        : expect.objectContaining({ code: "workload_not_declared" })
+    );
+  });
+
+  it("the five refusals throw five different messages, and the one for an unowned service names it only in issues", () => {
+    const thrown = REFUSAL_CASES.map(([, over]) => {
+      try {
+        resolvePoly(over);
+      } catch (e) {
+        return e as DeclarationError;
+      }
+      throw new Error("expected a refusal");
+    });
+    expect(new Set(thrown.map((e) => e.message)).size).toBe(
+      Object.values(REFUSAL).length
+    );
+    expect([...new Set(thrown.map((e) => e.message))].sort()).toEqual(
+      Object.values(REFUSAL).sort()
+    );
+    const stray = REFUSAL_CASES.findIndex(([l]) => l.includes("extra service"));
+    const strayError = thrown[stray] as DeclarationError;
+    expect(strayError.message).toBe(REFUSAL.noWorkload);
+    expect(strayError.issues).toEqual([
+      expect.objectContaining({
+        path: "deployment.services[3]",
+        message: expect.stringContaining('"stray"'),
+      }),
+    ]);
+  });
+
+  it("a worker beside an app that has no node-app profile is refused as a worker-shape error, not classified as a worker", () => {
+    expect(() =>
+      resolvePoly({
+        services: [
+          service({ name: "app", visibility: "public" }),
+          TRADER,
+          SANDBOX,
+        ],
+      })
+    ).toThrow(refusal(REFUSAL.workerShape));
+  });
+
+  describe("secret isolation with a node secrets catalog", () => {
+    const catalog = (entries: { name: string; workloads: string[] }[]) =>
+      `secrets:\n${entries
+        .map(
+          (e) => `  - name: ${e.name}
+    tier: A2
+    source: human
+    workloads: [${e.workloads.join(", ")}]
+    required: true
+    category: Node
+    description: Node-owned key.
+    steps: []
+`
+        )
+        .join("")}`;
+    const KEYS = [
+      { name: "SANDBOX_EXECD_TOKEN", workloads: ["sandbox"] },
+      { name: "PAPER_ENFORCE_MODE", workloads: ["app"] },
+      { name: "TRADER_ACCESS", workloads: ["paper-trader"] },
+    ];
+
+    it("the app release excludes the worker's key, and the worker gets only its own key", () => {
+      const secretsCatalogText = catalog(KEYS);
+      const app = resolvePoly({ secretsCatalogText });
+      expect(app.secretKeys).toContain("PAPER_ENFORCE_MODE");
+      expect(app.secretKeys).not.toContain("SANDBOX_EXECD_TOKEN");
+      expect(app.secretKeys).not.toContain("TRADER_ACCESS");
+      expect(app.companions?.[0]?.secretKeys).toEqual(["TRADER_ACCESS"]);
+      const worker = resolvePoly({ secretsCatalogText, workload: "sandbox" });
+      expect(worker.secretKeys).toEqual(["SANDBOX_EXECD_TOKEN"]);
+      expect(worker.runtimeProfile).toBe("worker");
+    });
+
+    it("a fleet credential that names the worker refuses the app release too", () => {
+      const secretsCatalogText = catalog([
+        ...KEYS,
+        { name: "OPENROUTER_API_KEY", workloads: ["sandbox"] },
+      ]);
+      const refused = expect.objectContaining({
+        code: "secrets_catalog_refused",
+        message: expect.stringContaining("OPENROUTER_API_KEY"),
+      });
+      expect(() => resolvePoly({ secretsCatalogText })).toThrow(refused);
+      expect(() =>
+        resolvePoly({ secretsCatalogText, workload: "sandbox" })
+      ).toThrow(refused);
+    });
+  });
+
+  it("a second service with the node-app profile is refused by the repo-spec schema, so it never becomes a worker", () => {
+    expect(() =>
+      resolvePoly({
+        services: [
+          APP,
+          TRADER,
+          service({
+            name: "sandbox",
+            port: 8080,
+            runtime_profile: "cogni-node-app-v1",
+          }),
+        ],
+      })
+    ).toThrow(expect.objectContaining({ code: "repo_spec_unparseable" }));
+  });
+});
+
+describe("poly#338 as declared (bug.5666 fixture: the real poly.yaml, sandbox.yaml and repo-spec.yaml)", () => {
+  const dir = path.join(
+    ROOT,
+    "nodes/operator/app/tests/_fixtures/node-deploy/poly-338"
+  );
+  const read = (f: string) => readFileSync(path.join(dir, f), "utf8");
+  const POLY_ID = "4b06359a-a859-4399-888e-a8c7a6696f7e";
+  const manifests = [
+    { path: ".cogni/workloads/poly.yaml", text: read("poly.yaml") },
+    { path: ".cogni/workloads/sandbox.yaml", text: read("sandbox.yaml") },
+  ];
+  const resolveReal = (
+    workload: string,
+    env: string,
+    over: Partial<Parameters<typeof resolveWorkloadDeclaration>[0]> = {}
+  ) =>
+    resolveWorkloadDeclaration({
+      workloadZone: WORKLOAD_ZONE,
+      nodeSlug: "poly",
+      repoSpecText: read("repo-spec.yaml"),
+      manifests,
+      nodeId: POLY_ID,
+      env,
+      workload,
+      pendingImage: `ghcr.io/cogni-dao/poly:sha-${"b".repeat(40)}`,
+      sourceRepository: "cogni-dao/poly",
+      ...over,
+    });
+
+  it.each([
+    "candidate-a",
+    "preview",
+    "production",
+  ])("the poly workload and its sandbox worker both resolve in %s", (env) => {
+    const app = resolveReal("poly", env);
+    expect(app.serviceName).toBe("app");
+    expect(app.artifactPlan?.services.map((s) => s.name)).toEqual([
+      "app",
+      "paper-trader",
+      "sandbox",
+    ]);
+    // paper-trader is gated to candidate-a and preview by `envs` in the repo-spec.
+    expect(app.companions?.map((c) => c.name) ?? []).toEqual(
+      env === "production" ? [] : ["paper-trader"]
+    );
+    const sandbox = resolveReal("sandbox", env);
+    expect(sandbox.runtimeProfile).toBe("worker");
+    expect(sandbox.image).toMatch(/^ghcr\.io\/cogni-dao\/red-sandbox@sha256:/);
+    expect(sandbox.expose).toEqual({
+      http: { host: hostForEnv("poly-sandbox.cognidao.org", env) },
+    });
+  });
+
+  it("removing sandbox.yaml, or adding an unowned service, is refused", () => {
+    expect(() =>
+      resolveReal("poly", "candidate-a", { manifests: manifests.slice(0, 1) })
+    ).toThrow(
+      expect.objectContaining({
+        code: "workload_manifest_refused",
+        message: REFUSAL.noWorkload,
+      })
+    );
+    const spec = parse(read("repo-spec.yaml")) as {
+      deployment: { services: Record<string, unknown>[] };
+    };
+    const stray = structuredClone(spec.deployment.services[2] as object);
+    spec.deployment.services.push({
+      ...stray,
+      name: "stray",
+      artifact: { ...(stray as { artifact: object }).artifact, name: "stray" },
+    });
+    expect(() =>
+      resolveReal("poly", "candidate-a", { repoSpecText: stringify(spec) })
+    ).toThrow(
+      expect.objectContaining({
+        code: "workload_manifest_refused",
+        message: REFUSAL.noWorkload,
+      })
+    );
+  });
+});

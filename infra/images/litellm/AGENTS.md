@@ -9,12 +9,12 @@
 
 ## Purpose
 
-Custom LiteLLM Docker image extending upstream with per-node billing callback routing. The `CogniNodeRouter` custom callback class inspects `node_id` from `spend_logs_metadata` and routes billing events to the correct node's `/api/internal/billing/ingest` endpoint.
+Custom LiteLLM Docker image extending upstream with per-node billing callback routing. The `CogniNodeRouter` routes unchanged billing events using the authenticated virtual-key alias `cogni:<lane>:<node UUID>:app:v1`. Only a verified master key may use local legacy node routes. Every success and failure also prints one `ai.gateway.receipt` JSON line (identity and instants only, no content) before billing routing; the operator trace reader verifies cross-lane generations against it in Loki (bug.5625).
 
 ## Pointers
 
-- [Multi-Node Tenancy Spec](../../docs/spec/multi-node-tenancy.md): CALLBACK_IS_ADAPTER_GLUE, MISSING_NODE_ID_DEFAULTS_OPERATOR
-- [Billing Ingest Spec](../../docs/spec/billing-ingest.md): Callback pipeline, ingest endpoint contract
+- [Multi-Node Tenancy Spec](https://node-template.cognidao.org/knowledge/node-tenancy-isolation): CALLBACK_IS_ADAPTER_GLUE, AUTHENTICATED_WORKLOAD_ROUTING
+- [Billing Ingest Spec](https://node-template.cognidao.org/knowledge/billing-ingest-callback): Callback pipeline, ingest endpoint contract
 
 ## Boundaries
 
@@ -40,20 +40,27 @@ Custom LiteLLM Docker image extending upstream with per-node billing callback ro
 ## Public Surface
 
 - `cogni_callbacks.CogniNodeRouter` — CustomLogger subclass for LiteLLM success callbacks
+- `cogni_callbacks.cogni_langfuse_otel` — Langfuse OTLP trace emitter (bug.5643); writes the metadata the operator trace reader authorizes on
 - `Dockerfile` — extends `ghcr.io/berriai/litellm` with the custom callback module
 
 ## Env Vars
 
-- `COGNI_NODE_ENDPOINTS` (required) — comma-separated `node_id=endpoint_url` pairs
+- `COGNI_NODE_ENDPOINTS` (required) — comma-separated authenticated workload alias or local legacy `node_id=base_url` pairs
+- `LITELLM_MASTER_KEY` — existing gateway key; its hash verifies the local compatibility path
+- `COGNI_DEFAULT_NODE_ID` — local primary node for master-key calls without node attribution
 - `BILLING_INGEST_TOKEN` — Bearer token forwarded to node ingest endpoints
+
+- `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST` / `LANGFUSE_TRACING_ENVIRONMENT` — Langfuse OTLP export; unset keys disable tracing without stopping the gateway
 
 ## Responsibilities
 
-- This directory **does**: build a custom LiteLLM image, route billing callbacks to per-node ingest endpoints based on `node_id` metadata
+- This directory **does**: build a custom LiteLLM image, route billing callbacks to per-node ingest endpoints based on server-stamped key identity and exact catalog routes
 - This directory **does not**: contain pricing logic, policy logic, reconciliation logic, or any business rules (CALLBACK_IS_ADAPTER_GLUE)
 
 ## Notes
 
-- Missing `node_id` defaults to operator with a warning (MISSING_NODE_ID_DEFAULTS_OPERATOR)
+- Virtual-key aliases must match an exact configured lane/node route; conflicting node claims fail closed.
+- Missing `node_id` defaults to the primary node only with verified master-key authentication. Unknown identities never fall back.
+- Catalog routing includes only declared lanes controlled by this gateway; foreign lanes have no legacy UUID/slug route.
 - Dockerfile extends the same SHA-pinned upstream image used previously in docker-compose
 - `COGNI_NODE_ENDPOINTS` is required — `CogniNodeRouter` raises `RuntimeError` at init if unset

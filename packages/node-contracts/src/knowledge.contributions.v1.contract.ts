@@ -12,16 +12,18 @@
  *   - Server stamps branch edits with source_ref='contribution:<id>:<seq>'
  *   - Confidence is never author-set; the server policy initializes + recomputes it
  * Side-effects: none
- * Links: docs/design/knowledge-contribution-api.md, docs/spec/knowledge-data-plane.md, work/items/task.0425.knowledge-contribution-api.md
+ * Links: https://node-template.cognidao.org/knowledge/knowledge-branch-design, https://node-template.cognidao.org/knowledge/knowledge-data-plane
  * @internal
  */
 
 import {
   ContributionCommitRecordSchema,
   ContributionDiffEntrySchema,
+  ContributionMergePreviewSchema,
   ContributionRecordSchema,
   KnowledgeContributionEditSchema,
 } from "@cogni/knowledge-store/contribution-schemas";
+import { ContributionCitationDiffEntrySchema } from "@cogni/shared-knowledge-store/contribution-schemas";
 import { z } from "zod";
 
 export const ContributionsCreateRequestSchema = z.object({
@@ -69,6 +71,9 @@ export type ContributionCommitRecord = z.infer<
 >;
 
 export type ContributionDiffEntry = z.infer<typeof ContributionDiffEntrySchema>;
+export type ContributionCitationDiffEntry = z.infer<
+  typeof ContributionCitationDiffEntrySchema
+>;
 
 export const ContributionsListResponseSchema = z.object({
   contributions: z.array(ContributionRecordSchema),
@@ -81,6 +86,8 @@ export const ContributionDiffResponseSchema = z.object({
   contributionId: z.string(),
   branch: z.string(),
   entries: z.array(ContributionDiffEntrySchema),
+  /** Each changed citation edge with its citing side's label and tone (bug.0011). */
+  citations: z.array(ContributionCitationDiffEntrySchema),
 });
 export type ContributionDiffResponse = z.infer<
   typeof ContributionDiffResponseSchema
@@ -100,4 +107,11 @@ export const ContributionMergeResponseSchema = z.object({
 });
 export type ContributionMergeResponse = z.infer<
   typeof ContributionMergeResponseSchema
+>;
+
+export const ContributionMergeCheckRequestSchema = z.strictObject({});
+export const ContributionMergeCheckResponseSchema =
+  ContributionMergePreviewSchema;
+export type ContributionMergeCheckResponse = z.infer<
+  typeof ContributionMergeCheckResponseSchema
 >;

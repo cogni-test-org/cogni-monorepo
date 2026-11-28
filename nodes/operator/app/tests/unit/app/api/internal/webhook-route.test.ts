@@ -19,7 +19,6 @@ const fakes = vi.hoisted(() => ({
   catalogLookup: vi.fn(),
   insert: vi.fn(),
   deliver: vi.fn(),
-  review: vi.fn(),
   preview: vi.fn(),
   signal: vi.fn(),
 }));
@@ -59,11 +58,11 @@ vi.mock("@/bootstrap/container", () => ({
     resolveRepoRoute: fakes.catalogLookup,
   }),
 }));
-vi.mock("@/app/_facades/review/dispatch.server", () => ({
-  dispatchPrReview: fakes.review,
-}));
 vi.mock("@/app/_facades/deploy/node-preview-promote.server", () => ({
   dispatchNodePreviewPromote: fakes.preview,
+}));
+vi.mock("@/app/_facades/review/queue-verdict.server", () => ({
+  dispatchQueueReviewVerdict: vi.fn(),
 }));
 vi.mock("@/features/governance/services/signal-dispatch", () => ({
   dispatchSignalExecution: fakes.signal,
@@ -119,7 +118,6 @@ describe("POST internal webhook verification boundary", () => {
     expect(fakes.normalize).not.toHaveBeenCalled();
     expect(fakes.insert).not.toHaveBeenCalled();
     expect(fakes.deliver).not.toHaveBeenCalled();
-    expect(fakes.review).not.toHaveBeenCalled();
     expect(fakes.preview).not.toHaveBeenCalled();
     expect(fakes.signal).not.toHaveBeenCalled();
   });
@@ -156,7 +154,6 @@ describe("POST internal webhook verification boundary", () => {
       expect.anything(),
       logger
     );
-    expect(fakes.review).not.toHaveBeenCalled();
   });
 
   it("does not acknowledge a push when the promotion dispatch is unobserved", async () => {

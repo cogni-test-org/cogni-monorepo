@@ -7,7 +7,7 @@
  * Scope: Pure observability utilities. Does NOT include logger factory (makeLogger), metrics, or redact — those stay app-local.
  * Invariants: PURE_LIBRARY — no pino runtime, no prom-client runtime.
  * Side-effects: none
- * Links: docs/spec/packages-architecture.md
+ * Links: https://node-template.cognidao.org/knowledge/package-isolation-rules
  * @public
  */
 
@@ -18,7 +18,11 @@ export type { Clock, RequestContext } from "./context";
 export { createRequestContext } from "./context";
 export type { EventBase, EventName } from "./events";
 // Event Registry (shared by client and server)
-export { EVENT_NAMES } from "./events";
+export {
+  EVENT_NAMES,
+  KNOWLEDGE_CONTRIBUTION_DIFF_ERROR_CODES,
+  WORK_ITEMS_LIST_ERROR_CODES,
+} from "./events";
 // Domain event payload types
 export * from "./events/ai";
 export * from "./events/payments";
